@@ -2,9 +2,9 @@ use anyhow::Result;
 use eframe::egui;
 use futures::StreamExt;
 use libp2p::{
-    identify, kad, mdns, noise, ping,
+    autonat, dcutr, identify, kad, mdns, noise, ping, relay,
     swarm::{NetworkBehaviour, SwarmEvent},
-    tcp, yamux, Multiaddr, PeerId,
+    tcp, yamux, Multiaddr, PeerId, Transport,
 };
 use std::collections::HashMap;
 use std::error::Error;
@@ -32,6 +32,9 @@ struct MyBehaviour {
     mdns: mdns::tokio::Behaviour,
     kad: kad::Behaviour<kad::store::MemoryStore>,
     identify: identify::Behaviour,
+    relay_client: relay::client::Behaviour,
+    dcutr: dcutr::Behaviour,
+    autonat: autonat::Behaviour,
 }
 
 struct P2pApp {
@@ -55,12 +58,9 @@ impl P2pApp {
         command_tx: mpsc::Sender<UICommand>,
         event_rx: mpsc::Receiver<NetworkEvent>,
     ) -> Self {
-        // Установка умеренного масштаба интерфейса (1.1x - 1.2x для 4K/больших мониторов)
         cc.egui_ctx.set_pixels_per_point(1.2);
 
-        // Настройка современного визуального стиля
         let mut visuals = egui::Visuals::dark();
-        // Используем Slate/Zinc палитру (глубокий серый)
         visuals.panel_fill = egui::Color32::from_rgb(18, 18, 22);
         visuals.widgets.noninteractive.bg_fill = egui::Color32::from_rgb(24, 24, 30);
         visuals.widgets.inactive.bg_fill = egui::Color32::from_rgb(34, 34, 42);
@@ -75,7 +75,6 @@ impl P2pApp {
         
         cc.egui_ctx.set_visuals(visuals);
 
-        // Настройка шрифтов и стиля
         let mut style = (*cc.egui_ctx.style()).clone();
         use egui::{FontId, TextStyle};
         style.text_styles = [
@@ -105,10 +104,13 @@ impl P2pApp {
 
 impl eframe::App for P2pApp {
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
-        // Обработка входящих событий от сети
         while let Ok(event) = self.event_rx.try_recv() {
             match event {
-                NetworkEvent::NewListenAddr(addr) => self.listen_addrs.push(addr),
+                NetworkEvent::NewListenAddr(addr) => {
+                    if !self.listen_addrs.contains(&addr) {
+                        self.listen_addrs.push(addr);
+                    }
+                }
                 NetworkEvent::PeerDiscovered(peer_id) => {
                     self.peers.entry(peer_id).or_insert(PeerInfo { rtt: None, protocols: Vec::new() });
                 }
@@ -126,7 +128,6 @@ impl eframe::App for P2pApp {
             }
         }
 
-        // Боковая панель
         egui::SidePanel::left("left_panel")
             .resizable(true)
             .default_width(320.0)
@@ -150,13 +151,12 @@ impl eframe::App for P2pApp {
             
             ui.add_space(15.0);
             ui.label(egui::RichText::new("ВАШИ АДРЕСА").small().weak());
-            egui::ScrollArea::vertical().id_salt("addrs").max_height(150.0).show(ui, |ui| {
+            egui::ScrollArea::vertical().id_salt("addrs").max_height(200.0).show(ui, |ui| {
                 for addr in &self.listen_addrs {
                     let full_addr = format!("{}/p2p/{}", addr, self.local_peer_id);
                     ui.horizontal(|ui| {
-                        // Показываем IP и TCP полностью, сокращаем только p2p ID
                         let addr_str = addr.to_string();
-                        ui.label(egui::RichText::new(addr_str).monospace().small());
+                        ui.label(egui::RichText::new(addr_str).monospace().small().color(egui::Color32::from_rgb(150, 255, 150)));
                         if ui.button("📎").on_hover_text("Копировать полный адрес").clicked() {
                             ui.output_mut(|o| o.copied_text = full_addr);
                         }
@@ -178,7 +178,7 @@ impl eframe::App for P2pApp {
                                 if let Some(rtt) = info.rtt {
                                     ui.label(egui::RichText::new(format!("RTT: {:?}", rtt)).small().weak());
                                 } else {
-                                    ui.label(egui::RichText::new("Подключение...").small().italics());
+                                    ui.label(egui::RichText::new("Поиск маршрута...").small().italics());
                                 }
                             });
                         });
@@ -187,7 +187,6 @@ impl eframe::App for P2pApp {
             });
         });
 
-        // Центральная панель
         egui::CentralPanel::default().show(ctx, |ui| {
             ui.add_space(10.0);
             ui.heading("Общение");
@@ -196,7 +195,7 @@ impl eframe::App for P2pApp {
             ui.group(|ui| {
                 ui.horizontal(|ui| {
                     let res = ui.add(egui::TextEdit::singleline(&mut self.dial_address)
-                        .hint_text("Вставьте адрес пира сюда...")
+                        .hint_text("Вставьте /ip4/ или /dnsaddr/ адрес...")
                         .desired_width(ui.available_width() - 120.0));
                     
                     if ui.add_sized([100.0, 30.0], egui::Button::new("Соединить")).clicked() || (res.lost_focus() && ctx.input(|i| i.key_pressed(egui::Key::Enter))) {
@@ -210,13 +209,15 @@ impl eframe::App for P2pApp {
             
             ui.vertical_centered(|ui| {
                 ui.add_space(100.0);
-                ui.label(egui::RichText::new("💬").size(60.0));
-                ui.label(egui::RichText::new("История сообщений появится здесь").weak());
-                ui.label(egui::RichText::new("Начните с подключения к другому узлу").small().weak());
+                ui.label(egui::RichText::new("📡").size(60.0));
+                ui.label(egui::RichText::new("Сервис глобальной связи активен").strong());
+                ui.add_space(10.0);
+                ui.label(egui::RichText::new("Если вы в разных сетях, просто скопируйте свой адрес").weak());
+                ui.label(egui::RichText::new("и передайте его через любой мессенджер.").weak());
+                ui.label(egui::RichText::new("Технологии Relay и DCUtR помогут пробить NAT.").small().weak());
             });
         });
 
-        // Постоянное обновление кадра для получения событий
         ctx.request_repaint_after(Duration::from_millis(100));
     }
 }
@@ -232,9 +233,11 @@ fn main() -> Result<(), Box<dyn Error>> {
     let (event_tx, event_rx) = mpsc::channel(100);
     let (command_tx, mut command_rx) = mpsc::channel(100);
 
-    // Запуск сетевого слоя в отдельном рантайме tokio
     let rt = tokio::runtime::Runtime::new()?;
     rt.spawn(async move {
+        // Создаем релей-клиент до сборки Swarm
+        let (relay_transport, relay_client) = relay::client::new(local_peer_id);
+
         let mut swarm = libp2p::SwarmBuilder::with_existing_identity(local_key)
             .with_tokio()
             .with_tcp(
@@ -242,7 +245,16 @@ fn main() -> Result<(), Box<dyn Error>> {
                 noise::Config::new,
                 yamux::Config::default,
             ).unwrap()
-            .with_behaviour(|key| {
+            .with_quic()
+            .with_other_transport(|key| {
+                relay_transport
+                    .upgrade(libp2p::core::upgrade::Version::V1Lazy)
+                    .authenticate(noise::Config::new(key).unwrap())
+                    .multiplex(yamux::Config::default())
+                    .map(|(p, c), _| (p, libp2p::core::muxing::StreamMuxerBox::new(c)))
+            }).unwrap()
+            .with_dns().unwrap()
+            .with_behaviour(|key: &libp2p::identity::Keypair| {
                 let local_peer_id = key.public().to_peer_id();
                 Ok(MyBehaviour {
                     ping: ping::Behaviour::default(),
@@ -258,12 +270,38 @@ fn main() -> Result<(), Box<dyn Error>> {
                         "/p2p-messenger/1.0.0".to_string(),
                         key.public(),
                     )),
+                    relay_client,
+                    dcutr: dcutr::Behaviour::new(local_peer_id),
+                    autonat: autonat::Behaviour::new(local_peer_id, autonat::Config::default()),
                 })
             }).unwrap()
-            .with_swarm_config(|c| c.with_idle_connection_timeout(Duration::from_secs(60)))
+            .with_swarm_config(|c: libp2p::swarm::Config| c.with_idle_connection_timeout(Duration::from_secs(60)))
             .build();
 
+        // Слушаем TCP, QUIC и Relay
         swarm.listen_on("/ip4/0.0.0.0/tcp/0".parse().unwrap()).unwrap();
+        swarm.listen_on("/ip4/0.0.0.0/udp/0/quic-v1".parse().unwrap()).unwrap();
+        
+        // Подключаемся к публичным реле для обхода NAT
+        let public_relays = [
+            "/dnsaddr/bootstrap.libp2p.io/p2p/QmNnooDN2uYkB1DURgnzsE9qztqcS1Scy1uW91P98fXSDj",
+            "/dnsaddr/bootstrap.libp2p.io/p2p/QmQCU2EcNm3unvTMpe2Y5rS61hZ8v8z9tM5S1qU7U9zD",
+        ];
+
+        for addr in public_relays {
+            if let Ok(maddr) = addr.parse::<Multiaddr>() {
+                if let Some(peer_id) = maddr.iter().find_map(|p| match p {
+                    libp2p::multiaddr::Protocol::P2p(peer_id) => Some(peer_id),
+                    _ => None,
+                }) {
+                    swarm.behaviour_mut().kad.add_address(&peer_id, maddr.clone());
+                    let _ = swarm.dial(maddr.clone());
+                    // Пытаемся слушать через это реле
+                    let listen_addr = maddr.with(libp2p::multiaddr::Protocol::P2pCircuit);
+                    let _ = swarm.listen_on(listen_addr);
+                }
+            }
+        }
 
         loop {
             tokio::select! {
@@ -282,12 +320,20 @@ fn main() -> Result<(), Box<dyn Error>> {
                             }
                         }
                         SwarmEvent::Behaviour(MyBehaviourEvent::Identify(identify::Event::Received { peer_id, info, .. })) => {
+                            // Проверяем поддержку Relay Server ДО того, как переместим протоколы
+                            let is_relay = info.protocols.iter().any(|p| p.to_string().contains("/libp2p/relay/2.0.0/stop"));
+                            
                             let _ = event_tx.send(NetworkEvent::IdentifyReceived { 
                                 peer_id, 
                                 protocols: info.protocols.into_iter().map(|p| p.to_string()).collect() 
                             }).await;
+
                             for addr in info.listen_addrs {
-                                swarm.behaviour_mut().kad.add_address(&peer_id, addr);
+                                swarm.behaviour_mut().kad.add_address(&peer_id, addr.clone());
+                                if is_relay {
+                                    let relay_addr = addr.with(libp2p::multiaddr::Protocol::P2pCircuit);
+                                    let _ = swarm.listen_on(relay_addr);
+                                }
                             }
                         }
                         SwarmEvent::Behaviour(MyBehaviourEvent::Kad(kad::Event::RoutingUpdated { .. })) => {
@@ -314,7 +360,6 @@ fn main() -> Result<(), Box<dyn Error>> {
         }
     });
 
-    // Запуск GUI в главном потоке
     let options = eframe::NativeOptions {
         viewport: egui::ViewportBuilder::default()
             .with_inner_size([1100.0, 700.0])
