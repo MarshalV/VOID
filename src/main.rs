@@ -18,6 +18,7 @@ enum NetworkEvent {
     PeerDiscovered(PeerId),
     IdentifyReceived { peer_id: PeerId, protocols: Vec<String> },
     PingResult { peer_id: PeerId, rtt: Duration },
+    #[allow(dead_code)]
     DhtUpdated(PeerId),
 }
 
@@ -239,7 +240,7 @@ fn main() -> Result<(), Box<dyn Error>> {
     eframe::run_native(
         "P2P Messenger",
         options,
-        Box::new(move |cc| Box::new(P2pApp::new(cc, local_peer_id, command_tx, event_rx))),
+        Box::new(move |cc| Ok(Box::new(P2pApp::new(cc, local_peer_id, command_tx, event_rx)))),
     ).map_err(|e| Box::new(e) as Box<dyn Error>)?;
 
     Ok(())
