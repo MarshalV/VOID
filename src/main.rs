@@ -154,9 +154,10 @@ impl eframe::App for P2pApp {
                 for addr in &self.listen_addrs {
                     let full_addr = format!("{}/p2p/{}", addr, self.local_peer_id);
                     ui.horizontal(|ui| {
-                        let short_addr = format!("{}/...", &full_addr[..20]);
-                        ui.label(egui::RichText::new(short_addr).monospace().small());
-                        if ui.button("📎").on_hover_text("Копировать адрес").clicked() {
+                        // Показываем IP и TCP полностью, сокращаем только p2p ID
+                        let addr_str = addr.to_string();
+                        ui.label(egui::RichText::new(addr_str).monospace().small());
+                        if ui.button("📎").on_hover_text("Копировать полный адрес").clicked() {
                             ui.output_mut(|o| o.copied_text = full_addr);
                         }
                     });
