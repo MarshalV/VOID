@@ -101,9 +101,12 @@ impl eframe::App for P2pApp {
             ui.small(self.local_peer_id.to_string());
             
             ui.separator();
-            ui.label("Ваши адреса:");
+            ui.label("Ваши адреса (нажмите, чтобы скопировать):");
             for addr in &self.listen_addrs {
-                ui.small(addr.to_string());
+                let full_addr = format!("{}/p2p/{}", addr, self.local_peer_id);
+                if ui.button(full_addr.clone()).on_hover_text("Нажмите, чтобы скопировать").clicked() {
+                    ui.output_mut(|o| o.copied_text = full_addr);
+                }
             }
 
             ui.separator();
