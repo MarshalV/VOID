@@ -4,7 +4,7 @@ use futures::StreamExt;
 use libp2p::{
     autonat, dcutr, identify, kad, mdns, noise, ping, relay,
     swarm::{NetworkBehaviour, SwarmEvent},
-    tcp, yamux, Multiaddr, PeerId, Transport,
+    tcp, upnp, yamux, Multiaddr, PeerId, Transport,
 };
 use std::collections::HashMap;
 use std::error::Error;
@@ -35,6 +35,7 @@ struct MyBehaviour {
     relay_client: relay::client::Behaviour,
     dcutr: dcutr::Behaviour,
     autonat: autonat::Behaviour,
+    upnp: upnp::tokio::Behaviour,
 }
 
 struct P2pApp {
@@ -273,6 +274,7 @@ fn main() -> Result<(), Box<dyn Error>> {
                     relay_client,
                     dcutr: dcutr::Behaviour::new(local_peer_id),
                     autonat: autonat::Behaviour::new(local_peer_id, autonat::Config::default()),
+                    upnp: upnp::tokio::Behaviour::default(),
                 })
             }).unwrap()
             .with_swarm_config(|c: libp2p::swarm::Config| c.with_idle_connection_timeout(Duration::from_secs(60)))
@@ -282,10 +284,12 @@ fn main() -> Result<(), Box<dyn Error>> {
         swarm.listen_on("/ip4/0.0.0.0/tcp/0".parse().unwrap()).unwrap();
         swarm.listen_on("/ip4/0.0.0.0/udp/0/quic-v1".parse().unwrap()).unwrap();
         
-        // Подключаемся к публичным реле для обхода NAT
+        // Расширенный список публичных реле-узлов
         let public_relays = [
             "/dnsaddr/bootstrap.libp2p.io/p2p/QmNnooDN2uYkB1DURgnzsE9qztqcS1Scy1uW91P98fXSDj",
             "/dnsaddr/bootstrap.libp2p.io/p2p/QmQCU2EcNm3unvTMpe2Y5rS61hZ8v8z9tM5S1qU7U9zD",
+            "/ip4/147.75.109.213/tcp/4001/p2p/QmNnooDN2uYkB1DURgnzsE9qztqcS1Scy1uW91P98fXSDj",
+            "/ip4/147.75.80.143/tcp/4001/p2p/QmQCU2EcNm3unvTMpe2Y5rS61hZ8v8z9tM5S1qU7U9zD",
         ];
 
         for addr in public_relays {
@@ -338,6 +342,19 @@ fn main() -> Result<(), Box<dyn Error>> {
                         }
                         SwarmEvent::Behaviour(MyBehaviourEvent::Kad(kad::Event::RoutingUpdated { .. })) => {
                             let _ = event_tx.send(NetworkEvent::DhtUpdated).await;
+                        }
+                        SwarmEvent::Behaviour(MyBehaviourEvent::Upnp(upnp::Event::NewExternalAddr(addr))) => {
+                            tracing::info!("UPnP: New external address mapped: {}", addr);
+                            let _ = event_tx.send(NetworkEvent::NewListenAddr(addr)).await;
+                        }
+                        SwarmEvent::Behaviour(MyBehaviourEvent::Upnp(upnp::Event::GatewayNotFound)) => {
+                            tracing::warn!("UPnP: Gateway not found (роутер не поддерживает или UPnP выключен)");
+                        }
+                        SwarmEvent::Behaviour(MyBehaviourEvent::Upnp(upnp::Event::NonRoutableGateway)) => {
+                            tracing::warn!("UPnP: Gateway is not routable (вы за двойным NAT или у роутера нет внешнего IP)");
+                        }
+                        SwarmEvent::Behaviour(MyBehaviourEvent::Upnp(upnp::Event::ExpiredExternalAddr(addr))) => {
+                            tracing::info!("UPnP: External address expired: {}", addr);
                         }
                         _ => {}
                     }
