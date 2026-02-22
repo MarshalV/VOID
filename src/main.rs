@@ -18,8 +18,7 @@ enum NetworkEvent {
     PeerDiscovered(PeerId),
     IdentifyReceived { peer_id: PeerId, protocols: Vec<String> },
     PingResult { peer_id: PeerId, rtt: Duration },
-    #[allow(dead_code)]
-    DhtUpdated(PeerId),
+    DhtUpdated,
 }
 
 // Сообщения от UI к сетевому слою
@@ -89,7 +88,7 @@ impl eframe::App for P2pApp {
                         info.rtt = Some(rtt);
                     }
                 }
-                NetworkEvent::DhtUpdated(_) => {}
+                NetworkEvent::DhtUpdated => {}
             }
         }
 
@@ -211,8 +210,8 @@ fn main() -> Result<(), Box<dyn Error>> {
                                 swarm.behaviour_mut().kad.add_address(&peer_id, addr);
                             }
                         }
-                        SwarmEvent::Behaviour(MyBehaviourEvent::Kad(kad::Event::RoutingUpdated { peer, .. })) => {
-                            let _ = event_tx.send(NetworkEvent::DhtUpdated(peer)).await;
+                        SwarmEvent::Behaviour(MyBehaviourEvent::Kad(kad::Event::RoutingUpdated { .. })) => {
+                            let _ = event_tx.send(NetworkEvent::DhtUpdated).await;
                         }
                         _ => {}
                     }
