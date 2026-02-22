@@ -19,6 +19,8 @@ enum NetworkEvent {
     IdentifyReceived { peer_id: PeerId, protocols: Vec<String> },
     PingResult { peer_id: PeerId, rtt: Duration },
     DhtUpdated,
+    RelayStatus { connected: bool, relay_id: PeerId },
+    TotalPeers(usize),
 }
 
 // Сообщения от UI к сетевому слою
@@ -45,6 +47,10 @@ struct P2pApp {
     dial_address: String,
     command_tx: mpsc::Sender<UICommand>,
     event_rx: mpsc::Receiver<NetworkEvent>,
+    // Новые метрики сети
+    relay_connected: bool,
+    active_relay_id: Option<PeerId>,
+    total_peers: usize,
 }
 
 struct PeerInfo {
@@ -99,6 +105,9 @@ impl P2pApp {
             dial_address: String::new(),
             command_tx,
             event_rx,
+            relay_connected: false,
+            active_relay_id: None,
+            total_peers: 0,
         }
     }
 }
@@ -126,8 +135,36 @@ impl eframe::App for P2pApp {
                     }
                 }
                 NetworkEvent::DhtUpdated => {}
+                NetworkEvent::RelayStatus { connected, relay_id } => {
+                    self.relay_connected = connected;
+                    if connected {
+                        self.active_relay_id = Some(relay_id);
+                    }
+                }
+                NetworkEvent::TotalPeers(count) => {
+                    self.total_peers = count;
+                }
             }
         }
+
+        egui::TopBottomPanel::bottom("status_bar").show(ctx, |ui| {
+            ui.horizontal(|ui| {
+                ui.label(egui::RichText::new("Статус сети:").small().weak());
+                let (status_text, color) = if self.relay_connected {
+                    ("● Реле активно", egui::Color32::from_rgb(100, 255, 100))
+                } else {
+                    ("○ Реле: поиск...", egui::Color32::from_rgb(255, 100, 100))
+                };
+                
+                let response = ui.label(egui::RichText::new(status_text).small().color(color));
+                if let Some(relay_id) = self.active_relay_id {
+                    response.on_hover_text(format!("Подключено к реле:\n{}", relay_id));
+                }
+                
+                ui.separator();
+                ui.label(egui::RichText::new(format!("Соединений: {}", self.total_peers)).small().weak());
+            });
+        });
 
         egui::SidePanel::left("left_panel")
             .resizable(true)
@@ -329,8 +366,12 @@ fn main() -> Result<(), Box<dyn Error>> {
                             
                             let _ = event_tx.send(NetworkEvent::IdentifyReceived { 
                                 peer_id, 
-                                protocols: info.protocols.into_iter().map(|p| p.to_string()).collect() 
+                                protocols: info.protocols.iter().map(|p| p.to_string()).collect() 
                             }).await;
+
+                            if is_relay {
+                                let _ = event_tx.send(NetworkEvent::RelayStatus { connected: true, relay_id: peer_id }).await;
+                            }
 
                             for addr in info.listen_addrs {
                                 swarm.behaviour_mut().kad.add_address(&peer_id, addr.clone());
@@ -355,6 +396,13 @@ fn main() -> Result<(), Box<dyn Error>> {
                         }
                         SwarmEvent::Behaviour(MyBehaviourEvent::Upnp(upnp::Event::ExpiredExternalAddr(addr))) => {
                             tracing::info!("UPnP: External address expired: {}", addr);
+                        }
+                        SwarmEvent::ConnectionEstablished { peer_id, .. } => {
+                            let _ = event_tx.send(NetworkEvent::TotalPeers(swarm.connected_peers().count())).await;
+                            let _ = event_tx.send(NetworkEvent::PeerDiscovered(peer_id)).await;
+                        }
+                        SwarmEvent::ConnectionClosed { .. } => {
+                            let _ = event_tx.send(NetworkEvent::TotalPeers(swarm.connected_peers().count())).await;
                         }
                         _ => {}
                     }

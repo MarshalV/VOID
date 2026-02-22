@@ -1,7 +1,7 @@
 ﻿cargo :     Finished `
 dev` profile [unoptimi
 zed + debuginfo] targe
-t(s) in 0.67s
+t(s) in 0.68s
 строка:1 знак:1
 + cargo check 2> error
 s.log; Get-Content err
@@ -10,12 +10,12 @@ error ...
 + ~~~~~~~~~~~~~~~~~~~~
 ~~~~~
     + CategoryInfo    
-          : NotSpeci  
-  fied: (    Finish   
- ed `d...get(s) in    
- 0.67s:String) []    ,
- RemoteException
-    + FullyQualifiedE 
-   rrorId : NativeCo  
-  mmandError
+          : NotSpecifi
+ed    : (    Finished 
+`d.    ..get(s) in 0.6
+8s:S    tring) [], Rem
+oteEx    ception
+    + FullyQualifiedEr
+r    orId : NativeComm
+an    dError
  
