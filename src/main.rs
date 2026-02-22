@@ -55,8 +55,31 @@ impl P2pApp {
         command_tx: mpsc::Sender<UICommand>,
         event_rx: mpsc::Receiver<NetworkEvent>,
     ) -> Self {
-        // Настройка визуального стиля (темная тема)
-        cc.egui_ctx.set_visuals(egui::Visuals::dark());
+        // Установка масштаба интерфейса для больших мониторов (150%)
+        cc.egui_ctx.set_pixels_per_point(1.5);
+
+        // Настройка визуального стиля
+        let mut visuals = egui::Visuals::dark();
+        visuals.window_rounding = 12.0.into();
+        cc.egui_ctx.set_visuals(visuals);
+
+        // Настройка шрифтов и отступов через Style
+        let mut style = (*cc.egui_ctx.style()).clone();
+        
+        // Масштабируем стандартные размеры текста
+        use egui::{FontId, TextStyle};
+        style.text_styles = [
+            (TextStyle::Heading, FontId::new(30.0, egui::FontFamily::Proportional)),
+            (TextStyle::Body, FontId::new(18.0, egui::FontFamily::Proportional)),
+            (TextStyle::Monospace, FontId::new(16.0, egui::FontFamily::Monospace)),
+            (TextStyle::Button, FontId::new(18.0, egui::FontFamily::Proportional)),
+            (TextStyle::Small, FontId::new(14.0, egui::FontFamily::Proportional)),
+        ].into();
+
+        style.spacing.item_spacing = egui::vec2(12.0, 16.0);
+        style.spacing.button_padding = egui::vec2(12.0, 8.0);
+        
+        cc.egui_ctx.set_style(style);
 
         Self {
             local_peer_id,
