@@ -55,29 +55,40 @@ impl P2pApp {
         command_tx: mpsc::Sender<UICommand>,
         event_rx: mpsc::Receiver<NetworkEvent>,
     ) -> Self {
-        // Установка масштаба интерфейса для больших мониторов (150%)
-        cc.egui_ctx.set_pixels_per_point(1.5);
+        // Установка умеренного масштаба интерфейса (1.1x - 1.2x для 4K/больших мониторов)
+        cc.egui_ctx.set_pixels_per_point(1.2);
 
-        // Настройка визуального стиля
+        // Настройка современного визуального стиля
         let mut visuals = egui::Visuals::dark();
+        // Используем Slate/Zinc палитру (глубокий серый)
+        visuals.panel_fill = egui::Color32::from_rgb(18, 18, 22);
+        visuals.widgets.noninteractive.bg_fill = egui::Color32::from_rgb(24, 24, 30);
+        visuals.widgets.inactive.bg_fill = egui::Color32::from_rgb(34, 34, 42);
+        visuals.widgets.hovered.bg_fill = egui::Color32::from_rgb(44, 44, 55);
+        visuals.widgets.active.bg_fill = egui::Color32::from_rgb(54, 54, 68);
+        
+        visuals.selection.bg_fill = egui::Color32::from_rgb(99, 102, 241); // Indigo
         visuals.window_rounding = 12.0.into();
+        visuals.widgets.inactive.rounding = 8.0.into();
+        visuals.widgets.hovered.rounding = 8.0.into();
+        visuals.widgets.active.rounding = 8.0.into();
+        
         cc.egui_ctx.set_visuals(visuals);
 
-        // Настройка шрифтов и отступов через Style
+        // Настройка шрифтов и стиля
         let mut style = (*cc.egui_ctx.style()).clone();
-        
-        // Масштабируем стандартные размеры текста
         use egui::{FontId, TextStyle};
         style.text_styles = [
-            (TextStyle::Heading, FontId::new(30.0, egui::FontFamily::Proportional)),
-            (TextStyle::Body, FontId::new(18.0, egui::FontFamily::Proportional)),
-            (TextStyle::Monospace, FontId::new(16.0, egui::FontFamily::Monospace)),
-            (TextStyle::Button, FontId::new(18.0, egui::FontFamily::Proportional)),
-            (TextStyle::Small, FontId::new(14.0, egui::FontFamily::Proportional)),
+            (TextStyle::Heading, FontId::new(24.0, egui::FontFamily::Proportional)),
+            (TextStyle::Body, FontId::new(16.0, egui::FontFamily::Proportional)),
+            (TextStyle::Monospace, FontId::new(14.0, egui::FontFamily::Monospace)),
+            (TextStyle::Button, FontId::new(16.0, egui::FontFamily::Proportional)),
+            (TextStyle::Small, FontId::new(13.0, egui::FontFamily::Proportional)),
         ].into();
 
-        style.spacing.item_spacing = egui::vec2(12.0, 16.0);
+        style.spacing.item_spacing = egui::vec2(12.0, 12.0);
         style.spacing.button_padding = egui::vec2(12.0, 8.0);
+        style.spacing.indent = 20.0;
         
         cc.egui_ctx.set_style(style);
 
@@ -116,31 +127,60 @@ impl eframe::App for P2pApp {
         }
 
         // Боковая панель
-        egui::SidePanel::left("left_panel").show(ctx, |ui| {
-            ui.heading("P2P Messenger");
-            ui.separator();
+        egui::SidePanel::left("left_panel")
+            .resizable(true)
+            .default_width(320.0)
+            .min_width(250.0)
+            .show(ctx, |ui| {
+            ui.add_space(10.0);
+            ui.vertical_centered(|ui| {
+                ui.heading("P2P Messenger");
+            });
+            ui.add_space(20.0);
 
-            ui.label(format!("Ваш ID:"));
-            ui.small(self.local_peer_id.to_string());
+            ui.group(|ui| {
+                ui.vertical(|ui| {
+                    ui.label(egui::RichText::new("ВАШ ПРОФИЛЬ").small().weak());
+                    ui.label(egui::RichText::new(format!("ID: {}", &self.local_peer_id.to_string()[..12])).monospace());
+                    if ui.button("📋 Копировать полный ID").clicked() {
+                        ui.output_mut(|o| o.copied_text = self.local_peer_id.to_string());
+                    }
+                });
+            });
             
-            ui.separator();
-            ui.label("Ваши адреса (нажмите, чтобы скопировать):");
-            for addr in &self.listen_addrs {
-                let full_addr = format!("{}/p2p/{}", addr, self.local_peer_id);
-                if ui.button(full_addr.clone()).on_hover_text("Нажмите, чтобы скопировать").clicked() {
-                    ui.output_mut(|o| o.copied_text = full_addr);
-                }
-            }
-
-            ui.separator();
-            ui.heading("Пиры в сети");
-            egui::ScrollArea::vertical().show(ui, |ui| {
-                for (peer_id, info) in &self.peers {
-                    ui.group(|ui| {
-                        ui.label(format!("Peer: {}", &peer_id.to_string()[..8]));
-                        if let Some(rtt) = info.rtt {
-                            ui.label(format!("Ping: {:?}", rtt));
+            ui.add_space(15.0);
+            ui.label(egui::RichText::new("ВАШИ АДРЕСА").small().weak());
+            egui::ScrollArea::vertical().id_salt("addrs").max_height(150.0).show(ui, |ui| {
+                for addr in &self.listen_addrs {
+                    let full_addr = format!("{}/p2p/{}", addr, self.local_peer_id);
+                    ui.horizontal(|ui| {
+                        let short_addr = format!("{}/...", &full_addr[..20]);
+                        ui.label(egui::RichText::new(short_addr).monospace().small());
+                        if ui.button("📎").on_hover_text("Копировать адрес").clicked() {
+                            ui.output_mut(|o| o.copied_text = full_addr);
                         }
+                    });
+                }
+            });
+
+            ui.add_space(20.0);
+            ui.label(egui::RichText::new("ПИРЫ В СЕТИ").small().weak());
+            ui.separator();
+            
+            egui::ScrollArea::vertical().id_salt("peers").show(ui, |ui| {
+                for (peer_id, info) in &self.peers {
+                    ui.add_space(4.0);
+                    ui.group(|ui| {
+                        ui.horizontal(|ui| {
+                            ui.vertical(|ui| {
+                                ui.label(egui::RichText::new(format!("Peer {}", &peer_id.to_string()[..8])).strong());
+                                if let Some(rtt) = info.rtt {
+                                    ui.label(egui::RichText::new(format!("RTT: {:?}", rtt)).small().weak());
+                                } else {
+                                    ui.label(egui::RichText::new("Подключение...").small().italics());
+                                }
+                            });
+                        });
                     });
                 }
             });
@@ -148,18 +188,31 @@ impl eframe::App for P2pApp {
 
         // Центральная панель
         egui::CentralPanel::default().show(ctx, |ui| {
-            ui.heading("Управление");
+            ui.add_space(10.0);
+            ui.heading("Общение");
+            ui.add_space(10.0);
             
-            ui.horizontal(|ui| {
-                ui.label("Подключиться к адресу:");
-                ui.text_edit_singleline(&mut self.dial_address);
-                if ui.button("Подключиться").clicked() {
-                    let _ = self.command_tx.try_send(UICommand::Dial(self.dial_address.clone()));
-                }
+            ui.group(|ui| {
+                ui.horizontal(|ui| {
+                    let res = ui.add(egui::TextEdit::singleline(&mut self.dial_address)
+                        .hint_text("Вставьте адрес пира сюда...")
+                        .desired_width(ui.available_width() - 120.0));
+                    
+                    if ui.add_sized([100.0, 30.0], egui::Button::new("Соединить")).clicked() || (res.lost_focus() && ctx.input(|i| i.key_pressed(egui::Key::Enter))) {
+                        let _ = self.command_tx.try_send(UICommand::Dial(self.dial_address.clone()));
+                        self.dial_address.clear();
+                    }
+                });
             });
 
-            ui.separator();
-            ui.label("Тут будет история сообщений в следующей фазе...");
+            ui.add_space(20.0);
+            
+            ui.vertical_centered(|ui| {
+                ui.add_space(100.0);
+                ui.label(egui::RichText::new("💬").size(60.0));
+                ui.label(egui::RichText::new("История сообщений появится здесь").weak());
+                ui.label(egui::RichText::new("Начните с подключения к другому узлу").small().weak());
+            });
         });
 
         // Постоянное обновление кадра для получения событий
@@ -244,7 +297,7 @@ fn main() -> Result<(), Box<dyn Error>> {
                 }
                 command = command_rx.recv() => {
                     if let Some(UICommand::Dial(addr)) = command {
-                        if let Ok(multiaddr) = addr.parse::<Multiaddr>() {
+                        if let Ok(multiaddr) = addr.trim().parse::<Multiaddr>() {
                             let _ = swarm.dial(multiaddr.clone());
                             if let Some(peer_id) = multiaddr.iter().find_map(|p| match p {
                                 libp2p::multiaddr::Protocol::P2p(peer_id) => Some(peer_id),
@@ -261,7 +314,13 @@ fn main() -> Result<(), Box<dyn Error>> {
     });
 
     // Запуск GUI в главном потоке
-    let options = eframe::NativeOptions::default();
+    let options = eframe::NativeOptions {
+        viewport: egui::ViewportBuilder::default()
+            .with_inner_size([1100.0, 700.0])
+            .with_min_inner_size([800.0, 500.0]),
+        ..Default::default()
+    };
+    
     eframe::run_native(
         "P2P Messenger",
         options,

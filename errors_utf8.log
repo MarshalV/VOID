@@ -1,55 +1,99 @@
-﻿cargo : warning: field
- `0` is never read
+﻿cargo :     Checking p2p
+-messenger v0.1.0 (C:\Us
+ers\banda\Desktop\VOID\p
+2p-messenger)
 строка:1 знак:1
-+ cargo check 2> error
-s.log; Get-Content err
-ors.log | Set-Content 
-error ...
-+ ~~~~~~~~~~~~~~~~~~~~
-~~~~~
-    + CategoryInfo    
-          : NotSpeci  
-  fied: (warning: f   
- ield `0` is never    
- read:String) [],     
-RemoteException
-    + FullyQualifiedE 
-   rrorId : NativeCo  
-  mmandError
++ cargo check 2> errors.
+log; Get-Content errors.
+log | Set-Content error 
+...
++ ~~~~~~~~~~~~~~~~~~~~~~
+~~~
+    + CategoryInfo      
+        : NotSpeci    fi
+ed: (    Checki    ng p2
+...\p2p-mess    enger):S
+tring) []    , RemoteExc
+eption
+    + FullyQualifiedE   
+ rrorId : NativeCo    mm
+andError
  
-  --> src\main.rs:21:1
-6
-   |
-21 |     DhtUpdated(Pe
-erId),
-   |     ---------- ^^
-^^^^
-   |     |
-   |     field in this
- variant
-   |
-   = note: `#[warn(dea
-d_code)]` (part of `#[
-warn(unused)]`) on by 
-default
-help: consider changin
-g the field to be of u
-nit type to suppress t
-his warning while pres
-erving the field numbe
-ring, or remove the fi
-eld
-   |
-21 -     DhtUpdated(Pe
-erId),
-21 +     DhtUpdated(()
-),
-   |
+warning: use of deprecat
+ed method `eframe::egui:
+:ScrollArea::id_source`:
+ Renamed id_salt
+   --> src\main.rs:153:4
+2
+    |
+153 |             egui::
+ScrollArea::vertical().i
+d_source("addrs").max_he
+ight(150.0).show(ui, |ui
+| {
+    |                   
+                       ^
+^^^^^^^^
+    |
+    = note: `#[warn(depr
+ecated)]` on by default
 
-warning: `p2p-messenge
-r` (bin "p2p-messenger
-") generated 1 warning
-    Finished `dev` pro
-file [unoptimized + de
-buginfo] target(s) in 
-0.58s
+warning: use of deprecat
+ed method `eframe::egui:
+:ScrollArea::id_source`:
+ Renamed id_salt
+   --> src\main.rs:170:4
+2
+    |
+170 |             egui::
+ScrollArea::vertical().i
+d_source("peers").show(u
+i, |ui| {
+    |                   
+                       ^
+^^^^^^^^
+
+error[E0599]: no method 
+named `italic` found for
+ struct `eframe::egui::R
+ichText` in the current 
+scope
+   --> src\main.rs:180:9
+2
+    |
+180 | ...               
+    ui.label(egui::RichT
+ext::new("╨Я╨╛╨┤╨║╨╗╤О╤З
+╨╡╨╜╨╕╨╡...").small().it
+alic());
+    |                   
+                        
+                        
+           ^^^^^^
+    |
+help: there is a method 
+`italics` with a similar
+ name
+    |
+180 |                   
+                  ui.lab
+el(egui::RichText::new("
+╨Я╨╛╨┤╨║╨╗╤О╤З╨╡╨╜╨╕╨╡..
+.").small().italics());
+    |                   
+                        
+                        
+                        
+       +
+
+For more information abo
+ut this error, try `rust
+c --explain E0599`.
+warning: `p2p-messenger`
+ (bin "p2p-messenger") g
+enerated 2 warnings
+error: could not compile
+ `p2p-messenger` (bin "p
+2p-messenger") due to 1 
+previous error; 2 warnin
+gs emitted
