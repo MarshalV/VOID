@@ -20,6 +20,8 @@ enum NetworkEvent {
     PingResult { peer_id: PeerId, rtt: Duration },
     DhtUpdated,
     RelayStatus { connected: bool, relay_id: PeerId },
+    RelayError(String),
+    NetworkError(String),
     TotalPeers(usize),
 }
 
@@ -51,6 +53,7 @@ struct P2pApp {
     relay_connected: bool,
     active_relay_id: Option<PeerId>,
     total_peers: usize,
+    last_error: Option<String>,
 }
 
 struct PeerInfo {
@@ -108,6 +111,7 @@ impl P2pApp {
             relay_connected: false,
             active_relay_id: None,
             total_peers: 0,
+            last_error: None,
         }
     }
 }
@@ -139,7 +143,15 @@ impl eframe::App for P2pApp {
                     self.relay_connected = connected;
                     if connected {
                         self.active_relay_id = Some(relay_id);
+                        self.last_error = None;
                     }
+                }
+                NetworkEvent::RelayError(err) => {
+                    self.relay_connected = false;
+                    self.last_error = Some(format!("Ошибка реле: {}", err));
+                }
+                NetworkEvent::NetworkError(err) => {
+                    self.last_error = Some(err);
                 }
                 NetworkEvent::TotalPeers(count) => {
                     self.total_peers = count;
@@ -159,10 +171,18 @@ impl eframe::App for P2pApp {
                 let response = ui.label(egui::RichText::new(status_text).small().color(color));
                 if let Some(relay_id) = self.active_relay_id {
                     response.on_hover_text(format!("Подключено к реле:\n{}", relay_id));
+                } else if let Some(err) = &self.last_error {
+                    response.on_hover_text(err);
                 }
                 
-                ui.separator();
-                ui.label(egui::RichText::new(format!("Соединений: {}", self.total_peers)).small().weak());
+                if let Some(err) = &self.last_error {
+                    ui.separator();
+                    ui.label(egui::RichText::new(err).small().color(egui::Color32::from_rgb(255, 150, 150)));
+                }
+
+                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                    ui.label(egui::RichText::new(format!("Соединений: {}", self.total_peers)).small().weak());
+                });
             });
         });
 
@@ -325,6 +345,8 @@ fn main() -> Result<(), Box<dyn Error>> {
         let public_relays = [
             "/dnsaddr/bootstrap.libp2p.io/p2p/QmNnooDN2uYkB1DURgnzsE9qztqcS1Scy1uW91P98fXSDj",
             "/dnsaddr/bootstrap.libp2p.io/p2p/QmQCU2EcNm3unvTMpe2Y5rS61hZ8v8z9tM5S1qU7U9zD",
+            "/dnsaddr/bootstrap.libp2p.io/p2p/QmbLHAnMo9UFnmWSznqreSTXpXGLmdYpY8pMUMfE6MqyS6",
+            "/dnsaddr/bootstrap.libp2p.io/p2p/QmcZf59bWwbsS9V9G9s7Vof2wRXm1T69vNMTc7k3N6872H",
             "/ip4/147.75.109.213/tcp/4001/p2p/QmNnooDN2uYkB1DURgnzsE9qztqcS1Scy1uW91P98fXSDj",
             "/ip4/147.75.80.143/tcp/4001/p2p/QmQCU2EcNm3unvTMpe2Y5rS61hZ8v8z9tM5S1qU7U9zD",
         ];
@@ -361,7 +383,6 @@ fn main() -> Result<(), Box<dyn Error>> {
                             }
                         }
                         SwarmEvent::Behaviour(MyBehaviourEvent::Identify(identify::Event::Received { peer_id, info, .. })) => {
-                            // Проверяем поддержку Relay Server ДО того, как переместим протоколы
                             let is_relay = info.protocols.iter().any(|p| p.to_string().contains("/libp2p/relay/2.0.0/stop"));
                             
                             let _ = event_tx.send(NetworkEvent::IdentifyReceived { 
@@ -370,6 +391,7 @@ fn main() -> Result<(), Box<dyn Error>> {
                             }).await;
 
                             if is_relay {
+                                tracing::info!("Подключено к реле: {}", peer_id);
                                 let _ = event_tx.send(NetworkEvent::RelayStatus { connected: true, relay_id: peer_id }).await;
                             }
 
@@ -377,6 +399,7 @@ fn main() -> Result<(), Box<dyn Error>> {
                                 swarm.behaviour_mut().kad.add_address(&peer_id, addr.clone());
                                 if is_relay {
                                     let relay_addr = addr.with(libp2p::multiaddr::Protocol::P2pCircuit);
+                                    tracing::info!("Попытка слушать через реле: {}", relay_addr);
                                     let _ = swarm.listen_on(relay_addr);
                                 }
                             }
@@ -403,6 +426,21 @@ fn main() -> Result<(), Box<dyn Error>> {
                         }
                         SwarmEvent::ConnectionClosed { .. } => {
                             let _ = event_tx.send(NetworkEvent::TotalPeers(swarm.connected_peers().count())).await;
+                        }
+                        SwarmEvent::ListenerError { listener_id, error } => {
+                            tracing::error!("Ошибка слушателя {:?}: {}", listener_id, error);
+                            let _ = event_tx.send(NetworkEvent::NetworkError(format!("Ошибка сети: {}", error))).await;
+                        }
+                        SwarmEvent::OutgoingConnectionError { peer_id, error, .. } => {
+                            if let Some(peer) = peer_id {
+                                tracing::warn!("Ошибка исходящего соединения к {:?}: {}", peer, error);
+                                if error.to_string().contains("relay") {
+                                    let _ = event_tx.send(NetworkEvent::RelayError(format!("Реле {:?}: {}", peer, error))).await;
+                                }
+                            }
+                        }
+                        SwarmEvent::IncomingConnectionError { error, .. } => {
+                            tracing::debug!("Ошибка входящего соединения: {}", error);
                         }
                         _ => {}
                     }
