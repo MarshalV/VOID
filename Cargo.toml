@@ -4,7 +4,7 @@ version = "0.1.0"
 edition = "2024"
 
 [dependencies]
-libp2p = { version = "0.56", features = ["tcp", "quic", "dns", "noise", "yamux", "ping", "macros", "tokio", "mdns", "kad", "identify", "relay", "dcutr", "autonat", "upnp", "websocket", "rsa", "secp256k1", "ecdsa", "tls"] }
+libp2p = { version = "0.56", features = ["tcp", "quic", "dns", "noise", "yamux", "ping", "macros", "tokio", "mdns", "kad", "identify", "relay", "dcutr", "autonat", "upnp", "websocket", "rsa", "secp256k1", "ecdsa", "tls", "gossipsub"] }
 tokio = { version = "1.0", features = ["full"] }
 anyhow = "1.0"
 futures = "0.3"
@@ -12,3 +12,19 @@ tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 chrono = "0.4"
 eframe = "0.29"
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+
+[profile.dev]
+incremental = false
+debug = 0
+panic = "abort"
+codegen-units = 1
+split-debuginfo = "off"
+
+[profile.release]
+incremental = false
+debug = 0
+strip = true
+lto = "thin"
+panic = "abort"
