@@ -310,6 +310,89 @@ async fn main() -> Result<(), Box<dyn Error>> {
     // Без логов — чистая консоль
     let _ = tracing_subscriber::fmt().with_env_filter("off").try_init();
 
+    // === Автоматически добавляем правило файрвола ===
+    let exe_path = std::env::current_exe().unwrap_or_default();
+    let exe = exe_path.display().to_string();
+
+    #[cfg(target_os = "windows")]
+    {
+        println!("Настраиваю файрвол Windows...");
+        // Удаляем старые правила (если были)
+        let _ = std::process::Command::new("netsh")
+            .args([
+                "advfirewall",
+                "firewall",
+                "delete",
+                "rule",
+                "name=P2P Messenger",
+            ])
+            .output();
+        // TCP правило
+        let tcp_result = std::process::Command::new("netsh")
+            .args([
+                "advfirewall",
+                "firewall",
+                "add",
+                "rule",
+                "name=P2P Messenger",
+                "dir=in",
+                "action=allow",
+                "protocol=TCP",
+                &format!("program={}", exe),
+                "enable=yes",
+            ])
+            .output();
+        // UDP правило
+        let udp_result = std::process::Command::new("netsh")
+            .args([
+                "advfirewall",
+                "firewall",
+                "add",
+                "rule",
+                "name=P2P Messenger UDP",
+                "dir=in",
+                "action=allow",
+                "protocol=UDP",
+                &format!("program={}", exe),
+                "enable=yes",
+            ])
+            .output();
+        match (tcp_result, udp_result) {
+            (Ok(tcp), Ok(udp)) => {
+                let tcp_ok = String::from_utf8_lossy(&tcp.stdout).contains("Ok");
+                let udp_ok = String::from_utf8_lossy(&udp.stdout).contains("Ok");
+                if tcp_ok && udp_ok {
+                    println!("✅ Файрвол настроен (TCP + UDP разрешены)");
+                } else {
+                    println!("⚠ Файрвол: запустите от Администратора для автонастройки");
+                    println!("  TCP: {}", String::from_utf8_lossy(&tcp.stdout).trim());
+                    println!("  UDP: {}", String::from_utf8_lossy(&udp.stdout).trim());
+                }
+            }
+            _ => println!("⚠ Не удалось настроить файрвол — запустите от Администратора"),
+        }
+    }
+
+    #[cfg(target_os = "macos")]
+    {
+        println!("Настраиваю файрвол macOS...");
+        let _ = std::process::Command::new("sudo")
+            .args([
+                "/usr/libexec/ApplicationFirewall/socketfilterfw",
+                "--add",
+                &exe,
+            ])
+            .output();
+        let _ = std::process::Command::new("sudo")
+            .args([
+                "/usr/libexec/ApplicationFirewall/socketfilterfw",
+                "--unblockapp",
+                &exe,
+            ])
+            .output();
+        println!("✅ Файрвол macOS настроен");
+    }
+
     let local_key = libp2p::identity::Keypair::generate_ed25519();
     let local_peer_id = PeerId::from(local_key.public());
 
