@@ -256,72 +256,44 @@ impl eframe::App for P2pApp {
             });
             ui.add_space(5.0);
             ui.separator();
-            ui.label("ВАШИ СЕТЕВЫЕ АДРЕСА:");
-            egui::ScrollArea::vertical()
-                .id_salt("addrs")
-                .max_height(150.0)
-                .show(ui, |ui| {
-                    // Показываем только локальные адреса (без p2p-circuit спама)
-                    for addr in &self.listen_addrs {
-                        ui.horizontal(|ui| {
-                            ui.label(egui::RichText::new(addr.to_string()).small().monospace());
-                            if ui.button("📋").on_hover_text("Копировать").clicked() {
-                                ui.output_mut(|o| o.copied_text = addr.to_string());
-                            }
-                        });
-                    }
-                    // Показываем relay-адреса отдельно (если есть)
-                    let relay_addrs: Vec<_> = self
-                        .all_listen_addrs
-                        .iter()
-                        .filter(|a| a.to_string().contains("p2p-circuit"))
-                        .collect();
-                    if !relay_addrs.is_empty() {
-                        ui.separator();
-                        ui.label(
-                            egui::RichText::new(format!("RELAY ({})", relay_addrs.len()))
-                                .small()
-                                .strong(),
-                        );
-                        for addr in relay_addrs.iter().take(3) {
-                            ui.horizontal(|ui| {
-                                ui.label(
-                                    egui::RichText::new(addr.to_string())
-                                        .small()
-                                        .monospace()
-                                        .weak(),
-                                );
-                                if ui.button("📋").on_hover_text("Копировать").clicked()
-                                {
-                                    ui.output_mut(|o| o.copied_text = addr.to_string());
-                                }
-                            });
-                        }
-                    }
-                });
-
-            ui.add_space(10.0);
-            ui.separator();
-            ui.label("NETWORK EVENT LOG:");
-            egui::ScrollArea::vertical()
-                .id_salt("log_scroll")
-                .show(ui, |ui| {
-                    for log in &self.network_log {
-                        ui.label(egui::RichText::new(log).small().weak());
-                    }
-                });
-            ui.add_space(10.0);
-            ui.separator();
-            ui.label("DIAL PEER:");
+            // === Подключение к пиру ===
+            ui.label(egui::RichText::new("ПОДКЛЮЧИТЬСЯ:").strong());
             ui.horizontal(|ui| {
-                ui.text_edit_singleline(&mut self.dial_address);
-                if ui.button("Join").clicked() {
+                ui.add(
+                    egui::TextEdit::singleline(&mut self.dial_address)
+                        .hint_text("Вставьте адрес..."),
+                );
+                if ui.button("➡ Join").clicked() && !self.dial_address.is_empty() {
                     let _ = self
                         .command_tx
                         .try_send(UICommand::Dial(self.dial_address.clone()));
                     self.dial_address.clear();
                 }
             });
+
+            ui.add_space(10.0);
+            ui.separator();
+            ui.label(egui::RichText::new("ВАШИ АДРЕСА (для другого клиента):").strong());
+            ui.label(
+                egui::RichText::new("Скопируйте любой адрес и вставьте в поле на другом клиенте")
+                    .small()
+                    .weak(),
+            );
+            egui::ScrollArea::vertical()
+                .id_salt("addrs")
+                .max_height(200.0)
+                .show(ui, |ui| {
+                    for addr in &self.listen_addrs {
+                        // Полный адрес с /p2p/ для подключения
+                        let full_addr = format!("{}/p2p/{}", addr, self.local_peer_id);
+                        ui.horizontal(|ui| {
+                            ui.label(egui::RichText::new(&full_addr).small().monospace());
+                            if ui.button("📋").on_hover_text("Копировать").clicked() {
+                                ui.output_mut(|o| o.copied_text = full_addr.clone());
+                            }
+                        });
+                    }
+                });
         });
 
         egui::CentralPanel::default().show(ctx, |ui| {
