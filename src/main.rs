@@ -2,9 +2,9 @@ use chrono;
 use eframe::egui;
 use futures::StreamExt;
 use libp2p::{
-    Multiaddr, PeerId, autonat, dcutr, gossipsub, identify, kad, mdns, noise, ping, relay,
+    autonat, dcutr, gossipsub, identify, kad, mdns, noise, ping, relay,
     swarm::{NetworkBehaviour, SwarmEvent},
-    tcp, upnp, yamux,
+    tcp, upnp, yamux, Multiaddr, PeerId,
 };
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
@@ -52,6 +52,7 @@ enum NetworkEvent {
     NetworkError(String),
     ConnectionAttempt(String),
     TotalPeers(usize),
+    MeshPeers(usize),
     NatStatus(String),
     ChatMessage(ChatMessage),
 }
@@ -78,6 +79,7 @@ struct MyBehaviour {
 struct P2pApp {
     local_peer_id: PeerId,
     listen_addrs: Vec<Multiaddr>,
+    all_listen_addrs: Vec<Multiaddr>,
     peers: HashMap<PeerId, PeerInfo>,
     dial_address: String,
     chat_input: String,
@@ -88,6 +90,7 @@ struct P2pApp {
     relay_connected: bool,
     active_relay_id: Option<PeerId>,
     total_peers: usize,
+    mesh_peers: usize,
     last_error: Option<String>,
     network_log: Vec<String>,
     nat_status: String,
@@ -113,6 +116,7 @@ impl P2pApp {
         Self {
             local_peer_id,
             listen_addrs: Vec::new(),
+            all_listen_addrs: Vec::new(),
             peers: HashMap::new(),
             dial_address: String::new(),
             chat_input: String::new(),
@@ -122,6 +126,7 @@ impl P2pApp {
             relay_connected: false,
             active_relay_id: None,
             total_peers: 0,
+            mesh_peers: 0,
             last_error: None,
             network_log: Vec::new(),
             nat_status: "Определение...".to_string(),
@@ -142,9 +147,12 @@ impl eframe::App for P2pApp {
         while let Ok(event) = self.event_rx.try_recv() {
             match event {
                 NetworkEvent::NewListenAddr(addr) => {
-                    if !self.listen_addrs.contains(&addr) {
-                        self.listen_addrs.push(addr.clone());
-                        add_to_log(&mut self.network_log, format!("Listen: {}", addr));
+                    if !self.all_listen_addrs.contains(&addr) {
+                        self.all_listen_addrs.push(addr.clone());
+                        if !is_bad_addr(&addr) && !self.listen_addrs.contains(&addr) {
+                            self.listen_addrs.push(addr.clone());
+                        }
+                        add_to_log(&mut self.network_log, format!("New Addr: {}", addr));
                     }
                 }
                 NetworkEvent::PeerDiscovered(peer_id) => {
@@ -184,6 +192,9 @@ impl eframe::App for P2pApp {
                 NetworkEvent::TotalPeers(count) => {
                     self.total_peers = count;
                 }
+                NetworkEvent::MeshPeers(count) => {
+                    self.mesh_peers = count;
+                }
                 NetworkEvent::NatStatus(status) => {
                     self.nat_status = status;
                 }
@@ -207,8 +218,18 @@ impl eframe::App for P2pApp {
                     egui::Color32::RED
                 };
                 ui.label(
-                    egui::RichText::new(format!("PEERS: {}", self.total_peers))
+                    egui::RichText::new(format!("NET: {}", self.total_peers))
                         .color(status_color)
+                        .strong(),
+                );
+                let mesh_color = if self.mesh_peers > 0 {
+                    egui::Color32::from_rgb(0, 255, 127)
+                } else {
+                    egui::Color32::GRAY
+                };
+                ui.label(
+                    egui::RichText::new(format!("CHAT: {}", self.mesh_peers))
+                        .color(mesh_color)
                         .strong(),
                 );
                 ui.separator();
@@ -220,31 +241,88 @@ impl eframe::App for P2pApp {
             ui.add_space(8.0);
         });
 
-        egui::SidePanel::left("left")
-            .resizable(true)
-            .show(ctx, |ui| {
-                ui.add_space(10.0);
-                ui.label("NETWORK EVENT LOG:");
-                egui::ScrollArea::vertical()
-                    .id_salt("log_scroll")
-                    .show(ui, |ui| {
-                        for log in &self.network_log {
-                            ui.label(egui::RichText::new(log).small().weak());
+        egui::SidePanel::left("left").show(ctx, |ui| {
+            ui.add_space(10.0);
+            ui.horizontal(|ui| {
+                ui.label("ID:");
+                ui.label(
+                    egui::RichText::new(&self.local_peer_id.to_string()[..12])
+                        .small()
+                        .monospace(),
+                );
+                if ui.button("📋").clicked() {
+                    ui.output_mut(|o| o.copied_text = self.local_peer_id.to_string());
+                }
+            });
+            ui.add_space(5.0);
+            ui.separator();
+            ui.label("ВАШИ СЕТЕВЫЕ АДРЕСА:");
+            egui::ScrollArea::vertical()
+                .id_salt("addrs")
+                .max_height(150.0)
+                .show(ui, |ui| {
+                    // Показываем только локальные адреса (без p2p-circuit спама)
+                    for addr in &self.listen_addrs {
+                        ui.horizontal(|ui| {
+                            ui.label(egui::RichText::new(addr.to_string()).small().monospace());
+                            if ui.button("📋").on_hover_text("Копировать").clicked() {
+                                ui.output_mut(|o| o.copied_text = addr.to_string());
+                            }
+                        });
+                    }
+                    // Показываем relay-адреса отдельно (если есть)
+                    let relay_addrs: Vec<_> = self
+                        .all_listen_addrs
+                        .iter()
+                        .filter(|a| a.to_string().contains("p2p-circuit"))
+                        .collect();
+                    if !relay_addrs.is_empty() {
+                        ui.separator();
+                        ui.label(
+                            egui::RichText::new(format!("RELAY ({})", relay_addrs.len()))
+                                .small()
+                                .strong(),
+                        );
+                        for addr in relay_addrs.iter().take(3) {
+                            ui.horizontal(|ui| {
+                                ui.label(
+                                    egui::RichText::new(addr.to_string())
+                                        .small()
+                                        .monospace()
+                                        .weak(),
+                                );
+                                if ui.button("📋").on_hover_text("Копировать").clicked()
+                                {
+                                    ui.output_mut(|o| o.copied_text = addr.to_string());
+                                }
+                            });
                         }
-                    });
-                ui.add_space(10.0);
-                ui.separator();
-                ui.label("DIAL PEER:");
-                ui.horizontal(|ui| {
-                    ui.text_edit_singleline(&mut self.dial_address);
-                    if ui.button("Join").clicked() {
-                        let _ = self
-                            .command_tx
-                            .try_send(UICommand::Dial(self.dial_address.clone()));
-                        self.dial_address.clear();
                     }
                 });
+
+            ui.add_space(10.0);
+            ui.separator();
+            ui.label("NETWORK EVENT LOG:");
+            egui::ScrollArea::vertical()
+                .id_salt("log_scroll")
+                .show(ui, |ui| {
+                    for log in &self.network_log {
+                        ui.label(egui::RichText::new(log).small().weak());
+                    }
+                });
+            ui.add_space(10.0);
+            ui.separator();
+            ui.label("DIAL PEER:");
+            ui.horizontal(|ui| {
+                ui.text_edit_singleline(&mut self.dial_address);
+                if ui.button("Join").clicked() {
+                    let _ = self
+                        .command_tx
+                        .try_send(UICommand::Dial(self.dial_address.clone()));
+                    self.dial_address.clear();
+                }
             });
+        });
 
         egui::CentralPanel::default().show(ctx, |ui| {
             ui.vertical(|ui| {
@@ -319,13 +397,12 @@ async fn main() -> Result<(), Box<dyn Error>> {
 
     // --- QUANTUM LEAP NODES (DNSaddr + IPs) ---
     let bootstrap_nodes = [
+        // Официальные IPFS bootstrap-узлы с корректными PeerID
         "/dnsaddr/bootstrap.libp2p.io",
         "/dnsaddr/am6.bootstrap.libp2p.io/p2p/QmbLHAnMoJPWSCR5Zhtx6BHJX9KiKNN6tpvbUcqanj75Nb",
-        "/dnsaddr/ny5.bootstrap.libp2p.io/p2p/QmQCU2EcMqAqQPR2i9bChDtGNJchTbq5TbXJJ16u19uLTa",
         "/dnsaddr/sg1.bootstrap.libp2p.io/p2p/QmcZf59bWwK5XFi76CZX8cbJ4BhTzzA3gU1ZjYZcYW3dwt",
-        "/dnsaddr/sv15.bootstrap.libp2p.io/p2p/QmNnooDu7bfjPFoTZYxMNLWUQJyrVwtbZg5gBMjTezGAJN",
-        "/ip4/104.131.131.82/tcp/4001/p2p/QmaCpDMGv3nyYQYMj26wBXxeDzHkGb86u78YJms5S4F8N",
-        "/ip4/147.75.109.213/tcp/4001/p2p/QmNnooDN2uYkB1DURgnzsE9qztqcS1Scy1uW91P98fXSDj",
+        "/ip4/104.131.131.82/tcp/4001/p2p/QmaCpDMGvV3nyYQYMj26wBXxeDzHkGb86u78YJms5S4F8Nj",
+        "/ip4/147.75.109.213/tcp/4001/p2p/QmNnooDu7bfjPFoNZSjzFBf4BLGEaKzxBBxFfPBsnn1CWi",
     ];
 
     tokio::spawn(async move {
@@ -398,11 +475,42 @@ async fn main() -> Result<(), Box<dyn Error>> {
             }
         }
 
-        let mut bootstrap_interval = tokio::time::interval(Duration::from_secs(15));
+        // Работаем в режиме сервера DHT — активно отвечаем на запросы
+        swarm.behaviour_mut().kad.set_mode(Some(kad::Mode::Server));
+
+        let chat_key = kad::RecordKey::new(&b"void-chat-v1".to_vec());
+        // Объявляем себя как чат-пир в DHT
+        let _ = swarm.behaviour_mut().kad.start_providing(chat_key.clone());
+
+        // Счётчик relay — ограничиваем до 2, чтобы не спамить адресами
+        let mut relay_count: usize = 0;
+        const MAX_RELAYS: usize = 2;
+
+        let mut bootstrap_interval = tokio::time::interval(Duration::from_secs(30));
+        let mut heartbeat_interval = tokio::time::interval(Duration::from_secs(15));
         loop {
             tokio::select! {
                 _ = bootstrap_interval.tick() => {
                     let _ = swarm.behaviour_mut().kad.bootstrap();
+                    // Ищем других чат-пиров в DHT
+                    swarm.behaviour_mut().kad.get_providers(chat_key.clone());
+                    // Обновляем счетчик меш-пиров
+                    let mesh = swarm.behaviour().gossipsub.all_mesh_peers().count();
+                    let _ = event_tx.send(NetworkEvent::MeshPeers(mesh)).await;
+                }
+                _ = heartbeat_interval.tick() => {
+                    // Keepalive: поддерживаем gossipsub-меш в живом состоянии
+                    let mesh = swarm.behaviour().gossipsub.all_mesh_peers().count();
+                    let _ = event_tx.send(NetworkEvent::MeshPeers(mesh)).await;
+                    if mesh > 0 {
+                        let heartbeat = ChatMessage {
+                            sender: "__system__".to_string(),
+                            text: "__heartbeat__".to_string(),
+                            timestamp: String::new(),
+                        };
+                        let json = serde_json::to_vec(&heartbeat).unwrap();
+                        let _ = swarm.behaviour_mut().gossipsub.publish(topic.clone(), json);
+                    }
                 }
                 cmd = command_rx.recv() => {
                     if let Some(c) = cmd {
@@ -438,12 +546,21 @@ async fn main() -> Result<(), Box<dyn Error>> {
                 event = swarm.select_next_some() => {
                     match event {
                         SwarmEvent::NewListenAddr { address, .. } => {
-                            if !is_bad_addr(&address) { let _ = event_tx.send(NetworkEvent::NewListenAddr(address)).await; }
+                            // Отправляем ВСЕ адреса в UI, включая /p2p-circuit
+                            let _ = event_tx.send(NetworkEvent::NewListenAddr(address)).await;
                         }
                         SwarmEvent::Behaviour(MyBehaviourEvent::Gossipsub(gossipsub::Event::Message { message, .. })) => {
                             if let Ok(msg) = serde_json::from_slice::<ChatMessage>(&message.data) {
-                                let _ = event_tx.send(NetworkEvent::ChatMessage(msg)).await;
+                                // Фильтруем системные heartbeat-сообщения — не показываем в чате
+                                if msg.sender != "__system__" {
+                                    let _ = event_tx.send(NetworkEvent::ChatMessage(msg)).await;
+                                }
                             }
+                        }
+                        SwarmEvent::Behaviour(MyBehaviourEvent::Gossipsub(gossipsub::Event::Subscribed { peer_id, topic: t })) => {
+                            let _ = event_tx.send(NetworkEvent::ConnectionAttempt(
+                                format!("📡 Пир {}... подписался на {}", &peer_id.to_string()[..8], t)
+                            )).await;
                         }
                         SwarmEvent::Behaviour(MyBehaviourEvent::RelayClient(relay::client::Event::ReservationReqAccepted { relay_peer_id, .. })) => {
                             let _ = event_tx.send(NetworkEvent::RelayStatus { connected: true, relay_id: relay_peer_id }).await;
@@ -461,29 +578,79 @@ async fn main() -> Result<(), Box<dyn Error>> {
                             let _ = event_tx.send(NetworkEvent::IdentifyReceived {
                                 peer_id, protocols: info.protocols.iter().map(|p| p.to_string()).collect()
                             }).await;
+
+                            // НЕ добавляем всех IPFS-пиров как explicit gossipsub peer,
+                            // т.к. они не подписаны на наш топик. Добавляем только через mDNS/DHT providers.
+
+                            // Проверяем поддержку реле (ограничиваем количество)
+                            let has_relay = relay_count < MAX_RELAYS && info.protocols.iter().any(|p| {
+                                let s = p.to_string();
+                                s.contains("/libp2p/circuit/relay") || s.contains("/libp2p/relay")
+                            });
+
+                            let mut relay_registered = false;
                             for addr in info.listen_addrs {
                                 if !is_bad_addr(&addr) {
-                                    swarm.behaviour_mut().kad.add_address(&peer_id, addr);
+                                    swarm.behaviour_mut().kad.add_address(&peer_id, addr.clone());
+                                    // Только первые MAX_RELAYS реле, и только 1 адрес на реле
+                                    if has_relay && !relay_registered {
+                                        let relay_addr = addr.with(libp2p::multiaddr::Protocol::P2p(peer_id)).with(libp2p::multiaddr::Protocol::P2pCircuit);
+                                        let _ = swarm.listen_on(relay_addr);
+                                        relay_registered = true;
+                                        relay_count += 1;
+                                    }
                                 }
+                            }
+                        }
+                        // === mDNS: обнаружение пиров в локальной сети ===
+                        SwarmEvent::Behaviour(MyBehaviourEvent::Mdns(mdns::Event::Discovered(peers))) => {
+                            for (peer_id, addr) in peers {
+                                let _ = event_tx.send(NetworkEvent::ConnectionAttempt(
+                                    format!("🔍 mDNS: найден {}... ({})", &peer_id.to_string()[..8], addr)
+                                )).await;
+                                let _ = event_tx.send(NetworkEvent::PeerDiscovered(peer_id)).await;
+                                // Добавляем в Kademlia
+                                swarm.behaviour_mut().kad.add_address(&peer_id, addr.clone());
+                                // Добавляем в Gossipsub как явный пир
+                                swarm.behaviour_mut().gossipsub.add_explicit_peer(&peer_id);
+                                // Подключаемся
+                                let _ = swarm.dial(addr);
+                            }
+                        }
+                        SwarmEvent::Behaviour(MyBehaviourEvent::Mdns(mdns::Event::Expired(peers))) => {
+                            for (peer_id, _addr) in peers {
+                                let _ = event_tx.send(NetworkEvent::ConnectionAttempt(
+                                    format!("⏳ mDNS: пир {}... ушёл", &peer_id.to_string()[..8])
+                                )).await;
+                            }
+                        }
+                        SwarmEvent::Behaviour(MyBehaviourEvent::Kad(kad::Event::OutboundQueryProgressed {
+                            result: kad::QueryResult::GetProviders(Ok(kad::GetProvidersOk::FoundProviders { providers, .. })),
+                            ..
+                        })) => {
+                            for peer in providers {
+                                // Нашли другого чат-пира! Подключаемся к нему.
+                                let _ = event_tx.send(NetworkEvent::ConnectionAttempt(format!("🎯 Chat peer found: {}...", &peer.to_string()[..8]))).await;
+                                let _ = swarm.dial(peer);
                             }
                         }
                         SwarmEvent::Behaviour(MyBehaviourEvent::Ping(ping::Event { peer, result: Ok(rtt), .. })) => {
                             let _ = event_tx.send(NetworkEvent::PingResult { peer_id: peer, rtt }).await;
                         }
                         SwarmEvent::ConnectionEstablished { peer_id, .. } => {
-                            let _ = event_tx.send(NetworkEvent::TotalPeers(swarm.connected_peers().count())).await;
-                            let _ = event_tx.send(NetworkEvent::ConnectionAttempt(format!("CONNECTED: {}", &peer_id.to_string()[..8]))).await;
+                            let total = swarm.connected_peers().count();
+                            let mesh = swarm.behaviour().gossipsub.all_mesh_peers().count();
+                            let _ = event_tx.send(NetworkEvent::TotalPeers(total)).await;
+                            let _ = event_tx.send(NetworkEvent::MeshPeers(mesh)).await;
+                            let _ = event_tx.send(NetworkEvent::ConnectionAttempt(format!("✅ CONNECTED: {}...", &peer_id.to_string()[..8]))).await;
+                            // Переобъявляем себя в DHT при каждом новом соединении
+                            let _ = swarm.behaviour_mut().kad.start_providing(chat_key.clone());
                         }
                         SwarmEvent::ConnectionClosed { .. } => {
-                            let _ = event_tx.send(NetworkEvent::TotalPeers(swarm.connected_peers().count())).await;
-                        }
-                        SwarmEvent::OutgoingConnectionError { peer_id, error, .. } => {
-                            let s = error.to_string();
-                            if !s.contains("127.0.0.1") && !s.contains("10048") && !s.contains("::1") {
-                                if let Some(pid) = peer_id {
-                                    let _ = event_tx.send(NetworkEvent::ConnectionAttempt(format!("Fail {:?}: {}", pid, s))).await;
-                                }
-                            }
+                            let total = swarm.connected_peers().count();
+                            let mesh = swarm.behaviour().gossipsub.all_mesh_peers().count();
+                            let _ = event_tx.send(NetworkEvent::TotalPeers(total)).await;
+                            let _ = event_tx.send(NetworkEvent::MeshPeers(mesh)).await;
                         }
                         _ => {}
                     }

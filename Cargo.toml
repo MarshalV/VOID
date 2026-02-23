@@ -1,7 +1,7 @@
 [package]
 name = "p2p-messenger"
 version = "0.1.0"
-edition = "2024"
+edition = "2021"
 
 [dependencies]
 libp2p = { version = "0.56", features = ["tcp", "quic", "dns", "noise", "yamux", "ping", "macros", "tokio", "mdns", "kad", "identify", "relay", "dcutr", "autonat", "upnp", "websocket", "rsa", "secp256k1", "ecdsa", "tls", "gossipsub"] }
