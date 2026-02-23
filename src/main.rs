@@ -13,18 +13,14 @@ use std::time::Duration;
 use tokio::sync::mpsc;
 use tracing_subscriber::EnvFilter;
 
-// Максимально широкие фильтры для обхода таймаутов на Windows
+// Фильтр адресов: убираем только IPv6 и 0.0.0.0
 fn is_bad_addr(addr: &Multiaddr) -> bool {
     let s = addr.to_string();
     // Игнорируем IPv6 (на Windows часто ведет в никуда)
     if s.contains("/ip6/") {
         return true;
     }
-    // Игнорируем локалхост
-    s.contains("/127.0.0.1")
-        || s.contains("/localhost")
-        || s.contains("/::1")
-        || s.contains("/0.0.0.0")
+    s.contains("/::1") || s.contains("/0.0.0.0")
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -149,10 +145,16 @@ impl eframe::App for P2pApp {
                 NetworkEvent::NewListenAddr(addr) => {
                     if !self.all_listen_addrs.contains(&addr) {
                         self.all_listen_addrs.push(addr.clone());
-                        if !is_bad_addr(&addr) && !self.listen_addrs.contains(&addr) {
-                            self.listen_addrs.push(addr.clone());
+                        // Показываем все адреса кроме p2p-circuit (relay)
+                        let s = addr.to_string();
+                        if !s.contains("p2p-circuit")
+                            && !s.contains("/ip6/")
+                            && !s.contains("/0.0.0.0")
+                        {
+                            if !self.listen_addrs.contains(&addr) {
+                                self.listen_addrs.push(addr.clone());
+                            }
                         }
-                        add_to_log(&mut self.network_log, format!("New Addr: {}", addr));
                     }
                 }
                 NetworkEvent::PeerDiscovered(peer_id) => {
@@ -357,8 +359,7 @@ impl eframe::App for P2pApp {
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn Error>> {
-    let filter =
-        EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("info,libp2p=debug"));
+    let filter = EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("warn"));
     tracing_subscriber::fmt().with_env_filter(filter).init();
 
     let local_key = libp2p::identity::Keypair::generate_ed25519();
@@ -488,8 +489,22 @@ async fn main() -> Result<(), Box<dyn Error>> {
                     if let Some(c) = cmd {
                         match c {
                             UICommand::Dial(addr) => {
-                                if let Ok(m) = addr.parse::<Multiaddr>() {
-                                    if !is_bad_addr(&m) { let _ = swarm.dial(m); }
+                                match addr.parse::<Multiaddr>() {
+                                    Ok(m) => {
+                                        let _ = event_tx.send(NetworkEvent::ConnectionAttempt(
+                                            format!("📞 Подключаюсь к {}...", &addr[..addr.len().min(40)])
+                                        )).await;
+                                        if let Err(e) = swarm.dial(m) {
+                                            let _ = event_tx.send(NetworkEvent::NetworkError(
+                                                format!("Ошибка dial: {:?}", e)
+                                            )).await;
+                                        }
+                                    }
+                                    Err(e) => {
+                                        let _ = event_tx.send(NetworkEvent::NetworkError(
+                                            format!("Неверный адрес: {:?}", e)
+                                        )).await;
+                                    }
                                 }
                             }
                             UICommand::SendMessage(text) => {
