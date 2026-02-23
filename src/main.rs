@@ -359,7 +359,9 @@ impl eframe::App for P2pApp {
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn Error>> {
-    let filter = EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("warn"));
+    let filter = EnvFilter::try_from_default_env().unwrap_or_else(|_| {
+        EnvFilter::new("error,libp2p_gossipsub=off,quinn_udp=off,libp2p_mdns=off")
+    });
     tracing_subscriber::fmt().with_env_filter(filter).init();
 
     let local_key = libp2p::identity::Keypair::generate_ed25519();
