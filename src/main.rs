@@ -436,8 +436,8 @@ async fn main() -> Result<(), Box<dyn Error>> {
                     match event {
                         SwarmEvent::NewListenAddr { address, .. } => {
                             let s = address.to_string();
-                            // Показываем только IPv4 адреса (не 0.0.0.0)
-                            if !s.contains("/ip6/") && !s.contains("/0.0.0.0") {
+                            // Только IPv4, не 0.0.0.0, не 127.0.0.1
+                            if !s.contains("/ip6/") && !s.contains("/0.0.0.0") && !s.contains("/127.0.0.1") {
                                 println!("Слушаю: {}/p2p/{}", address, local_peer_id);
                                 let _ = event_tx.send(NetworkEvent::NewListenAddr(address)).await;
                             }
@@ -452,7 +452,18 @@ async fn main() -> Result<(), Box<dyn Error>> {
                                 // Добавляем в gossipsub
                                 swarm.behaviour_mut().gossipsub.add_explicit_peer(&peer_id);
                                 // Подключаемся
-                                let _ = swarm.dial(addr);
+                                match swarm.dial(addr) {
+                                    Ok(_) => {
+                                        let _ = event_tx.send(NetworkEvent::Status(
+                                            format!("📞 mDNS: подключаюсь к {}...", &peer_id.to_string()[..8])
+                                        )).await;
+                                    }
+                                    Err(e) => {
+                                        let _ = event_tx.send(NetworkEvent::Status(
+                                            format!("❌ mDNS dial ошибка: {}", e)
+                                        )).await;
+                                    }
+                                }
                             }
                         }
                         SwarmEvent::Behaviour(ChatBehaviourEvent::Mdns(mdns::Event::Expired(peers))) => {
@@ -486,6 +497,20 @@ async fn main() -> Result<(), Box<dyn Error>> {
                             let mesh = swarm.behaviour().gossipsub.all_mesh_peers().count();
                             let _ = event_tx.send(NetworkEvent::Disconnected(peer_id)).await;
                             let _ = event_tx.send(NetworkEvent::MeshPeers(mesh)).await;
+                        }
+
+                        // === Ошибки соединений ===
+                        SwarmEvent::OutgoingConnectionError { peer_id, error, .. } => {
+                            let peer_str = peer_id.map(|p| format!("{}...", &p.to_string()[..8])).unwrap_or("?".into());
+                            let _ = event_tx.send(NetworkEvent::Status(
+                                format!("❌ Не удалось подключиться к {}: {}", peer_str, error)
+                            )).await;
+                            println!("Ошибка подключения к {}: {}", peer_str, error);
+                        }
+                        SwarmEvent::IncomingConnectionError { error, .. } => {
+                            let _ = event_tx.send(NetworkEvent::Status(
+                                format!("❌ Входящее подключение отклонено: {}", error)
+                            )).await;
                         }
 
                         _ => {}
