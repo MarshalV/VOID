@@ -2,12 +2,11 @@
 nt `DhtPeers` is never
  constructed
 строка:1 знак:1
-+ cargo check 2> error
-s.log; Get-Content err
-ors.log | Set-Content 
-error ...
-+ ~~~~~~~~~~~~~~~~~~~~
-~~~~~
++ cargo check 2>&1 | O
+ut-File -FilePath fina
+l_check.txt -Encoding 
+utf8; ...
++ ~~~~~~~~~~~~~~~~
     + CategoryInfo    
           : NotSpeci  
   fied: (warning: v   
@@ -40,4 +39,4 @@ r` (bin "p2p-messenger
     Finished `dev` pro
 file [unoptimized + de
 buginfo] target(s) in 
-0.86s
+0.66s

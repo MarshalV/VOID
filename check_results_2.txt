@@ -1,0 +1,75 @@
+﻿cargo :     Checking p
+2p-messenger v0.1.0 (C
+:\Users\banda\Desktop\
+VOID\p2p-messenger)
+строка:1 знак:1
++ cargo check 2>&1 | O
+ut-File -FilePath chec
+k_results_2.txt -Encod
+ing u ...
++ ~~~~~~~~~~~~~~~~
+    + CategoryInfo    
+          : NotSpeci  
+  fied: (    Checki   
+ ng p2...\p2p-mess    
+enger):String) []    ,
+ RemoteException
+    + FullyQualifiedE 
+   rrorId : NativeCo  
+  mmandError
+ 
+error[E0061]: this met
+hod takes 0 arguments 
+but 1 argument was sup
+plied
+   --> src\main.rs:318
+:92
+    |
+318 |                 
+        ui.add(egui::L
+abel::new(egui::RichTe
+xt::new(entry).small()
+.weak()).wrap(true));
+    |                 
+                      
+                      
+                      
+         ^^^^ ---- une
+xpected argument of ty
+pe `bool`
+    |
+note: method defined h
+ere
+   --> C:\Users\banda\
+.cargo\registry\src\in
+dex.crates.io-1949cf8c
+6b5b557f\egui-0.29.1\s
+rc\widgets\label.rs:63
+:12
+    |
+ 63 |     pub fn wrap(
+mut self) -> Self {
+    |            ^^^^
+help: remove the extra
+ argument
+    |
+318 -                 
+        ui.add(egui::L
+abel::new(egui::RichTe
+xt::new(entry).small()
+.weak()).wrap(true));
+318 +                 
+        ui.add(egui::L
+abel::new(egui::RichTe
+xt::new(entry).small()
+.weak()).wrap());
+    |
+
+For more information a
+bout this error, try `
+rustc --explain E0061`
+.
+error: could not compi
+le `p2p-messenger` (bi
+n "p2p-messenger") due
+ to 1 previous error
