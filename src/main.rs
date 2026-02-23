@@ -455,10 +455,6 @@ async fn main() -> Result<(), Box<dyn Error>> {
         // Объявляем себя как чат-пир в DHT
         let _ = swarm.behaviour_mut().kad.start_providing(chat_key.clone());
 
-        // Счётчик relay — ограничиваем до 2, чтобы не спамить адресами
-        let mut relay_count: usize = 0;
-        const MAX_RELAYS: usize = 2;
-
         let mut bootstrap_interval = tokio::time::interval(Duration::from_secs(30));
         let mut heartbeat_interval = tokio::time::interval(Duration::from_secs(15));
         loop {
@@ -566,26 +562,10 @@ async fn main() -> Result<(), Box<dyn Error>> {
                                 peer_id, protocols: info.protocols.iter().map(|p| p.to_string()).collect()
                             }).await;
 
-                            // НЕ добавляем всех IPFS-пиров как explicit gossipsub peer,
-                            // т.к. они не подписаны на наш топик. Добавляем только через mDNS/DHT providers.
-
-                            // Проверяем поддержку реле (ограничиваем количество)
-                            let has_relay = relay_count < MAX_RELAYS && info.protocols.iter().any(|p| {
-                                let s = p.to_string();
-                                s.contains("/libp2p/circuit/relay") || s.contains("/libp2p/relay")
-                            });
-
-                            let mut relay_registered = false;
+                            // Добавляем адреса пира в Kademlia для маршрутизации
                             for addr in info.listen_addrs {
                                 if !is_bad_addr(&addr) {
                                     swarm.behaviour_mut().kad.add_address(&peer_id, addr.clone());
-                                    // Только первые MAX_RELAYS реле, и только 1 адрес на реле
-                                    if has_relay && !relay_registered {
-                                        let relay_addr = addr.with(libp2p::multiaddr::Protocol::P2p(peer_id)).with(libp2p::multiaddr::Protocol::P2pCircuit);
-                                        let _ = swarm.listen_on(relay_addr);
-                                        relay_registered = true;
-                                        relay_count += 1;
-                                    }
                                 }
                             }
                         }
