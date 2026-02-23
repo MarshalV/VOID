@@ -324,7 +324,7 @@ async fn main() -> Result<(), Box<dyn Error>> {
     tokio::spawn(async move {
         let event_tx = event_tx_clone;
 
-        // Минимальный swarm: TCP + noise + yamux
+        // Swarm: TCP + QUIC (UDP) + noise + yamux
         let mut swarm = libp2p::SwarmBuilder::with_existing_identity(local_key.clone())
             .with_tokio()
             .with_tcp(
@@ -333,6 +333,7 @@ async fn main() -> Result<(), Box<dyn Error>> {
                 yamux::Config::default,
             )
             .unwrap()
+            .with_quic()
             .with_behaviour(|key| {
                 let local_peer_id = key.public().to_peer_id();
 
@@ -365,9 +366,12 @@ async fn main() -> Result<(), Box<dyn Error>> {
         let topic = gossipsub::IdentTopic::new("void-chat-v1");
         swarm.behaviour_mut().gossipsub.subscribe(&topic).unwrap();
 
-        // Слушаем на всех интерфейсах, порт автоматический
+        // Слушаем TCP и QUIC (UDP) — оба транспорта для максимальной совместимости
         swarm
             .listen_on("/ip4/0.0.0.0/tcp/0".parse().unwrap())
+            .unwrap();
+        swarm
+            .listen_on("/ip4/0.0.0.0/udp/0/quic-v1".parse().unwrap())
             .unwrap();
 
         let _ = event_tx
