@@ -327,13 +327,7 @@ async fn main() -> Result<(), Box<dyn Error>> {
         if is_admin {
             println!("Настраиваю файрвол Windows...");
             let _ = std::process::Command::new("netsh")
-                .args([
-                    "advfirewall",
-                    "firewall",
-                    "delete",
-                    "rule",
-                    "name=P2P Messenger",
-                ])
+                .args(["advfirewall", "firewall", "delete", "rule", "name=VOID P2P"])
                 .output();
             let tcp_r = std::process::Command::new("netsh")
                 .args([
@@ -341,7 +335,7 @@ async fn main() -> Result<(), Box<dyn Error>> {
                     "firewall",
                     "add",
                     "rule",
-                    "name=P2P Messenger",
+                    "name=VOID P2P",
                     "dir=in",
                     "action=allow",
                     "protocol=TCP",
@@ -355,7 +349,7 @@ async fn main() -> Result<(), Box<dyn Error>> {
                     "firewall",
                     "add",
                     "rule",
-                    "name=P2P Messenger UDP",
+                    "name=VOID P2P UDP",
                     "dir=in",
                     "action=allow",
                     "protocol=UDP",
@@ -370,29 +364,35 @@ async fn main() -> Result<(), Box<dyn Error>> {
                 _ => println!("⚠ Не удалось настроить файрвол"),
             }
         } else {
-            // Перезапуск с UAC элевацией — добавляем правило через PowerShell
-            println!("Настраиваю файрвол (запрос прав Администратора)...");
-            // PowerShell: netsh от админа через Start-Process -Verb RunAs
-            let ps_cmd = format!(
-                "netsh advfirewall firewall delete rule name='P2P Messenger'; \
-                 netsh advfirewall firewall add rule name='P2P Messenger' dir=in action=allow protocol=TCP program='{}' enable=yes; \
-                 netsh advfirewall firewall add rule name='P2P Messenger UDP' dir=in action=allow protocol=UDP program='{}' enable=yes",
+            // Пишем команды в временный .bat файл, запускаем от админа через UAC
+            let bat = format!(
+                "@echo off\r\n\
+                 netsh advfirewall firewall delete rule name=\"VOID P2P\"\r\n\
+                 netsh advfirewall firewall add rule name=\"VOID P2P\" dir=in action=allow protocol=TCP program=\"{}\" enable=yes\r\n\
+                 netsh advfirewall firewall add rule name=\"VOID P2P UDP\" dir=in action=allow protocol=UDP program=\"{}\" enable=yes\r\n",
                 exe, exe
             );
-            let result = std::process::Command::new("powershell")
-                .args([
-                    "-Command",
-                    &format!(
-                        "Start-Process powershell -Verb RunAs -Wait -ArgumentList '-Command {}'",
-                        ps_cmd
-                    ),
-                ])
-                .output();
-            match result {
-                Ok(o) if o.status.success() => println!("✅ Файрвол настроен"),
-                _ => println!(
-                    "⚠ Файрвол: принятье UAC было отклонено — запустите от Администратора вручную"
-                ),
+            let bat_path = std::env::temp_dir().join("void_p2p_firewall.bat");
+            if std::fs::write(&bat_path, bat).is_ok() {
+                println!("Настраиваю файрвол (запрос UAC)...");
+                // ShellExecute runas — самый надёжный способ UAC-элевации
+                let result = std::process::Command::new("powershell")
+                    .args([
+                        "-NoProfile",
+                        "-Command",
+                        &format!(
+                            "Start-Process -FilePath '{}' -Verb RunAs -Wait",
+                            bat_path.display()
+                        ),
+                    ])
+                    .status();
+                match result {
+                    Ok(s) if s.success() => println!("✅ Файрвол настроен"),
+                    _ => {
+                        println!("⚠ UAC отклонён. Запустите вручную от Админастратора:");
+                        println!("  {}", bat_path.display());
+                    }
+                }
             }
         }
     }
@@ -655,16 +655,27 @@ async fn main() -> Result<(), Box<dyn Error>> {
 
                         // === Ошибки соединений ===
                         SwarmEvent::OutgoingConnectionError { peer_id, error, .. } => {
-                            let peer_str = peer_id.map(|p| format!("{}...", &p.to_string()[..8])).unwrap_or("?".into());
+                            let peer_str = peer_id
+                                .map(|p| format!("{}...", &p.to_string()[..8]))
+                                .unwrap_or_else(|| "?".into());
+                            // Очищаем pending_dials — без этого mDNS не сможет повторить
+                            if let Some(p) = peer_id {
+                                pending_dials.remove(&p);
+                                peer_addrs.remove(&p); // сброс: при следующем mDNS попробуем свежие адреса
+                            }
                             let _ = event_tx.send(NetworkEvent::Status(
                                 format!("❌ Не удалось подключиться к {}: {}", peer_str, error)
                             )).await;
                             println!("Ошибка подключения к {}: {}", peer_str, error);
                         }
                         SwarmEvent::IncomingConnectionError { error, .. } => {
-                            let _ = event_tx.send(NetworkEvent::Status(
-                                format!("❌ Входящее подключение отклонено: {}", error)
-                            )).await;
+                            // Молча игнорируем входящие ошибки — это часто повторные попытки libp2p
+                            let err_str = error.to_string();
+                            if !err_str.contains("Handshake") && !err_str.contains("Timeout") {
+                                let _ = event_tx.send(NetworkEvent::Status(
+                                    format!("❌ Входящее подключение отклонено: {}", error)
+                                )).await;
+                            }
                         }
 
                         _ => {}
