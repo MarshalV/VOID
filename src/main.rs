@@ -313,8 +313,8 @@ async fn main() -> Result<(), Box<dyn Error>> {
     let _ = tracing_subscriber::fmt().with_env_filter("off").try_init();
 
     // === Автоматически добавляем правило файрвола ===
-    let exe_path = std::env::current_exe().unwrap_or_default();
-    let exe = exe_path.display().to_string();
+    let _exe_path = std::env::current_exe().unwrap_or_default();
+    let _exe = _exe_path.display().to_string();
 
     #[cfg(target_os = "windows")]
     {
@@ -341,6 +341,7 @@ async fn main() -> Result<(), Box<dyn Error>> {
                     "action=allow",
                     "protocol=TCP",
                     "localport=64000",
+                    "profile=any",
                     "enable=yes",
                 ])
                 .output();
@@ -355,6 +356,8 @@ async fn main() -> Result<(), Box<dyn Error>> {
                     "action=allow",
                     "protocol=UDP",
                     "localport=64000",
+                    "profile=any",
+                    "edge=yes",
                     "enable=yes",
                 ])
                 .output();
@@ -369,8 +372,8 @@ async fn main() -> Result<(), Box<dyn Error>> {
             let bat = format!(
                 "@echo off\r\n\
                  netsh advfirewall firewall delete rule name=\"VOID P2P\"\r\n\
-                 netsh advfirewall firewall add rule name=\"VOID P2P\" dir=in action=allow protocol=TCP localport=64000 enable=yes\r\n\
-                 netsh advfirewall firewall add rule name=\"VOID P2P\" dir=in action=allow protocol=UDP localport=64000 enable=yes\r\n"
+                 netsh advfirewall firewall add rule name=\"VOID P2P\" dir=in action=allow protocol=TCP localport=64000 profile=any enable=yes\r\n\
+                 netsh advfirewall firewall add rule name=\"VOID P2P\" dir=in action=allow protocol=UDP localport=64000 profile=any edge=yes enable=yes\r\n"
             );
             let bat_path = std::env::temp_dir().join("void_p2p_firewall.bat");
             if std::fs::write(&bat_path, bat).is_ok() {
@@ -610,18 +613,23 @@ async fn main() -> Result<(), Box<dyn Error>> {
                                     }
                                 }
 
-                                // Детерминированная задержка на основе нашего Peer ID (0–2999ms):
-                                // Увеличиваем окно, чтобы один пир гарантированно был "слушателем" дольше.
-                                let delay_ms = (local_peer_id.to_bytes()
-                                    .iter().fold(0u64, |acc, &b| acc.wrapping_add(b as u64))
-                                    % 3) * 1000;
+                                // Стратегия Leader/Follower:
+                                // Пир с меньшим ID (leader) dial-ит почти сразу (200ms).
+                                // Пир с большим ID (follower) ждёт 4 секунды и dial-ит только если не подключился.
+                                // Это гарантирует, что Windows Firewall не увидит "одновременный" dial.
+                                let is_leader = local_peer_id.to_string() < peer_id.to_string();
+                                let delay_ms = if is_leader { 200 } else { 4000 };
 
                                 pending_dials.insert(peer_id);
-                                // Dial через command channel ␸ задержкой, чтобы не блокировать event loop
                                 let cmd_tx2 = command_tx_for_mdns.clone();
                                 let dial_addrs = all_addrs.clone();
+                                let tx = event_tx.clone();
                                 tokio::spawn(async move {
                                     tokio::time::sleep(Duration::from_millis(delay_ms)).await;
+                                    let type_str = if is_leader { "Leader" } else { "Follower" };
+                                    let _ = tx.send(NetworkEvent::Status(
+                                        format!("🔄 [{}] Попытка соединения с {}...", type_str, &peer_id.to_string()[..8])
+                                    )).await;
                                     let _ = cmd_tx2.send(UICommand::DialPeer(peer_id, dial_addrs)).await;
                                 });
                             }
