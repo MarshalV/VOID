@@ -32,6 +32,7 @@ enum NetworkEvent {
 
 enum UICommand {
     Dial(String),
+    DialPeer(PeerId, Vec<Multiaddr>),
     SendMessage(String),
 }
 
@@ -427,9 +428,11 @@ async fn main() -> Result<(), Box<dyn Error>> {
     let (command_tx, mut command_rx) = mpsc::channel(256);
 
     let event_tx_clone = event_tx.clone();
+    let command_tx_for_mdns = command_tx.clone(); // для delayed dial из mDNS
 
     tokio::spawn(async move {
         let event_tx = event_tx_clone;
+        let command_tx_for_mdns = command_tx_for_mdns;
 
         // Swarm: TCP + QUIC (UDP) + noise + yamux
         let mut swarm = libp2p::SwarmBuilder::with_existing_identity(local_key.clone())
@@ -526,6 +529,34 @@ async fn main() -> Result<(), Box<dyn Error>> {
                                     }
                                 }
                             }
+                            UICommand::DialPeer(peer_id, addrs) => {
+                                // Delayed mDNS dial — пришёл из tokio::spawn после задержки
+                                if swarm.is_connected(&peer_id) {
+                                    pending_dials.remove(&peer_id);
+                                } else {
+                                    let short = &peer_id.to_string()[..16];
+                                    match swarm.dial(
+                                        DialOpts::peer_id(peer_id)
+                                            .addresses(addrs.clone())
+                                            .build()
+                                    ) {
+                                        Ok(_) => {
+                                            let _ = event_tx.send(NetworkEvent::Status(
+                                                format!("📞 Подключаюсь к {}... ({} адресов)", short, addrs.len())
+                                            )).await;
+                                        }
+                                        Err(e) => {
+                                            pending_dials.remove(&peer_id);
+                                            let err_str = e.to_string();
+                                            if !err_str.contains("Pending") && !err_str.contains("already") {
+                                                let _ = event_tx.send(NetworkEvent::Status(
+                                                    format!("❌ dial ошибка: {}", e)
+                                                )).await;
+                                            }
+                                        }
+                                    }
+                                }
+                            }
                             UICommand::SendMessage(text) => {
                                 let msg = ChatMessage {
                                     sender: local_peer_id.to_string(),
@@ -560,15 +591,12 @@ async fn main() -> Result<(), Box<dyn Error>> {
 
                         // === mDNS: автоматическое обнаружение в локальной сети ===
                         SwarmEvent::Behaviour(ChatBehaviourEvent::Mdns(mdns::Event::Discovered(peers))) => {
-                            // Собираем адреса: mDNS может дать сначала TCP, потом QUIC адрес
-                            // Накапливаем все адреса пира перед dial'ом
                             let mut to_dial: HashMap<PeerId, Vec<Multiaddr>> = HashMap::new();
                             for (peer_id, addr) in peers {
                                 if peer_id == local_peer_id { continue; }
                                 println!("mDNS: найден {} на {}", peer_id, addr);
                                 let _ = event_tx.send(NetworkEvent::MdnsDiscovered(peer_id, addr.clone())).await;
                                 swarm.behaviour_mut().gossipsub.add_explicit_peer(&peer_id);
-                                // Пропускаем если уже подключены или в процессе dial
                                 if swarm.is_connected(&peer_id) || pending_dials.contains(&peer_id) {
                                     continue;
                                 }
@@ -583,41 +611,21 @@ async fn main() -> Result<(), Box<dyn Error>> {
                                     }
                                 }
 
-                                // Одностороннее подключение: dialит только пир с меньшим ID.
-                                // Windows Firewall блокирует входящие, но разрешает исходящие.
-                                // Сравниваем строковое представление — base58 детерминированно
-                                let local_str = local_peer_id.to_string();
-                                let remote_str = peer_id.to_string();
-                                if local_str >= remote_str {
-                                    // Мы "больше" — ждём входящего, другая сторона позвонит нам
-                                    let _ = event_tx.send(NetworkEvent::Status(
-                                        format!("⏳ Жду входящего от {}...", &remote_str[..16])
-                                    )).await;
-                                    continue;
-                                }
+                                // Детерминированная задержка на основе нашего Peer ID (0–999ms):
+                                // Каждый пир ждёт не своё время → один успевает подключиться раньше,
+                                // другой видит is_connected=true и пропускает свой dial.
+                                let delay_ms = local_peer_id.to_bytes()
+                                    .iter().fold(0u64, |acc, &b| acc.wrapping_add(b as u64))
+                                    % 1000;
 
-                                // Мы "меньше" — инициируем соединение
                                 pending_dials.insert(peer_id);
-                                match swarm.dial(
-                                    DialOpts::peer_id(peer_id)
-                                        .addresses(all_addrs.clone())
-                                        .build()
-                                ) {
-                                    Ok(_) => {
-                                        let _ = event_tx.send(NetworkEvent::Status(
-                                            format!("📞 Подключаюсь к {}... ({} адресов)", &remote_str[..16], all_addrs.len())
-                                        )).await;
-                                    }
-                                    Err(e) => {
-                                        pending_dials.remove(&peer_id);
-                                        let err_str = e.to_string();
-                                        if !err_str.contains("Pending") && !err_str.contains("already") {
-                                            let _ = event_tx.send(NetworkEvent::Status(
-                                                format!("❌ mDNS dial ошибка: {}", e)
-                                            )).await;
-                                        }
-                                    }
-                                }
+                                // Dial через command channel ␸ задержкой, чтобы не блокировать event loop
+                                let cmd_tx2 = command_tx_for_mdns.clone();
+                                let dial_addrs = all_addrs.clone();
+                                tokio::spawn(async move {
+                                    tokio::time::sleep(Duration::from_millis(delay_ms)).await;
+                                    let _ = cmd_tx2.send(UICommand::DialPeer(peer_id, dial_addrs)).await;
+                                });
                             }
                         }
                         SwarmEvent::Behaviour(ChatBehaviourEvent::Mdns(mdns::Event::Expired(peers))) => {
