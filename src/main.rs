@@ -3,10 +3,11 @@ use eframe::egui;
 use futures::StreamExt;
 use libp2p::{
     gossipsub, mdns, noise, ping,
-    swarm::{NetworkBehaviour, SwarmEvent},
+    swarm::{dial_opts::DialOpts, NetworkBehaviour, SwarmEvent},
     tcp, yamux, Multiaddr, PeerId,
 };
 use serde::{Deserialize, Serialize};
+use std::collections::HashMap;
 use std::error::Error;
 use std::time::Duration;
 use tokio::sync::mpsc;
@@ -464,6 +465,8 @@ async fn main() -> Result<(), Box<dyn Error>> {
             .await;
 
         let mut mesh_check = tokio::time::interval(Duration::from_secs(5));
+        // Кэш адресов для mDNS: пир → все его адреса (TCP + QUIC)
+        let mut peer_addrs: HashMap<PeerId, Vec<Multiaddr>> = HashMap::new();
 
         loop {
             tokio::select! {
@@ -532,36 +535,41 @@ async fn main() -> Result<(), Box<dyn Error>> {
 
                         // === mDNS: автоматическое обнаружение в локальной сети ===
                         SwarmEvent::Behaviour(ChatBehaviourEvent::Mdns(mdns::Event::Discovered(peers))) => {
+                            // Собираем адреса: mDNS может дать сначала TCP, потом QUIC адрес
+                            // Накапливаем все адреса пира перед dial'ом
+                            let mut to_dial: HashMap<PeerId, Vec<Multiaddr>> = HashMap::new();
                             for (peer_id, addr) in peers {
                                 if peer_id == local_peer_id { continue; }
                                 println!("mDNS: найден {} на {}", peer_id, addr);
                                 let _ = event_tx.send(NetworkEvent::MdnsDiscovered(peer_id, addr.clone())).await;
-                                // Добавляем в gossipsub
                                 swarm.behaviour_mut().gossipsub.add_explicit_peer(&peer_id);
-                                // Пропускаем dial если уже подключены
-                                if swarm.is_connected(&peer_id) {
-                                    continue;
+                                if !swarm.is_connected(&peer_id) {
+                                    to_dial.entry(peer_id).or_default().push(addr);
                                 }
-                                // Предпочитаем TCP (избегаем одновременных TCP+QUIC dial'ов)
-                                let addr_str = addr.to_string();
-                                if addr_str.contains("/udp/") && addr_str.contains("/quic") {
-                                    // Пропускаем QUIC — TCP имеет приоритет
-                                    continue;
+                            }
+                            // Один dial на пира со всеми адресами (TCP + QUIC)
+                            // libp2p пробует их параллельно и использует первый успешный
+                            for (peer_id, addrs) in to_dial {
+                                // Накапливаем с предыдущими mDNS-ответами если пир ещё не добавлен
+                                let all_addrs = peer_addrs.entry(peer_id).or_default();
+                                for a in &addrs {
+                                    if !all_addrs.contains(a) {
+                                        all_addrs.push(a.clone());
+                                    }
                                 }
-                                // Dial через peer_id чтобы libp2p дедупликацировал соединения
                                 match swarm.dial(
-                                    libp2p::swarm::dial_opts::DialOpts::peer_id(peer_id)
-                                        .addresses(vec![addr.clone()])
+                                    DialOpts::peer_id(peer_id)
+                                        .addresses(all_addrs.clone())
                                         .build()
                                 ) {
                                     Ok(_) => {
                                         let _ = event_tx.send(NetworkEvent::Status(
-                                            format!("📞 mDNS: подключаюсь к {}...", &peer_id.to_string()[..8])
+                                            format!("📞 mDNS: подключаюсь к {}... ({} адресов)", &peer_id.to_string()[..8], all_addrs.len())
                                         )).await;
                                     }
                                     Err(e) => {
-                                        // AlreadyDialing — нормальная ситуация, молча пропускаем
                                         let err_str = e.to_string();
+                                        // Pending/AlreadyDialing — нормальная ситуация
                                         if !err_str.contains("Pending") && !err_str.contains("already") {
                                             let _ = event_tx.send(NetworkEvent::Status(
                                                 format!("❌ mDNS dial ошибка: {}", e)
