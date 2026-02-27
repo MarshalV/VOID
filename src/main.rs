@@ -313,8 +313,10 @@ async fn main() -> Result<(), Box<dyn Error>> {
     let _ = tracing_subscriber::fmt().with_env_filter("off").try_init();
 
     // === Автоматически добавляем правило файрвола ===
-    let _exe_path = std::env::current_exe().unwrap_or_default();
-    let _exe = _exe_path.display().to_string();
+    #[allow(unused_variables)]
+    let exe_path = std::env::current_exe().unwrap_or_default();
+    #[allow(unused_variables)]
+    let exe = exe_path.display().to_string();
 
     #[cfg(target_os = "windows")]
     {
