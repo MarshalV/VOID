@@ -340,7 +340,7 @@ async fn main() -> Result<(), Box<dyn Error>> {
                     "dir=in",
                     "action=allow",
                     "protocol=TCP",
-                    &format!("program={}", exe),
+                    "localport=64000",
                     "enable=yes",
                 ])
                 .output();
@@ -350,11 +350,11 @@ async fn main() -> Result<(), Box<dyn Error>> {
                     "firewall",
                     "add",
                     "rule",
-                    "name=VOID P2P UDP",
+                    "name=VOID P2P",
                     "dir=in",
                     "action=allow",
                     "protocol=UDP",
-                    &format!("program={}", exe),
+                    "localport=64000",
                     "enable=yes",
                 ])
                 .output();
@@ -369,9 +369,8 @@ async fn main() -> Result<(), Box<dyn Error>> {
             let bat = format!(
                 "@echo off\r\n\
                  netsh advfirewall firewall delete rule name=\"VOID P2P\"\r\n\
-                 netsh advfirewall firewall add rule name=\"VOID P2P\" dir=in action=allow protocol=TCP program=\"{}\" enable=yes\r\n\
-                 netsh advfirewall firewall add rule name=\"VOID P2P UDP\" dir=in action=allow protocol=UDP program=\"{}\" enable=yes\r\n",
-                exe, exe
+                 netsh advfirewall firewall add rule name=\"VOID P2P\" dir=in action=allow protocol=TCP localport=64000 enable=yes\r\n\
+                 netsh advfirewall firewall add rule name=\"VOID P2P\" dir=in action=allow protocol=UDP localport=64000 enable=yes\r\n"
             );
             let bat_path = std::env::temp_dir().join("void_p2p_firewall.bat");
             if std::fs::write(&bat_path, bat).is_ok() {
@@ -476,12 +475,12 @@ async fn main() -> Result<(), Box<dyn Error>> {
         let topic = gossipsub::IdentTopic::new("void-chat-v1");
         swarm.behaviour_mut().gossipsub.subscribe(&topic).unwrap();
 
-        // Слушаем TCP и QUIC (UDP) — оба транспорта для максимальной совместимости
+        // Слушаем TCP и QUIC (UDP) на фиксированном порту 64000
         swarm
-            .listen_on("/ip4/0.0.0.0/tcp/0".parse().unwrap())
+            .listen_on("/ip4/0.0.0.0/tcp/64000".parse().unwrap())
             .unwrap();
         swarm
-            .listen_on("/ip4/0.0.0.0/udp/0/quic-v1".parse().unwrap())
+            .listen_on("/ip4/0.0.0.0/udp/64000/quic-v1".parse().unwrap())
             .unwrap();
 
         let _ = event_tx
@@ -611,12 +610,11 @@ async fn main() -> Result<(), Box<dyn Error>> {
                                     }
                                 }
 
-                                // Детерминированная задержка на основе нашего Peer ID (0–999ms):
-                                // Каждый пир ждёт не своё время → один успевает подключиться раньше,
-                                // другой видит is_connected=true и пропускает свой dial.
-                                let delay_ms = local_peer_id.to_bytes()
+                                // Детерминированная задержка на основе нашего Peer ID (0–2999ms):
+                                // Увеличиваем окно, чтобы один пир гарантированно был "слушателем" дольше.
+                                let delay_ms = (local_peer_id.to_bytes()
                                     .iter().fold(0u64, |acc, &b| acc.wrapping_add(b as u64))
-                                    % 1000;
+                                    % 3) * 1000;
 
                                 pending_dials.insert(peer_id);
                                 // Dial через command channel ␸ задержкой, чтобы не блокировать event loop
