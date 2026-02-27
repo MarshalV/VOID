@@ -538,17 +538,35 @@ async fn main() -> Result<(), Box<dyn Error>> {
                                 let _ = event_tx.send(NetworkEvent::MdnsDiscovered(peer_id, addr.clone())).await;
                                 // Добавляем в gossipsub
                                 swarm.behaviour_mut().gossipsub.add_explicit_peer(&peer_id);
-                                // Подключаемся
-                                match swarm.dial(addr) {
+                                // Пропускаем dial если уже подключены
+                                if swarm.is_connected(&peer_id) {
+                                    continue;
+                                }
+                                // Предпочитаем TCP (избегаем одновременных TCP+QUIC dial'ов)
+                                let addr_str = addr.to_string();
+                                if addr_str.contains("/udp/") && addr_str.contains("/quic") {
+                                    // Пропускаем QUIC — TCP имеет приоритет
+                                    continue;
+                                }
+                                // Dial через peer_id чтобы libp2p дедупликацировал соединения
+                                match swarm.dial(
+                                    libp2p::swarm::dial_opts::DialOpts::peer_id(peer_id)
+                                        .addresses(vec![addr.clone()])
+                                        .build()
+                                ) {
                                     Ok(_) => {
                                         let _ = event_tx.send(NetworkEvent::Status(
                                             format!("📞 mDNS: подключаюсь к {}...", &peer_id.to_string()[..8])
                                         )).await;
                                     }
                                     Err(e) => {
-                                        let _ = event_tx.send(NetworkEvent::Status(
-                                            format!("❌ mDNS dial ошибка: {}", e)
-                                        )).await;
+                                        // AlreadyDialing — нормальная ситуация, молча пропускаем
+                                        let err_str = e.to_string();
+                                        if !err_str.contains("Pending") && !err_str.contains("already") {
+                                            let _ = event_tx.send(NetworkEvent::Status(
+                                                format!("❌ mDNS dial ошибка: {}", e)
+                                            )).await;
+                                        }
                                     }
                                 }
                             }
