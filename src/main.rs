@@ -7,7 +7,7 @@ use libp2p::{
     tcp, yamux, Multiaddr, PeerId,
 };
 use serde::{Deserialize, Serialize};
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::error::Error;
 use std::time::Duration;
 use tokio::sync::mpsc;
@@ -317,60 +317,83 @@ async fn main() -> Result<(), Box<dyn Error>> {
 
     #[cfg(target_os = "windows")]
     {
-        println!("Настраиваю файрвол Windows...");
-        // Удаляем старые правила (если были)
-        let _ = std::process::Command::new("netsh")
-            .args([
-                "advfirewall",
-                "firewall",
-                "delete",
-                "rule",
-                "name=P2P Messenger",
-            ])
-            .output();
-        // TCP правило
-        let tcp_result = std::process::Command::new("netsh")
-            .args([
-                "advfirewall",
-                "firewall",
-                "add",
-                "rule",
-                "name=P2P Messenger",
-                "dir=in",
-                "action=allow",
-                "protocol=TCP",
-                &format!("program={}", exe),
-                "enable=yes",
-            ])
-            .output();
-        // UDP правило
-        let udp_result = std::process::Command::new("netsh")
-            .args([
-                "advfirewall",
-                "firewall",
-                "add",
-                "rule",
-                "name=P2P Messenger UDP",
-                "dir=in",
-                "action=allow",
-                "protocol=UDP",
-                &format!("program={}", exe),
-                "enable=yes",
-            ])
-            .output();
-        match (tcp_result, udp_result) {
-            (Ok(tcp), Ok(udp)) => {
-                let tcp_ok = String::from_utf8_lossy(&tcp.stdout).contains("Ok");
-                let udp_ok = String::from_utf8_lossy(&udp.stdout).contains("Ok");
-                if tcp_ok && udp_ok {
-                    println!("✅ Файрвол настроен (TCP + UDP разрешены)");
-                } else {
-                    println!("⚠ Файрвол: запустите от Администратора для автонастройки");
-                    println!("  TCP: {}", String::from_utf8_lossy(&tcp.stdout).trim());
-                    println!("  UDP: {}", String::from_utf8_lossy(&udp.stdout).trim());
+        // Проверяем, запущены ли мы уже от Администратора
+        let is_admin = std::process::Command::new("net")
+            .args(["session"])
+            .output()
+            .map(|o| o.status.success())
+            .unwrap_or(false);
+
+        if is_admin {
+            println!("Настраиваю файрвол Windows...");
+            let _ = std::process::Command::new("netsh")
+                .args([
+                    "advfirewall",
+                    "firewall",
+                    "delete",
+                    "rule",
+                    "name=P2P Messenger",
+                ])
+                .output();
+            let tcp_r = std::process::Command::new("netsh")
+                .args([
+                    "advfirewall",
+                    "firewall",
+                    "add",
+                    "rule",
+                    "name=P2P Messenger",
+                    "dir=in",
+                    "action=allow",
+                    "protocol=TCP",
+                    &format!("program={}", exe),
+                    "enable=yes",
+                ])
+                .output();
+            let udp_r = std::process::Command::new("netsh")
+                .args([
+                    "advfirewall",
+                    "firewall",
+                    "add",
+                    "rule",
+                    "name=P2P Messenger UDP",
+                    "dir=in",
+                    "action=allow",
+                    "protocol=UDP",
+                    &format!("program={}", exe),
+                    "enable=yes",
+                ])
+                .output();
+            match (tcp_r, udp_r) {
+                (Ok(t), Ok(u)) if t.status.success() && u.status.success() => {
+                    println!("✅ Файрвол настроен (TCP + UDP разрешены)")
                 }
+                _ => println!("⚠ Не удалось настроить файрвол"),
             }
-            _ => println!("⚠ Не удалось настроить файрвол — запустите от Администратора"),
+        } else {
+            // Перезапуск с UAC элевацией — добавляем правило через PowerShell
+            println!("Настраиваю файрвол (запрос прав Администратора)...");
+            // PowerShell: netsh от админа через Start-Process -Verb RunAs
+            let ps_cmd = format!(
+                "netsh advfirewall firewall delete rule name='P2P Messenger'; \
+                 netsh advfirewall firewall add rule name='P2P Messenger' dir=in action=allow protocol=TCP program='{}' enable=yes; \
+                 netsh advfirewall firewall add rule name='P2P Messenger UDP' dir=in action=allow protocol=UDP program='{}' enable=yes",
+                exe, exe
+            );
+            let result = std::process::Command::new("powershell")
+                .args([
+                    "-Command",
+                    &format!(
+                        "Start-Process powershell -Verb RunAs -Wait -ArgumentList '-Command {}'",
+                        ps_cmd
+                    ),
+                ])
+                .output();
+            match result {
+                Ok(o) if o.status.success() => println!("✅ Файрвол настроен"),
+                _ => println!(
+                    "⚠ Файрвол: принятье UAC было отклонено — запустите от Администратора вручную"
+                ),
+            }
         }
     }
 
@@ -467,6 +490,8 @@ async fn main() -> Result<(), Box<dyn Error>> {
         let mut mesh_check = tokio::time::interval(Duration::from_secs(5));
         // Кэш адресов для mDNS: пир → все его адреса (TCP + QUIC)
         let mut peer_addrs: HashMap<PeerId, Vec<Multiaddr>> = HashMap::new();
+        // Пиры, к которым уже запущен или идёт dial (избегаем дубликат)
+        let mut pending_dials: HashSet<PeerId> = HashSet::new();
 
         loop {
             tokio::select! {
@@ -543,14 +568,14 @@ async fn main() -> Result<(), Box<dyn Error>> {
                                 println!("mDNS: найден {} на {}", peer_id, addr);
                                 let _ = event_tx.send(NetworkEvent::MdnsDiscovered(peer_id, addr.clone())).await;
                                 swarm.behaviour_mut().gossipsub.add_explicit_peer(&peer_id);
-                                if !swarm.is_connected(&peer_id) {
-                                    to_dial.entry(peer_id).or_default().push(addr);
+                                // Пропускаем если уже подключены или в процессе dial
+                                if swarm.is_connected(&peer_id) || pending_dials.contains(&peer_id) {
+                                    continue;
                                 }
+                                to_dial.entry(peer_id).or_default().push(addr);
                             }
-                            // Один dial на пира со всеми адресами (TCP + QUIC)
-                            // libp2p пробует их параллельно и использует первый успешный
+
                             for (peer_id, addrs) in to_dial {
-                                // Накапливаем с предыдущими mDNS-ответами если пир ещё не добавлен
                                 let all_addrs = peer_addrs.entry(peer_id).or_default();
                                 for a in &addrs {
                                     if !all_addrs.contains(a) {
@@ -558,19 +583,21 @@ async fn main() -> Result<(), Box<dyn Error>> {
                                     }
                                 }
 
-                                // Избегаем одновременного dial с обеих сторон:
-                                // Только "меньший" Peer ID инициирует соединение.
-                                // "Больший" ждёт входящего — Windows Firewall разрешает
-                                // исходящие по умолчанию, поэтому связь устанавливается.
-                                let local_bytes = local_peer_id.to_bytes();
-                                let remote_bytes = peer_id.to_bytes();
-                                if local_bytes >= remote_bytes {
+                                // Одностороннее подключение: dialит только пир с меньшим ID.
+                                // Windows Firewall блокирует входящие, но разрешает исходящие.
+                                // Сравниваем строковое представление — base58 детерминированно
+                                let local_str = local_peer_id.to_string();
+                                let remote_str = peer_id.to_string();
+                                if local_str >= remote_str {
+                                    // Мы "больше" — ждём входящего, другая сторона позвонит нам
                                     let _ = event_tx.send(NetworkEvent::Status(
-                                        format!("⏳ Жду входящего от {}... (они инициируют)", &peer_id.to_string()[..8])
+                                        format!("⏳ Жду входящего от {}...", &remote_str[..16])
                                     )).await;
                                     continue;
                                 }
 
+                                // Мы "меньше" — инициируем соединение
+                                pending_dials.insert(peer_id);
                                 match swarm.dial(
                                     DialOpts::peer_id(peer_id)
                                         .addresses(all_addrs.clone())
@@ -578,12 +605,12 @@ async fn main() -> Result<(), Box<dyn Error>> {
                                 ) {
                                     Ok(_) => {
                                         let _ = event_tx.send(NetworkEvent::Status(
-                                            format!("📞 mDNS: подключаюсь к {}... ({} адресов)", &peer_id.to_string()[..8], all_addrs.len())
+                                            format!("📞 Подключаюсь к {}... ({} адресов)", &remote_str[..16], all_addrs.len())
                                         )).await;
                                     }
                                     Err(e) => {
+                                        pending_dials.remove(&peer_id);
                                         let err_str = e.to_string();
-                                        // Pending/AlreadyDialing — нормальная ситуация
                                         if !err_str.contains("Pending") && !err_str.contains("already") {
                                             let _ = event_tx.send(NetworkEvent::Status(
                                                 format!("❌ mDNS dial ошибка: {}", e)
@@ -614,7 +641,7 @@ async fn main() -> Result<(), Box<dyn Error>> {
                         // === Соединения ===
                         SwarmEvent::ConnectionEstablished { peer_id, .. } => {
                             println!("Подключён: {}", peer_id);
-                            // Добавляем в gossipsub при любом подключении
+                            pending_dials.remove(&peer_id);
                             swarm.behaviour_mut().gossipsub.add_explicit_peer(&peer_id);
                             let mesh = swarm.behaviour().gossipsub.all_mesh_peers().count();
                             let _ = event_tx.send(NetworkEvent::Connected(peer_id)).await;
