@@ -557,6 +557,20 @@ async fn main() -> Result<(), Box<dyn Error>> {
                                         all_addrs.push(a.clone());
                                     }
                                 }
+
+                                // Избегаем одновременного dial с обеих сторон:
+                                // Только "меньший" Peer ID инициирует соединение.
+                                // "Больший" ждёт входящего — Windows Firewall разрешает
+                                // исходящие по умолчанию, поэтому связь устанавливается.
+                                let local_bytes = local_peer_id.to_bytes();
+                                let remote_bytes = peer_id.to_bytes();
+                                if local_bytes >= remote_bytes {
+                                    let _ = event_tx.send(NetworkEvent::Status(
+                                        format!("⏳ Жду входящего от {}... (они инициируют)", &peer_id.to_string()[..8])
+                                    )).await;
+                                    continue;
+                                }
+
                                 match swarm.dial(
                                     DialOpts::peer_id(peer_id)
                                         .addresses(all_addrs.clone())
