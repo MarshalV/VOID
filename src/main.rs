@@ -663,12 +663,16 @@ async fn main() -> Result<(), Box<dyn Error>> {
         let topic = gossipsub::IdentTopic::new("void-chat-v1");
         swarm.behaviour_mut().gossipsub.subscribe(&topic).unwrap();
 
-        // Слушаем TCP и QUIC (UDP) на фиксированном порту 64000
+        // Пытаемся занять порт 64000, если не получается — берем любой свободный
+        let _ = swarm.listen_on("/ip4/0.0.0.0/tcp/64000".parse().unwrap());
+        let _ = swarm.listen_on("/ip4/0.0.0.0/udp/64000/quic-v1".parse().unwrap());
+
+        // Резервные слушатели на случайных портах
         swarm
-            .listen_on("/ip4/0.0.0.0/tcp/64000".parse().unwrap())
+            .listen_on("/ip4/0.0.0.0/tcp/0".parse().unwrap())
             .unwrap();
         swarm
-            .listen_on("/ip4/0.0.0.0/udp/64000/quic-v1".parse().unwrap())
+            .listen_on("/ip4/0.0.0.0/udp/0/quic-v1".parse().unwrap())
             .unwrap();
 
         let _ = event_tx
