@@ -52,17 +52,20 @@ struct App {
     chat_input: String,
     chat_messages: Vec<ChatMessage>,
     status_log: Vec<String>,
+    show_logs: bool,
+    show_sidebar: bool,
     command_tx: mpsc::Sender<UICommand>,
     event_rx: mpsc::Receiver<NetworkEvent>,
 }
 
 impl App {
     fn new(
-        _cc: &eframe::CreationContext<'_>,
+        cc: &eframe::CreationContext<'_>,
         local_peer_id: PeerId,
         command_tx: mpsc::Sender<UICommand>,
         event_rx: mpsc::Receiver<NetworkEvent>,
     ) -> Self {
+        setup_custom_style(&cc.egui_ctx);
         Self {
             local_peer_id,
             listen_addrs: Vec::new(),
@@ -72,49 +75,173 @@ impl App {
             chat_input: String::new(),
             chat_messages: Vec::new(),
             status_log: Vec::new(),
+            show_logs: false,
+            show_sidebar: true,
             command_tx,
             event_rx,
         }
     }
 
     fn add_status(&mut self, msg: String) {
-        let ts = chrono::Local::now().format("%H:%M:%S").to_string();
+        let ts = chrono::Local::now().format("%H:%M").to_string();
         self.status_log.push(format!("[{}] {}", ts, msg));
-        if self.status_log.len() > 20 {
+        if self.status_log.len() > 30 {
             self.status_log.remove(0);
         }
     }
+
+    fn ui_sidebar(&mut self, ui: &mut egui::Ui, accent_color: egui::Color32) {
+        ui.vertical(|ui| {
+            ui.label(
+                egui::RichText::new("IDENTITY")
+                    .size(16.0)
+                    .strong()
+                    .color(accent_color),
+            );
+            ui.label(
+                egui::RichText::new(&self.local_peer_id.to_string()[..16])
+                    .size(15.0)
+                    .monospace(),
+            );
+            ui.add_space(25.0);
+
+            ui.label(
+                egui::RichText::new("YOUR ADDRESSES")
+                    .size(16.0)
+                    .strong()
+                    .color(accent_color),
+            );
+            if self.listen_addrs.is_empty() {
+                ui.label(
+                    egui::RichText::new("🔍 Starting network...")
+                        .size(13.0)
+                        .weak(),
+                );
+            } else {
+                let addrs = self.listen_addrs.clone();
+                for addr in addrs {
+                    let label = egui::Label::new(egui::RichText::new(&addr).size(13.0).monospace())
+                        .sense(egui::Sense::click());
+                    if ui
+                        .add(label)
+                        .on_hover_text("Double click to copy")
+                        .double_clicked()
+                    {
+                        ui.output_mut(|o| o.copied_text = addr.clone());
+                        self.add_status(format!("📋 Copied address"));
+                    }
+                }
+            }
+            ui.add_space(25.0);
+
+            ui.label(
+                egui::RichText::new("NETWORK")
+                    .size(16.0)
+                    .strong()
+                    .color(accent_color),
+            );
+            ui.label(
+                egui::RichText::new(format!("Connected: {}", self.connected_peers)).size(16.0),
+            );
+            ui.label(egui::RichText::new(format!("Mesh Size: {}", self.mesh_peers)).size(16.0));
+
+            ui.add_space(30.0);
+            ui.label(
+                egui::RichText::new("DIAL PEER")
+                    .size(16.0)
+                    .strong()
+                    .color(accent_color),
+            );
+            ui.add(
+                egui::TextEdit::singleline(&mut self.dial_address)
+                    .hint_text("/ip4/...")
+                    .desired_width(220.0),
+            );
+            ui.add_space(12.0);
+            if ui
+                .add(egui::Button::new(egui::RichText::new("CONNECT").size(16.0)))
+                .clicked()
+                && !self.dial_address.is_empty()
+            {
+                let _ = self
+                    .command_tx
+                    .try_send(UICommand::Dial(self.dial_address.clone()));
+                self.dial_address.clear();
+            }
+
+            ui.add_space(50.0);
+            if ui
+                .add(egui::Button::new(
+                    egui::RichText::new("📋 SYSTEM LOGS").size(16.0),
+                ))
+                .clicked()
+            {
+                self.show_logs = true;
+            }
+        });
+    }
+}
+
+fn setup_custom_style(ctx: &egui::Context) {
+    let mut visuals = egui::Visuals::dark();
+    let bg_color = egui::Color32::from_rgb(26, 26, 28); // #1A1A1C
+    let text_color = egui::Color32::from_rgb(209, 209, 209); // #D1D1D1
+    let accent_color = egui::Color32::from_rgb(0, 195, 255); // Cyan accent
+
+    visuals.panel_fill = bg_color;
+    visuals.window_fill = bg_color;
+    visuals.widgets.noninteractive.bg_fill = bg_color;
+    visuals.widgets.inactive.bg_fill = bg_color;
+    visuals.widgets.hovered.bg_fill = egui::Color32::from_rgb(34, 34, 37);
+    visuals.widgets.active.bg_fill = egui::Color32::from_rgb(18, 18, 20);
+
+    visuals.widgets.noninteractive.fg_stroke = egui::Stroke::new(1.0, text_color);
+    visuals.widgets.inactive.fg_stroke = egui::Stroke::new(1.0, text_color);
+    visuals.widgets.hovered.fg_stroke = egui::Stroke::new(1.5, accent_color);
+    visuals.widgets.active.fg_stroke = egui::Stroke::new(1.5, accent_color);
+
+    visuals.selection.bg_fill = egui::Color32::from_rgb(60, 60, 70);
+    visuals.window_rounding = 40.0.into();
+    visuals.widgets.noninteractive.rounding = 15.0.into();
+    visuals.widgets.inactive.rounding = 15.0.into();
+
+    ctx.set_visuals(visuals);
+
+    let mut style = (*ctx.style()).clone();
+    style.spacing.item_spacing = egui::vec2(15.0, 15.0);
+    style.spacing.window_margin = egui::Margin::same(30.0);
+    style.spacing.button_padding = egui::vec2(12.0, 8.0);
+    ctx.set_style(style);
 }
 
 impl eframe::App for App {
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
-        // Обрабатываем все события из сети
         while let Ok(event) = self.event_rx.try_recv() {
             match event {
                 NetworkEvent::NewListenAddr(addr) => {
                     let full = format!("{}/p2p/{}", addr, self.local_peer_id);
                     if !self.listen_addrs.contains(&full) {
-                        self.add_status(format!("Слушаю: {}", addr));
+                        self.add_status(format!("🚀 Listen: {}", addr));
                         self.listen_addrs.push(full);
                     }
                 }
                 NetworkEvent::MdnsDiscovered(peer, addr) => {
                     self.add_status(format!(
-                        "🔍 Найден: {}... ({})",
+                        "🔍 Peer Found: {} at {}",
                         &peer.to_string()[..8],
                         addr
                     ));
                 }
                 NetworkEvent::MdnsExpired(peer) => {
-                    self.add_status(format!("⏳ Ушёл: {}...", &peer.to_string()[..8]));
+                    self.add_status(format!("⏳ Offline (MDNS): {}", &peer.to_string()[..8]));
                 }
                 NetworkEvent::Connected(peer) => {
                     self.connected_peers += 1;
-                    self.add_status(format!("✅ Подключён: {}...", &peer.to_string()[..8]));
+                    self.add_status(format!("✅ Connected: {}...", &peer.to_string()[..8]));
                 }
                 NetworkEvent::Disconnected(peer) => {
                     self.connected_peers = self.connected_peers.saturating_sub(1);
-                    self.add_status(format!("❌ Отключён: {}...", &peer.to_string()[..8]));
+                    self.add_status(format!("❌ Disconnected: {}...", &peer.to_string()[..8]));
                 }
                 NetworkEvent::MeshPeers(count) => {
                     self.mesh_peers = count;
@@ -128,180 +255,236 @@ impl eframe::App for App {
             }
         }
 
-        // === ВЕРХНЯЯ ПАНЕЛЬ ===
-        egui::TopBottomPanel::top("top").show(ctx, |ui| {
-            ui.add_space(6.0);
-            ui.horizontal(|ui| {
-                ui.heading(
-                    egui::RichText::new("VOID P2P Chat")
-                        .color(egui::Color32::from_rgb(0, 255, 255)),
-                );
-                ui.separator();
-                let color = if self.mesh_peers > 0 {
-                    egui::Color32::GREEN
-                } else if self.connected_peers > 0 {
-                    egui::Color32::YELLOW
-                } else {
-                    egui::Color32::RED
-                };
-                ui.label(
-                    egui::RichText::new(format!(
-                        "Подключено: {}  |  В чате: {}",
-                        self.connected_peers, self.mesh_peers
-                    ))
-                    .color(color)
-                    .strong(),
-                );
-            });
-            ui.add_space(6.0);
-        });
+        let bg_color = egui::Color32::from_rgb(26, 26, 28);
+        let text_color = egui::Color32::from_rgb(209, 209, 209);
+        let shadow_light = egui::Color32::from_rgba_premultiplied(45, 45, 48, 255);
+        let shadow_dark = egui::Color32::from_rgba_premultiplied(12, 12, 14, 255);
+        let accent_color = egui::Color32::from_rgb(0, 195, 255);
 
-        // === ЛЕВАЯ ПАНЕЛЬ ===
-        egui::SidePanel::left("left")
-            .min_width(320.0)
+        // --- Log Window ---
+        if self.show_logs {
+            egui::Window::new("SYSTEM CONSOLE")
+                .open(&mut self.show_logs)
+                .resizable(true)
+                .default_size([400.0, 300.0])
+                .show(ctx, |ui| {
+                    ui.label(
+                        egui::RichText::new("LOCAL ADDRESSES")
+                            .strong()
+                            .color(accent_color),
+                    );
+                    for addr in &self.listen_addrs {
+                        ui.label(egui::RichText::new(addr).small().monospace());
+                    }
+                    ui.add_space(8.0);
+                    ui.separator();
+                    ui.add_space(8.0);
+                    ui.label(
+                        egui::RichText::new("EVENT LOG")
+                            .strong()
+                            .color(accent_color),
+                    );
+                    egui::ScrollArea::vertical()
+                        .id_salt("log_scroll")
+                        .show(ui, |ui| {
+                            for log in &self.status_log {
+                                ui.label(egui::RichText::new(log).size(11.0).weak());
+                            }
+                        });
+                });
+        }
+
+        // --- Top Bar (Header) ---
+        egui::TopBottomPanel::top("header")
+            .frame(egui::Frame::none().fill(bg_color).inner_margin(20.0))
             .show(ctx, |ui| {
-                ui.add_space(8.0);
-
-                // ID
                 ui.horizontal(|ui| {
-                    ui.label("Ваш ID:");
-                    let id_short = &self.local_peer_id.to_string()[..16];
-                    ui.label(egui::RichText::new(id_short).monospace().strong());
                     if ui
-                        .button("📋")
-                        .on_hover_text("Копировать полный ID")
+                        .add(egui::Button::new(
+                            egui::RichText::new(if self.show_sidebar { "⬅" } else { "☰" })
+                                .size(22.0),
+                        ))
                         .clicked()
                     {
-                        ui.output_mut(|o| o.copied_text = self.local_peer_id.to_string());
+                        self.show_sidebar = !self.show_sidebar;
                     }
-                });
 
-                ui.add_space(8.0);
-                ui.separator();
-
-                // ПОДКЛЮЧЕНИЕ
-                ui.label(egui::RichText::new("➡ ПОДКЛЮЧИТЬСЯ К ПИРУ:").strong());
-                ui.label(
-                    egui::RichText::new("Вставьте адрес другого клиента")
-                        .small()
-                        .weak(),
-                );
-                ui.horizontal(|ui| {
-                    let response = ui.add(
-                        egui::TextEdit::singleline(&mut self.dial_address)
-                            .hint_text("/ip4/.../tcp/.../p2p/...")
-                            .desired_width(ui.available_width() - 60.0),
-                    );
-                    if (ui.button("Join").clicked()
-                        || (response.lost_focus()
-                            && ctx.input(|i| i.key_pressed(egui::Key::Enter))))
-                        && !self.dial_address.is_empty()
-                    {
-                        let _ = self
-                            .command_tx
-                            .try_send(UICommand::Dial(self.dial_address.clone()));
-                        self.dial_address.clear();
-                    }
-                });
-
-                ui.add_space(8.0);
-                ui.separator();
-
-                // ВАШИ АДРЕСА
-                ui.label(egui::RichText::new("📋 ВАШИ АДРЕСА (скопируйте другу):").strong());
-                egui::ScrollArea::vertical()
-                    .id_salt("addrs")
-                    .max_height(120.0)
-                    .show(ui, |ui| {
-                        if self.listen_addrs.is_empty() {
-                            ui.label(egui::RichText::new("Ожидание...").weak());
-                        }
-                        for addr in &self.listen_addrs {
-                            ui.horizontal(|ui| {
-                                ui.label(egui::RichText::new(addr).small().monospace());
-                                if ui.button("📋").clicked() {
-                                    ui.output_mut(|o| o.copied_text = addr.clone());
-                                }
-                            });
-                        }
+                    ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                        ui.label(
+                            egui::RichText::new("VOID P2P DARK")
+                                .size(32.0)
+                                .color(accent_color)
+                                .strong(),
+                        );
                     });
-
-                ui.add_space(8.0);
-                ui.separator();
-
-                // СТАТУС
-                ui.label(egui::RichText::new("📊 СТАТУС:").strong());
-                egui::ScrollArea::vertical()
-                    .id_salt("status")
-                    .max_height(200.0)
-                    .stick_to_bottom(true)
-                    .show(ui, |ui| {
-                        for log in &self.status_log {
-                            ui.label(egui::RichText::new(log).small().weak());
-                        }
-                    });
-            });
-
-        // === ЦЕНТРАЛЬНАЯ ПАНЕЛЬ — ЧАТ ===
-        egui::CentralPanel::default().show(ctx, |ui| {
-            ui.vertical(|ui| {
-                if self.mesh_peers == 0 {
-                    ui.label(
-                        egui::RichText::new("⚠ Нет собеседников. Скопируйте адрес и отправьте другу, или вставьте его адрес в поле ПОДКЛЮЧИТЬСЯ.")
-                            .color(egui::Color32::YELLOW),
-                    );
-                    ui.separator();
-                }
-
-                egui::ScrollArea::vertical()
-                    .id_salt("chat")
-                    .stick_to_bottom(true)
-                    .max_height(ui.available_height() - 50.0)
-                    .show(ui, |ui| {
-                        ui.set_width(ui.available_width());
-                        for msg in &self.chat_messages {
-                            let is_me = msg.sender == self.local_peer_id.to_string();
-                            let color = if is_me {
-                                egui::Color32::from_rgb(100, 255, 150)
-                            } else {
-                                egui::Color32::from_rgb(255, 215, 0)
-                            };
-                            let name = if is_me {
-                                "Вы".to_string()
-                            } else {
-                                format!("{}...", &msg.sender[..6])
-                            };
-                            ui.horizontal(|ui| {
-                                ui.label(
-                                    egui::RichText::new(format!("[{}] <{}>", msg.timestamp, name))
-                                        .color(color)
-                                        .monospace(),
-                                );
-                                ui.label(&msg.text);
-                            });
-                        }
-                    });
-
-                ui.separator();
-                ui.horizontal(|ui| {
-                    let res = ui.add(
-                        egui::TextEdit::singleline(&mut self.chat_input)
-                            .hint_text("Введите сообщение...")
-                            .desired_width(ui.available_width() - 80.0),
-                    );
-                    if (ui.button("Отправить").clicked()
-                        || (res.lost_focus()
-                            && ctx.input(|i| i.key_pressed(egui::Key::Enter))))
-                        && !self.chat_input.is_empty()
-                    {
-                        let _ = self
-                            .command_tx
-                            .try_send(UICommand::SendMessage(self.chat_input.clone()));
-                        self.chat_input.clear();
-                    }
                 });
             });
-        });
+
+        // --- Sidebar (Collapsible) ---
+        if self.show_sidebar {
+            egui::SidePanel::left("sidebar")
+                .frame(egui::Frame::none().fill(bg_color).inner_margin(20.0))
+                .resizable(true)
+                .default_width(280.0)
+                .width_range(200.0..=400.0)
+                .show(ctx, |ui| {
+                    egui::ScrollArea::vertical().show(ui, |ui| {
+                        self.ui_sidebar(ui, accent_color);
+                    });
+                });
+        }
+
+        // --- Main Chat Area ---
+        egui::CentralPanel::default()
+            .frame(egui::Frame::none().fill(bg_color).inner_margin(20.0))
+            .show(ctx, |ui| {
+                ui.vertical(|ui| {
+                    // Chat bubbles container
+                    egui::Frame::none()
+                        .fill(bg_color)
+                        .rounding(30.0)
+                        .shadow(egui::Shadow {
+                            offset: egui::vec2(-6.0, -6.0),
+                            blur: 16.0,
+                            spread: 0.0,
+                            color: shadow_light,
+                        })
+                        .show(ui, |ui| {
+                            egui::Frame::none()
+                                .fill(bg_color)
+                                .rounding(30.0)
+                                .shadow(egui::Shadow {
+                                    offset: egui::vec2(6.0, 6.0),
+                                    blur: 12.0,
+                                    spread: 0.0,
+                                    color: shadow_dark,
+                                })
+                                .inner_margin(30.0)
+                                .show(ui, |ui| {
+                                    ui.set_width(ui.available_width());
+                                    ui.set_height(ui.available_height() - 100.0);
+
+                                    egui::ScrollArea::vertical()
+                                        .id_salt("chat_stream")
+                                        .stick_to_bottom(true)
+                                        .auto_shrink([false, false])
+                                        .show(ui, |ui| {
+                                            ui.set_width(ui.available_width());
+                                            for msg in &self.chat_messages {
+                                                let is_me =
+                                                    msg.sender == self.local_peer_id.to_string();
+                                                ui.add_space(20.0);
+                                                ui.horizontal(|ui| {
+                                                    if is_me {
+                                                        ui.add_space(ui.available_width() * 0.1);
+                                                    }
+
+                                                    egui::Frame::none()
+                                                        .fill(if is_me {
+                                                            egui::Color32::from_rgb(45, 45, 50)
+                                                        } else {
+                                                            egui::Color32::from_rgb(33, 33, 36)
+                                                        })
+                                                        .rounding(22.0)
+                                                        .inner_margin(18.0)
+                                                        .show(ui, |ui| {
+                                                            ui.vertical(|ui| {
+                                                                if !is_me {
+                                                                    ui.label(
+                                                                        egui::RichText::new(
+                                                                            &msg.sender[..12],
+                                                                        )
+                                                                        .size(14.0)
+                                                                        .color(accent_color)
+                                                                        .strong(),
+                                                                    );
+                                                                }
+                                                                ui.label(
+                                                                    egui::RichText::new(&msg.text)
+                                                                        .size(20.0)
+                                                                        .color(text_color),
+                                                                );
+                                                                ui.with_layout(
+                                                                    egui::Layout::right_to_left(
+                                                                        egui::Align::BOTTOM,
+                                                                    ),
+                                                                    |ui| {
+                                                                        ui.label(
+                                                                            egui::RichText::new(
+                                                                                &msg.timestamp,
+                                                                            )
+                                                                            .size(11.0)
+                                                                            .weak(),
+                                                                        );
+                                                                    },
+                                                                );
+                                                            });
+                                                        });
+
+                                                    if !is_me {
+                                                        ui.add_space(ui.available_width() * 0.1);
+                                                    }
+                                                });
+                                            }
+                                        });
+                                });
+                        });
+
+                    ui.add_space(20.0);
+
+                    // --- Input Bar ---
+                    egui::Frame::none()
+                        .fill(bg_color)
+                        .rounding(30.0)
+                        .shadow(egui::Shadow {
+                            offset: egui::vec2(-6.0, -6.0),
+                            blur: 16.0,
+                            spread: 0.0,
+                            color: shadow_light,
+                        })
+                        .show(ui, |ui| {
+                            egui::Frame::none()
+                                .fill(bg_color)
+                                .rounding(30.0)
+                                .shadow(egui::Shadow {
+                                    offset: egui::vec2(6.0, 6.0),
+                                    blur: 12.0,
+                                    spread: 0.0,
+                                    color: shadow_dark,
+                                })
+                                .inner_margin(18.0)
+                                .show(ui, |ui| {
+                                    ui.set_width(ui.available_width());
+                                    ui.horizontal(|ui| {
+                                        let res = ui.add(
+                                            egui::TextEdit::singleline(&mut self.chat_input)
+                                                .hint_text("Message...")
+                                                .desired_width(ui.available_width() - 110.0)
+                                                .font(egui::TextStyle::Body),
+                                        );
+
+                                        if (ui
+                                            .add_sized(
+                                                [100.0, 40.0],
+                                                egui::Button::new(
+                                                    egui::RichText::new("SEND").size(16.0),
+                                                ),
+                                            )
+                                            .clicked()
+                                            || (res.lost_focus()
+                                                && ctx.input(|i| i.key_pressed(egui::Key::Enter))))
+                                            && !self.chat_input.is_empty()
+                                        {
+                                            let _ = self.command_tx.try_send(
+                                                UICommand::SendMessage(self.chat_input.clone()),
+                                            );
+                                            self.chat_input.clear();
+                                        }
+                                    });
+                                });
+                        });
+                });
+            });
 
         ctx.request_repaint_after(Duration::from_millis(100));
     }
@@ -702,7 +885,7 @@ async fn main() -> Result<(), Box<dyn Error>> {
     });
 
     eframe::run_native(
-        "VOID P2P Chat",
+        "VOID",
         eframe::NativeOptions::default(),
         Box::new(move |cc| Ok(Box::new(App::new(cc, local_peer_id, command_tx, event_rx)))),
     )
