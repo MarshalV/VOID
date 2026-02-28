@@ -9,6 +9,7 @@ use libp2p::{
 use serde::{Deserialize, Serialize};
 use std::collections::{HashMap, HashSet};
 use std::error::Error;
+use std::sync::Arc;
 use std::time::Duration;
 use tokio::sync::mpsc;
 
@@ -701,10 +702,27 @@ async fn main() -> Result<(), Box<dyn Error>> {
         }
     });
 
+    let icon = Arc::new(load_icon());
+
     eframe::run_native(
         "VOID P2P Chat",
-        eframe::NativeOptions::default(),
+        eframe::NativeOptions {
+            viewport: egui::ViewportBuilder::default().with_icon(icon),
+            ..Default::default()
+        },
         Box::new(move |cc| Ok(Box::new(App::new(cc, local_peer_id, command_tx, event_rx)))),
     )
     .map_err(|e| Box::new(e) as Box<dyn Error>)
+}
+
+fn load_icon() -> egui::IconData {
+    let icon_data = include_bytes!("../icon.png");
+    let image = image::load_from_memory(icon_data).expect("Failed to open icon");
+    let image = image.to_rgba8();
+    let (width, height) = image.dimensions();
+    egui::IconData {
+        rgba: image.into_raw(),
+        width,
+        height,
+    }
 }
