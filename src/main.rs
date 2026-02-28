@@ -14,7 +14,9 @@ use tokio::sync::mpsc;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 struct ChatMessage {
-    sender: String,
+    sender_id: String,
+    sender_name: String,
+    recipient_id: Option<String>, // Some(peer_id) for private, None for global
     text: String,
     timestamp: String,
 }
@@ -33,7 +35,12 @@ enum NetworkEvent {
 enum UICommand {
     Dial(String),
     DialPeer(PeerId, Vec<Multiaddr>),
-    SendMessage(String),
+    SendMessage {
+        sender_name: String,
+        text: String,
+        recipient: Option<PeerId>,
+    },
+    UpdateNickname(String),
 }
 
 #[derive(NetworkBehaviour)]
@@ -45,12 +52,16 @@ struct ChatBehaviour {
 
 struct App {
     local_peer_id: PeerId,
+    local_nickname: String,
     listen_addrs: Vec<String>,
     connected_peers: usize,
     mesh_peers: usize,
     dial_address: String,
     chat_input: String,
-    chat_messages: Vec<ChatMessage>,
+    // Storage: "GLOBAL" or PeerId string
+    messages: HashMap<String, Vec<ChatMessage>>,
+    known_peers: HashMap<PeerId, String>,
+    selected_chat: String, // "GLOBAL" or PeerId string
     status_log: Vec<String>,
     show_logs: bool,
     show_sidebar: bool,
@@ -66,14 +77,20 @@ impl App {
         event_rx: mpsc::Receiver<NetworkEvent>,
     ) -> Self {
         setup_custom_style(&cc.egui_ctx);
+        let mut messages = HashMap::new();
+        messages.insert("GLOBAL".to_string(), Vec::new());
+
         Self {
             local_peer_id,
+            local_nickname: format!("User_{}", &local_peer_id.to_string()[..4]),
             listen_addrs: Vec::new(),
             connected_peers: 0,
             mesh_peers: 0,
             dial_address: String::new(),
             chat_input: String::new(),
-            chat_messages: Vec::new(),
+            messages,
+            known_peers: HashMap::new(),
+            selected_chat: "GLOBAL".to_string(),
             status_log: Vec::new(),
             show_logs: false,
             show_sidebar: true,
@@ -98,54 +115,57 @@ impl App {
                     .strong()
                     .color(accent_color),
             );
+
+            ui.horizontal(|ui| {
+                ui.label("Nick:");
+                if ui
+                    .add(egui::TextEdit::singleline(&mut self.local_nickname).desired_width(120.0))
+                    .changed()
+                {
+                    // Update nickname if needed (not strictly required for local, but good for sending)
+                }
+            });
+
             ui.label(
                 egui::RichText::new(&self.local_peer_id.to_string()[..16])
-                    .size(15.0)
-                    .monospace(),
+                    .size(12.0)
+                    .monospace()
+                    .weak(),
             );
-            ui.add_space(25.0);
+            ui.add_space(20.0);
 
             ui.label(
-                egui::RichText::new("YOUR ADDRESSES")
+                egui::RichText::new("CHATS")
                     .size(16.0)
                     .strong()
                     .color(accent_color),
             );
-            if self.listen_addrs.is_empty() {
-                ui.label(
-                    egui::RichText::new("🔍 Starting network...")
-                        .size(13.0)
-                        .weak(),
-                );
-            } else {
-                let addrs = self.listen_addrs.clone();
-                for addr in addrs {
-                    let label = egui::Label::new(egui::RichText::new(&addr).size(13.0).monospace())
-                        .sense(egui::Sense::click());
-                    if ui
-                        .add(label)
-                        .on_hover_text("Double click to copy")
-                        .double_clicked()
-                    {
-                        ui.output_mut(|o| o.copied_text = addr.clone());
-                        self.add_status(format!("📋 Copied address"));
-                    }
+
+            // Global Chat
+            let is_global = self.selected_chat == "GLOBAL";
+            if ui.selectable_label(is_global, "🌍 Global Chat").clicked() {
+                self.selected_chat = "GLOBAL".to_string();
+            }
+
+            ui.add_space(10.0);
+            ui.label(egui::RichText::new("DIRECT MESSAGES").size(14.0).weak());
+
+            // List of known/connected peers
+            let known_peers = self.known_peers.clone();
+            for (peer_id, name) in known_peers {
+                let peer_str = peer_id.to_string();
+                let is_selected = self.selected_chat == peer_str;
+                let label = format!("👤 {}", name);
+                if ui.selectable_label(is_selected, label).clicked() {
+                    self.selected_chat = peer_str;
+                    // Ensure message bucket exists
+                    self.messages
+                        .entry(self.selected_chat.clone())
+                        .or_insert(Vec::new());
                 }
             }
+
             ui.add_space(25.0);
-
-            ui.label(
-                egui::RichText::new("NETWORK")
-                    .size(16.0)
-                    .strong()
-                    .color(accent_color),
-            );
-            ui.label(
-                egui::RichText::new(format!("Connected: {}", self.connected_peers)).size(16.0),
-            );
-            ui.label(egui::RichText::new(format!("Mesh Size: {}", self.mesh_peers)).size(16.0));
-
-            ui.add_space(30.0);
             ui.label(
                 egui::RichText::new("DIAL PEER")
                     .size(16.0)
@@ -169,7 +189,7 @@ impl App {
                 self.dial_address.clear();
             }
 
-            ui.add_space(50.0);
+            ui.add_space(30.0);
             if ui
                 .add(egui::Button::new(
                     egui::RichText::new("📋 SYSTEM LOGS").size(16.0),
@@ -247,7 +267,27 @@ impl eframe::App for App {
                     self.mesh_peers = count;
                 }
                 NetworkEvent::ChatMessage(msg) => {
-                    self.chat_messages.push(msg);
+                    // Update known peers for display names
+                    if let Ok(peer_id) = msg.sender_id.parse::<PeerId>() {
+                        self.known_peers.insert(peer_id, msg.sender_name.clone());
+                    }
+
+                    // Route message
+                    let bucket = if let Some(ref target) = msg.recipient_id {
+                        if target == &self.local_peer_id.to_string() {
+                            Some(msg.sender_id.clone())
+                        } else if msg.sender_id == self.local_peer_id.to_string() {
+                            Some(target.clone())
+                        } else {
+                            None
+                        }
+                    } else {
+                        Some("GLOBAL".to_string())
+                    };
+
+                    if let Some(b) = bucket {
+                        self.messages.entry(b).or_default().push(msg);
+                    }
                 }
                 NetworkEvent::Status(msg) => {
                     self.add_status(msg);
@@ -370,9 +410,14 @@ impl eframe::App for App {
                                         .auto_shrink([false, false])
                                         .show(ui, |ui| {
                                             ui.set_width(ui.available_width());
-                                            for msg in &self.chat_messages {
+                                            let current_messages = self
+                                                .messages
+                                                .get(&self.selected_chat)
+                                                .cloned()
+                                                .unwrap_or_default();
+                                            for msg in &current_messages {
                                                 let is_me =
-                                                    msg.sender == self.local_peer_id.to_string();
+                                                    msg.sender_id == self.local_peer_id.to_string();
                                                 ui.add_space(20.0);
                                                 ui.horizontal(|ui| {
                                                     if is_me {
@@ -392,7 +437,7 @@ impl eframe::App for App {
                                                                 if !is_me {
                                                                     ui.label(
                                                                         egui::RichText::new(
-                                                                            &msg.sender[..12],
+                                                                            &msg.sender_name,
                                                                         )
                                                                         .size(14.0)
                                                                         .color(accent_color)
@@ -475,9 +520,17 @@ impl eframe::App for App {
                                                 && ctx.input(|i| i.key_pressed(egui::Key::Enter))))
                                             && !self.chat_input.is_empty()
                                         {
-                                            let _ = self.command_tx.try_send(
-                                                UICommand::SendMessage(self.chat_input.clone()),
-                                            );
+                                            let recipient = if self.selected_chat == "GLOBAL" {
+                                                None
+                                            } else {
+                                                self.selected_chat.parse::<PeerId>().ok()
+                                            };
+                                            let _ =
+                                                self.command_tx.try_send(UICommand::SendMessage {
+                                                    sender_name: self.local_nickname.clone(),
+                                                    text: self.chat_input.clone(),
+                                                    recipient,
+                                                });
                                             self.chat_input.clear();
                                         }
                                     });
@@ -663,16 +716,12 @@ async fn main() -> Result<(), Box<dyn Error>> {
         let topic = gossipsub::IdentTopic::new("void-chat-v1");
         swarm.behaviour_mut().gossipsub.subscribe(&topic).unwrap();
 
-        // Пытаемся занять порт 64000, если не получается — берем любой свободный
-        let _ = swarm.listen_on("/ip4/0.0.0.0/tcp/64000".parse().unwrap());
-        let _ = swarm.listen_on("/ip4/0.0.0.0/udp/64000/quic-v1".parse().unwrap());
-
-        // Резервные слушатели на случайных портах
+        // Слушаем TCP и QUIC (UDP) на фиксированном порту 64000
         swarm
-            .listen_on("/ip4/0.0.0.0/tcp/0".parse().unwrap())
+            .listen_on("/ip4/0.0.0.0/tcp/64000".parse().unwrap())
             .unwrap();
         swarm
-            .listen_on("/ip4/0.0.0.0/udp/0/quic-v1".parse().unwrap())
+            .listen_on("/ip4/0.0.0.0/udp/64000/quic-v1".parse().unwrap())
             .unwrap();
 
         let _ = event_tx
@@ -721,7 +770,6 @@ async fn main() -> Result<(), Box<dyn Error>> {
                                 }
                             }
                             UICommand::DialPeer(peer_id, addrs) => {
-                                // Delayed mDNS dial — пришёл из tokio::spawn после задержки
                                 if swarm.is_connected(&peer_id) {
                                     pending_dials.remove(&peer_id);
                                 } else {
@@ -748,9 +796,11 @@ async fn main() -> Result<(), Box<dyn Error>> {
                                     }
                                 }
                             }
-                            UICommand::SendMessage(text) => {
+                            UICommand::SendMessage { sender_name, text, recipient } => {
                                 let msg = ChatMessage {
-                                    sender: local_peer_id.to_string(),
+                                    sender_id: local_peer_id.to_string(),
+                                    sender_name,
+                                    recipient_id: recipient.map(|p| p.to_string()),
                                     text,
                                     timestamp: chrono::Local::now().format("%H:%M").to_string(),
                                 };
@@ -763,9 +813,9 @@ async fn main() -> Result<(), Box<dyn Error>> {
                                         )).await;
                                     }
                                 }
-                                // Показываем своё сообщение в чате
                                 let _ = event_tx.send(NetworkEvent::ChatMessage(msg)).await;
                             }
+                            UICommand::UpdateNickname(_) => {}
                         }
                     }
                 }
@@ -773,14 +823,12 @@ async fn main() -> Result<(), Box<dyn Error>> {
                     match event {
                         SwarmEvent::NewListenAddr { address, .. } => {
                             let s = address.to_string();
-                            // Только IPv4, не 0.0.0.0, не 127.0.0.1
                             if !s.contains("/ip6/") && !s.contains("/0.0.0.0") && !s.contains("/127.0.0.1") {
                                 println!("Слушаю: {}/p2p/{}", address, local_peer_id);
                                 let _ = event_tx.send(NetworkEvent::NewListenAddr(address)).await;
                             }
                         }
 
-                        // === mDNS: автоматическое обнаружение в локальной сети ===
                         SwarmEvent::Behaviour(ChatBehaviourEvent::Mdns(mdns::Event::Discovered(peers))) => {
                             let mut to_dial: HashMap<PeerId, Vec<Multiaddr>> = HashMap::new();
                             for (peer_id, addr) in peers {
@@ -802,10 +850,6 @@ async fn main() -> Result<(), Box<dyn Error>> {
                                     }
                                 }
 
-                                // Стратегия Leader/Follower:
-                                // Пир с меньшим ID (leader) dial-ит почти сразу (200ms).
-                                // Пир с большим ID (follower) ждёт 4 секунды и dial-ит только если не подключился.
-                                // Это гарантирует, что Windows Firewall не увидит "одновременный" dial.
                                 let is_leader = local_peer_id.to_string() < peer_id.to_string();
                                 let delay_ms = if is_leader { 200 } else { 4000 };
 
@@ -829,7 +873,6 @@ async fn main() -> Result<(), Box<dyn Error>> {
                             }
                         }
 
-                        // === Gossipsub: входящие сообщения ===
                         SwarmEvent::Behaviour(ChatBehaviourEvent::Gossipsub(gossipsub::Event::Message { message, .. })) => {
                             if let Ok(msg) = serde_json::from_slice::<ChatMessage>(&message.data) {
                                 let _ = event_tx.send(NetworkEvent::ChatMessage(msg)).await;
@@ -841,7 +884,6 @@ async fn main() -> Result<(), Box<dyn Error>> {
                             )).await;
                         }
 
-                        // === Соединения ===
                         SwarmEvent::ConnectionEstablished { peer_id, .. } => {
                             println!("Подключён: {}", peer_id);
                             pending_dials.remove(&peer_id);
@@ -856,23 +898,19 @@ async fn main() -> Result<(), Box<dyn Error>> {
                             let _ = event_tx.send(NetworkEvent::MeshPeers(mesh)).await;
                         }
 
-                        // === Ошибки соединений ===
                         SwarmEvent::OutgoingConnectionError { peer_id, error, .. } => {
                             let peer_str = peer_id
                                 .map(|p| format!("{}...", &p.to_string()[..8]))
                                 .unwrap_or_else(|| "?".into());
-                            // Очищаем pending_dials — без этого mDNS не сможет повторить
                             if let Some(p) = peer_id {
                                 pending_dials.remove(&p);
-                                peer_addrs.remove(&p); // сброс: при следующем mDNS попробуем свежие адреса
+                                peer_addrs.remove(&p);
                             }
                             let _ = event_tx.send(NetworkEvent::Status(
                                 format!("❌ Не удалось подключиться к {}: {}", peer_str, error)
                             )).await;
-                            println!("Ошибка подключения к {}: {}", peer_str, error);
                         }
                         SwarmEvent::IncomingConnectionError { error, .. } => {
-                            // Молча игнорируем входящие ошибки — это часто повторные попытки libp2p
                             let err_str = error.to_string();
                             if !err_str.contains("Handshake") && !err_str.contains("Timeout") {
                                 let _ = event_tx.send(NetworkEvent::Status(
@@ -889,7 +927,7 @@ async fn main() -> Result<(), Box<dyn Error>> {
     });
 
     eframe::run_native(
-        "VOID",
+        "VOID P2P Chat",
         eframe::NativeOptions::default(),
         Box::new(move |cc| Ok(Box::new(App::new(cc, local_peer_id, command_tx, event_rx)))),
     )
