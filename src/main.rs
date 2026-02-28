@@ -249,8 +249,20 @@ impl App {
 
             ui.add_space(20.0);
 
+            ui.add_space(10.0);
             ui.label(
-                egui::RichText::new("CHATS")
+                egui::RichText::new("СЕТЬ")
+                    .size(16.0)
+                    .strong()
+                    .color(accent_color),
+            );
+            ui.label(format!("🌐 Подключено: {}", self.connected_peers));
+            ui.label(format!("📡 В сети (Mesh): {}", self.mesh_peers));
+
+            ui.add_space(20.0);
+
+            ui.label(
+                egui::RichText::new("ЧАТЫ")
                     .size(16.0)
                     .strong()
                     .color(accent_color),
@@ -258,12 +270,15 @@ impl App {
 
             // Global Chat
             let is_global = self.selected_chat == "GLOBAL";
-            if ui.selectable_label(is_global, "🌍 Global Chat").clicked() {
+            if ui
+                .selectable_label(is_global, "🌍 Глобальный чат")
+                .clicked()
+            {
                 self.selected_chat = "GLOBAL".to_string();
             }
 
             ui.add_space(10.0);
-            ui.label(egui::RichText::new("DIRECT MESSAGES").size(14.0).weak());
+            ui.label(egui::RichText::new("ЛИЧНЫЕ СООБЩЕНИЯ").size(14.0).weak());
 
             // Список известных/подключенных пиров
             let mut known_peers: Vec<_> = self.known_peers.iter().collect();
@@ -284,7 +299,7 @@ impl App {
 
             ui.add_space(25.0);
             ui.label(
-                egui::RichText::new("DIAL PEER")
+                egui::RichText::new("ПОДКЛЮЧИТЬ ПИРА")
                     .size(16.0)
                     .strong()
                     .color(accent_color),
@@ -296,7 +311,9 @@ impl App {
             );
             ui.add_space(12.0);
             if ui
-                .add(egui::Button::new(egui::RichText::new("CONNECT").size(16.0)))
+                .add(egui::Button::new(
+                    egui::RichText::new("ПОДКЛЮЧИТЬ").size(16.0),
+                ))
                 .clicked()
                 && !self.dial_address.is_empty()
             {
@@ -309,7 +326,7 @@ impl App {
             ui.add_space(30.0);
             if ui
                 .add(egui::Button::new(
-                    egui::RichText::new("📋 SYSTEM LOGS").size(16.0),
+                    egui::RichText::new("📋 СИСТЕМНЫЕ ЛОГИ").size(16.0),
                 ))
                 .clicked()
             {
@@ -428,13 +445,13 @@ impl eframe::App for App {
 
         // --- Log Window ---
         if self.show_logs {
-            egui::Window::new("SYSTEM CONSOLE")
+            egui::Window::new("СИСТЕМНАЯ КОНСОЛЬ")
                 .open(&mut self.show_logs)
                 .resizable(true)
                 .default_size([400.0, 300.0])
                 .show(ctx, |ui| {
                     ui.label(
-                        egui::RichText::new("LOCAL ADDRESSES")
+                        egui::RichText::new("ЛОКАЛЬНЫЕ АДРЕСА")
                             .strong()
                             .color(accent_color),
                     );
@@ -445,7 +462,7 @@ impl eframe::App for App {
                     ui.separator();
                     ui.add_space(8.0);
                     ui.label(
-                        egui::RichText::new("EVENT LOG")
+                        egui::RichText::new("ЛОГ СОБЫТИЙ")
                             .strong()
                             .color(accent_color),
                     );
@@ -628,7 +645,7 @@ impl eframe::App for App {
                                     ui.horizontal(|ui| {
                                         let res = ui.add(
                                             egui::TextEdit::singleline(&mut self.chat_input)
-                                                .hint_text("Message...")
+                                                .hint_text("Сообщение...")
                                                 .desired_width(ui.available_width() - 110.0)
                                                 .font(egui::TextStyle::Body),
                                         );
@@ -637,7 +654,7 @@ impl eframe::App for App {
                                             .add_sized(
                                                 [100.0, 40.0],
                                                 egui::Button::new(
-                                                    egui::RichText::new("SEND").size(16.0),
+                                                    egui::RichText::new("ОТПРАВИТЬ").size(16.0),
                                                 ),
                                             )
                                             .clicked()
