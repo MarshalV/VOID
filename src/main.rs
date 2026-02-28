@@ -194,139 +194,264 @@ impl App {
     }
 
     fn ui_sidebar(&mut self, ui: &mut egui::Ui, accent_color: egui::Color32) {
-        ui.vertical(|ui| {
-            egui::CollapsingHeader::new(
-                egui::RichText::new("👤 MY IDENTITY")
-                    .strong()
-                    .color(accent_color),
-            )
-            .default_open(false)
-            .show(ui, |ui| {
-                ui.horizontal(|ui| {
-                    ui.label("Имя:");
-                    if ui
-                        .add(
-                            egui::TextEdit::singleline(&mut self.local_nickname)
-                                .desired_width(120.0),
-                        )
-                        .changed()
-                    {
-                        let _ = Storage::save(&self.local_nickname, None);
-                    }
-                });
-                ui.label(
-                    egui::RichText::new(&self.local_peer_id.to_string()[..16])
-                        .size(12.0)
-                        .monospace()
-                        .weak(),
-                );
-            });
+        let shadow_light = egui::Color32::from_rgba_premultiplied(45, 45, 48, 255);
+        let shadow_dark = egui::Color32::from_rgba_premultiplied(12, 12, 14, 255);
+        let bg_color = egui::Color32::from_rgb(26, 26, 28);
 
-            if !self.listen_addrs.is_empty() {
-                ui.add_space(5.0);
-                egui::CollapsingHeader::new(
-                    egui::RichText::new("🌐 MY ADDRESSES")
-                        .strong()
-                        .color(accent_color),
-                )
-                .default_open(false)
+        ui.vertical(|ui| {
+            // --- SECTION: IDENTITY ---
+            egui::Frame::none()
+                .fill(bg_color)
+                .rounding(15.0)
+                .shadow(egui::Shadow {
+                    offset: egui::vec2(-3.0, -3.0),
+                    blur: 8.0,
+                    spread: 0.0,
+                    color: shadow_light,
+                })
                 .show(ui, |ui| {
-                    for addr in &self.listen_addrs {
-                        ui.horizontal(|ui| {
-                            let short_addr = if addr.len() > 30 {
-                                format!("{}...", &addr[..27])
-                            } else {
-                                addr.clone()
-                            };
-                            ui.label(egui::RichText::new(short_addr).small().weak());
-                            if ui.button("📋").on_hover_text("Copy address").clicked() {
-                                ui.output_mut(|o| o.copied_text = addr.clone());
+                    egui::Frame::none()
+                        .fill(bg_color)
+                        .rounding(15.0)
+                        .shadow(egui::Shadow {
+                            offset: egui::vec2(3.0, 3.0),
+                            blur: 6.0,
+                            spread: 0.0,
+                            color: shadow_dark,
+                        })
+                        .inner_margin(12.0)
+                        .show(ui, |ui| {
+                            ui.set_width(ui.available_width());
+                            egui::CollapsingHeader::new(
+                                egui::RichText::new("👤 МОЙ ПРОФИЛЬ")
+                                    .strong()
+                                    .color(accent_color),
+                            )
+                            .default_open(false)
+                            .show(ui, |ui| {
+                                ui.horizontal(|ui| {
+                                    ui.label("Имя:");
+                                    if ui
+                                        .add(
+                                            egui::TextEdit::singleline(&mut self.local_nickname)
+                                                .desired_width(120.0),
+                                        )
+                                        .changed()
+                                    {
+                                        let _ = Storage::save(&self.local_nickname, None);
+                                    }
+                                });
+                                ui.label(
+                                    egui::RichText::new(&self.local_peer_id.to_string()[..16])
+                                        .size(12.0)
+                                        .monospace()
+                                        .weak(),
+                                );
+                            });
+                        });
+                });
+
+            ui.add_space(15.0);
+
+            // --- SECTION: NETWORK ---
+            egui::Frame::none()
+                .fill(bg_color)
+                .rounding(15.0)
+                .shadow(egui::Shadow {
+                    offset: egui::vec2(-3.0, -3.0),
+                    blur: 8.0,
+                    spread: 0.0,
+                    color: shadow_light,
+                })
+                .show(ui, |ui| {
+                    egui::Frame::none()
+                        .fill(bg_color)
+                        .rounding(15.0)
+                        .shadow(egui::Shadow {
+                            offset: egui::vec2(3.0, 3.0),
+                            blur: 6.0,
+                            spread: 0.0,
+                            color: shadow_dark,
+                        })
+                        .inner_margin(12.0)
+                        .show(ui, |ui| {
+                            ui.set_width(ui.available_width());
+                            ui.label(
+                                egui::RichText::new("СЕТЬ")
+                                    .size(14.0)
+                                    .strong()
+                                    .color(accent_color),
+                            );
+                            ui.label(format!("🌐 Подключено: {}", self.connected_peers));
+                            ui.label(format!("📡 В сети (Mesh): {}", self.mesh_peers));
+
+                            if !self.listen_addrs.is_empty() {
+                                ui.add_space(5.0);
+                                egui::CollapsingHeader::new(
+                                    egui::RichText::new("📍 МОИ АДРЕСА").size(12.0).weak(),
+                                )
+                                .show(ui, |ui| {
+                                    for addr in &self.listen_addrs {
+                                        ui.horizontal(|ui| {
+                                            let short_addr = if addr.len() > 20 {
+                                                format!("{}...", &addr[..17])
+                                            } else {
+                                                addr.clone()
+                                            };
+                                            ui.label(
+                                                egui::RichText::new(short_addr).small().weak(),
+                                            );
+                                            if ui.button("📋").clicked() {
+                                                ui.output_mut(|o| o.copied_text = addr.clone());
+                                            }
+                                        });
+                                    }
+                                });
                             }
                         });
-                    }
                 });
-            }
+
+            ui.add_space(15.0);
+
+            // --- SECTION: CHATS ---
+            egui::Frame::none()
+                .fill(bg_color)
+                .rounding(15.0)
+                .shadow(egui::Shadow {
+                    offset: egui::vec2(-3.0, -3.0),
+                    blur: 8.0,
+                    spread: 0.0,
+                    color: shadow_light,
+                })
+                .show(ui, |ui| {
+                    egui::Frame::none()
+                        .fill(bg_color)
+                        .rounding(15.0)
+                        .shadow(egui::Shadow {
+                            offset: egui::vec2(3.0, 3.0),
+                            blur: 6.0,
+                            spread: 0.0,
+                            color: shadow_dark,
+                        })
+                        .inner_margin(12.0)
+                        .show(ui, |ui| {
+                            ui.set_width(ui.available_width());
+                            ui.label(
+                                egui::RichText::new("ЧАТЫ")
+                                    .size(14.0)
+                                    .strong()
+                                    .color(accent_color),
+                            );
+
+                            let is_global = self.selected_chat == "GLOBAL";
+                            if ui
+                                .selectable_label(is_global, "🌍 Глобальный чат")
+                                .clicked()
+                            {
+                                self.selected_chat = "GLOBAL".to_string();
+                            }
+
+                            ui.add_space(10.0);
+                            ui.label(egui::RichText::new("ЛИЧНЫЕ").size(12.0).weak());
+
+                            let mut peers_to_remove = Vec::new();
+                            let mut known_peers_list: Vec<_> = self.known_peers.iter().collect();
+                            known_peers_list.sort_by(|a, b| a.1.cmp(b.1));
+
+                            for (peer_id, name) in known_peers_list {
+                                let peer_str = peer_id.to_string();
+                                let is_selected = self.selected_chat == peer_str;
+
+                                ui.horizontal(|ui| {
+                                    if ui
+                                        .selectable_label(is_selected, format!("👤 {}", name))
+                                        .clicked()
+                                    {
+                                        self.selected_chat = peer_str.clone();
+                                        self.messages.entry(peer_str.clone()).or_insert(Vec::new());
+                                    }
+                                    ui.with_layout(
+                                        egui::Layout::right_to_left(egui::Align::Center),
+                                        |ui| {
+                                            if ui
+                                                .button("🗑")
+                                                .on_hover_text("Удалить диалог")
+                                                .clicked()
+                                            {
+                                                peers_to_remove.push(*peer_id);
+                                            }
+                                        },
+                                    );
+                                });
+                            }
+
+                            for pid in peers_to_remove {
+                                let p_str = pid.to_string();
+                                self.known_peers.remove(&pid);
+                                self.messages.remove(&p_str);
+                                if self.selected_chat == p_str {
+                                    self.selected_chat = "GLOBAL".to_string();
+                                }
+                            }
+                        });
+                });
+
+            ui.add_space(15.0);
+
+            // --- SECTION: DIAL ---
+            egui::Frame::none()
+                .fill(bg_color)
+                .rounding(15.0)
+                .shadow(egui::Shadow {
+                    offset: egui::vec2(-3.0, -3.0),
+                    blur: 8.0,
+                    spread: 0.0,
+                    color: shadow_light,
+                })
+                .show(ui, |ui| {
+                    egui::Frame::none()
+                        .fill(bg_color)
+                        .rounding(15.0)
+                        .shadow(egui::Shadow {
+                            offset: egui::vec2(3.0, 3.0),
+                            blur: 6.0,
+                            spread: 0.0,
+                            color: shadow_dark,
+                        })
+                        .inner_margin(12.0)
+                        .show(ui, |ui| {
+                            ui.set_width(ui.available_width());
+                            ui.label(
+                                egui::RichText::new("ПОДКЛЮЧЕНИЕ")
+                                    .size(14.0)
+                                    .strong()
+                                    .color(accent_color),
+                            );
+                            ui.add(
+                                egui::TextEdit::singleline(&mut self.dial_address)
+                                    .hint_text("/ip4/...")
+                                    .desired_width(ui.available_width()),
+                            );
+                            ui.add_space(8.0);
+                            if ui
+                                .add(egui::Button::new(
+                                    egui::RichText::new("ПОДКЛЮЧИТЬ").size(14.0),
+                                ))
+                                .clicked()
+                                && !self.dial_address.is_empty()
+                            {
+                                let _ = self
+                                    .command_tx
+                                    .try_send(UICommand::Dial(self.dial_address.clone()));
+                                self.dial_address.clear();
+                            }
+                        });
+                });
 
             ui.add_space(20.0);
-
-            ui.add_space(10.0);
-            ui.label(
-                egui::RichText::new("СЕТЬ")
-                    .size(16.0)
-                    .strong()
-                    .color(accent_color),
-            );
-            ui.label(format!("🌐 Подключено: {}", self.connected_peers));
-            ui.label(format!("📡 В сети (Mesh): {}", self.mesh_peers));
-
-            ui.add_space(20.0);
-
-            ui.label(
-                egui::RichText::new("ЧАТЫ")
-                    .size(16.0)
-                    .strong()
-                    .color(accent_color),
-            );
-
-            // Global Chat
-            let is_global = self.selected_chat == "GLOBAL";
-            if ui
-                .selectable_label(is_global, "🌍 Глобальный чат")
-                .clicked()
-            {
-                self.selected_chat = "GLOBAL".to_string();
-            }
-
-            ui.add_space(10.0);
-            ui.label(egui::RichText::new("ЛИЧНЫЕ СООБЩЕНИЯ").size(14.0).weak());
-
-            // Список известных/подключенных пиров
-            let mut known_peers: Vec<_> = self.known_peers.iter().collect();
-            known_peers.sort_by(|a, b| a.1.cmp(b.1));
-
-            for (peer_id, name) in known_peers {
-                let peer_str = peer_id.to_string();
-                let is_selected = self.selected_chat == peer_str;
-                let label = format!("👤 {}", name);
-                if ui.selectable_label(is_selected, label).clicked() {
-                    self.selected_chat = peer_str;
-                    // Убедимся, что корзина сообщений существует
-                    self.messages
-                        .entry(self.selected_chat.clone())
-                        .or_insert(Vec::new());
-                }
-            }
-
-            ui.add_space(25.0);
-            ui.label(
-                egui::RichText::new("ПОДКЛЮЧИТЬ ПИРА")
-                    .size(16.0)
-                    .strong()
-                    .color(accent_color),
-            );
-            ui.add(
-                egui::TextEdit::singleline(&mut self.dial_address)
-                    .hint_text("/ip4/...")
-                    .desired_width(220.0),
-            );
-            ui.add_space(12.0);
             if ui
                 .add(egui::Button::new(
-                    egui::RichText::new("ПОДКЛЮЧИТЬ").size(16.0),
-                ))
-                .clicked()
-                && !self.dial_address.is_empty()
-            {
-                let _ = self
-                    .command_tx
-                    .try_send(UICommand::Dial(self.dial_address.clone()));
-                self.dial_address.clear();
-            }
-
-            ui.add_space(30.0);
-            if ui
-                .add(egui::Button::new(
-                    egui::RichText::new("📋 СИСТЕМНЫЕ ЛОГИ").size(16.0),
+                    egui::RichText::new("📋 СИСТЕМНАЯ КОНСОЛЬ").size(14.0),
                 ))
                 .clicked()
             {
