@@ -1,3 +1,7 @@
+use aes_gcm::{
+    aead::{Aead, KeyInit},
+    Aes256Gcm, Key, Nonce,
+};
 use chrono;
 use eframe::egui;
 use futures::StreamExt;
@@ -6,11 +10,93 @@ use libp2p::{
     swarm::{dial_opts::DialOpts, NetworkBehaviour, SwarmEvent},
     tcp, yamux, Multiaddr, PeerId,
 };
+use rand::RngCore;
 use serde::{Deserialize, Serialize};
 use std::collections::{HashMap, HashSet};
 use std::error::Error;
 use std::time::Duration;
 use tokio::sync::mpsc;
+
+#[derive(Serialize, Deserialize)]
+struct StorageData {
+    nickname: String,
+    keypair_bytes: Vec<u8>,
+}
+
+struct Storage;
+impl Storage {
+    const FILE: &'static str = "vault.bin";
+    const KEY_FILE: &'static str = "void.key";
+
+    fn get_master_key() -> [u8; 32] {
+        if let Ok(k) = std::fs::read(Self::KEY_FILE) {
+            if k.len() == 32 {
+                let mut key = [0u8; 32];
+                key.copy_from_slice(&k);
+                return key;
+            }
+        }
+        let mut key = [0u8; 32];
+        rand::thread_rng().fill_bytes(&mut key);
+        let _ = std::fs::write(Self::KEY_FILE, &key);
+        key
+    }
+
+    fn save(
+        nickname: &str,
+        keypair: Option<&libp2p::identity::Keypair>,
+    ) -> Result<(), Box<dyn Error>> {
+        let keypair_bytes = if let Some(kp) = keypair {
+            kp.to_protobuf_encoding()?
+        } else {
+            Self::load()?.keypair_bytes
+        };
+
+        let data = StorageData {
+            nickname: nickname.to_string(),
+            keypair_bytes,
+        };
+        let plaintext = serde_json::to_vec(&data)?;
+
+        let master_key = Self::get_master_key();
+        let cipher = Aes256Gcm::new(Key::<Aes256Gcm>::from_slice(&master_key));
+
+        let mut nonce_bytes = [0u8; 12];
+        rand::thread_rng().fill_bytes(&mut nonce_bytes);
+        let nonce = Nonce::from_slice(&nonce_bytes);
+
+        let ciphertext = cipher
+            .encrypt(nonce, plaintext.as_ref())
+            .map_err(|e| format!("Encryption error: {}", e))?;
+
+        let mut final_data = nonce_bytes.to_vec();
+        final_data.extend(ciphertext);
+        std::fs::write(Self::FILE, final_data)?;
+        Ok(())
+    }
+
+    fn load() -> Result<StorageData, Box<dyn Error>> {
+        if !std::path::Path::new(Self::FILE).exists() {
+            return Err("Vault file not found".into());
+        }
+        let data = std::fs::read(Self::FILE)?;
+        if data.len() < 12 {
+            return Err("Invalid vault".into());
+        }
+
+        let (nonce_bytes, ciphertext) = data.split_at(12);
+        let master_key = Self::get_master_key();
+        let cipher = Aes256Gcm::new(Key::<Aes256Gcm>::from_slice(&master_key));
+        let nonce = Nonce::from_slice(nonce_bytes);
+
+        let plaintext = cipher
+            .decrypt(nonce, ciphertext)
+            .map_err(|e| format!("Decryption error: {}", e))?;
+
+        let storage: StorageData = serde_json::from_slice(&plaintext)?;
+        Ok(storage)
+    }
+}
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 struct ChatMessage {
@@ -40,7 +126,6 @@ enum UICommand {
         text: String,
         recipient: Option<PeerId>,
     },
-    UpdateNickname(String),
 }
 
 #[derive(NetworkBehaviour)]
@@ -73,6 +158,7 @@ impl App {
     fn new(
         cc: &eframe::CreationContext<'_>,
         local_peer_id: PeerId,
+        local_nickname: String,
         command_tx: mpsc::Sender<UICommand>,
         event_rx: mpsc::Receiver<NetworkEvent>,
     ) -> Self {
@@ -82,7 +168,7 @@ impl App {
 
         Self {
             local_peer_id,
-            local_nickname: format!("User_{}", &local_peer_id.to_string()[..4]),
+            local_nickname,
             listen_addrs: Vec::new(),
             connected_peers: 0,
             mesh_peers: 0,
@@ -109,29 +195,58 @@ impl App {
 
     fn ui_sidebar(&mut self, ui: &mut egui::Ui, accent_color: egui::Color32) {
         ui.vertical(|ui| {
-            ui.label(
-                egui::RichText::new("IDENTITY")
-                    .size(16.0)
+            egui::CollapsingHeader::new(
+                egui::RichText::new("👤 MY IDENTITY")
                     .strong()
                     .color(accent_color),
-            );
-
-            ui.horizontal(|ui| {
-                ui.label("Nick:");
-                if ui
-                    .add(egui::TextEdit::singleline(&mut self.local_nickname).desired_width(120.0))
-                    .changed()
-                {
-                    // Update nickname if needed (not strictly required for local, but good for sending)
-                }
+            )
+            .default_open(false)
+            .show(ui, |ui| {
+                ui.horizontal(|ui| {
+                    ui.label("Имя:");
+                    if ui
+                        .add(
+                            egui::TextEdit::singleline(&mut self.local_nickname)
+                                .desired_width(120.0),
+                        )
+                        .changed()
+                    {
+                        let _ = Storage::save(&self.local_nickname, None);
+                    }
+                });
+                ui.label(
+                    egui::RichText::new(&self.local_peer_id.to_string()[..16])
+                        .size(12.0)
+                        .monospace()
+                        .weak(),
+                );
             });
 
-            ui.label(
-                egui::RichText::new(&self.local_peer_id.to_string()[..16])
-                    .size(12.0)
-                    .monospace()
-                    .weak(),
-            );
+            if !self.listen_addrs.is_empty() {
+                ui.add_space(5.0);
+                egui::CollapsingHeader::new(
+                    egui::RichText::new("🌐 MY ADDRESSES")
+                        .strong()
+                        .color(accent_color),
+                )
+                .default_open(false)
+                .show(ui, |ui| {
+                    for addr in &self.listen_addrs {
+                        ui.horizontal(|ui| {
+                            let short_addr = if addr.len() > 30 {
+                                format!("{}...", &addr[..27])
+                            } else {
+                                addr.clone()
+                            };
+                            ui.label(egui::RichText::new(short_addr).small().weak());
+                            if ui.button("📋").on_hover_text("Copy address").clicked() {
+                                ui.output_mut(|o| o.copied_text = addr.clone());
+                            }
+                        });
+                    }
+                });
+            }
+
             ui.add_space(20.0);
 
             ui.label(
@@ -150,15 +265,17 @@ impl App {
             ui.add_space(10.0);
             ui.label(egui::RichText::new("DIRECT MESSAGES").size(14.0).weak());
 
-            // List of known/connected peers
-            let known_peers = self.known_peers.clone();
+            // Список известных/подключенных пиров
+            let mut known_peers: Vec<_> = self.known_peers.iter().collect();
+            known_peers.sort_by(|a, b| a.1.cmp(b.1));
+
             for (peer_id, name) in known_peers {
                 let peer_str = peer_id.to_string();
                 let is_selected = self.selected_chat == peer_str;
                 let label = format!("👤 {}", name);
                 if ui.selectable_label(is_selected, label).clicked() {
                     self.selected_chat = peer_str;
-                    // Ensure message bucket exists
+                    // Убедимся, что корзина сообщений существует
                     self.messages
                         .entry(self.selected_chat.clone())
                         .or_insert(Vec::new());
@@ -247,21 +364,29 @@ impl eframe::App for App {
                 }
                 NetworkEvent::MdnsDiscovered(peer, addr) => {
                     self.add_status(format!(
-                        "🔍 Peer Found: {} at {}",
+                        "🔍 Найдён пир: {} на {}",
                         &peer.to_string()[..8],
                         addr
                     ));
+                    // Добавляем в список известных, если еще нет
+                    self.known_peers
+                        .entry(peer)
+                        .or_insert_with(|| format!("Peer_{}", &peer.to_string()[..4]));
                 }
                 NetworkEvent::MdnsExpired(peer) => {
-                    self.add_status(format!("⏳ Offline (MDNS): {}", &peer.to_string()[..8]));
+                    self.add_status(format!("⏳ Оффлайн (MDNS): {}", &peer.to_string()[..8]));
                 }
                 NetworkEvent::Connected(peer) => {
                     self.connected_peers += 1;
-                    self.add_status(format!("✅ Connected: {}...", &peer.to_string()[..8]));
+                    self.add_status(format!("✅ Подключено: {}...", &peer.to_string()[..8]));
+                    // Добавляем в список известных, если еще нет
+                    self.known_peers
+                        .entry(peer)
+                        .or_insert_with(|| format!("Peer_{}", &peer.to_string()[..4]));
                 }
                 NetworkEvent::Disconnected(peer) => {
                     self.connected_peers = self.connected_peers.saturating_sub(1);
-                    self.add_status(format!("❌ Disconnected: {}...", &peer.to_string()[..8]));
+                    self.add_status(format!("❌ Отключено: {}...", &peer.to_string()[..8]));
                 }
                 NetworkEvent::MeshPeers(count) => {
                     self.mesh_peers = count;
@@ -658,11 +783,21 @@ async fn main() -> Result<(), Box<dyn Error>> {
         println!("✅ Файрвол macOS настроен");
     }
 
-    let local_key = libp2p::identity::Keypair::generate_ed25519();
+    let (local_key, local_nickname) = if let Ok(storage) = Storage::load() {
+        let key = libp2p::identity::Keypair::from_protobuf_encoding(&storage.keypair_bytes)
+            .expect("Failed to decode saved keypair");
+        (key, storage.nickname)
+    } else {
+        let key = libp2p::identity::Keypair::generate_ed25519();
+        let nickname = format!("User_{}", &PeerId::from(key.public()).to_string()[..4]);
+        let _ = Storage::save(&nickname, Some(&key));
+        (key, nickname)
+    };
     let local_peer_id = PeerId::from(local_key.public());
 
     println!("=== VOID P2P Chat ===");
     println!("Ваш Peer ID: {}", local_peer_id);
+    println!("Ваш никнейм: {}", local_nickname);
 
     let (event_tx, event_rx) = mpsc::channel(256);
     let (command_tx, mut command_rx) = mpsc::channel(256);
@@ -815,7 +950,6 @@ async fn main() -> Result<(), Box<dyn Error>> {
                                 }
                                 let _ = event_tx.send(NetworkEvent::ChatMessage(msg)).await;
                             }
-                            UICommand::UpdateNickname(_) => {}
                         }
                     }
                 }
@@ -929,7 +1063,15 @@ async fn main() -> Result<(), Box<dyn Error>> {
     eframe::run_native(
         "VOID P2P Chat",
         eframe::NativeOptions::default(),
-        Box::new(move |cc| Ok(Box::new(App::new(cc, local_peer_id, command_tx, event_rx)))),
+        Box::new(move |cc| {
+            Ok(Box::new(App::new(
+                cc,
+                local_peer_id,
+                local_nickname,
+                command_tx,
+                event_rx,
+            )))
+        }),
     )
     .map_err(|e| Box::new(e) as Box<dyn Error>)
 }

@@ -3942,12 +3942,14 @@ dependencies = [
 name = "p2p-messenger"
 version = "0.1.0"
 dependencies = [
+ "aes-gcm",
  "anyhow",
  "chrono",
  "eframe",
  "futures",
  "image",
  "libp2p",
+ "rand 0.8.5",
  "serde",
  "serde_json",
  "tokio",
