@@ -1056,6 +1056,7 @@ async fn main() -> Result<(), Box<dyn Error>> {
                                 }
                             }
                             UICommand::DialPeer(peer_id, addrs) => {
+                                println!("🔌 UI_COMMAND: DialPeer {} ({} addresses)", peer_id, addrs.len());
                                 if swarm.is_connected(&peer_id) {
                                     pending_dials.remove(&peer_id);
                                 } else {
@@ -1141,18 +1142,15 @@ async fn main() -> Result<(), Box<dyn Error>> {
                                     }
                                 }
 
-                                let is_leader = local_peer_id.to_string() < peer_id.to_string();
-                                let delay_ms = if is_leader { 200 } else { 4000 };
 
                                 pending_dials.insert(peer_id);
                                 let cmd_tx2 = command_tx_for_mdns.clone();
                                 let dial_addrs = all_addrs.clone();
                                 let tx = event_tx.clone();
                                 tokio::spawn(async move {
-                                    tokio::time::sleep(Duration::from_millis(delay_ms)).await;
-                                    let type_str = if is_leader { "Leader" } else { "Follower" };
+                                    // Убираем задержку для отладки
                                     let _ = tx.send(NetworkEvent::Status(
-                                        format!("🔄 [{}] Попытка соединения с {}...", type_str, &peer_id.to_string()[..8])
+                                        format!("🔄 [mDNS] Попытка соединения с {}...", &peer_id.to_string()[..8])
                                     )).await;
                                     let _ = cmd_tx2.send(UICommand::DialPeer(peer_id, dial_addrs)).await;
                                 });
@@ -1184,24 +1182,29 @@ async fn main() -> Result<(), Box<dyn Error>> {
                             println!("📡 Gossipsub: {}... ОТПИСАЛСЯ от топика ({})", &peer_id.to_string()[..8], topic);
                         }
 
-                        SwarmEvent::ConnectionEstablished { peer_id, .. } => {
+                        SwarmEvent::ConnectionEstablished { peer_id, endpoint, .. } => {
                             let mesh_count = swarm.behaviour().gossipsub.all_mesh_peers().count();
-                            println!("✅ СОЕДИНЕНО: {}. В меше: {}", peer_id, mesh_count);
+                            println!("✅ СОЕДИНЕНО: {}. Endpoint: {:?}. В меше: {}", peer_id, endpoint, mesh_count);
                             pending_dials.remove(&peer_id);
                             swarm.behaviour_mut().gossipsub.add_explicit_peer(&peer_id);
                             let _ = event_tx.send(NetworkEvent::Connected(peer_id)).await;
                             let _ = event_tx.send(NetworkEvent::MeshPeers(mesh_count)).await;
                         }
-                        SwarmEvent::ConnectionClosed { peer_id, .. } => {
+                        SwarmEvent::ConnectionClosed { peer_id, cause, .. } => {
                             let mesh = swarm.behaviour().gossipsub.all_mesh_peers().count();
+                            println!("❌ СОЕДИНЕНИЕ ЗАКРЫТО: {}. Причина: {:?}", peer_id, cause);
                             let _ = event_tx.send(NetworkEvent::Disconnected(peer_id)).await;
                             let _ = event_tx.send(NetworkEvent::MeshPeers(mesh)).await;
+                        }
+                        SwarmEvent::IncomingConnection { local_addr, send_back_addr, .. } => {
+                            println!("📥 Входящее соединение: from {:?} to {:?}", send_back_addr, local_addr);
                         }
 
                         SwarmEvent::OutgoingConnectionError { peer_id, error, .. } => {
                             let peer_str = peer_id
                                 .map(|p| format!("{}...", &p.to_string()[..8]))
                                 .unwrap_or_else(|| "?".into());
+                            println!("❌ ОШИБКА ИСХОДЯЩЕГО СОЕДИНЕНИЯ (peer: {}): {:?}", peer_str, error);
                             if let Some(p) = peer_id {
                                 pending_dials.remove(&p);
                                 peer_addrs.remove(&p);
