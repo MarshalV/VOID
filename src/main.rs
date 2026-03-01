@@ -1087,8 +1087,12 @@ async fn main() -> Result<(), Box<dyn Error>> {
                                     timestamp: chrono::Local::now().format("%H:%M").to_string(),
                                 };
                                 let json = serde_json::to_vec(&msg).unwrap();
+
+                                let peers_count = swarm.behaviour().gossipsub.all_peers().count();
+                                println!("📊 Gossipsub: Всего пиров в системе: {}", peers_count);
+
                                 match swarm.behaviour_mut().gossipsub.publish(topic.clone(), json) {
-                                    Ok(id) => println!("✅ Gossipsub: Опубликовано, ID: {:?}", id),
+                                    Ok(id) => println!("✅ Gossipsub: Опубликовано транзитом, ID: {:?}", id),
                                     Err(e) => {
                                         println!("❌ Gossipsub ERROR: {:?}", e);
                                         let _ = event_tx.send(NetworkEvent::Status(
@@ -1164,6 +1168,14 @@ async fn main() -> Result<(), Box<dyn Error>> {
                                 println!("⚠️ Gossipsub: Ошибка парсинга JSON");
                             }
                         }
+                        SwarmEvent::Behaviour(ChatBehaviourEvent::Gossipsub(gossipsub::Event::Subscribed { peer_id, .. })) => {
+                            println!("📡 Gossipsub: {}... ПОДПИСАЛСЯ на топик", &peer_id.to_string()[..8]);
+                        }
+
+                        SwarmEvent::Behaviour(ChatBehaviourEvent::Gossipsub(gossipsub::Event::Unsubscribed { peer_id, topic })) => {
+                            println!("📡 Gossipsub: {}... ОТПИСАЛСЯ от топика ({})", &peer_id.to_string()[..8], topic);
+                        }
+
                         SwarmEvent::Behaviour(ChatBehaviourEvent::Gossipsub(gossipsub::Event::Subscribed { peer_id, topic })) => {
                             let _ = event_tx.send(NetworkEvent::Status(
                                 format!("📡 {}... присоединился к чату ({})", &peer_id.to_string()[..8], topic)
@@ -1175,9 +1187,8 @@ async fn main() -> Result<(), Box<dyn Error>> {
                             println!("✅ СОЕДИНЕНО: {}. В меше: {}", peer_id, mesh_count);
                             pending_dials.remove(&peer_id);
                             swarm.behaviour_mut().gossipsub.add_explicit_peer(&peer_id);
-                            let mesh = swarm.behaviour().gossipsub.all_mesh_peers().count();
                             let _ = event_tx.send(NetworkEvent::Connected(peer_id)).await;
-                            let _ = event_tx.send(NetworkEvent::MeshPeers(mesh)).await;
+                            let _ = event_tx.send(NetworkEvent::MeshPeers(mesh_count)).await;
                         }
                         SwarmEvent::ConnectionClosed { peer_id, .. } => {
                             let mesh = swarm.behaviour().gossipsub.all_mesh_peers().count();
