@@ -1056,22 +1056,25 @@ async fn main() -> Result<(), Box<dyn Error>> {
                                 }
                             }
                             UICommand::DialPeer(peer_id, addrs) => {
-                                println!("🔌 UI_COMMAND: DialPeer {} ({} addresses)", peer_id, addrs.len());
+                                let short = &peer_id.to_string()[..16];
+                                println!("🔌 UI_COMMAND: DialPeer {} ({} addresses)", short, addrs.len());
                                 if swarm.is_connected(&peer_id) {
+                                    println!("✅ Уже подключен к {}", short);
                                     pending_dials.remove(&peer_id);
                                 } else {
-                                    let short = &peer_id.to_string()[..16];
                                     match swarm.dial(
                                         DialOpts::peer_id(peer_id)
                                             .addresses(addrs.clone())
                                             .build()
                                     ) {
                                         Ok(_) => {
+                                            println!("⏳ Dial запущен для {}", short);
                                             let _ = event_tx.send(NetworkEvent::Status(
                                                 format!("📞 Подключаюсь к {}... ({} адресов)", short, addrs.len())
                                             )).await;
                                         }
                                         Err(e) => {
+                                            println!("❌ Dial ERROR для {}: {:?}", short, e);
                                             pending_dials.remove(&peer_id);
                                             let err_str = e.to_string();
                                             if !err_str.contains("Pending") && !err_str.contains("already") {
@@ -1142,15 +1145,18 @@ async fn main() -> Result<(), Box<dyn Error>> {
                                     }
                                 }
 
+                                let is_leader = local_peer_id.to_string() < peer_id.to_string();
+                                let delay_ms = if is_leader { 200 } else { 3000 };
 
                                 pending_dials.insert(peer_id);
                                 let cmd_tx2 = command_tx_for_mdns.clone();
                                 let dial_addrs = all_addrs.clone();
                                 let tx = event_tx.clone();
                                 tokio::spawn(async move {
-                                    // Убираем задержку для отладки
+                                    tokio::time::sleep(Duration::from_millis(delay_ms)).await;
+                                    let type_str = if is_leader { "Leader" } else { "Follower" };
                                     let _ = tx.send(NetworkEvent::Status(
-                                        format!("🔄 [mDNS] Попытка соединения с {}...", &peer_id.to_string()[..8])
+                                        format!("🔄 [{}] Попытка соединения с {}...", type_str, &peer_id.to_string()[..8])
                                     )).await;
                                     let _ = cmd_tx2.send(UICommand::DialPeer(peer_id, dial_addrs)).await;
                                 });
