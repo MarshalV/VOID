@@ -976,6 +976,7 @@ async fn main() -> Result<(), Box<dyn Error>> {
                     .mesh_n_low(1)
                     .mesh_n(2)
                     .mesh_n_high(4)
+                    .flood_publish(true) // Позволяет отправлять сообщения даже если пир еще не в меше
                     .build()
                     .unwrap();
 
@@ -989,7 +990,7 @@ async fn main() -> Result<(), Box<dyn Error>> {
                         .unwrap(),
                     ping: ping::Behaviour::default(),
                     identify: identify::Behaviour::new(identify::Config::new(
-                        "/void-chat/1.0.0".into(),
+                        "ipfs/1.0.0".into(), // Используем стандартную версию для лучшей совместимости
                         key.public(),
                     )),
                 })
@@ -1087,7 +1088,8 @@ async fn main() -> Result<(), Box<dyn Error>> {
                                 }
                             }
                             UICommand::SendMessage { sender_name, text, recipient } => {
-                                println!("📤 UI_SEND: '{}' (To: {:?})", text, recipient);
+                                let now = chrono::Local::now().format("%H:%M:%S").to_string();
+                                println!("[{}] 📤 UI_SEND: '{}' (To: {:?})", now, text, recipient);
                                 let msg = ChatMessage {
                                     sender_id: local_peer_id.to_string(),
                                     sender_name,
@@ -1097,16 +1099,22 @@ async fn main() -> Result<(), Box<dyn Error>> {
                                 };
                                 let json = serde_json::to_vec(&msg).unwrap();
 
-                                let peers_count = swarm.behaviour().gossipsub.all_peers().count();
-                                println!("📊 Gossipsub: Всего пиров в системе: {}", peers_count);
+                                {
+                                    let peer_ids: Vec<String> = swarm.behaviour().gossipsub.all_peers()
+                                        .map(|(p, _)| p.to_string().chars().take(8).collect())
+                                        .collect();
+                                    println!("[{}] 📊 Gossipsub: Пиров: {}. IDs: {:?}", now, peer_ids.len(), peer_ids);
+                                }
 
                                 match swarm.behaviour_mut().gossipsub.publish(topic.clone(), json) {
-                                    Ok(id) => println!("✅ Gossipsub: Опубликовано транзитом, ID: {:?}", id),
+                                    Ok(id) => println!("[{}] ✅ Gossipsub: Опубликовано, ID: {:?}", now, id),
                                     Err(e) => {
-                                        println!("❌ Gossipsub ERROR: {:?}", e);
-                                        let _ = event_tx.send(NetworkEvent::Status(
-                                            format!("❌ Не удалось отправить: {:?}", e)
-                                        )).await;
+                                        println!("[{}] ❌ Gossipsub ERROR: {:?}. Попытка добавить пиров принудительно...", now, e);
+                                        // Если пиров нет, пробуем еще раз добавить всех подключенных
+                                        let connected: Vec<_> = swarm.connected_peers().cloned().collect();
+                                        for peer in connected {
+                                            swarm.behaviour_mut().gossipsub.add_explicit_peer(&peer);
+                                        }
                                     }
                                 }
                                 let _ = event_tx.send(NetworkEvent::ChatMessage(msg)).await;
@@ -1229,9 +1237,11 @@ async fn main() -> Result<(), Box<dyn Error>> {
                         }
 
                         SwarmEvent::Behaviour(ChatBehaviourEvent::Identify(identify::Event::Received { peer_id, info, .. })) => {
-                            println!("🆔 Identify: Получена информация от {}: protocols={:?}", peer_id, info.protocols);
+                            let now = chrono::Local::now().format("%H:%M:%S").to_string();
+                            println!("[{}] 🆔 Identify: Получено от {}: protocols={:?}", now, peer_id, info.protocols);
                             if info.protocols.iter().any(|p| p.to_string().contains("gossipsub")) {
-                                println!("✨ Пир {} поддерживает Gossipsub", peer_id);
+                                println!("[{}] ✨ Пир {} поддерживает Gossipsub. Добавляю принудительно.", now, peer_id);
+                                swarm.behaviour_mut().gossipsub.add_explicit_peer(&peer_id);
                             }
                         }
                         SwarmEvent::Behaviour(ChatBehaviourEvent::Identify(identify::Event::Sent { peer_id, .. })) => {
