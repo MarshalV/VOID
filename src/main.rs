@@ -137,8 +137,6 @@ struct ChatBehaviour {
     identify: identify::Behaviour,
 }
 
-}
-
 struct App {
     local_peer_id: PeerId,
     local_nickname: String,
