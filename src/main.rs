@@ -816,8 +816,8 @@ impl eframe::App for App {
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn Error>> {
-    // Без логов — чистая консоль
-    let _ = tracing_subscriber::fmt().with_env_filter("off").try_init();
+    // Включаем логи для отладки
+    let _ = tracing_subscriber::fmt().with_env_filter("info").try_init();
 
     // === Автоматически добавляем правило файрвола ===
     #[allow(unused_variables)]
