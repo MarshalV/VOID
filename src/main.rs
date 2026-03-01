@@ -1078,17 +1078,19 @@ async fn main() -> Result<(), Box<dyn Error>> {
                                 }
                             }
                             UICommand::SendMessage { sender_name, text, recipient } => {
+                                println!("📤 UI_SEND: '{}' (To: {:?})", text, recipient);
                                 let msg = ChatMessage {
                                     sender_id: local_peer_id.to_string(),
                                     sender_name,
                                     recipient_id: recipient.map(|p| p.to_string()),
-                                    text,
+                                    text: text.clone(),
                                     timestamp: chrono::Local::now().format("%H:%M").to_string(),
                                 };
                                 let json = serde_json::to_vec(&msg).unwrap();
                                 match swarm.behaviour_mut().gossipsub.publish(topic.clone(), json) {
-                                    Ok(_) => {}
+                                    Ok(id) => println!("✅ Gossipsub: Опубликовано, ID: {:?}", id),
                                     Err(e) => {
+                                        println!("❌ Gossipsub ERROR: {:?}", e);
                                         let _ = event_tx.send(NetworkEvent::Status(
                                             format!("❌ Не удалось отправить: {:?}", e)
                                         )).await;
@@ -1154,8 +1156,12 @@ async fn main() -> Result<(), Box<dyn Error>> {
                         }
 
                         SwarmEvent::Behaviour(ChatBehaviourEvent::Gossipsub(gossipsub::Event::Message { message, .. })) => {
+                            println!("📩 Gossipsub: ПОЛУЧЕНО от {:?}", message.source);
                             if let Ok(msg) = serde_json::from_slice::<ChatMessage>(&message.data) {
+                                println!("📖 Текст сообщения: {}", msg.text);
                                 let _ = event_tx.send(NetworkEvent::ChatMessage(msg)).await;
+                            } else {
+                                println!("⚠️ Gossipsub: Ошибка парсинга JSON");
                             }
                         }
                         SwarmEvent::Behaviour(ChatBehaviourEvent::Gossipsub(gossipsub::Event::Subscribed { peer_id, topic })) => {
@@ -1165,7 +1171,8 @@ async fn main() -> Result<(), Box<dyn Error>> {
                         }
 
                         SwarmEvent::ConnectionEstablished { peer_id, .. } => {
-                            println!("Подключён: {}", peer_id);
+                            let mesh_count = swarm.behaviour().gossipsub.all_mesh_peers().count();
+                            println!("✅ СОЕДИНЕНО: {}. В меше: {}", peer_id, mesh_count);
                             pending_dials.remove(&peer_id);
                             swarm.behaviour_mut().gossipsub.add_explicit_peer(&peer_id);
                             let mesh = swarm.behaviour().gossipsub.all_mesh_peers().count();
