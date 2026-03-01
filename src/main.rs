@@ -990,7 +990,7 @@ async fn main() -> Result<(), Box<dyn Error>> {
                         .unwrap(),
                     ping: ping::Behaviour::default(),
                     identify: identify::Behaviour::new(identify::Config::new(
-                        "ipfs/1.0.0".into(), // Используем стандартную версию для лучшей совместимости
+                        "/ipfs/id/1.0.0".into(),
                         key.public(),
                     )),
                 })
@@ -1003,13 +1003,22 @@ async fn main() -> Result<(), Box<dyn Error>> {
         let topic = gossipsub::IdentTopic::new("void-chat-v1");
         swarm.behaviour_mut().gossipsub.subscribe(&topic).unwrap();
 
-        // Слушаем TCP и QUIC (UDP) на фиксированном порту 64000
-        swarm
-            .listen_on("/ip4/0.0.0.0/tcp/64000".parse().unwrap())
-            .unwrap();
-        swarm
-            .listen_on("/ip4/0.0.0.0/udp/64000/quic-v1".parse().unwrap())
-            .unwrap();
+        // Слушаем TCP и QUIC (UDP). Сначала пробуем 64000, если занято - берем любой свободный.
+        let tcp_addr: Multiaddr = "/ip4/0.0.0.0/tcp/64000".parse().unwrap();
+        let quic_addr: Multiaddr = "/ip4/0.0.0.0/udp/64000/quic-v1".parse().unwrap();
+
+        if let Err(e) = swarm.listen_on(tcp_addr.clone()) {
+            println!("⚠️ TCP порт 64000 занят ({:?}), пробую случайный...", e);
+            swarm
+                .listen_on("/ip4/0.0.0.0/tcp/0".parse().unwrap())
+                .unwrap();
+        }
+        if let Err(e) = swarm.listen_on(quic_addr.clone()) {
+            println!("⚠️ QUIC порт 64000 занят ({:?}), пробую случайный...", e);
+            swarm
+                .listen_on("/ip4/0.0.0.0/udp/0/quic-v1".parse().unwrap())
+                .unwrap();
+        }
 
         let _ = event_tx
             .send(NetworkEvent::Status(
@@ -1154,7 +1163,7 @@ async fn main() -> Result<(), Box<dyn Error>> {
                                 }
 
                                 let is_leader = local_peer_id.to_string() < peer_id.to_string();
-                                let delay_ms = if is_leader { 200 } else { 3000 };
+                                let delay_ms = if is_leader { 200 } else { 5000 };
 
                                 pending_dials.insert(peer_id);
                                 let cmd_tx2 = command_tx_for_mdns.clone();
