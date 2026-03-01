@@ -1,3 +1,4 @@
+mod crypto;
 use aes_gcm::{
     aead::{Aead, KeyInit},
     Aes256Gcm, Key, Nonce,
@@ -152,6 +153,8 @@ struct App {
     show_sidebar: bool,
     command_tx: mpsc::Sender<UICommand>,
     event_rx: mpsc::Receiver<NetworkEvent>,
+    #[allow(dead_code)]
+    sessions: HashMap<libp2p::PeerId, crypto::SecureSession>,
 }
 
 impl App {
@@ -182,6 +185,7 @@ impl App {
             show_sidebar: true,
             command_tx,
             event_rx,
+            sessions: HashMap::new(),
         }
     }
 
