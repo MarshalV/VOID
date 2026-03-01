@@ -7,7 +7,7 @@ use chrono;
 use eframe::egui;
 use futures::StreamExt;
 use libp2p::{
-    gossipsub, mdns, noise, ping,
+    gossipsub, identify, mdns, noise, ping,
     swarm::{dial_opts::DialOpts, NetworkBehaviour, SwarmEvent},
     tcp, yamux, Multiaddr, PeerId,
 };
@@ -134,6 +134,9 @@ struct ChatBehaviour {
     gossipsub: gossipsub::Behaviour,
     mdns: mdns::tokio::Behaviour,
     ping: ping::Behaviour,
+    identify: identify::Behaviour,
+}
+
 }
 
 struct App {
@@ -987,6 +990,10 @@ async fn main() -> Result<(), Box<dyn Error>> {
                     mdns: mdns::tokio::Behaviour::new(mdns::Config::default(), local_peer_id)
                         .unwrap(),
                     ping: ping::Behaviour::default(),
+                    identify: identify::Behaviour::new(identify::Config::new(
+                        "/void-chat/1.0.0".into(),
+                        key.public(),
+                    )),
                 })
             })
             .unwrap()
@@ -1168,18 +1175,15 @@ async fn main() -> Result<(), Box<dyn Error>> {
                                 println!("⚠️ Gossipsub: Ошибка парсинга JSON");
                             }
                         }
-                        SwarmEvent::Behaviour(ChatBehaviourEvent::Gossipsub(gossipsub::Event::Subscribed { peer_id, .. })) => {
-                            println!("📡 Gossipsub: {}... ПОДПИСАЛСЯ на топик", &peer_id.to_string()[..8]);
+                        SwarmEvent::Behaviour(ChatBehaviourEvent::Gossipsub(gossipsub::Event::Subscribed { peer_id, topic })) => {
+                            println!("📡 Gossipsub: {}... ПОДПИСАЛСЯ на топик ({})", &peer_id.to_string()[..8], topic);
+                            let _ = event_tx.send(NetworkEvent::Status(
+                                format!("📡 {}... присоединился к чату ({})", &peer_id.to_string()[..8], topic)
+                            )).await;
                         }
 
                         SwarmEvent::Behaviour(ChatBehaviourEvent::Gossipsub(gossipsub::Event::Unsubscribed { peer_id, topic })) => {
                             println!("📡 Gossipsub: {}... ОТПИСАЛСЯ от топика ({})", &peer_id.to_string()[..8], topic);
-                        }
-
-                        SwarmEvent::Behaviour(ChatBehaviourEvent::Gossipsub(gossipsub::Event::Subscribed { peer_id, topic })) => {
-                            let _ = event_tx.send(NetworkEvent::Status(
-                                format!("📡 {}... присоединился к чату ({})", &peer_id.to_string()[..8], topic)
-                            )).await;
                         }
 
                         SwarmEvent::ConnectionEstablished { peer_id, .. } => {
@@ -1215,6 +1219,19 @@ async fn main() -> Result<(), Box<dyn Error>> {
                                     format!("❌ Входящее подключение отклонено: {}", error)
                                 )).await;
                             }
+                        }
+
+                        SwarmEvent::Behaviour(ChatBehaviourEvent::Identify(identify::Event::Received { peer_id, info, .. })) => {
+                            println!("🆔 Identify: Получена информация от {}: protocols={:?}", peer_id, info.protocols);
+                            if info.protocols.iter().any(|p| p.to_string().contains("gossipsub")) {
+                                println!("✨ Пир {} поддерживает Gossipsub", peer_id);
+                            }
+                        }
+                        SwarmEvent::Behaviour(ChatBehaviourEvent::Identify(identify::Event::Sent { peer_id, .. })) => {
+                            println!("🆔 Identify: Отправлена информация пиру {}", peer_id);
+                        }
+                        SwarmEvent::Behaviour(ChatBehaviourEvent::Identify(identify::Event::Error { peer_id, error, .. })) => {
+                            println!("🆔 Identify: Ошибка с пиром {}: {:?}", peer_id, error);
                         }
 
                         _ => {}
