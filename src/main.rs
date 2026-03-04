@@ -1010,6 +1010,8 @@ async fn main() -> Result<(), Box<dyn Error>> {
                 yamux::Config::default,
             )
             .unwrap()
+            .with_dns()
+            .unwrap()
             .with_relay_client(noise::Config::new, yamux::Config::default)
             .unwrap()
             .with_behaviour(|key, relay_client| {
@@ -1372,7 +1374,15 @@ async fn main() -> Result<(), Box<dyn Error>> {
                             let _ = event_tx.send(NetworkEvent::MeshPeers(mesh)).await;
                         }
                         SwarmEvent::IncomingConnection { local_addr, send_back_addr, .. } => {
-                            println!("📥 Входящее соединение: from {:?} to {:?}", send_back_addr, local_addr);
+                            let s_addr = send_back_addr.to_string();
+                            if s_addr.contains("64000") {
+                                println!("⚠️ [ВНИМАНИЕ] Входящее от СТАРОЙ ВЕРСИИ (порт 64000): from {:?}. Ожидайте ошибку Identify.", send_back_addr);
+                                let _ = event_tx.send(NetworkEvent::Status(
+                                    "⚠️ ВНИМАНИЕ: Подключился старый пир. Сообщения НЕ БУДУТ работать до его обновления!".into()
+                                )).await;
+                            } else {
+                                println!("📥 Входящее соединение: from {:?} to {:?}", send_back_addr, local_addr);
+                            }
                         }
 
                         SwarmEvent::OutgoingConnectionError { peer_id, error, .. } => {
@@ -1422,9 +1432,10 @@ async fn main() -> Result<(), Box<dyn Error>> {
                         SwarmEvent::Behaviour(ChatBehaviourEvent::Identify(identify::Event::Error { peer_id, error, .. })) => {
                             let err_str = error.to_string();
                             if err_str.contains("NegotiationFailed") {
-                                println!("⚠️ [КРИТИЧНО] Identify: Ошибка согласования протоколов с {}. Скорее всего, ПИР ИСПОЛЬЗУЕТ СТАРУЮ ВЕРСИЮ приложения!", peer_id);
+                                println!("❌ [КРИТИЧНО] Identify: Несовпадение версий с {}.", peer_id);
+                                println!("🔥 Срочно ОБНОВИТЕ другое приложение и ЗАКРОЙТЕ старые процессы!");
                                 let _ = event_tx.send(NetworkEvent::Status(
-                                    format!("⚠️ ПРЕДУПРЕЖДЕНИЕ: Пир {}... имеет несовместимую версию!", &peer_id.to_string()[..8])
+                                    format!("❌ ОШИБКА: Пир {}... использует СТАРУЮ ВЕРСИЮ!", &peer_id.to_string()[..8])
                                 )).await;
                             } else {
                                 println!("🆔 Identify: Ошибка с пиром {}: {:?}", peer_id, error);
