@@ -913,8 +913,9 @@ async fn main() -> Result<(), Box<dyn Error>> {
             let bat = format!(
                 "@echo off\r\n\
                  netsh advfirewall firewall delete rule name=\"VOID P2P\"\r\n\
-                 netsh advfirewall firewall add rule name=\"VOID P2P\" dir=in action=allow protocol=TCP localport=64000 profile=any enable=yes\r\n\
-                 netsh advfirewall firewall add rule name=\"VOID P2P\" dir=in action=allow protocol=UDP localport=64000 profile=any edge=yes enable=yes\r\n"
+                 netsh advfirewall firewall add rule name=\"VOID P2P\" dir=in action=allow protocol=TCP localport=50001 profile=any enable=yes program=\"{}\"\r\n\
+                 netsh advfirewall firewall add rule name=\"VOID P2P\" dir=in action=allow protocol=UDP localport=50001 profile=any edge=yes enable=yes program=\"{}\"\r\n",
+                exe, exe
             );
             let bat_path = std::env::temp_dir().join("void_p2p_firewall.bat");
             if std::fs::write(&bat_path, bat).is_ok() {
@@ -1007,7 +1008,7 @@ async fn main() -> Result<(), Box<dyn Error>> {
 
                 // Gossipsub: оптимизированные параметры для Windows
                 let gossipsub_config = gossipsub::ConfigBuilder::default()
-                    .heartbeat_interval(Duration::from_secs(1))
+                    .heartbeat_interval(Duration::from_millis(500))
                     .validation_mode(gossipsub::ValidationMode::Permissive)
                     .mesh_n_low(2) // Минимум 2 пира для меша
                     .mesh_n(3) // Цель - 3
@@ -1043,11 +1044,11 @@ async fn main() -> Result<(), Box<dyn Error>> {
         let topic = gossipsub::IdentTopic::new("void-chat-v1");
         swarm.behaviour_mut().gossipsub.subscribe(&topic).unwrap();
 
-        // Слушаем TCP. Сначала пробуем 64000, если занято - берем любой свободный.
-        let tcp_addr: Multiaddr = "/ip4/0.0.0.0/tcp/64000".parse().unwrap();
+        // Слушаем TCP. Сначала пробуем 50001, если занято - берем любой свободный.
+        let tcp_addr: Multiaddr = "/ip4/0.0.0.0/tcp/50001".parse().unwrap();
 
         if let Err(e) = swarm.listen_on(tcp_addr.clone()) {
-            println!("⚠️ TCP порт 64000 занят ({:?}), пробую случайный...", e);
+            println!("⚠️ TCP порт 50001 занят ({:?}), пробую случайный...", e);
             swarm
                 .listen_on("/ip4/0.0.0.0/tcp/0".parse().unwrap())
                 .unwrap();
