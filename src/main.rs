@@ -7,9 +7,9 @@ use chrono;
 use eframe::egui;
 use futures::StreamExt;
 use libp2p::{
-    gossipsub, identify, mdns, noise, ping,
+    autonat, dcutr, gossipsub, identify, kad, mdns, noise, ping, relay,
     swarm::{dial_opts::DialOpts, NetworkBehaviour, SwarmEvent},
-    tcp, yamux, Multiaddr, PeerId,
+    tcp, upnp, yamux, Multiaddr, PeerId,
 };
 use rand::RngCore;
 use serde::{Deserialize, Serialize};
@@ -164,6 +164,11 @@ struct ChatBehaviour {
     mdns: mdns::tokio::Behaviour,
     ping: ping::Behaviour,
     identify: identify::Behaviour,
+    kad: kad::Behaviour<kad::store::MemoryStore>,
+    relay: relay::client::Behaviour,
+    dcutr: dcutr::Behaviour,
+    autonat: autonat::Behaviour,
+    upnp: upnp::tokio::Behaviour,
 }
 
 struct App {
@@ -996,7 +1001,7 @@ async fn main() -> Result<(), Box<dyn Error>> {
         let mut sessions: HashMap<PeerId, crypto::SecureSession> = HashMap::new();
         let my_public_key = crypto::PublicKey::from(&local_static);
 
-        // Swarm: TCP + noise + yamux (QUIC временно отключен для стабильности на Windows)
+        // Swarm: TCP + noise + yamux + Relay Client
         let mut swarm = libp2p::SwarmBuilder::with_existing_identity(local_key.clone())
             .with_tokio()
             .with_tcp(
@@ -1005,7 +1010,9 @@ async fn main() -> Result<(), Box<dyn Error>> {
                 yamux::Config::default,
             )
             .unwrap()
-            .with_behaviour(|key| {
+            .with_relay_client(noise::Config::new, yamux::Config::default)
+            .unwrap()
+            .with_behaviour(|key, relay_client| {
                 let local_peer_id = key.public().to_peer_id();
 
                 // Gossipsub: оптимизированные параметры для Windows
@@ -1020,6 +1027,26 @@ async fn main() -> Result<(), Box<dyn Error>> {
                     .build()
                     .unwrap();
 
+                // Kademlia: хранилище в памяти
+                let kad_store = kad::store::MemoryStore::new(local_peer_id);
+                let mut kad = kad::Behaviour::new(local_peer_id, kad_store);
+
+                // Добавляем бутстрап-ноды IPFS (надежные)
+                let bootstrap = [
+                    "/dnsaddr/bootstrap.libp2p.io/p2p/QmNnoo2uR3GuwhvBqyM4tTDp6NoS7wB9G9o9wE5pS9Y6mY",
+                    "/dnsaddr/bootstrap.libp2p.io/p2p/QmQCU2EcSTwsrmMvFUXS7uK9z1V64p9C8ndn4y2K8w8f3z",
+                ];
+                for addr in bootstrap {
+                    if let Ok(ma) = addr.parse::<Multiaddr>() {
+                        if let Some(peer_id) = ma.clone().pop().and_then(|p| {
+                            if let libp2p::multiaddr::Protocol::P2p(peer_id) = p { Some(peer_id) } else { None }
+                        }) {
+                             kad.add_address(&peer_id, ma);
+                        }
+                    }
+                }
+                let _ = kad.bootstrap();
+
                 Ok(ChatBehaviour {
                     gossipsub: gossipsub::Behaviour::new(
                         gossipsub::MessageAuthenticity::Signed(key.clone()),
@@ -1033,11 +1060,16 @@ async fn main() -> Result<(), Box<dyn Error>> {
                         "/ipfs/id/1.0.0".into(),
                         key.public(),
                     )),
+                    kad,
+                    relay: relay_client,
+                    dcutr: dcutr::Behaviour::new(local_peer_id),
+                    autonat: autonat::Behaviour::new(local_peer_id, Default::default()),
+                    upnp: upnp::tokio::Behaviour::default(),
                 })
             })
             .unwrap()
             .with_swarm_config(|c| {
-                c.with_idle_connection_timeout(Duration::from_secs(30))
+                c.with_idle_connection_timeout(Duration::from_secs(60))
                     .with_per_connection_event_buffer_size(256)
             })
             .build();
@@ -1056,6 +1088,9 @@ async fn main() -> Result<(), Box<dyn Error>> {
                 .unwrap();
         }
 
+        // Слушаем через Relay для работы за NAT
+        let _ = swarm.listen_on("/p2p-circuit".parse().unwrap());
+
         let _ = event_tx
             .send(NetworkEvent::Status(
                 "🚀 Запущен. Ищу пиров через mDNS...".into(),
@@ -1064,7 +1099,8 @@ async fn main() -> Result<(), Box<dyn Error>> {
 
         let mut mesh_check = tokio::time::interval(Duration::from_secs(5));
         let mut hello_broadcast = tokio::time::interval(Duration::from_secs(30));
-        // Кэш адресов для mDNS: пир → все его адреса (TCP + QUIC)
+        let mut kad_bootstrap_timer = tokio::time::interval(Duration::from_secs(300)); // 5 минут
+                                                                                       // Кэш адресов для mDNS: пир → все его адреса (TCP + QUIC)
         let mut peer_addrs: HashMap<PeerId, Vec<Multiaddr>> = HashMap::new();
         // Пиры, к которым уже запущен или идёт dial (избегаем дубликат)
         let mut pending_dials: HashSet<PeerId> = HashSet::new();
@@ -1108,40 +1144,23 @@ async fn main() -> Result<(), Box<dyn Error>> {
                                     }
                                 }
                             }
-                            UICommand::DialPeer(peer_id, addrs) => {
-                                let short = &peer_id.to_string()[..16];
-                                println!("🔌 UI_COMMAND: DialPeer {} ({} addresses)", short, addrs.len());
-                                if swarm.is_connected(&peer_id) {
-                                    println!("✅ Уже подключен к {}", short);
-                                    pending_dials.remove(&peer_id);
-                                } else {
-                                    match swarm.dial(
-                                        DialOpts::peer_id(peer_id)
-                                            .addresses(addrs.clone())
-                                            .build()
-                                    ) {
-                                        Ok(_) => {
-                                            println!("⏳ Dial запущен для {}", short);
-                                            let _ = event_tx.send(NetworkEvent::Status(
-                                                format!("📞 Подключаюсь к {}... ({} адресов)", short, addrs.len())
-                                            )).await;
-                                        }
-                                        Err(e) => {
-                                            let err_str = e.to_string();
-                                            // Не спамим ошибками, если пир уже в процессе подключения или отключен
-                                            if !err_str.contains("DisconnectedAndNotDialing") &&
-                                               !err_str.contains("Pending") &&
-                                               !err_str.contains("already") {
-                                                println!("❌ Dial ERROR для {}: {:?}", short, e);
-                                                let _ = event_tx.send(NetworkEvent::Status(
-                                                    format!("❌ dial ошибка: {}", e)
-                                                )).await;
-                                            }
-                                            pending_dials.remove(&peer_id);
-                                        }
-                                    }
-                                }
-                            }
+                             UICommand::DialPeer(peer_id, addrs) => {
+                                 let short = &peer_id.to_string()[..16];
+                                 println!("🔌 UI_COMMAND: DialPeer {} ({} addresses)", short, addrs.len());
+
+                                 // Добавляем адреса в Kad перед дозвоном
+                                 for addr in addrs {
+                                     swarm.behaviour_mut().kad.add_address(&peer_id, addr);
+                                 }
+
+                                 let opts = DialOpts::peer_id(peer_id)
+                                     .condition(libp2p::swarm::dial_opts::PeerCondition::DisconnectedAndNotDialing)
+                                     .build();
+
+                                 if let Err(e) = swarm.dial(opts) {
+                                      println!("❌ Dial ERROR для {}: {:?}", short, e);
+                                 }
+                             }
                             UICommand::SendMessage { sender_name, text, recipient } => {
                                 let now = chrono::Local::now().format("%H:%M:%S").to_string();
                                 println!("[{}] 📤 UI_SEND: '{}' (To: {:?})", now, text, recipient);
@@ -1386,6 +1405,12 @@ async fn main() -> Result<(), Box<dyn Error>> {
                         SwarmEvent::Behaviour(ChatBehaviourEvent::Identify(identify::Event::Received { peer_id, info, .. })) => {
                             let now = chrono::Local::now().format("%H:%M:%S").to_string();
                             println!("[{}] 🆔 Identify: Получено от {}: protocols={:?}", now, peer_id, info.protocols);
+
+                            // Добавляем внешние адреса пира в DHT
+                            for addr in info.listen_addrs {
+                                swarm.behaviour_mut().kad.add_address(&peer_id, addr);
+                            }
+
                             if info.protocols.iter().any(|p| p.to_string().contains("gossipsub")) {
                                 println!("[{}] ✨ Пир {} поддерживает Gossipsub. Добавляю принудительно.", now, peer_id);
                                 swarm.behaviour_mut().gossipsub.add_explicit_peer(&peer_id);
@@ -1408,6 +1433,9 @@ async fn main() -> Result<(), Box<dyn Error>> {
 
                         _ => {}
                     }
+                }
+                _ = kad_bootstrap_timer.tick() => {
+                    let _ = swarm.behaviour_mut().kad.bootstrap();
                 }
             }
         }
