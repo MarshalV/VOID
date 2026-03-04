@@ -1006,14 +1006,15 @@ async fn main() -> Result<(), Box<dyn Error>> {
             .with_behaviour(|key| {
                 let local_peer_id = key.public().to_peer_id();
 
-                // Gossipsub: работает даже с 1 пиром
+                // Gossipsub: оптимизированные параметры для Windows
                 let gossipsub_config = gossipsub::ConfigBuilder::default()
                     .heartbeat_interval(Duration::from_secs(1))
                     .validation_mode(gossipsub::ValidationMode::Permissive)
-                    .mesh_n_low(1)
-                    .mesh_n(2)
-                    .mesh_n_high(4)
-                    .flood_publish(true) // Позволяет отправлять сообщения даже если пир еще не в меше
+                    .mesh_n_low(2) // Минимум 2 пира для меша
+                    .mesh_n(3) // Цель - 3
+                    .mesh_n_high(6)
+                    .flood_publish(true)
+                    .max_transmit_size(262144) // 256KB
                     .build()
                     .unwrap();
 
@@ -1033,7 +1034,10 @@ async fn main() -> Result<(), Box<dyn Error>> {
                 })
             })
             .unwrap()
-            .with_swarm_config(|c| c.with_idle_connection_timeout(Duration::from_secs(120)))
+            .with_swarm_config(|c| {
+                c.with_idle_connection_timeout(Duration::from_secs(60))
+                    .with_per_connection_event_buffer_size(64)
+            })
             .build();
 
         // Подписываемся на топик
@@ -1128,14 +1132,17 @@ async fn main() -> Result<(), Box<dyn Error>> {
                                             )).await;
                                         }
                                         Err(e) => {
-                                            println!("❌ Dial ERROR для {}: {:?}", short, e);
-                                            pending_dials.remove(&peer_id);
                                             let err_str = e.to_string();
-                                            if !err_str.contains("Pending") && !err_str.contains("already") {
+                                            // Не спамим ошибками, если пир уже в процессе подключения или отключен
+                                            if !err_str.contains("DisconnectedAndNotDialing") &&
+                                               !err_str.contains("Pending") &&
+                                               !err_str.contains("already") {
+                                                println!("❌ Dial ERROR для {}: {:?}", short, e);
                                                 let _ = event_tx.send(NetworkEvent::Status(
                                                     format!("❌ dial ошибка: {}", e)
                                                 )).await;
                                             }
+                                            pending_dials.remove(&peer_id);
                                         }
                                     }
                                 }
@@ -1217,7 +1224,7 @@ async fn main() -> Result<(), Box<dyn Error>> {
                                 }
 
                                 let is_leader = local_peer_id.to_string() < peer_id.to_string();
-                                let delay_ms = if is_leader { 200 } else { 5000 };
+                                let delay_ms = if is_leader { 500 } else { 10000 };
 
                                 pending_dials.insert(peer_id);
                                 let cmd_tx2 = command_tx_for_mdns.clone();
@@ -1263,7 +1270,7 @@ async fn main() -> Result<(), Box<dyn Error>> {
                                             if let Some(session) = sessions.get_mut(&src) {
                                                 if let Ok(plaintext) = session.decrypt_payload(&header, &ciphertext) {
                                                     if let Ok(msg) = serde_json::from_slice::<ChatMessage>(&plaintext) {
-                                                        println!("[{}] � E2EE: Сообщение ДЕШИФРОВАНО от {}", now, &src.to_string()[..8]);
+                                                        println!("[{}]  E2EE: Сообщение ДЕШИФРОВАНО от {}", now, &src.to_string()[..8]);
                                                         let _ = event_tx.send(NetworkEvent::ChatMessage(msg)).await;
                                                     }
                                                 } else {
@@ -1298,7 +1305,12 @@ async fn main() -> Result<(), Box<dyn Error>> {
                             let mesh_count = swarm.behaviour().gossipsub.all_mesh_peers().count();
                             println!("✅ СОЕДИНЕНО: {}. Endpoint: {:?}. В меше: {}", peer_id, endpoint, mesh_count);
                             pending_dials.remove(&peer_id);
+
+                            // Принудительно добавляем и подписываем (для надежности)
                             swarm.behaviour_mut().gossipsub.add_explicit_peer(&peer_id);
+                            let topic = gossipsub::IdentTopic::new("void-chat-v1");
+                            let _ = swarm.behaviour_mut().gossipsub.subscribe(&topic);
+
                             let _ = event_tx.send(NetworkEvent::Connected(peer_id)).await;
                             let _ = event_tx.send(NetworkEvent::MeshPeers(mesh_count)).await;
                         }
@@ -1321,9 +1333,12 @@ async fn main() -> Result<(), Box<dyn Error>> {
                                 pending_dials.remove(&p);
                                 peer_addrs.remove(&p);
                             }
-                            let _ = event_tx.send(NetworkEvent::Status(
-                                format!("❌ Не удалось подключиться к {}: {}", peer_str, error)
-                            )).await;
+                            let err_str = error.to_string();
+                            if !err_str.contains("HandshakeTimedOut") && !err_str.contains("Timeout") {
+                                let _ = event_tx.send(NetworkEvent::Status(
+                                    format!("❌ Не удалось подключиться к {}: {}", peer_str, error)
+                                )).await;
+                            }
                         }
                         SwarmEvent::IncomingConnectionError { error, .. } => {
                             let err_str = error.to_string();
