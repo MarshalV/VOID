@@ -8,7 +8,7 @@ use rand::rngs::OsRng;
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 #[allow(dead_code)]
-use x25519_dalek::{PublicKey, SharedSecret, StaticSecret};
+pub use x25519_dalek::{PublicKey, SharedSecret, StaticSecret};
 use zeroize::{Zeroize, ZeroizeOnDrop};
 
 /// KDF (Key Derivation Function) на базе BLAKE2b
@@ -29,10 +29,20 @@ struct ChainKey {
 
 impl ChainKey {
     fn step(&mut self) -> [u8; 32] {
-        let message_key = kdf(&self.key, b"message_key", &self.index.to_be_bytes(), 32);
-        self.key = kdf(&self.key, b"chain_key", &self.index.to_be_bytes(), 32)
-            .try_into()
-            .unwrap_or([0; 32]);
+        let message_key = kdf(
+            self.key.as_slice(),
+            b"message_key",
+            &self.index.to_be_bytes(),
+            32,
+        );
+        self.key = kdf(
+            self.key.as_slice(),
+            b"chain_key",
+            &self.index.to_be_bytes(),
+            32,
+        )
+        .try_into()
+        .unwrap_or([0; 32]);
         self.index += 1;
         let mut mk = [0u8; 32];
         mk.copy_from_slice(&message_key);
@@ -41,7 +51,7 @@ impl ChainKey {
 }
 
 #[allow(dead_code)]
-#[derive(Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct MessageHeader {
     pub dh_pub: [u8; 32],
     pub pn: u32, // Previous number of messages in sending chain
@@ -71,9 +81,14 @@ impl SecureSession {
         let dhr = *remote_static;
 
         let shared = local_static.diffie_hellman(remote_static);
-        let rk: [u8; 32] = kdf(b"VOID_SALT", shared.as_bytes(), b"VOID_INIT_IK", 32)
-            .try_into()
-            .unwrap();
+        let rk: [u8; 32] = kdf(
+            b"VOID_SALT".as_slice(),
+            shared.as_bytes(),
+            b"VOID_INIT_IK".as_slice(),
+            32,
+        )
+        .try_into()
+        .unwrap();
 
         Self {
             dhs,
@@ -81,6 +96,31 @@ impl SecureSession {
             rk,
             ck_send: Some(ChainKey { key: rk, index: 0 }),
             ck_recv: None,
+            ns: 0,
+            nr: 0,
+            pn: 0,
+            skipped_keys: HashMap::new(),
+        }
+    }
+
+    pub fn new_responder(local_static: &StaticSecret, remote_static: &PublicKey) -> Self {
+        let dhr = *remote_static;
+        let shared = local_static.diffie_hellman(&dhr);
+        let rk: [u8; 32] = kdf(
+            b"VOID_SALT".as_slice(),
+            shared.as_bytes(),
+            b"VOID_INIT_IK".as_slice(),
+            32,
+        )
+        .try_into()
+        .unwrap();
+
+        Self {
+            dhs: StaticSecret::random_from_rng(&mut OsRng),
+            dhr,
+            rk,
+            ck_send: None,
+            ck_recv: Some(ChainKey { key: rk, index: 0 }),
             ns: 0,
             nr: 0,
             pn: 0,
@@ -172,7 +212,7 @@ impl SecureSession {
     }
 
     fn kdf_rk(&self, shared: &SharedSecret) -> ([u8; 32], [u8; 32]) {
-        let out = kdf(&self.rk, shared.as_bytes(), b"dr_ratchet", 64);
+        let out = kdf(self.rk.as_slice(), shared.as_bytes(), b"dr_ratchet", 64);
         (
             out[0..32].try_into().unwrap(),
             out[32..64].try_into().unwrap(),

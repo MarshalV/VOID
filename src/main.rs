@@ -22,6 +22,7 @@ use tokio::sync::mpsc;
 struct StorageData {
     nickname: String,
     keypair_bytes: Vec<u8>,
+    static_secret_bytes: [u8; 32],
 }
 
 struct Storage;
@@ -46,16 +47,32 @@ impl Storage {
     fn save(
         nickname: &str,
         keypair: Option<&libp2p::identity::Keypair>,
+        static_secret: Option<&crypto::StaticSecret>,
     ) -> Result<(), Box<dyn Error>> {
+        let current = Self::load().ok();
+
         let keypair_bytes = if let Some(kp) = keypair {
             kp.to_protobuf_encoding()?
         } else {
-            Self::load()?.keypair_bytes
+            current
+                .as_ref()
+                .map(|c| c.keypair_bytes.clone())
+                .unwrap_or_default()
+        };
+
+        let static_secret_bytes = if let Some(ss) = static_secret {
+            ss.to_bytes()
+        } else {
+            current
+                .as_ref()
+                .map(|c| c.static_secret_bytes)
+                .unwrap_or([0u8; 32])
         };
 
         let data = StorageData {
             nickname: nickname.to_string(),
             keypair_bytes,
+            static_secret_bytes,
         };
         let plaintext = serde_json::to_vec(&data)?;
 
@@ -108,6 +125,18 @@ struct ChatMessage {
     timestamp: String,
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize)]
+enum V1Packet {
+    Hello {
+        public_key: [u8; 32],
+    },
+    Encrypted {
+        header: crypto::MessageHeader,
+        ciphertext: Vec<u8>,
+    },
+    Plain(ChatMessage),
+}
+
 enum NetworkEvent {
     NewListenAddr(Multiaddr),
     MdnsDiscovered(PeerId, Multiaddr),
@@ -154,8 +183,8 @@ struct App {
     show_sidebar: bool,
     command_tx: mpsc::Sender<UICommand>,
     event_rx: mpsc::Receiver<NetworkEvent>,
-    #[allow(dead_code)]
-    sessions: HashMap<libp2p::PeerId, crypto::SecureSession>,
+    _sessions: HashMap<libp2p::PeerId, crypto::SecureSession>,
+    _local_static: crypto::StaticSecret,
 }
 
 impl App {
@@ -163,6 +192,7 @@ impl App {
         cc: &eframe::CreationContext<'_>,
         local_peer_id: PeerId,
         local_nickname: String,
+        local_static: crypto::StaticSecret,
         command_tx: mpsc::Sender<UICommand>,
         event_rx: mpsc::Receiver<NetworkEvent>,
     ) -> Self {
@@ -186,7 +216,8 @@ impl App {
             show_sidebar: true,
             command_tx,
             event_rx,
-            sessions: HashMap::new(),
+            _sessions: HashMap::new(),
+            _local_static: local_static,
         }
     }
 
@@ -243,7 +274,7 @@ impl App {
                                         )
                                         .changed()
                                     {
-                                        let _ = Storage::save(&self.local_nickname, None);
+                                        let _ = Storage::save(&self.local_nickname, None, None);
                                     }
                                 });
                                 ui.label(
@@ -930,15 +961,17 @@ async fn main() -> Result<(), Box<dyn Error>> {
         println!("✅ Файрвол macOS настроен");
     }
 
-    let (local_key, local_nickname) = if let Ok(storage) = Storage::load() {
+    let (local_key, local_nickname, static_secret) = if let Ok(storage) = Storage::load() {
         let key = libp2p::identity::Keypair::from_protobuf_encoding(&storage.keypair_bytes)
             .expect("Failed to decode saved keypair");
-        (key, storage.nickname)
+        let static_secret = crypto::StaticSecret::from(storage.static_secret_bytes);
+        (key, storage.nickname, static_secret)
     } else {
         let key = libp2p::identity::Keypair::generate_ed25519();
+        let static_secret = crypto::StaticSecret::random_from_rng(&mut rand::rngs::OsRng);
         let nickname = format!("User_{}", &PeerId::from(key.public()).to_string()[..4]);
-        let _ = Storage::save(&nickname, Some(&key));
-        (key, nickname)
+        let _ = Storage::save(&nickname, Some(&key), Some(&static_secret));
+        (key, nickname, static_secret)
     };
     let local_peer_id = PeerId::from(local_key.public());
 
@@ -952,9 +985,13 @@ async fn main() -> Result<(), Box<dyn Error>> {
     let event_tx_clone = event_tx.clone();
     let command_tx_for_mdns = command_tx.clone(); // для delayed dial из mDNS
 
+    let static_secret_net = static_secret.clone();
     tokio::spawn(async move {
         let event_tx = event_tx_clone;
         let command_tx_for_mdns = command_tx_for_mdns;
+        let local_static = static_secret_net;
+        let mut sessions: HashMap<PeerId, crypto::SecureSession> = HashMap::new();
+        let my_public_key = crypto::PublicKey::from(&local_static);
 
         // Swarm: TCP + QUIC (UDP) + noise + yamux
         let mut swarm = libp2p::SwarmBuilder::with_existing_identity(local_key.clone())
@@ -1027,6 +1064,7 @@ async fn main() -> Result<(), Box<dyn Error>> {
             .await;
 
         let mut mesh_check = tokio::time::interval(Duration::from_secs(5));
+        let mut hello_broadcast = tokio::time::interval(Duration::from_secs(30));
         // Кэш адресов для mDNS: пир → все его адреса (TCP + QUIC)
         let mut peer_addrs: HashMap<PeerId, Vec<Multiaddr>> = HashMap::new();
         // Пиры, к которым уже запущен или идёт dial (избегаем дубликат)
@@ -1034,6 +1072,12 @@ async fn main() -> Result<(), Box<dyn Error>> {
 
         loop {
             tokio::select! {
+                _ = hello_broadcast.tick() => {
+                    let hello = V1Packet::Hello { public_key: my_public_key.to_bytes() };
+                    if let Ok(json) = serde_json::to_vec(&hello) {
+                        let _ = swarm.behaviour_mut().gossipsub.publish(topic.clone(), json);
+                    }
+                }
                 _ = mesh_check.tick() => {
                     let mesh = swarm.behaviour().gossipsub.all_mesh_peers().count();
                     let _ = event_tx.send(NetworkEvent::MeshPeers(mesh)).await;
@@ -1106,20 +1150,30 @@ async fn main() -> Result<(), Box<dyn Error>> {
                                     text: text.clone(),
                                     timestamp: chrono::Local::now().format("%H:%M").to_string(),
                                 };
-                                let json = serde_json::to_vec(&msg).unwrap();
 
-                                {
-                                    let peer_ids: Vec<String> = swarm.behaviour().gossipsub.all_peers()
-                                        .map(|(p, _)| p.to_string().chars().take(8).collect())
-                                        .collect();
-                                    println!("[{}] 📊 Gossipsub: Пиров: {}. IDs: {:?}", now, peer_ids.len(), peer_ids);
+                                let json_data = serde_json::to_vec(&msg).unwrap();
+                                let mut packet = V1Packet::Plain(msg.clone());
+
+                                if let Some(peer_id) = recipient {
+                                    if let Some(session) = sessions.get_mut(&peer_id) {
+                                        if let Ok((header, ciphertext)) = session.encrypt_payload(json_data.as_slice()) {
+                                            packet = V1Packet::Encrypted { header, ciphertext };
+                                            println!("[{}] 🔒 E2EE: Сообщение зашифровано для {}", now, &peer_id.to_string()[..8]);
+                                        }
+                                    } else {
+                                        let hello = V1Packet::Hello { public_key: my_public_key.to_bytes() };
+                                        let h_json = serde_json::to_vec(&hello).unwrap();
+                                        let _ = swarm.behaviour_mut().gossipsub.publish(topic.clone(), h_json);
+                                        println!("[{}] 🤝 E2EE: Сессии нет, отправлен Hello пиру {}", now, &peer_id.to_string()[..8]);
+                                    }
                                 }
 
-                                match swarm.behaviour_mut().gossipsub.publish(topic.clone(), json) {
-                                    Ok(id) => println!("[{}] ✅ Gossipsub: Опубликовано, ID: {:?}", now, id),
+                                let final_json = serde_json::to_vec(&packet).unwrap();
+
+                                match swarm.behaviour_mut().gossipsub.publish(topic.clone(), final_json) {
+                                    Ok(id) => println!("[{}] ✅ Gossipsub: Опубликовано, ID: {:?}, Packet: {:?}", now, id, packet),
                                     Err(e) => {
                                         println!("[{}] ❌ Gossipsub ERROR: {:?}. Попытка добавить пиров принудительно...", now, e);
-                                        // Если пиров нет, пробуем еще раз добавить всех подключенных
                                         let connected: Vec<_> = swarm.connected_peers().cloned().collect();
                                         for peer in connected {
                                             swarm.behaviour_mut().gossipsub.add_explicit_peer(&peer);
@@ -1186,12 +1240,47 @@ async fn main() -> Result<(), Box<dyn Error>> {
                         }
 
                         SwarmEvent::Behaviour(ChatBehaviourEvent::Gossipsub(gossipsub::Event::Message { message, .. })) => {
-                            println!("📩 Gossipsub: ПОЛУЧЕНО от {:?}", message.source);
-                            if let Ok(msg) = serde_json::from_slice::<ChatMessage>(&message.data) {
-                                println!("📖 Текст сообщения: {}", msg.text);
-                                let _ = event_tx.send(NetworkEvent::ChatMessage(msg)).await;
-                            } else {
-                                println!("⚠️ Gossipsub: Ошибка парсинга JSON");
+                            let now = chrono::Local::now().format("%H:%M:%S").to_string();
+                            if let Ok(packet) = serde_json::from_slice::<V1Packet>(&message.data) {
+                                match packet {
+                                    V1Packet::Hello { public_key } => {
+                                        if let Some(src) = message.source {
+                                            if src != local_peer_id {
+                                                println!("[{}] 🤝 E2EE: Получен Hello от {}. Создаю сессию.", now, &src.to_string()[..8]);
+                                                let remote_key = crypto::PublicKey::from(public_key);
+                                                let session = crypto::SecureSession::new_responder(&local_static, &remote_key);
+                                                sessions.insert(src, session);
+
+                                                // Отвечаем своим Hello, если сессии с ним еще не было
+                                                let my_hello = V1Packet::Hello { public_key: my_public_key.to_bytes() };
+                                                let h_json = serde_json::to_vec(&my_hello).unwrap();
+                                                let _ = swarm.behaviour_mut().gossipsub.publish(topic.clone(), h_json);
+                                            }
+                                        }
+                                    }
+                                    V1Packet::Encrypted { header, ciphertext } => {
+                                        if let Some(src) = message.source {
+                                            if let Some(session) = sessions.get_mut(&src) {
+                                                if let Ok(plaintext) = session.decrypt_payload(&header, &ciphertext) {
+                                                    if let Ok(msg) = serde_json::from_slice::<ChatMessage>(&plaintext) {
+                                                        println!("[{}] � E2EE: Сообщение ДЕШИФРОВАНО от {}", now, &src.to_string()[..8]);
+                                                        let _ = event_tx.send(NetworkEvent::ChatMessage(msg)).await;
+                                                    }
+                                                } else {
+                                                    println!("[{}] ❌ E2EE: Ошибка дешифровки от {}", now, &src.to_string()[..8]);
+                                                }
+                                            } else {
+                                                println!("[{}] ⚠️ E2EE: Получен шифрованный пакет, но сессия не найдена для {}", now, &src.to_string()[..8]);
+                                            }
+                                        }
+                                    }
+                                    V1Packet::Plain(msg) => {
+                                        if message.source != Some(local_peer_id) {
+                                            println!("[{}] 📖 Текст сообщения (отрытый): {}", now, msg.text);
+                                            let _ = event_tx.send(NetworkEvent::ChatMessage(msg)).await;
+                                        }
+                                    }
+                                }
                             }
                         }
                         SwarmEvent::Behaviour(ChatBehaviourEvent::Gossipsub(gossipsub::Event::Subscribed { peer_id, topic })) => {
@@ -1275,6 +1364,7 @@ async fn main() -> Result<(), Box<dyn Error>> {
                 cc,
                 local_peer_id,
                 local_nickname,
+                static_secret,
                 command_tx,
                 event_rx,
             )))
