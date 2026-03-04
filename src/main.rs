@@ -551,10 +551,12 @@ impl eframe::App for App {
                         &peer.to_string()[..8],
                         addr
                     ));
-                    // Добавляем в список известных, если еще нет
-                    self.known_peers
-                        .entry(peer)
-                        .or_insert_with(|| format!("Peer_{}", &peer.to_string()[..4]));
+                    // Добавляем в список известных, если это не мы сами
+                    if peer != self.local_peer_id {
+                        self.known_peers
+                            .entry(peer)
+                            .or_insert_with(|| format!("Peer_{}", &peer.to_string()[..8]));
+                    }
                 }
                 NetworkEvent::MdnsExpired(peer) => {
                     self.add_status(format!("⏳ Оффлайн (MDNS): {}", &peer.to_string()[..8]));
@@ -562,10 +564,12 @@ impl eframe::App for App {
                 NetworkEvent::Connected(peer) => {
                     self.connected_peers += 1;
                     self.add_status(format!("✅ Подключено: {}...", &peer.to_string()[..8]));
-                    // Добавляем в список известных, если еще нет
-                    self.known_peers
-                        .entry(peer)
-                        .or_insert_with(|| format!("Peer_{}", &peer.to_string()[..4]));
+                    // Добавляем в список известных, если это не мы сами
+                    if peer != self.local_peer_id {
+                        self.known_peers
+                            .entry(peer)
+                            .or_insert_with(|| format!("Peer_{}", &peer.to_string()[..8]));
+                    }
                 }
                 NetworkEvent::Disconnected(peer) => {
                     self.connected_peers = self.connected_peers.saturating_sub(1);
@@ -577,7 +581,9 @@ impl eframe::App for App {
                 NetworkEvent::ChatMessage(msg) => {
                     // Update known peers for display names
                     if let Ok(peer_id) = msg.sender_id.parse::<PeerId>() {
-                        self.known_peers.insert(peer_id, msg.sender_name.clone());
+                        if peer_id != self.local_peer_id {
+                            self.known_peers.insert(peer_id, msg.sender_name.clone());
+                        }
                     }
 
                     // Route message
@@ -1059,7 +1065,7 @@ async fn main() -> Result<(), Box<dyn Error>> {
                         .unwrap(),
                     ping: ping::Behaviour::default(),
                     identify: identify::Behaviour::new(identify::Config::new(
-                        "/ipfs/id/1.0.0".into(),
+                        "/void/id/1.1.0".into(),
                         key.public(),
                     )),
                     kad,
@@ -1370,12 +1376,14 @@ async fn main() -> Result<(), Box<dyn Error>> {
                             println!("✅ СОЕДИНЕНО: {}. Endpoint: {:?}. В меше: {}", peer_id, endpoint, mesh_count);
                             pending_dials.remove(&peer_id);
 
-                            // Принудительно добавляем и подписываем (для надежности)
-                            swarm.behaviour_mut().gossipsub.add_explicit_peer(&peer_id);
-                            let topic = gossipsub::IdentTopic::new("void-chat-v1");
-                            let _ = swarm.behaviour_mut().gossipsub.subscribe(&topic);
+                            if peer_id != local_peer_id {
+                                // Принудительно добавляем и подписываем (для надежности)
+                                swarm.behaviour_mut().gossipsub.add_explicit_peer(&peer_id);
+                                let topic = gossipsub::IdentTopic::new("void-chat-v1");
+                                let _ = swarm.behaviour_mut().gossipsub.subscribe(&topic);
 
-                            let _ = event_tx.send(NetworkEvent::Connected(peer_id)).await;
+                                let _ = event_tx.send(NetworkEvent::Connected(peer_id)).await;
+                            }
                             let _ = event_tx.send(NetworkEvent::MeshPeers(mesh_count)).await;
                         }
                         SwarmEvent::ConnectionClosed { peer_id, cause, .. } => {
