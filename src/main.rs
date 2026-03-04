@@ -913,8 +913,8 @@ async fn main() -> Result<(), Box<dyn Error>> {
             let bat = format!(
                 "@echo off\r\n\
                  netsh advfirewall firewall delete rule name=\"VOID P2P\"\r\n\
-                 netsh advfirewall firewall add rule name=\"VOID P2P\" dir=in action=allow protocol=TCP localport=50001 profile=any enable=yes program=\"{}\"\r\n\
-                 netsh advfirewall firewall add rule name=\"VOID P2P\" dir=in action=allow protocol=UDP localport=50001 profile=any edge=yes enable=yes program=\"{}\"\r\n",
+                 netsh advfirewall firewall add rule name=\"VOID P2P\" dir=in action=allow protocol=TCP localport=50001 profile=any enable=yes program=\"\\\"{}\\\"\"\r\n\
+                 netsh advfirewall firewall add rule name=\"VOID P2P\" dir=in action=allow protocol=UDP localport=50001 profile=any edge=yes enable=yes program=\"\\\"{}\\\"\"\r\n",
                 exe, exe
             );
             let bat_path = std::env::temp_dir().join("void_p2p_firewall.bat");
@@ -1145,7 +1145,7 @@ async fn main() -> Result<(), Box<dyn Error>> {
                                 println!("[{}] 📤 UI_SEND: '{}' (To: {:?})", now, text, recipient);
                                 let msg = ChatMessage {
                                     sender_id: local_peer_id.to_string(),
-                                    sender_name,
+                                    sender_name: sender_name.clone(),
                                     recipient_id: recipient.map(|p| p.to_string()),
                                     text: text.clone(),
                                     timestamp: chrono::Local::now().format("%H:%M").to_string(),
@@ -1170,13 +1170,35 @@ async fn main() -> Result<(), Box<dyn Error>> {
 
                                 let final_json = serde_json::to_vec(&packet).unwrap();
 
-                                match swarm.behaviour_mut().gossipsub.publish(topic.clone(), final_json) {
-                                    Ok(id) => println!("[{}] ✅ Gossipsub: Опубликовано, ID: {:?}, Packet: {:?}", now, id, packet),
+                                match swarm.behaviour_mut().gossipsub.publish(topic.clone(), final_json.clone()) {
+                                    Ok(id) => println!("[{}] ✅ Gossipsub: Опубликовано, ID: {:?}", now, id),
                                     Err(e) => {
-                                        println!("[{}] ❌ Gossipsub ERROR: {:?}. Попытка добавить пиров принудительно...", now, e);
+                                        println!("[{}] ❌ Gossipsub ERROR: {:?}. Рефреш пиров...", now, e);
+                                        // Форсируем добавление всех подключенных
                                         let connected: Vec<_> = swarm.connected_peers().cloned().collect();
                                         for peer in connected {
                                             swarm.behaviour_mut().gossipsub.add_explicit_peer(&peer);
+                                        }
+                                        // Пробуем еще раз через секунду, если это была ошибка пустой подписки
+                                        // Важно: swarm не может быть перемещен, так как он используется дальше в цикле.
+                                        // Вместо этого, мы можем отправить команду на повторную публикацию через command_tx (clone).
+                                        // Однако, для простоты и избежания рефакторинга всего цикла,
+                                        // мы просто отправляем повторную команду в канал.
+                                        // Если меш пуст, то это может быть `NotSubscribed` или `NoMesh`
+                                        if swarm.behaviour().gossipsub.all_mesh_peers().count() == 0 {
+                                            println!("[{}] ⚠️ Gossipsub: Меш пуст, повторная попытка публикации через 1с...", now);
+                                            let command_tx_clone = command_tx_for_mdns.clone();
+                                            let sender_name_clone = sender_name.clone();
+                                            let text_clone = text.clone();
+                                            let recipient_clone = recipient;
+                                            tokio::spawn(async move {
+                                                tokio::time::sleep(Duration::from_secs(1)).await;
+                                                let _ = command_tx_clone.send(UICommand::SendMessage {
+                                                    sender_name: sender_name_clone,
+                                                    text: text_clone,
+                                                    recipient: recipient_clone,
+                                                }).await;
+                                            });
                                         }
                                     }
                                 }
@@ -1191,7 +1213,9 @@ async fn main() -> Result<(), Box<dyn Error>> {
                             let s = address.to_string();
                             if !s.contains("/ip6/") && !s.contains("/0.0.0.0") && !s.contains("/127.0.0.1") {
                                 println!("Слушаю: {}/p2p/{}", address, local_peer_id);
-                                let _ = event_tx.send(NetworkEvent::NewListenAddr(address)).await;
+                                let _ = event_tx.send(NetworkEvent::NewListenAddr(address.clone())).await;
+                                // Объявляем адрес внешним для лучшего дискавери
+                                swarm.add_external_address(address);
                             }
                         }
 
@@ -1199,6 +1223,14 @@ async fn main() -> Result<(), Box<dyn Error>> {
                             let mut to_dial: HashMap<PeerId, Vec<Multiaddr>> = HashMap::new();
                             for (peer_id, addr) in peers {
                                 if peer_id == local_peer_id { continue; }
+                                // Игнорируем QUIC и старые порты (64000) для стабильности
+                                let a_str = addr.to_string();
+                                if a_str.contains("quic") { continue; }
+                                if a_str.contains("/tcp/64000") {
+                                    println!("⚠️ mDNS: Пропускаю старый адрес {} (порт 64000)", peer_id);
+                                    continue;
+                                }
+
                                 println!("mDNS: найден {} на {}", peer_id, addr);
                                 let _ = event_tx.send(NetworkEvent::MdnsDiscovered(peer_id, addr.clone())).await;
                                 swarm.behaviour_mut().gossipsub.add_explicit_peer(&peer_id);
@@ -1328,7 +1360,8 @@ async fn main() -> Result<(), Box<dyn Error>> {
                                 peer_addrs.remove(&p);
                             }
                             let err_str = error.to_string();
-                            if !err_str.contains("HandshakeTimedOut") && !err_str.contains("Timeout") {
+                            // Игнорируем таймауты для старого порта 64000, чтобы не спамить UI
+                            if !err_str.contains("HandshakeTimedOut") && !err_str.contains("Timeout") && !err_str.contains("64000") {
                                 let _ = event_tx.send(NetworkEvent::Status(
                                     format!("❌ Не удалось подключиться к {}: {}", peer_str, error)
                                 )).await;
