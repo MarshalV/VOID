@@ -993,16 +993,15 @@ async fn main() -> Result<(), Box<dyn Error>> {
         let mut sessions: HashMap<PeerId, crypto::SecureSession> = HashMap::new();
         let my_public_key = crypto::PublicKey::from(&local_static);
 
-        // Swarm: TCP + QUIC (UDP) + noise + yamux
+        // Swarm: TCP + noise + yamux (QUIC временно отключен для стабильности на Windows)
         let mut swarm = libp2p::SwarmBuilder::with_existing_identity(local_key.clone())
             .with_tokio()
             .with_tcp(
-                tcp::Config::default(),
+                tcp::Config::default().nodelay(true),
                 noise::Config::new,
                 yamux::Config::default,
             )
             .unwrap()
-            .with_quic()
             .with_behaviour(|key| {
                 let local_peer_id = key.public().to_peer_id();
 
@@ -1035,8 +1034,8 @@ async fn main() -> Result<(), Box<dyn Error>> {
             })
             .unwrap()
             .with_swarm_config(|c| {
-                c.with_idle_connection_timeout(Duration::from_secs(60))
-                    .with_per_connection_event_buffer_size(64)
+                c.with_idle_connection_timeout(Duration::from_secs(30))
+                    .with_per_connection_event_buffer_size(256)
             })
             .build();
 
@@ -1044,20 +1043,13 @@ async fn main() -> Result<(), Box<dyn Error>> {
         let topic = gossipsub::IdentTopic::new("void-chat-v1");
         swarm.behaviour_mut().gossipsub.subscribe(&topic).unwrap();
 
-        // Слушаем TCP и QUIC (UDP). Сначала пробуем 64000, если занято - берем любой свободный.
+        // Слушаем TCP. Сначала пробуем 64000, если занято - берем любой свободный.
         let tcp_addr: Multiaddr = "/ip4/0.0.0.0/tcp/64000".parse().unwrap();
-        let quic_addr: Multiaddr = "/ip4/0.0.0.0/udp/64000/quic-v1".parse().unwrap();
 
         if let Err(e) = swarm.listen_on(tcp_addr.clone()) {
             println!("⚠️ TCP порт 64000 занят ({:?}), пробую случайный...", e);
             swarm
                 .listen_on("/ip4/0.0.0.0/tcp/0".parse().unwrap())
-                .unwrap();
-        }
-        if let Err(e) = swarm.listen_on(quic_addr.clone()) {
-            println!("⚠️ QUIC порт 64000 занят ({:?}), пробую случайный...", e);
-            swarm
-                .listen_on("/ip4/0.0.0.0/udp/0/quic-v1".parse().unwrap())
                 .unwrap();
         }
 
@@ -1233,6 +1225,7 @@ async fn main() -> Result<(), Box<dyn Error>> {
                                 tokio::spawn(async move {
                                     tokio::time::sleep(Duration::from_millis(delay_ms)).await;
                                     let type_str = if is_leader { "Leader" } else { "Follower" };
+                                    // Ослабляем спам, отправляем только если еще не подключены
                                     let _ = tx.send(NetworkEvent::Status(
                                         format!("🔄 [{}] Попытка соединения с {}...", type_str, &peer_id.to_string()[..8])
                                     )).await;
