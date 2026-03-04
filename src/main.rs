@@ -1033,10 +1033,10 @@ async fn main() -> Result<(), Box<dyn Error>> {
                 let kad_store = kad::store::MemoryStore::new(local_peer_id);
                 let mut kad = kad::Behaviour::new(local_peer_id, kad_store);
 
-                // Добавляем бутстрап-ноды IPFS (надежные)
+                // Добавляем бутстрап-ноды IPFS (прямые IP для обхода DNS ошибок)
                 let bootstrap = [
-                    "/dnsaddr/bootstrap.libp2p.io/p2p/QmNnoo2uR3GuwhvBqyM4tTDp6NoS7wB9G9o9wE5pS9Y6mY",
-                    "/dnsaddr/bootstrap.libp2p.io/p2p/QmQCU2EcSTwsrmMvFUXS7uK9z1V64p9C8ndn4y2K8w8f3z",
+                    "/ip4/147.75.109.213/tcp/4001/p2p/QmNnoo2uR3GuwhvBqyM4tTDp6NoS7wB9G9o9wE5pS9Y6mY",
+                    "/ip4/147.75.101.139/tcp/4001/p2p/QmQCU2EcSTwsrmMvFUXS7uK9z1V64p9C8ndn4y2K8w8f3z",
                 ];
                 for addr in bootstrap {
                     if let Ok(ma) = addr.parse::<Multiaddr>() {
@@ -1117,6 +1117,17 @@ async fn main() -> Result<(), Box<dyn Error>> {
                 }
                 _ = mesh_check.tick() => {
                     let mesh = swarm.behaviour().gossipsub.all_mesh_peers().count();
+
+                    // Если меш пуст, пробуем форсировать подключение ко всем известным пирам
+                    if mesh == 0 {
+                        let connected: Vec<PeerId> = swarm.connected_peers().cloned().collect();
+                        if !connected.is_empty() {
+                            for peer_id in connected {
+                                swarm.behaviour_mut().gossipsub.add_explicit_peer(&peer_id);
+                            }
+                        }
+                    }
+
                     let _ = event_tx.send(NetworkEvent::MeshPeers(mesh)).await;
                 }
                 cmd = command_rx.recv() => {
@@ -1391,8 +1402,14 @@ async fn main() -> Result<(), Box<dyn Error>> {
                                 .unwrap_or_else(|| "?".into());
 
                             let err_str = error.to_string();
-                            // Игнорируем технический шум и старые порты
-                            if !err_str.contains("64000") && !err_str.contains("HandshakeTimedOut") && !err_str.contains("Timeout") {
+                            // Игнорируем технический шум (DNS, Handshake, Timeout)
+                            let is_noise = err_str.contains("64000") ||
+                                          err_str.contains("HandshakeTimedOut") ||
+                                          err_str.contains("Timeout") ||
+                                          err_str.contains("No Matching Records Found") ||
+                                          err_str.contains("ResolveError");
+
+                            if !is_noise {
                                 println!("❌ ОШИБКА ИСХОДЯЩЕГО СОЕДИНЕНИЯ (peer: {}): {:?}", peer_str, error);
                                 let _ = event_tx.send(NetworkEvent::Status(
                                     format!("❌ Не удалось подключиться к {}: {}", peer_str, error)
