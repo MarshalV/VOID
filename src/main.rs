@@ -867,7 +867,7 @@ async fn main() -> Result<(), Box<dyn Error>> {
             .unwrap_or(false);
 
         if is_admin {
-            println!("Настраиваю файрвол Windows...");
+            println!("Настраиваю файрвол Windows (Admin Mode)...");
             let _ = std::process::Command::new("netsh")
                 .args(["advfirewall", "firewall", "delete", "rule", "name=VOID P2P"])
                 .output();
@@ -881,9 +881,10 @@ async fn main() -> Result<(), Box<dyn Error>> {
                     "dir=in",
                     "action=allow",
                     "protocol=TCP",
-                    "localport=64000",
+                    "localport=50001",
                     "profile=any",
                     "enable=yes",
+                    &format!("program=\"{}\"", exe),
                 ])
                 .output();
             let udp_r = std::process::Command::new("netsh")
@@ -896,10 +897,11 @@ async fn main() -> Result<(), Box<dyn Error>> {
                     "dir=in",
                     "action=allow",
                     "protocol=UDP",
-                    "localport=64000",
+                    "localport=50001",
                     "profile=any",
                     "edge=yes",
                     "enable=yes",
+                    &format!("program=\"{}\"", exe),
                 ])
                 .output();
             match (tcp_r, udp_r) {
@@ -1186,13 +1188,13 @@ async fn main() -> Result<(), Box<dyn Error>> {
                                         // мы просто отправляем повторную команду в канал.
                                         // Если меш пуст, то это может быть `NotSubscribed` или `NoMesh`
                                         if swarm.behaviour().gossipsub.all_mesh_peers().count() == 0 {
-                                            println!("[{}] ⚠️ Gossipsub: Меш пуст, повторная попытка публикации через 1с...", now);
+                                            println!("[{}] ⚠️ Gossipsub: Меш пуст, повтор будет через 2с (лимит 1 раз)...", now);
                                             let command_tx_clone = command_tx_for_mdns.clone();
                                             let sender_name_clone = sender_name.clone();
                                             let text_clone = text.clone();
                                             let recipient_clone = recipient;
                                             tokio::spawn(async move {
-                                                tokio::time::sleep(Duration::from_secs(1)).await;
+                                                tokio::time::sleep(Duration::from_secs(2)).await;
                                                 let _ = command_tx_clone.send(UICommand::SendMessage {
                                                     sender_name: sender_name_clone,
                                                     text: text_clone,
@@ -1223,11 +1225,15 @@ async fn main() -> Result<(), Box<dyn Error>> {
                             let mut to_dial: HashMap<PeerId, Vec<Multiaddr>> = HashMap::new();
                             for (peer_id, addr) in peers {
                                 if peer_id == local_peer_id { continue; }
-                                // Игнорируем QUIC и старые порты (64000) для стабильности
                                 let a_str = addr.to_string();
+
+                                // Профилактическая чистка: если мы видим этого пира, удаляем старые записи 64000 из его кэша
+                                let p_addrs = peer_addrs.entry(peer_id).or_default();
+                                p_addrs.retain(|a| !a.to_string().contains(":64000") && !a.to_string().contains("/64000"));
+
+                                // Игнорируем QUIC и старые порты (64000) для стабильности
                                 if a_str.contains("quic") { continue; }
                                 if a_str.contains("/tcp/64000") {
-                                    println!("⚠️ mDNS: Пропускаю старый адрес {} (порт 64000)", peer_id);
                                     continue;
                                 }
 
@@ -1354,17 +1360,18 @@ async fn main() -> Result<(), Box<dyn Error>> {
                             let peer_str = peer_id
                                 .map(|p| format!("{}...", &p.to_string()[..8]))
                                 .unwrap_or_else(|| "?".into());
-                            println!("❌ ОШИБКА ИСХОДЯЩЕГО СОЕДИНЕНИЯ (peer: {}): {:?}", peer_str, error);
-                            if let Some(p) = peer_id {
-                                pending_dials.remove(&p);
-                                peer_addrs.remove(&p);
-                            }
+
                             let err_str = error.to_string();
-                            // Игнорируем таймауты для старого порта 64000, чтобы не спамить UI
-                            if !err_str.contains("HandshakeTimedOut") && !err_str.contains("Timeout") && !err_str.contains("64000") {
+                            // Игнорируем технический шум и старые порты
+                            if !err_str.contains("64000") && !err_str.contains("HandshakeTimedOut") && !err_str.contains("Timeout") {
+                                println!("❌ ОШИБКА ИСХОДЯЩЕГО СОЕДИНЕНИЯ (peer: {}): {:?}", peer_str, error);
                                 let _ = event_tx.send(NetworkEvent::Status(
                                     format!("❌ Не удалось подключиться к {}: {}", peer_str, error)
                                 )).await;
+                            }
+
+                            if let Some(p) = peer_id {
+                                pending_dials.remove(&p);
                             }
                         }
                         SwarmEvent::IncomingConnectionError { error, .. } => {
@@ -1388,7 +1395,15 @@ async fn main() -> Result<(), Box<dyn Error>> {
                             println!("🆔 Identify: Отправлена информация пиру {}", peer_id);
                         }
                         SwarmEvent::Behaviour(ChatBehaviourEvent::Identify(identify::Event::Error { peer_id, error, .. })) => {
-                            println!("🆔 Identify: Ошибка с пиром {}: {:?}", peer_id, error);
+                            let err_str = error.to_string();
+                            if err_str.contains("NegotiationFailed") {
+                                println!("⚠️ [КРИТИЧНО] Identify: Ошибка согласования протоколов с {}. Скорее всего, ПИР ИСПОЛЬЗУЕТ СТАРУЮ ВЕРСИЮ приложения!", peer_id);
+                                let _ = event_tx.send(NetworkEvent::Status(
+                                    format!("⚠️ ПРЕДУПРЕЖДЕНИЕ: Пир {}... имеет несовместимую версию!", &peer_id.to_string()[..8])
+                                )).await;
+                            } else {
+                                println!("🆔 Identify: Ошибка с пиром {}: {:?}", peer_id, error);
+                            }
                         }
 
                         _ => {}
