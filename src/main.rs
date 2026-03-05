@@ -536,6 +536,7 @@ fn setup_custom_style(ctx: &egui::Context) {
 
 impl eframe::App for App {
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
+        self.known_peers.remove(&self.local_peer_id);
         while let Ok(event) = self.event_rx.try_recv() {
             match event {
                 NetworkEvent::NewListenAddr(addr) => {
@@ -1394,7 +1395,7 @@ async fn main() -> Result<(), Box<dyn Error>> {
                         }
                         SwarmEvent::IncomingConnection { local_addr, send_back_addr, .. } => {
                             let s_addr = send_back_addr.to_string();
-                            if s_addr.contains("64000") {
+                            if s_addr.contains("64000") || s_addr.contains(":64000") {
                                 println!("⚠️ [ВНИМАНИЕ] Входящее от СТАРОЙ ВЕРСИИ (порт 64000): from {:?}. Ожидайте ошибку Identify.", send_back_addr);
                                 let _ = event_tx.send(NetworkEvent::Status(
                                     "⚠️ ВНИМАНИЕ: Подключился старый пир. Сообщения НЕ БУДУТ работать до его обновления!".into()
@@ -1456,7 +1457,8 @@ async fn main() -> Result<(), Box<dyn Error>> {
                         }
                         SwarmEvent::Behaviour(ChatBehaviourEvent::Identify(identify::Event::Error { peer_id, error, .. })) => {
                             let err_str = error.to_string();
-                            if err_str.contains("NegotiationFailed") {
+                            let err_lower = error.to_string().to_lowercase();
+                            if err_lower.contains("negotiat") || err_lower.contains("failed to negotiate") || err_lower.contains("support") {
                                 println!("❌ [КРИТИЧНО] Identify: Несовпадение версий с {}.", peer_id);
                                 println!("🔥 Срочно ОБНОВИТЕ другое приложение и ЗАКРОЙТЕ старые процессы!");
                                 let _ = event_tx.send(NetworkEvent::Status(
@@ -1478,7 +1480,7 @@ async fn main() -> Result<(), Box<dyn Error>> {
     });
 
     eframe::run_native(
-        "VOID P2P Chat",
+        &format!("VOID Chat [{}]", local_peer_id.to_string()[..8].to_string()),
         eframe::NativeOptions::default(),
         Box::new(move |cc| {
             Ok(Box::new(App::new(
