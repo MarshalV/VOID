@@ -1044,8 +1044,17 @@ async fn main() -> Result<(), Box<dyn Error>> {
 
                 // Добавляем бутстрап-ноды IPFS (прямые IP для обхода DNS ошибок)
                 let bootstrap = [
+                    "/ip4/104.131.131.82/tcp/4001/p2p/QmaCpDMGvLcZunBNqv9U7Z8hSAt79S9JcyG316w8nL62m9",
                     "/ip4/147.75.109.213/tcp/4001/p2p/QmNnoo2uR3GuwhvBqyM4tTDp6NoS7wB9G9o9wE5pS9Y6mY",
                     "/ip4/147.75.101.139/tcp/4001/p2p/QmQCU2EcSTwsrmMvFUXS7uK9z1V64p9C8ndn4y2K8w8f3z",
+                    "/ip4/147.75.83.83/tcp/4001/p2p/QmbLHAnMo9UFwv9V9QdfyLc4Dn91S2AnkL8Vat4DTHiV4f",
+                    "/ip4/147.75.77.187/tcp/4001/p2p/QmNQP97ZByia9h9YFmbSNoBeC7pQYQSpN1C8S2B75SXC6u",
+                    // Дополнительные бутстрап-ноды
+                    "/dnsaddr/bootstrap.libp2p.io/p2p/QmNnoo2uR3GuwhvBqyM4tTDp6NoS7wB9G9o9wE5pS9Y6mY",
+                    "/dnsaddr/bootstrap.libp2p.io/p2p/QmQCU2EcSTwsrmMvFUXS7uK9z1V64p9C8ndn4y2K8w8f3z",
+                    "/dnsaddr/bootstrap.libp2p.io/p2p/QmbLHAnMo9UFwv9V9QdfyLc4Dn91S2AnkL8Vat4DTHiV4f",
+                    "/dnsaddr/bootstrap.libp2p.io/p2p/QmNZgLzNf1K17y2g3Y2y2y2y2y2y2y2y2y2y2y2y2y2y2",
+                    "/dnsaddr/bootstrap.libp2p.io/p2p/QmcZf59cGBK9f33B2y2y2y2y2y2y2y2y2y2y2y2y2y2y2",
                 ];
                 for addr in bootstrap {
                     if let Ok(ma) = addr.parse::<Multiaddr>() {
@@ -1176,8 +1185,8 @@ async fn main() -> Result<(), Box<dyn Error>> {
                                  }
 
                                   let opts = DialOpts::peer_id(peer_id)
-                                     .condition(libp2p::swarm::dial_opts::PeerCondition::Disconnected)
-                                     .addresses(addrs.to_vec())
+                                     .condition(libp2p::swarm::dial_opts::PeerCondition::DisconnectedAndNotDialing)
+                                     .addresses(addrs)
                                      .build();
 
                                  if let Err(e) = swarm.dial(opts) {
@@ -1268,30 +1277,28 @@ async fn main() -> Result<(), Box<dyn Error>> {
                             }
                         }
 
-                        SwarmEvent::Behaviour(ChatBehaviourEvent::Mdns(mdns::Event::Discovered(peers))) => {
+                        SwarmEvent::Behaviour(ChatBehaviourEvent::Mdns(mdns::Event::Discovered(list))) => {
                             let mut to_dial: HashMap<PeerId, Vec<Multiaddr>> = HashMap::new();
-                            for (peer_id, addr) in peers {
+                            for (peer_id, addr) in list {
                                 if peer_id == local_peer_id { continue; }
-                                let a_str = addr.to_string();
+                                if addr.to_string().contains("127.0.0.1") || addr.to_string().contains("::1") { continue; }
+                                if pending_dials.contains(&peer_id) { continue; }
 
-                                // Профилактическая чистка: если мы видим этого пира, удаляем старые записи 64000 из его кэша
-                                let p_addrs = peer_addrs.entry(peer_id).or_default();
-                                p_addrs.retain(|a| !a.to_string().contains(":64000") && !a.to_string().contains("/64000"));
-
-                                // Игнорируем QUIC и старые порты (64000) для стабильности
-                                if a_str.contains("quic") { continue; }
-                                if a_str.contains("/tcp/64000") {
-                                    continue;
+                                // Проверяем, не подключены ли мы уже
+                                let mut is_connected = false;
+                                for p in swarm.connected_peers() {
+                                    if p == &peer_id {
+                                        is_connected = true;
+                                        break;
+                                    }
                                 }
+                                if is_connected { continue; }
 
-                                println!("mDNS: найден {} на {}", peer_id, addr);
-                                let _ = event_tx.send(NetworkEvent::MdnsDiscovered(peer_id, addr.clone())).await;
-                                swarm.behaviour_mut().gossipsub.add_explicit_peer(&peer_id);
-                                if swarm.is_connected(&peer_id) || pending_dials.contains(&peer_id) {
-                                    continue;
-                                }
-                                to_dial.entry(peer_id).or_default().push(addr);
-                            }
+                                 println!("mDNS: найден {} на {}", peer_id, addr);
+                                 let _ = event_tx.send(NetworkEvent::MdnsDiscovered(peer_id, addr.clone())).await;
+                                 swarm.behaviour_mut().gossipsub.add_explicit_peer(&peer_id);
+                                 to_dial.entry(peer_id).or_default().push(addr);
+                             }
 
                              for (peer_id, addrs) in to_dial {
                                  let all_addrs = peer_addrs.entry(peer_id).or_default();
@@ -1301,13 +1308,17 @@ async fn main() -> Result<(), Box<dyn Error>> {
                                      }
                                  }
 
+                                 let is_leader = local_peer_id > peer_id;
+                                 let delay_ms = if is_leader { 500 } else { 8000 };
+
                                  pending_dials.insert(peer_id);
                                  let cmd_tx2 = command_tx_for_mdns.clone();
                                  let dial_addrs = all_addrs.clone();
 
                                  tokio::spawn(async move {
-                                     // Упрощаем задержку: 2 секунды для всех, чтобы избежать коллизий
-                                     tokio::time::sleep(Duration::from_secs(2)).await;
+                                     let type_str = if is_leader { "Leader" } else { "Follower" };
+                                     println!("mDNS: Dialing {} ({} delay: {}ms)", &peer_id.to_string()[..8], type_str, delay_ms);
+                                     tokio::time::sleep(Duration::from_millis(delay_ms)).await;
                                      let _ = cmd_tx2.send(UICommand::DialPeer(peer_id, dial_addrs)).await;
                                  });
                              }
@@ -1423,8 +1434,8 @@ async fn main() -> Result<(), Box<dyn Error>> {
                                 .unwrap_or_else(|| "?".into());
 
                              let err_str = error.to_string();
-                             // Показываем ВСЕ ошибки, кроме 64000 (старые версии), чтобы понять причину
-                             let is_noise = err_str.contains("64000");
+                             // Показываем важные ошибки. 64000 (старые версии) и 10048 (AddrInUse на Windows) игнорируем как технические
+                             let is_noise = err_str.contains("64000") || err_str.contains("10048");
 
                              if !is_noise {
                                  println!("❌ ОШИБКА ИСХОДЯЩЕГО СОЕДИНЕНИЯ (peer: {}): {:?}", peer_str, error);
