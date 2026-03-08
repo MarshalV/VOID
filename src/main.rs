@@ -1327,15 +1327,18 @@ async fn main() -> Result<(), Box<dyn Error>> {
                                     V1Packet::Hello { public_key } => {
                                         if let Some(src) = message.source {
                                             if src != local_peer_id {
+                                                let session_exists = sessions.contains_key(&src);
                                                 println!("[{}] 🤝 E2EE: Получен Hello от {}. Создаю сессию.", now, &src.to_string()[..8]);
                                                 let remote_key = crypto::PublicKey::from(public_key);
                                                 let session = crypto::SecureSession::new_responder(&local_static, &remote_key);
                                                 sessions.insert(src, session);
 
-                                                // Отвечаем своим Hello, если сессии с ним еще не было
-                                                let my_hello = V1Packet::Hello { public_key: my_public_key.to_bytes() };
-                                                let h_json = serde_json::to_vec(&my_hello).unwrap();
-                                                let _ = swarm.behaviour_mut().gossipsub.publish(topic.clone(), h_json);
+                                                // Отвечаем своим Hello только если сессии с ним еще не было
+                                                if !session_exists {
+                                                    let my_hello = V1Packet::Hello { public_key: my_public_key.to_bytes() };
+                                                    let h_json = serde_json::to_vec(&my_hello).unwrap();
+                                                    let _ = swarm.behaviour_mut().gossipsub.publish(topic.clone(), h_json);
+                                                }
                                             }
                                         }
                                     }
