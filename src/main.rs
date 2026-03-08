@@ -1171,12 +1171,13 @@ async fn main() -> Result<(), Box<dyn Error>> {
                                  println!("🔌 UI_COMMAND: DialPeer {} ({} addresses)", short, addrs.len());
 
                                  // Добавляем адреса в Kad перед дозвоном
-                                 for addr in addrs {
-                                     swarm.behaviour_mut().kad.add_address(&peer_id, addr);
+                                 for addr in &addrs {
+                                     swarm.behaviour_mut().kad.add_address(&peer_id, addr.clone());
                                  }
 
-                                 let opts = DialOpts::peer_id(peer_id)
-                                     .condition(libp2p::swarm::dial_opts::PeerCondition::DisconnectedAndNotDialing)
+                                  let opts = DialOpts::peer_id(peer_id)
+                                     .condition(libp2p::swarm::dial_opts::PeerCondition::Disconnected)
+                                     .addresses(addrs.to_vec())
                                      .build();
 
                                  if let Err(e) = swarm.dial(opts) {
@@ -1184,7 +1185,7 @@ async fn main() -> Result<(), Box<dyn Error>> {
                                       if !err_str.contains("Condition") {
                                           println!("❌ Dial ERROR для {}: {:?}", short, e);
                                       }
-                                      pending_dials.remove(&peer_id); // Remove immediately if dial attempt failed to start
+                                      pending_dials.remove(&peer_id);
                                  }
                              }
                             UICommand::SendMessage { sender_name, text, recipient, is_retry } => {
@@ -1292,31 +1293,24 @@ async fn main() -> Result<(), Box<dyn Error>> {
                                 to_dial.entry(peer_id).or_default().push(addr);
                             }
 
-                            for (peer_id, addrs) in to_dial {
-                                let all_addrs = peer_addrs.entry(peer_id).or_default();
-                                for a in &addrs {
-                                    if !all_addrs.contains(a) {
-                                        all_addrs.push(a.clone());
-                                    }
-                                }
+                             for (peer_id, addrs) in to_dial {
+                                 let all_addrs = peer_addrs.entry(peer_id).or_default();
+                                 for a in &addrs {
+                                     if !all_addrs.contains(a) {
+                                         all_addrs.push(a.clone());
+                                     }
+                                 }
 
-                                let is_leader = local_peer_id.to_string() < peer_id.to_string();
-                                let delay_ms = if is_leader { 500 } else { 10000 };
+                                 pending_dials.insert(peer_id);
+                                 let cmd_tx2 = command_tx_for_mdns.clone();
+                                 let dial_addrs = all_addrs.clone();
 
-                                pending_dials.insert(peer_id);
-                                let cmd_tx2 = command_tx_for_mdns.clone();
-                                let dial_addrs = all_addrs.clone();
-                                let tx = event_tx.clone();
-                                tokio::spawn(async move {
-                                    tokio::time::sleep(Duration::from_millis(delay_ms)).await;
-                                    let type_str = if is_leader { "Leader" } else { "Follower" };
-                                    // Ослабляем спам, отправляем только если еще не подключены
-                                    let _ = tx.send(NetworkEvent::Status(
-                                        format!("🔄 [{}] Попытка соединения с {}...", type_str, &peer_id.to_string()[..8])
-                                    )).await;
-                                    let _ = cmd_tx2.send(UICommand::DialPeer(peer_id, dial_addrs)).await;
-                                });
-                            }
+                                 tokio::spawn(async move {
+                                     // Упрощаем задержку: 2 секунды для всех, чтобы избежать коллизий
+                                     tokio::time::sleep(Duration::from_secs(2)).await;
+                                     let _ = cmd_tx2.send(UICommand::DialPeer(peer_id, dial_addrs)).await;
+                                 });
+                             }
                         }
                         SwarmEvent::Behaviour(ChatBehaviourEvent::Mdns(mdns::Event::Expired(peers))) => {
                             for (peer_id, _) in peers {
@@ -1428,20 +1422,16 @@ async fn main() -> Result<(), Box<dyn Error>> {
                                 .map(|p| format!("{}...", &p.to_string()[..8]))
                                 .unwrap_or_else(|| "?".into());
 
-                            let err_str = error.to_string();
-                            // Игнорируем технический шум (DNS, Handshake, Timeout)
-                            let is_noise = err_str.contains("64000") ||
-                                          err_str.contains("HandshakeTimedOut") ||
-                                          err_str.contains("Timeout") ||
-                                          err_str.contains("No Matching Records Found") ||
-                                          err_str.contains("ResolveError");
+                             let err_str = error.to_string();
+                             // Показываем ВСЕ ошибки, кроме 64000 (старые версии), чтобы понять причину
+                             let is_noise = err_str.contains("64000");
 
-                            if !is_noise {
-                                println!("❌ ОШИБКА ИСХОДЯЩЕГО СОЕДИНЕНИЯ (peer: {}): {:?}", peer_str, error);
-                                let _ = event_tx.send(NetworkEvent::Status(
-                                    format!("❌ Не удалось подключиться к {}: {}", peer_str, error)
-                                )).await;
-                            }
+                             if !is_noise {
+                                 println!("❌ ОШИБКА ИСХОДЯЩЕГО СОЕДИНЕНИЯ (peer: {}): {:?}", peer_str, error);
+                                 let _ = event_tx.send(NetworkEvent::Status(
+                                     format!("❌ Ошибка подключения к {}: {}", peer_str, error)
+                                 )).await;
+                             }
 
                             if let Some(p) = peer_id {
                                 pending_dials.remove(&p);
