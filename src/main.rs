@@ -1180,7 +1180,11 @@ async fn main() -> Result<(), Box<dyn Error>> {
                                      .build();
 
                                  if let Err(e) = swarm.dial(opts) {
-                                      println!("❌ Dial ERROR для {}: {:?}", short, e);
+                                      let err_str = format!("{:?}", e);
+                                      if !err_str.contains("Condition") {
+                                          println!("❌ Dial ERROR для {}: {:?}", short, e);
+                                      }
+                                      pending_dials.remove(&peer_id); // Remove immediately if dial attempt failed to start
                                  }
                              }
                             UICommand::SendMessage { sender_name, text, recipient, is_retry } => {
@@ -1326,11 +1330,19 @@ async fn main() -> Result<(), Box<dyn Error>> {
                                 match packet {
                                     V1Packet::Hello { public_key } => {
                                         if let Some(src) = message.source {
-                                            if src != local_peer_id {
+                                             if src != local_peer_id {
                                                 let session_exists = sessions.contains_key(&src);
-                                                println!("[{}] 🤝 E2EE: Получен Hello от {}. Создаю сессию.", now, &src.to_string()[..8]);
+                                                let is_initiator = local_peer_id < src;
+                                                let role_str = if is_initiator { "Initiator" } else { "Responder" };
+
+                                                println!("[{}] 🤝 E2EE: Получен Hello от {}. Роль: {}. Создаю сессию.", now, &src.to_string()[..8], role_str);
+
                                                 let remote_key = crypto::PublicKey::from(public_key);
-                                                let session = crypto::SecureSession::new_responder(&local_static, &remote_key);
+                                                let session = if is_initiator {
+                                                    crypto::SecureSession::new_initiator(&local_static, &remote_key)
+                                                } else {
+                                                    crypto::SecureSession::new_responder(&local_static, &remote_key)
+                                                };
                                                 sessions.insert(src, session);
 
                                                 // Отвечаем своим Hello только если сессии с ним еще не было
