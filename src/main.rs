@@ -155,6 +155,7 @@ enum UICommand {
         sender_name: String,
         text: String,
         recipient: Option<PeerId>,
+        is_retry: bool,
     },
 }
 
@@ -845,6 +846,7 @@ impl eframe::App for App {
                                                     sender_name: self.local_nickname.clone(),
                                                     text: self.chat_input.clone(),
                                                     recipient,
+                                                    is_retry: false,
                                                 });
                                             self.chat_input.clear();
                                         }
@@ -1181,7 +1183,7 @@ async fn main() -> Result<(), Box<dyn Error>> {
                                       println!("❌ Dial ERROR для {}: {:?}", short, e);
                                  }
                              }
-                            UICommand::SendMessage { sender_name, text, recipient } => {
+                            UICommand::SendMessage { sender_name, text, recipient, is_retry } => {
                                 let now = chrono::Local::now().format("%H:%M:%S").to_string();
                                 println!("[{}] 📤 UI_SEND: '{}' (To: {:?})", now, text, recipient);
                                 let msg = ChatMessage {
@@ -1226,7 +1228,7 @@ async fn main() -> Result<(), Box<dyn Error>> {
                                         // Однако, для простоты и избежания рефакторинга всего цикла,
                                         // мы просто отправляем повторную команду в канал.
                                         // Если меш пуст, то это может быть `NotSubscribed` или `NoMesh`
-                                        if swarm.behaviour().gossipsub.all_mesh_peers().count() == 0 {
+                                        if !is_retry && swarm.behaviour().gossipsub.all_mesh_peers().count() == 0 {
                                             println!("[{}] ⚠️ Gossipsub: Меш пуст, повтор будет через 2с (лимит 1 раз)...", now);
                                             let command_tx_clone = command_tx_for_mdns.clone();
                                             let sender_name_clone = sender_name.clone();
@@ -1238,6 +1240,7 @@ async fn main() -> Result<(), Box<dyn Error>> {
                                                     sender_name: sender_name_clone,
                                                     text: text_clone,
                                                     recipient: recipient_clone,
+                                                    is_retry: true,
                                                 }).await;
                                             });
                                         }
