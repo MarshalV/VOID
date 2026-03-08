@@ -1132,7 +1132,7 @@ async fn main() -> Result<(), Box<dyn Error>> {
                     if let Ok(json) = serde_json::to_vec(&hello) {
                         let _ = swarm.behaviour_mut().gossipsub.publish(topic.clone(), json);
                     }
-                }
+                },
                 _ = mesh_check.tick() => {
                     let mesh = swarm.behaviour().gossipsub.all_mesh_peers().count();
 
@@ -1147,7 +1147,7 @@ async fn main() -> Result<(), Box<dyn Error>> {
                     }
 
                     let _ = event_tx.send(NetworkEvent::MeshPeers(mesh)).await;
-                }
+                },
                 cmd = command_rx.recv() => {
                     if let Some(c) = cmd {
                         match c {
@@ -1179,9 +1179,12 @@ async fn main() -> Result<(), Box<dyn Error>> {
                                  let short = &peer_id.to_string()[..16];
                                  println!("🔌 UI_COMMAND: DialPeer {} ({} addresses)", short, addrs.len());
 
-                                 // Добавляем адреса в Kad перед дозвоном
+                                 // Добавляем только не-loopback адреса в Kad
                                  for addr in &addrs {
-                                     swarm.behaviour_mut().kad.add_address(&peer_id, addr.clone());
+                                     let s = addr.to_string();
+                                     if !s.contains("127.0.0.1") && !s.contains("::1") {
+                                         swarm.behaviour_mut().kad.add_address(&peer_id, addr.clone());
+                                     }
                                  }
 
                                   let opts = DialOpts::peer_id(peer_id)
@@ -1278,7 +1281,7 @@ async fn main() -> Result<(), Box<dyn Error>> {
                         }
 
                         SwarmEvent::Behaviour(ChatBehaviourEvent::Mdns(mdns::Event::Discovered(list))) => {
-                            let mut to_dial: HashMap<PeerId, Vec<Multiaddr>> = HashMap::new();
+                            let mut to_dial: std::collections::HashMap<libp2p::PeerId, Vec<libp2p::Multiaddr>> = std::collections::HashMap::new();
                             for (peer_id, addr) in list {
                                 if peer_id == local_peer_id { continue; }
                                 if addr.to_string().contains("127.0.0.1") || addr.to_string().contains("::1") { continue; }
@@ -1394,22 +1397,21 @@ async fn main() -> Result<(), Box<dyn Error>> {
                         SwarmEvent::Behaviour(ChatBehaviourEvent::Gossipsub(gossipsub::Event::Unsubscribed { peer_id, topic })) => {
                             println!("📡 Gossipsub: {}... ОТПИСАЛСЯ от топика ({})", &peer_id.to_string()[..8], topic);
                         }
-
                         SwarmEvent::ConnectionEstablished { peer_id, endpoint, .. } => {
                             let mesh_count = swarm.behaviour().gossipsub.all_mesh_peers().count();
                             println!("✅ СОЕДИНЕНО: {}. Endpoint: {:?}. В меше: {}", peer_id, endpoint, mesh_count);
                             pending_dials.remove(&peer_id);
 
-                            if peer_id != local_peer_id {
-                                // Принудительно добавляем и подписываем (для надежности)
-                                swarm.behaviour_mut().gossipsub.add_explicit_peer(&peer_id);
-                                let topic = gossipsub::IdentTopic::new("void-chat-v1");
-                                let _ = swarm.behaviour_mut().gossipsub.subscribe(&topic);
+                             if peer_id != local_peer_id {
+                                 // Принудительно добавляем и подписываем (для надежности)
+                                 swarm.behaviour_mut().gossipsub.add_explicit_peer(&peer_id);
+                                 let topic = gossipsub::IdentTopic::new("void-chat-v1");
+                                 let _ = swarm.behaviour_mut().gossipsub.subscribe(&topic);
 
-                                let _ = event_tx.send(NetworkEvent::Connected(peer_id)).await;
-                            }
-                            let _ = event_tx.send(NetworkEvent::MeshPeers(mesh_count)).await;
-                        }
+                                 let _ = event_tx.send(NetworkEvent::Connected(peer_id)).await;
+                             }
+                             let _ = event_tx.send(NetworkEvent::MeshPeers(mesh_count)).await;
+                        },
                         SwarmEvent::ConnectionClosed { peer_id, cause, .. } => {
                             let mesh = swarm.behaviour().gossipsub.all_mesh_peers().count();
                             println!("❌ СОЕДИНЕНИЕ ЗАКРЫТО: {}. Причина: {:?}", peer_id, cause);
@@ -1426,7 +1428,7 @@ async fn main() -> Result<(), Box<dyn Error>> {
                             } else {
                                 println!("📥 Входящее соединение: from {:?} to {:?}", send_back_addr, local_addr);
                             }
-                        }
+                        },
 
                         SwarmEvent::OutgoingConnectionError { peer_id, error, .. } => {
                             let peer_str = peer_id
@@ -1434,20 +1436,25 @@ async fn main() -> Result<(), Box<dyn Error>> {
                                 .unwrap_or_else(|| "?".into());
 
                              let err_str = error.to_string();
-                             // Показываем важные ошибки. 64000 (старые версии) и 10048 (AddrInUse на Windows) игнорируем как технические
-                             let is_noise = err_str.contains("64000") || err_str.contains("10048");
+                             // 10048 (AddrInUse), Timeout, Handshake — игнорируем в UI, показываем только в консоли
+                             let is_noise = err_str.contains("64000") ||
+                                           err_str.contains("10048") ||
+                                           err_str.contains("Timeout") ||
+                                           err_str.contains("Handshake");
 
                              if !is_noise {
                                  println!("❌ ОШИБКА ИСХОДЯЩЕГО СОЕДИНЕНИЯ (peer: {}): {:?}", peer_str, error);
                                  let _ = event_tx.send(NetworkEvent::Status(
                                      format!("❌ Ошибка подключения к {}: {}", peer_str, error)
                                  )).await;
+                             } else {
+                                 println!("ℹ️ Техническая задержка/отказ (peer: {}): {}", peer_str, err_str);
                              }
 
                             if let Some(p) = peer_id {
                                 pending_dials.remove(&p);
                             }
-                        }
+                        },
                         SwarmEvent::IncomingConnectionError { error, .. } => {
                             let err_str = error.to_string();
                             if !err_str.contains("Handshake") && !err_str.contains("Timeout") {
@@ -1455,7 +1462,7 @@ async fn main() -> Result<(), Box<dyn Error>> {
                                     format!("❌ Входящее подключение отклонено: {}", error)
                                 )).await;
                             }
-                        }
+                        },
 
                         SwarmEvent::Behaviour(ChatBehaviourEvent::Identify(identify::Event::Received { peer_id, info, .. })) => {
                             let now = chrono::Local::now().format("%H:%M:%S").to_string();
@@ -1490,7 +1497,7 @@ async fn main() -> Result<(), Box<dyn Error>> {
 
                         _ => {}
                     }
-                }
+                },
                 _ = kad_bootstrap_timer.tick() => {
                     let _ = swarm.behaviour_mut().kad.bootstrap();
                 }
