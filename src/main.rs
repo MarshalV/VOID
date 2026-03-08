@@ -1457,7 +1457,7 @@ async fn main() -> Result<(), Box<dyn Error>> {
                         }
                         SwarmEvent::Behaviour(ChatBehaviourEvent::Identify(identify::Event::Error { peer_id, error, .. })) => {
                             let err_str = error.to_string();
-                            let err_lower = error.to_string().to_lowercase();
+                            let err_lower = err_str.to_lowercase();
                             if err_lower.contains("negotiat") || err_lower.contains("failed to negotiate") || err_lower.contains("support") {
                                 println!("❌ [КРИТИЧНО] Identify: Несовпадение версий с {}.", peer_id);
                                 println!("🔥 Срочно ОБНОВИТЕ другое приложение и ЗАКРОЙТЕ старые процессы!");
