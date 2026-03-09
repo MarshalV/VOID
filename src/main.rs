@@ -15,7 +15,7 @@ use rand::RngCore;
 use serde::{Deserialize, Serialize};
 use std::collections::{HashMap, HashSet};
 use std::error::Error;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 use tokio::sync::mpsc;
 
 #[derive(Serialize, Deserialize)]
@@ -1042,19 +1042,17 @@ async fn main() -> Result<(), Box<dyn Error>> {
                 let kad_store = kad::store::MemoryStore::new(local_peer_id);
                 let mut kad = kad::Behaviour::new(local_peer_id, kad_store);
 
-                // Добавляем бутстрап-ноды IPFS (прямые IP для обхода DNS ошибок)
+                // Добавляем бутстрап-ноды IPFS/libp2p
                 let bootstrap = [
-                    "/ip4/104.131.131.82/tcp/4001/p2p/QmaCpDMGvLcZunBNqv9U7Z8hSAt79S9JcyG316w8nL62m9",
+                    "/dnsaddr/bootstrap.libp2p.io/p2p/QmNQP97ZByia9h9YFmbSNoBeC7pQYQSppN1C8S2B75SXC6u",
+                    "/dnsaddr/bootstrap.libp2p.io/p2p/QmQCU2EcSTwsrmMvFUXS7uK9z1V64p99C8ndn4y2K8w8f3z",
+                    "/dnsaddr/bootstrap.libp2p.io/p2p/QmbLHAnMo9UFwv9V9QdfyLc4Dn91S2AnkkL8Vat4DTHiV4f",
+                    "/dnsaddr/bootstrap.libp2p.io/p2p/QmcZf59bWwK5XFi7U4S6n32FRV9RmrHnoz6L8N9ndBnd6u",
+                    "/ip4/104.131.131.82/tcp/4001/p2p/QmaCpDMGvLcZunBNqv9U7Z8hSAt79S99JcyG316w8nL62m9",
+                    "/ip4/147.75.101.139/tcp/4001/p2p/QmQCU2EcSTwsrmMvFUXS7uK9z1V64p99C8ndn4y2K8w8f3z",
+                    "/ip4/147.75.83.83/tcp/4001/p2p/QmbLHAnMo9UFwv9V9QdfyLc4Dn91S2AnkkL8Vat4DTHiV4f",
                     "/ip4/147.75.109.213/tcp/4001/p2p/QmNnoo2uR3GuwhvBqyM4tTDp6NoS7wB9G9o9wE5pS9Y6mY",
-                    "/ip4/147.75.101.139/tcp/4001/p2p/QmQCU2EcSTwsrmMvFUXS7uK9z1V64p9C8ndn4y2K8w8f3z",
-                    "/ip4/147.75.83.83/tcp/4001/p2p/QmbLHAnMo9UFwv9V9QdfyLc4Dn91S2AnkL8Vat4DTHiV4f",
                     "/ip4/147.75.77.187/tcp/4001/p2p/QmNQP97ZByia9h9YFmbSNoBeC7pQYQSpN1C8S2B75SXC6u",
-                    // Дополнительные бутстрап-ноды
-                    "/dnsaddr/bootstrap.libp2p.io/p2p/QmNnoo2uR3GuwhvBqyM4tTDp6NoS7wB9G9o9wE5pS9Y6mY",
-                    "/dnsaddr/bootstrap.libp2p.io/p2p/QmQCU2EcSTwsrmMvFUXS7uK9z1V64p9C8ndn4y2K8w8f3z",
-                    "/dnsaddr/bootstrap.libp2p.io/p2p/QmbLHAnMo9UFwv9V9QdfyLc4Dn91S2AnkL8Vat4DTHiV4f",
-                    "/dnsaddr/bootstrap.libp2p.io/p2p/QmNZgLzNf1K17y2g3Y2y2y2y2y2y2y2y2y2y2y2y2y2y2",
-                    "/dnsaddr/bootstrap.libp2p.io/p2p/QmcZf59cGBK9f33B2y2y2y2y2y2y2y2y2y2y2y2y2y2y2",
                 ];
                 for addr in bootstrap {
                     if let Ok(ma) = addr.parse::<Multiaddr>() {
@@ -1120,10 +1118,10 @@ async fn main() -> Result<(), Box<dyn Error>> {
         let mut mesh_check = tokio::time::interval(Duration::from_secs(5));
         let mut hello_broadcast = tokio::time::interval(Duration::from_secs(30));
         let mut kad_bootstrap_timer = tokio::time::interval(Duration::from_secs(300)); // 5 минут
-                                                                                       // Кэш адресов для mDNS: пир → все его адреса (TCP + QUIC)
         let mut peer_addrs: HashMap<PeerId, Vec<Multiaddr>> = HashMap::new();
-        // Пиры, к которым уже запущен или идёт dial (избегаем дубликат)
         let mut pending_dials: HashSet<PeerId> = HashSet::new();
+        let mut dial_backoff: HashMap<PeerId, Instant> = HashMap::new();
+        let mut local_listen_addrs: HashSet<Multiaddr> = HashSet::new();
 
         loop {
             tokio::select! {
@@ -1272,20 +1270,43 @@ async fn main() -> Result<(), Box<dyn Error>> {
                     match event {
                         SwarmEvent::NewListenAddr { address, .. } => {
                             let s = address.to_string();
+                            local_listen_addrs.insert(address.clone());
                             if !s.contains("/ip6/") && !s.contains("/0.0.0.0") && !s.contains("/127.0.0.1") {
                                 println!("Слушаю: {}/p2p/{}", address, local_peer_id);
                                 let _ = event_tx.send(NetworkEvent::NewListenAddr(address.clone())).await;
                                 // Объявляем адрес внешним для лучшего дискавери
                                 swarm.add_external_address(address);
                             }
-                        }
+                        },
 
                         SwarmEvent::Behaviour(ChatBehaviourEvent::Mdns(mdns::Event::Discovered(list))) => {
                             let mut to_dial: std::collections::HashMap<libp2p::PeerId, Vec<libp2p::Multiaddr>> = std::collections::HashMap::new();
                             for (peer_id, addr) in list {
                                 if peer_id == local_peer_id { continue; }
-                                if addr.to_string().contains("127.0.0.1") || addr.to_string().contains("::1") { continue; }
                                 if pending_dials.contains(&peer_id) { continue; }
+
+                                // Проверяем кулдаун (30 секунд после последней неудачи)
+                                if let Some(last_fail) = dial_backoff.get(&peer_id) {
+                                    if last_fail.elapsed() < Duration::from_secs(30) {
+                                        continue;
+                                    }
+                                }
+
+                                let a_str = addr.to_string();
+                                if a_str.contains("127.0.0.1") || a_str.contains("::1") { continue; }
+
+                                // Фильтруем наши собственные адреса, которые могли прийти через LAN
+                                let mut is_local = false;
+                                for local in &local_listen_addrs {
+                                    let l_str = local.to_string();
+                                    if let Some(ip) = l_str.split('/').nth(2) {
+                                        if !ip.is_empty() && a_str.contains(ip) {
+                                            is_local = true;
+                                            break;
+                                        }
+                                    }
+                                }
+                                if is_local { continue; }
 
                                 // Проверяем, не подключены ли мы уже
                                 let mut is_connected = false;
@@ -1312,7 +1333,7 @@ async fn main() -> Result<(), Box<dyn Error>> {
                                  }
 
                                  let is_leader = local_peer_id > peer_id;
-                                 let delay_ms = if is_leader { 500 } else { 8000 };
+                                 let delay_ms = if is_leader { 500 } else { 12000 };
 
                                  pending_dials.insert(peer_id);
                                  let cmd_tx2 = command_tx_for_mdns.clone();
@@ -1453,6 +1474,7 @@ async fn main() -> Result<(), Box<dyn Error>> {
 
                             if let Some(p) = peer_id {
                                 pending_dials.remove(&p);
+                                dial_backoff.insert(p, std::time::Instant::now());
                             }
                         },
                         SwarmEvent::IncomingConnectionError { error, .. } => {
