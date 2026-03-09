@@ -1285,9 +1285,9 @@ async fn main() -> Result<(), Box<dyn Error>> {
                                 if peer_id == local_peer_id { continue; }
                                 if pending_dials.contains(&peer_id) { continue; }
 
-                                // Проверяем кулдаун (30 секунд после последней неудачи)
+                                // Проверяем кулдаун (5 секунд после последней неудачи)
                                 if let Some(last_fail) = dial_backoff.get(&peer_id) {
-                                    if last_fail.elapsed() < Duration::from_secs(30) {
+                                    if last_fail.elapsed() < Duration::from_secs(5) {
                                         continue;
                                     }
                                 }
@@ -1295,28 +1295,8 @@ async fn main() -> Result<(), Box<dyn Error>> {
                                 let a_str = addr.to_string();
                                 if a_str.contains("127.0.0.1") || a_str.contains("::1") { continue; }
 
-                                // Фильтруем наши собственные адреса, которые могли прийти через LAN
-                                let mut is_local = false;
-                                for local in &local_listen_addrs {
-                                    let l_str = local.to_string();
-                                    if let Some(ip) = l_str.split('/').nth(2) {
-                                        if !ip.is_empty() && a_str.contains(ip) {
-                                            is_local = true;
-                                            break;
-                                        }
-                                    }
-                                }
-                                if is_local { continue; }
-
-                                // Проверяем, не подключены ли мы уже
-                                let mut is_connected = false;
-                                for p in swarm.connected_peers() {
-                                    if p == &peer_id {
-                                        is_connected = true;
-                                        break;
-                                    }
-                                }
-                                if is_connected { continue; }
+                                // Проверяем, не подключены ли мы уже (избегаем дублей)
+                                if swarm.connected_peers().any(|p| p == &peer_id) { continue; }
 
                                  println!("mDNS: найден {} на {}", peer_id, addr);
                                  let _ = event_tx.send(NetworkEvent::MdnsDiscovered(peer_id, addr.clone())).await;
@@ -1333,7 +1313,7 @@ async fn main() -> Result<(), Box<dyn Error>> {
                                  }
 
                                  let is_leader = local_peer_id > peer_id;
-                                 let delay_ms = if is_leader { 500 } else { 12000 };
+                                 let delay_ms = if is_leader { 300 } else { 3000 };
 
                                  pending_dials.insert(peer_id);
                                  let cmd_tx2 = command_tx_for_mdns.clone();
