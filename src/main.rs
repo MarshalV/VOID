@@ -1102,7 +1102,7 @@ async fn main() -> Result<(), Box<dyn Error>> {
                         .unwrap(),
                     ping: ping::Behaviour::default(),
                     identify: identify::Behaviour::new(identify::Config::new(
-                        "/void/id/1.1.0".into(),
+                        "/void/id/1.2.0".into(),
                         key.public(),
                     )),
                     kad,
@@ -1123,14 +1123,14 @@ async fn main() -> Result<(), Box<dyn Error>> {
         let topic = gossipsub::IdentTopic::new("void-chat-v1");
         swarm.behaviour_mut().gossipsub.subscribe(&topic).unwrap();
 
-        // Слушаем TCP. Сначала пробуем 64000.
-        let tcp_addr: Multiaddr = "/ip4/0.0.0.0/tcp/64000".parse().unwrap();
+        // Слушаем TCP. Сначала пробуем 50001 (согласно правилам файрвола).
+        let tcp_addr: Multiaddr = "/ip4/0.0.0.0/tcp/50001".parse().unwrap();
 
         if let Err(e) = swarm.listen_on(tcp_addr.clone()) {
-            println!("⚠️ TCP порт 64000 занят ({:?}). Срочно ЗАКРОЙТЕ старые процессы или используйте другой порт.", e);
+            println!("⚠️ TCP порт 50001 занят ({:?}). Срочно ЗАКРОЙТЕ старые процессы или проверьте настройки.", e);
             let _ = event_tx
                 .send(NetworkEvent::Status(
-                    "⚠️ ПОРТ 64000 ЗАНЯТ! Закройте старые копии программы.".into(),
+                    "⚠️ ПОРТ 50001 ЗАНЯТ! Закройте старые копии программы.".into(),
                 ))
                 .await;
             swarm
@@ -1139,7 +1139,7 @@ async fn main() -> Result<(), Box<dyn Error>> {
         }
 
         // Слушаем QUIC.
-        let _ = swarm.listen_on("/ip4/0.0.0.0/udp/64000/quic-v1".parse().unwrap());
+        let _ = swarm.listen_on("/ip4/0.0.0.0/udp/50001/quic-v1".parse().unwrap());
 
         // Слушаем через Relay для работы за NAT
         let _ = swarm.listen_on("/p2p-circuit".parse().unwrap());
@@ -1461,15 +1461,7 @@ async fn main() -> Result<(), Box<dyn Error>> {
                             let _ = event_tx.send(NetworkEvent::MeshPeers(connected_count)).await;
                         }
                         SwarmEvent::IncomingConnection { local_addr, send_back_addr, .. } => {
-                            let s_addr = send_back_addr.to_string();
-                            if s_addr.contains("64000") || s_addr.contains(":64000") {
-                                println!("⚠️ [ВНИМАНИЕ] Входящее от СТАРОЙ ВЕРСИИ (порт 64000): from {:?}. Ожидайте ошибку Identify.", send_back_addr);
-                                let _ = event_tx.send(NetworkEvent::Status(
-                                    "⚠️ ВНИМАНИЕ: Подключился старый пир. Сообщения НЕ БУДУТ работать до его обновления!".into()
-                                )).await;
-                            } else {
-                                println!("📥 Входящее соединение: from {:?} to {:?}", send_back_addr, local_addr);
-                            }
+                            println!("📥 Входящее соединение: from {:?} to {:?}", send_back_addr, local_addr);
                         },
 
                         SwarmEvent::OutgoingConnectionError { peer_id, error, .. } => {
@@ -1489,11 +1481,13 @@ async fn main() -> Result<(), Box<dyn Error>> {
                              if !is_noise {
                                  println!("❌ ОШИБКА ИСХОДЯЩЕГО СОЕДИНЕНИЯ (peer: {}): {:?}", peer_str, error);
                                  let _ = event_tx.send(NetworkEvent::Status(
-                                     format!("❌ Ошибка подключения к {}: {}", peer_str, error)
+                                     format!("❌ Ошибка подключения: {}", peer_str)
                                  )).await;
                              } else {
-                                 // В консоли пишем кратко, чтобы не спамить
-                                 if err_str.contains("10048") {
+                                 // В консоли пишем кратко
+                                 if err_str.contains("Timeout") || err_str.contains("Handshake") {
+                                     println!("ℹ️ [{}] Тайм-аут с {}. Проверьте ФАЙРВОЛ на обоих сторонах!", now, peer_str);
+                                 } else if err_str.contains("10048") {
                                      println!("ℹ️ [{}] Ошибка 10048 (нормально для Windows): {}", now, peer_str);
                                  } else {
                                      println!("ℹ️ [{}] Техническая задержка/отказ (peer: {}): {}", now, peer_str, err_str);
