@@ -923,7 +923,6 @@ async fn main() -> Result<(), Box<dyn Error>> {
                     "localport=50001",
                     "profile=any",
                     "enable=yes",
-                    &format!("program=\"{}\"", exe),
                 ])
                 .output();
             let udp_r = std::process::Command::new("netsh")
@@ -940,7 +939,6 @@ async fn main() -> Result<(), Box<dyn Error>> {
                     "profile=any",
                     "edge=yes",
                     "enable=yes",
-                    &format!("program=\"{}\"", exe),
                 ])
                 .output();
             match (tcp_r, udp_r) {
@@ -954,9 +952,8 @@ async fn main() -> Result<(), Box<dyn Error>> {
             let bat = format!(
                 "@echo off\r\n\
                  netsh advfirewall firewall delete rule name=\"VOID P2P\"\r\n\
-                 netsh advfirewall firewall add rule name=\"VOID P2P\" dir=in action=allow protocol=TCP localport=50001 profile=any enable=yes program=\"\\\"{}\\\"\"\r\n\
-                 netsh advfirewall firewall add rule name=\"VOID P2P\" dir=in action=allow protocol=UDP localport=50001 profile=any edge=yes enable=yes program=\"\\\"{}\\\"\"\r\n",
-                exe, exe
+                 netsh advfirewall firewall add rule name=\"VOID P2P\" dir=in action=allow protocol=TCP localport=50001 profile=any enable=yes\r\n\
+                 netsh advfirewall firewall add rule name=\"VOID P2P\" dir=in action=allow protocol=UDP localport=50001 profile=any edge=yes enable=yes\r\n"
             );
             let bat_path = std::env::temp_dir().join("void_p2p_firewall.bat");
             if std::fs::write(&bat_path, bat).is_ok() {
@@ -1139,7 +1136,11 @@ async fn main() -> Result<(), Box<dyn Error>> {
         }
 
         // Слушаем QUIC.
-        let _ = swarm.listen_on("/ip4/0.0.0.0/udp/50001/quic-v1".parse().unwrap());
+        let quic_addr: Multiaddr = "/ip4/0.0.0.0/udp/50001/quic-v1".parse().unwrap();
+        match swarm.listen_on(quic_addr.clone()) {
+            Ok(_) => println!("🚀 QUIC слушаю на 50001"),
+            Err(e) => println!("⚠️ QUIC ошибка: {:?}", e),
+        }
 
         // Слушаем через Relay для работы за NAT
         let _ = swarm.listen_on("/p2p-circuit".parse().unwrap());
@@ -1439,6 +1440,20 @@ async fn main() -> Result<(), Box<dyn Error>> {
                         SwarmEvent::Behaviour(ChatBehaviourEvent::Gossipsub(gossipsub::Event::Unsubscribed { peer_id, topic })) => {
                             println!("📡 Gossipsub: {}... ОТПИСАЛСЯ от топика ({})", &peer_id.to_string()[..8], topic);
                         }
+                        SwarmEvent::NewListenAddr { address, .. } => {
+                            println!("📡 СЛУШАЮ: {}", address);
+                            if address.to_string().contains("p2p-circuit") {
+                                let _ = event_tx.send(NetworkEvent::Status(
+                                    "✨ СВЯЗЬ ЧЕРЕЗ RELAY: Вы доступны через посредника (за NAT)!".into()
+                                )).await;
+                            }
+                        }
+                        SwarmEvent::ExternalAddrConfirmed { address } => {
+                            println!("🌍 ВНЕШНИЙ АДРЕС ПОДТВЕРЖДЕН: {}", address);
+                            let _ = event_tx.send(NetworkEvent::Status(
+                                format!("🌍 ГЛОБАЛЬНЫЙ АДРЕС: Вы доступны из интернета!")
+                            )).await;
+                        }
                         SwarmEvent::ConnectionEstablished { peer_id, endpoint, .. } => {
                             let connected_count = swarm.connected_peers().count();
                             println!("✅ СОЕДИНЕНО: {}. Endpoint: {:?}. Всего пиров: {}", peer_id, endpoint, connected_count);
@@ -1476,7 +1491,8 @@ async fn main() -> Result<(), Box<dyn Error>> {
                                            err_str.contains("10048") ||
                                            err_str.contains("Timeout") ||
                                            err_str.contains("Handshake") ||
-                                           err_str.contains("ResolveError");
+                                           err_str.contains("ResolveError") ||
+                                           err_str.contains("No Matching Records Found");
 
                              if !is_noise {
                                  println!("❌ ОШИБКА ИСХОДЯЩЕГО СОЕДИНЕНИЯ (peer: {}): {:?}", peer_str, error);
