@@ -151,6 +151,7 @@ enum NetworkEvent {
 enum UICommand {
     Dial(String),
     DialPeer(PeerId, Vec<Multiaddr>),
+    SearchPeer(PeerId),
     SendMessage {
         sender_name: String,
         text: String,
@@ -283,12 +284,23 @@ impl App {
                                         let _ = Storage::save(&self.local_nickname, None, None);
                                     }
                                 });
-                                ui.label(
-                                    egui::RichText::new(&self.local_peer_id.to_string()[..16])
-                                        .size(12.0)
-                                        .monospace()
-                                        .weak(),
-                                );
+                                ui.horizontal(|ui| {
+                                    ui.label(
+                                        egui::RichText::new(&self.local_peer_id.to_string()[..16])
+                                            .size(12.0)
+                                            .monospace()
+                                            .weak(),
+                                    );
+                                    if ui
+                                        .button("📋")
+                                        .on_hover_text("Копировать Peer ID")
+                                        .clicked()
+                                    {
+                                        ui.output_mut(|o| {
+                                            o.copied_text = self.local_peer_id.to_string()
+                                        });
+                                    }
+                                });
                             });
                         });
                 });
@@ -471,22 +483,35 @@ impl App {
                             );
                             ui.add(
                                 egui::TextEdit::singleline(&mut self.dial_address)
-                                    .hint_text("/ip4/...")
+                                    .hint_text("Peer ID или Multiaddr")
                                     .desired_width(ui.available_width()),
                             );
                             ui.add_space(8.0);
-                            if ui
-                                .add(egui::Button::new(
-                                    egui::RichText::new("ПОДКЛЮЧИТЬ").size(14.0),
-                                ))
-                                .clicked()
-                                && !self.dial_address.is_empty()
-                            {
-                                let _ = self
-                                    .command_tx
-                                    .try_send(UICommand::Dial(self.dial_address.clone()));
-                                self.dial_address.clear();
-                            }
+                            ui.horizontal(|ui| {
+                                if ui
+                                    .add(egui::Button::new(
+                                        egui::RichText::new("ПОДКЛЮЧИТЬ").size(14.0),
+                                    ))
+                                    .clicked()
+                                    && !self.dial_address.is_empty()
+                                {
+                                    let input = self.dial_address.trim().to_string();
+                                    if let Ok(peer_id) = input.parse::<PeerId>() {
+                                        let _ = self
+                                            .command_tx
+                                            .try_send(UICommand::SearchPeer(peer_id));
+                                    } else {
+                                        let _ = self.command_tx.try_send(UICommand::Dial(input));
+                                    }
+                                    self.dial_address.clear();
+                                }
+
+                                if ui.button("📋 СВОЙ ID").clicked() {
+                                    ui.output_mut(|o| {
+                                        o.copied_text = self.local_peer_id.to_string()
+                                    });
+                                }
+                            });
                         });
                 });
 
@@ -1019,6 +1044,7 @@ async fn main() -> Result<(), Box<dyn Error>> {
                 yamux::Config::default,
             )
             .unwrap()
+            .with_quic()
             .with_dns()
             .unwrap()
             .with_relay_client(noise::Config::new, yamux::Config::default)
@@ -1096,15 +1122,18 @@ async fn main() -> Result<(), Box<dyn Error>> {
         let topic = gossipsub::IdentTopic::new("void-chat-v1");
         swarm.behaviour_mut().gossipsub.subscribe(&topic).unwrap();
 
-        // Слушаем TCP. Сначала пробуем 50001, если занято - берем любой свободный.
-        let tcp_addr: Multiaddr = "/ip4/0.0.0.0/tcp/50001".parse().unwrap();
+        // Слушаем TCP. Сначала пробуем 64000.
+        let tcp_addr: Multiaddr = "/ip4/0.0.0.0/tcp/64000".parse().unwrap();
 
         if let Err(e) = swarm.listen_on(tcp_addr.clone()) {
-            println!("⚠️ TCP порт 50001 занят ({:?}), пробую случайный...", e);
+            println!("⚠️ TCP порт 64000 занят ({:?}), пробую случайный...", e);
             swarm
                 .listen_on("/ip4/0.0.0.0/tcp/0".parse().unwrap())
                 .unwrap();
         }
+
+        // Слушаем QUIC.
+        let _ = swarm.listen_on("/ip4/0.0.0.0/udp/64000/quic-v1".parse().unwrap());
 
         // Слушаем через Relay для работы за NAT
         let _ = swarm.listen_on("/p2p-circuit".parse().unwrap());
@@ -1173,7 +1202,13 @@ async fn main() -> Result<(), Box<dyn Error>> {
                                     }
                                 }
                             }
-                             UICommand::DialPeer(peer_id, addrs) => {
+                            UICommand::SearchPeer(peer_id) => {
+                                let _ = event_tx.send(NetworkEvent::Status(
+                                    format!("🔍 Ищу пира {} в Kademlia...", &peer_id.to_string()[..16])
+                                )).await;
+                                swarm.behaviour_mut().kad.get_closest_peers(peer_id);
+                            }
+                            UICommand::DialPeer(peer_id, addrs) => {
                                  let short = &peer_id.to_string()[..16];
                                  println!("🔌 UI_COMMAND: DialPeer {} ({} addresses)", short, addrs.len());
 
@@ -1399,8 +1434,8 @@ async fn main() -> Result<(), Box<dyn Error>> {
                             println!("📡 Gossipsub: {}... ОТПИСАЛСЯ от топика ({})", &peer_id.to_string()[..8], topic);
                         }
                         SwarmEvent::ConnectionEstablished { peer_id, endpoint, .. } => {
-                            let mesh_count = swarm.behaviour().gossipsub.all_mesh_peers().count();
-                            println!("✅ СОЕДИНЕНО: {}. Endpoint: {:?}. В меше: {}", peer_id, endpoint, mesh_count);
+                            let connected_count = swarm.connected_peers().count();
+                            println!("✅ СОЕДИНЕНО: {}. Endpoint: {:?}. Всего пиров: {}", peer_id, endpoint, connected_count);
                             pending_dials.remove(&peer_id);
 
                              if peer_id != local_peer_id {
@@ -1411,13 +1446,13 @@ async fn main() -> Result<(), Box<dyn Error>> {
 
                                  let _ = event_tx.send(NetworkEvent::Connected(peer_id)).await;
                              }
-                             let _ = event_tx.send(NetworkEvent::MeshPeers(mesh_count)).await;
+                             let _ = event_tx.send(NetworkEvent::MeshPeers(connected_count)).await;
                         },
                         SwarmEvent::ConnectionClosed { peer_id, cause, .. } => {
-                            let mesh = swarm.behaviour().gossipsub.all_mesh_peers().count();
-                            println!("❌ СОЕДИНЕНИЕ ЗАКРЫТО: {}. Причина: {:?}", peer_id, cause);
+                            let connected_count = swarm.connected_peers().count();
+                            println!("❌ СОЕДИНЕНИЕ ЗАКРЫТО: {}. Причина: {:?}. Осталось: {}", peer_id, cause, connected_count);
                             let _ = event_tx.send(NetworkEvent::Disconnected(peer_id)).await;
-                            let _ = event_tx.send(NetworkEvent::MeshPeers(mesh)).await;
+                            let _ = event_tx.send(NetworkEvent::MeshPeers(connected_count)).await;
                         }
                         SwarmEvent::IncomingConnection { local_addr, send_back_addr, .. } => {
                             let s_addr = send_back_addr.to_string();
@@ -1495,6 +1530,23 @@ async fn main() -> Result<(), Box<dyn Error>> {
                             } else {
                                 println!("🆔 Identify: Ошибка с пиром {}: {:?}", peer_id, error);
                             }
+                        }
+
+                        SwarmEvent::Behaviour(ChatBehaviourEvent::Kad(kad::Event::OutboundQueryProgressed { result, .. })) => {
+                            match result {
+                                kad::QueryResult::GetClosestPeers(Ok(ok)) => {
+                                    for peer in ok.peers {
+                                        if !peer.addrs.is_empty() {
+                                            println!("🔍 Kademlia: найден пир {} с {} адресами", peer.peer_id, peer.addrs.len());
+                                            let _ = command_tx_for_mdns.try_send(UICommand::DialPeer(peer.peer_id, peer.addrs));
+                                        }
+                                    }
+                                }
+                                _ => {}
+                            }
+                        }
+                        SwarmEvent::Behaviour(ChatBehaviourEvent::Kad(kad::Event::RoutingUpdated { peer, addresses, .. })) => {
+                            println!("📍 Kademlia: маршрут обновлен для {}: {:?}", peer, addresses);
                         }
 
                         _ => {}
