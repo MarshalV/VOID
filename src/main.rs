@@ -1075,10 +1075,11 @@ async fn main() -> Result<(), Box<dyn Error>> {
                     "/dnsaddr/bootstrap.libp2p.io/p2p/QmbLHAnMo9UFwv9V9QdfyLc4Dn91S2AnkkL8Vat4DTHiV4f",
                     "/dnsaddr/bootstrap.libp2p.io/p2p/QmcZf59bWwK5XFi7U4S6n32FRV9RmrHnoz6L8N9ndBnd6u",
                     "/ip4/104.131.131.82/tcp/4001/p2p/QmaCpDMGvLcZunBNqv9U7Z8hSAt79S99JcyG316w8nL62m9",
+                    // Дополнительные надежные ноды
                     "/ip4/147.75.101.139/tcp/4001/p2p/QmQCU2EcSTwsrmMvFUXS7uK9z1V64p99C8ndn4y2K8w8f3z",
                     "/ip4/147.75.83.83/tcp/4001/p2p/QmbLHAnMo9UFwv9V9QdfyLc4Dn91S2AnkkL8Vat4DTHiV4f",
                     "/ip4/147.75.109.213/tcp/4001/p2p/QmNnoo2uR3GuwhvBqyM4tTDp6NoS7wB9G9o9wE5pS9Y6mY",
-                    "/ip4/147.75.77.187/tcp/4001/p2p/QmNQP97ZByia9h9YFmbSNoBeC7pQYQSpN1C8S2B75SXC6u",
+                    "/ip4/147.75.77.187/tcp/4001/p2p/QmNQP97ZByia9h9YFmbSNoBeC7pQYQSppN1C8S2B75SXC6u",
                 ];
                 for addr in bootstrap {
                     if let Ok(ma) = addr.parse::<Multiaddr>() {
@@ -1126,7 +1127,12 @@ async fn main() -> Result<(), Box<dyn Error>> {
         let tcp_addr: Multiaddr = "/ip4/0.0.0.0/tcp/64000".parse().unwrap();
 
         if let Err(e) = swarm.listen_on(tcp_addr.clone()) {
-            println!("⚠️ TCP порт 64000 занят ({:?}), пробую случайный...", e);
+            println!("⚠️ TCP порт 64000 занят ({:?}). Срочно ЗАКРОЙТЕ старые процессы или используйте другой порт.", e);
+            let _ = event_tx
+                .send(NetworkEvent::Status(
+                    "⚠️ ПОРТ 64000 ЗАНЯТ! Закройте старые копии программы.".into(),
+                ))
+                .await;
             swarm
                 .listen_on("/ip4/0.0.0.0/tcp/0".parse().unwrap())
                 .unwrap();
@@ -1467,16 +1473,18 @@ async fn main() -> Result<(), Box<dyn Error>> {
                         },
 
                         SwarmEvent::OutgoingConnectionError { peer_id, error, .. } => {
+                            let now = chrono::Local::now().format("%H:%M:%S").to_string();
                             let peer_str = peer_id
                                 .map(|p| format!("{}...", &p.to_string()[..8]))
                                 .unwrap_or_else(|| "?".into());
 
                              let err_str = error.to_string();
-                             // 10048 (AddrInUse), Timeout, Handshake — игнорируем в UI, показываем только в консоли
+                             // 10048 (AddrInUse), Timeout, Handshake, DNS Resolve — игнорируем в UI
                              let is_noise = err_str.contains("64000") ||
                                            err_str.contains("10048") ||
                                            err_str.contains("Timeout") ||
-                                           err_str.contains("Handshake");
+                                           err_str.contains("Handshake") ||
+                                           err_str.contains("ResolveError");
 
                              if !is_noise {
                                  println!("❌ ОШИБКА ИСХОДЯЩЕГО СОЕДИНЕНИЯ (peer: {}): {:?}", peer_str, error);
@@ -1484,7 +1492,12 @@ async fn main() -> Result<(), Box<dyn Error>> {
                                      format!("❌ Ошибка подключения к {}: {}", peer_str, error)
                                  )).await;
                              } else {
-                                 println!("ℹ️ Техническая задержка/отказ (peer: {}): {}", peer_str, err_str);
+                                 // В консоли пишем кратко, чтобы не спамить
+                                 if err_str.contains("10048") {
+                                     println!("ℹ️ [{}] Ошибка 10048 (нормально для Windows): {}", now, peer_str);
+                                 } else {
+                                     println!("ℹ️ [{}] Техническая задержка/отказ (peer: {}): {}", now, peer_str, err_str);
+                                 }
                              }
 
                             if let Some(p) = peer_id {
