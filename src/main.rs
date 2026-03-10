@@ -1080,7 +1080,7 @@ async fn main() -> Result<(), Box<dyn Error>> {
                         .unwrap(),
                     ping: ping::Behaviour::default(),
                     identify: identify::Behaviour::new(identify::Config::new(
-                        "/void/id/1.2.0".into(),
+                        "/void/id/1.0.0".into(),
                         key.public(),
                     )),
                     kad,
@@ -1116,7 +1116,13 @@ async fn main() -> Result<(), Box<dyn Error>> {
         let quic_addr: Multiaddr = "/ip4/0.0.0.0/udp/50001/quic-v1".parse().unwrap();
         match swarm.listen_on(quic_addr.clone()) {
             Ok(_) => println!("🚀 QUIC слушаю на 50001"),
-            Err(e) => println!("⚠️ QUIC ошибка: {:?}", e),
+            Err(e) => {
+                println!(
+                    "⚠️ QUIC ошибка на 50001 ({:?}). Пробую случайный порт...",
+                    e
+                );
+                let _ = swarm.listen_on("/ip4/0.0.0.0/udp/0/quic-v1".parse().unwrap());
+            }
         }
 
         // Слушаем через Relay для работы за NAT
@@ -1264,9 +1270,11 @@ async fn main() -> Result<(), Box<dyn Error>> {
                         SwarmEvent::Behaviour(ChatBehaviourEvent::Mdns(mdns::Event::Discovered(list))) => {
                             for (peer_id, addr) in list {
                                 if peer_id == local_peer_id { continue; }
-                                println!("🔍 mDNS: найден пир {} на {}. (Авто-подключение ОТКЛЮЧЕНО)", &peer_id.to_string()[..8], addr);
+                                println!("🔍 mDNS: найден пир {} на {}. Подключаюсь (Local)...", &peer_id.to_string()[..8], addr);
                                 // Регистрация адреса в Kademlia для возможности прямого вызова (Request-Response)
                                 swarm.behaviour_mut().kad.add_address(&peer_id, addr.clone());
+                                // АВТО-ПОДКЛЮЧЕНИЕ для mDNS (локальная сеть)
+                                let _ = swarm.dial(addr.clone());
                                 let _ = event_tx.send(NetworkEvent::MdnsDiscovered(peer_id, addr.clone())).await;
                                 peer_addrs.entry(peer_id).or_default().push(addr);
                             }
