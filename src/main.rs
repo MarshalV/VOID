@@ -1067,7 +1067,8 @@ async fn main() -> Result<(), Box<dyn Error>> {
                 }
                 let _ = kad.bootstrap();
 
-                let rr_config = libp2p::request_response::Config::default();
+                let rr_config = libp2p::request_response::Config::default()
+                    .with_request_timeout(Duration::from_secs(30)); // Увеличиваем тайм-аут до 30с
                 let rr_protocol = libp2p::StreamProtocol::new("/void/chat/1.0.0");
                 let rr_behaviour = libp2p::request_response::json::Behaviour::<V1Packet, V1Packet>::new(
                     [(rr_protocol, libp2p::request_response::ProtocolSupport::Full)],
@@ -1080,7 +1081,7 @@ async fn main() -> Result<(), Box<dyn Error>> {
                         .unwrap(),
                     ping: ping::Behaviour::default(),
                     identify: identify::Behaviour::new(identify::Config::new(
-                        "/void/id/1.0.0".into(),
+                        "/void/v1".into(), // Фиксируем версию для всех
                         key.public(),
                     )),
                     kad,
@@ -1092,7 +1093,7 @@ async fn main() -> Result<(), Box<dyn Error>> {
             })
             .unwrap()
             .with_swarm_config(|c| {
-                c.with_idle_connection_timeout(Duration::from_secs(60))
+                c.with_idle_connection_timeout(Duration::from_secs(120)) // 2 минуты покоя
                     .with_per_connection_event_buffer_size(256)
             })
             .build();
@@ -1270,11 +1271,19 @@ async fn main() -> Result<(), Box<dyn Error>> {
                         SwarmEvent::Behaviour(ChatBehaviourEvent::Mdns(mdns::Event::Discovered(list))) => {
                             for (peer_id, addr) in list {
                                 if peer_id == local_peer_id { continue; }
-                                println!("🔍 mDNS: найден пир {} на {}. Подключаюсь (Local)...", &peer_id.to_string()[..8], addr);
-                                // Регистрация адреса в Kademlia для возможности прямого вызова (Request-Response)
+
+                                // Регистрация адреса в Kademlia
                                 swarm.behaviour_mut().kad.add_address(&peer_id, addr.clone());
-                                // АВТО-ПОДКЛЮЧЕНИЕ для mDNS (локальная сеть)
-                                let _ = swarm.dial(addr.clone());
+
+                                // ДЕДУПЛИКАЦИЯ: пробуем подключаться ТОЛЬКО по QUIC (он быстрее и лучше за NAT)
+                                // Если это TCP, просто игнорируем авто-диал, он подхватится если QUIC не сработает
+                                if addr.to_string().contains("quic-v1") {
+                                    println!("🔍 mDNS: найден пир {} (QUIC). Подключаюсь...", &peer_id.to_string()[..8]);
+                                    let _ = swarm.dial(addr.clone());
+                                } else {
+                                    println!("🔍 mDNS: найден пир {} (TCP). (Пропускаю авто-диал, жду QUIC)", &peer_id.to_string()[..8]);
+                                }
+
                                 let _ = event_tx.send(NetworkEvent::MdnsDiscovered(peer_id, addr.clone())).await;
                                 peer_addrs.entry(peer_id).or_default().push(addr);
                             }
@@ -1350,6 +1359,7 @@ async fn main() -> Result<(), Box<dyn Error>> {
 
                              if peer_id != local_peer_id {
                                  let _ = event_tx.send(NetworkEvent::Connected(peer_id)).await;
+                                 let _ = event_tx.send(NetworkEvent::Status(format!("✅ СОЕДИНЕНО: {}", &peer_id.to_string()[..8]))).await;
                              }
                         },
                         SwarmEvent::ConnectionClosed { peer_id, cause, .. } => {
