@@ -587,12 +587,6 @@ impl eframe::App for App {
                 NetworkEvent::Connected(peer) => {
                     self.connected_peers += 1;
                     self.add_status(format!("✅ Подключено: {}...", &peer.to_string()[..8]));
-                    // Добавляем в список известных, если это не мы сами
-                    if peer != self.local_peer_id {
-                        self.known_peers
-                            .entry(peer)
-                            .or_insert_with(|| format!("Peer_{}", &peer.to_string()[..8]));
-                    }
                 }
                 NetworkEvent::Disconnected(peer) => {
                     self.connected_peers = self.connected_peers.saturating_sub(1);
@@ -1044,7 +1038,10 @@ async fn main() -> Result<(), Box<dyn Error>> {
 
                 // Kademlia: хранилище в памяти
                 let kad_store = kad::store::MemoryStore::new(local_peer_id);
-                let mut kad = kad::Behaviour::new(local_peer_id, kad_store);
+                let kad_config = kad::Config::default();
+                let mut kad = kad::Behaviour::with_config(local_peer_id, kad_store, kad_config);
+                // Включаем серверный режим на самом поведении
+                kad.set_mode(Some(libp2p::kad::Mode::Server));
 
                 // Добавляем бутстрап-ноды IPFS/libp2p
                 let bootstrap = [
@@ -1249,8 +1246,10 @@ async fn main() -> Result<(), Box<dyn Error>> {
                             local_listen_addrs.insert(address.clone());
                             println!("📡 СЛУШАЮ: {}", address);
 
-                            if !s.contains("/ip6/") && !s.contains("/0.0.0.0") && !s.contains("/127.0.0.1") {
-                                println!("  (Внешний): {}/p2p/{}", address, local_peer_id);
+                            let is_external = !s.contains("/ip6/") && !s.contains("/0.0.0.0") && !s.contains("/127.0.0.1") || s.contains("p2p-circuit");
+
+                            if is_external {
+                                println!("  (Внешний/Relay): {}/p2p/{}", address, local_peer_id);
                                 let _ = event_tx.send(NetworkEvent::NewListenAddr(address.clone())).await;
                                 swarm.add_external_address(address);
                             }
@@ -1266,6 +1265,8 @@ async fn main() -> Result<(), Box<dyn Error>> {
                             for (peer_id, addr) in list {
                                 if peer_id == local_peer_id { continue; }
                                 println!("🔍 mDNS: найден пир {} на {}. (Авто-подключение ОТКЛЮЧЕНО)", &peer_id.to_string()[..8], addr);
+                                // Регистрация адреса в Kademlia для возможности прямого вызова (Request-Response)
+                                swarm.behaviour_mut().kad.add_address(&peer_id, addr.clone());
                                 let _ = event_tx.send(NetworkEvent::MdnsDiscovered(peer_id, addr.clone())).await;
                                 peer_addrs.entry(peer_id).or_default().push(addr);
                             }
@@ -1426,10 +1427,12 @@ async fn main() -> Result<(), Box<dyn Error>> {
 
                         SwarmEvent::Behaviour(ChatBehaviourEvent::Kad(kad::Event::OutboundQueryProgressed { result, .. })) => {
                             match result {
-                                kad::QueryResult::GetClosestPeers(Ok(ok)) => {
+                                 libp2p::kad::QueryResult::GetClosestPeers(Ok(ok)) => {
+                                    println!("🔍 Kademlia: поиск завершен. Найдено {} узлов.", ok.peers.len());
                                     for peer in ok.peers {
                                         if !peer.addrs.is_empty() {
-                                            println!("🔍 Kademlia: найден пир {} с {} адресами", peer.peer_id, peer.addrs.len());
+                                            println!("📍 Найдено: {} ({} адресов)", &peer.peer_id.to_string()[..8], peer.addrs.len());
+                                            // Если среди найденных есть тот, кого мы искали - подключаемся
                                             let _ = command_tx_for_mdns.try_send(UICommand::DialPeer(peer.peer_id, peer.addrs));
                                         }
                                     }
