@@ -1,1 +1,6 @@
 /target
+vault.bin
+void.key
+nickname.txt
+*.log
+*.txt
