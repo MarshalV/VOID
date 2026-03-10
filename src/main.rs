@@ -7,7 +7,7 @@ use chrono;
 use eframe::egui;
 use futures::StreamExt;
 use libp2p::{
-    autonat, dcutr, gossipsub, identify, kad, mdns, noise, ping, relay,
+    autonat, dcutr, identify, kad, mdns, noise, ping, relay,
     swarm::{dial_opts::DialOpts, NetworkBehaviour, SwarmEvent},
     tcp, upnp, yamux, Multiaddr, PeerId,
 };
@@ -143,7 +143,6 @@ enum NetworkEvent {
     MdnsExpired(PeerId),
     Connected(PeerId),
     Disconnected(PeerId),
-    MeshPeers(usize),
     ChatMessage(ChatMessage),
     Status(String),
 }
@@ -162,7 +161,7 @@ enum UICommand {
 
 #[derive(NetworkBehaviour)]
 struct ChatBehaviour {
-    gossipsub: gossipsub::Behaviour,
+    request_response: libp2p::request_response::json::Behaviour<V1Packet, V1Packet>,
     mdns: mdns::tokio::Behaviour,
     ping: ping::Behaviour,
     identify: identify::Behaviour,
@@ -178,7 +177,6 @@ struct App {
     local_nickname: String,
     listen_addrs: Vec<String>,
     connected_peers: usize,
-    mesh_peers: usize,
     dial_address: String,
     chat_input: String,
     // Storage: "GLOBAL" or PeerId string
@@ -212,7 +210,6 @@ impl App {
             local_nickname,
             listen_addrs: Vec::new(),
             connected_peers: 0,
-            mesh_peers: 0,
             dial_address: String::new(),
             chat_input: String::new(),
             messages,
@@ -337,7 +334,6 @@ impl App {
                                     .color(accent_color),
                             );
                             ui.label(format!("🌐 Подключено: {}", self.connected_peers));
-                            ui.label(format!("📡 В сети (Mesh): {}", self.mesh_peers));
 
                             if !self.listen_addrs.is_empty() {
                                 ui.add_space(5.0);
@@ -399,7 +395,7 @@ impl App {
 
                             let is_global = self.selected_chat == "GLOBAL";
                             if ui
-                                .selectable_label(is_global, "🌍 Глобальный чат")
+                                .selectable_label(is_global, "🌍 Общий поток (все)")
                                 .clicked()
                             {
                                 self.selected_chat = "GLOBAL".to_string();
@@ -601,9 +597,6 @@ impl eframe::App for App {
                 NetworkEvent::Disconnected(peer) => {
                     self.connected_peers = self.connected_peers.saturating_sub(1);
                     self.add_status(format!("❌ Отключено: {}...", &peer.to_string()[..8]));
-                }
-                NetworkEvent::MeshPeers(count) => {
-                    self.mesh_peers = count;
                 }
                 NetworkEvent::ChatMessage(msg) => {
                     // Update known peers for display names
@@ -1049,18 +1042,6 @@ async fn main() -> Result<(), Box<dyn Error>> {
             .with_behaviour(|key, relay_client| {
                 let local_peer_id = key.public().to_peer_id();
 
-                // Gossipsub: оптимизированные параметры для Windows
-                let gossipsub_config = gossipsub::ConfigBuilder::default()
-                    .heartbeat_interval(Duration::from_millis(500))
-                    .validation_mode(gossipsub::ValidationMode::Permissive)
-                    .mesh_n_low(2) // Минимум 2 пира для меша
-                    .mesh_n(3) // Цель - 3
-                    .mesh_n_high(6)
-                    .flood_publish(true)
-                    .max_transmit_size(262144) // 256KB
-                    .build()
-                    .unwrap();
-
                 // Kademlia: хранилище в памяти
                 let kad_store = kad::store::MemoryStore::new(local_peer_id);
                 let mut kad = kad::Behaviour::new(local_peer_id, kad_store);
@@ -1089,12 +1070,15 @@ async fn main() -> Result<(), Box<dyn Error>> {
                 }
                 let _ = kad.bootstrap();
 
+                let rr_config = libp2p::request_response::Config::default();
+                let rr_protocol = libp2p::StreamProtocol::new("/void/chat/1.0.0");
+                let rr_behaviour = libp2p::request_response::json::Behaviour::<V1Packet, V1Packet>::new(
+                    [(rr_protocol, libp2p::request_response::ProtocolSupport::Full)],
+                    rr_config,
+                );
+
                 Ok(ChatBehaviour {
-                    gossipsub: gossipsub::Behaviour::new(
-                        gossipsub::MessageAuthenticity::Signed(key.clone()),
-                        gossipsub_config,
-                    )
-                    .unwrap(),
+                    request_response: rr_behaviour,
                     mdns: mdns::tokio::Behaviour::new(mdns::Config::default(), local_peer_id)
                         .unwrap(),
                     ping: ping::Behaviour::default(),
@@ -1115,10 +1099,6 @@ async fn main() -> Result<(), Box<dyn Error>> {
                     .with_per_connection_event_buffer_size(256)
             })
             .build();
-
-        // Подписываемся на топик
-        let topic = gossipsub::IdentTopic::new("void-chat-v1");
-        swarm.behaviour_mut().gossipsub.subscribe(&topic).unwrap();
 
         // Слушаем TCP. Сначала пробуем 50001 (согласно правилам файрвола).
         let tcp_addr: Multiaddr = "/ip4/0.0.0.0/tcp/50001".parse().unwrap();
@@ -1151,8 +1131,6 @@ async fn main() -> Result<(), Box<dyn Error>> {
             ))
             .await;
 
-        let mut mesh_check = tokio::time::interval(Duration::from_secs(5));
-        let mut hello_broadcast = tokio::time::interval(Duration::from_secs(30));
         let mut kad_bootstrap_timer = tokio::time::interval(Duration::from_secs(300)); // 5 минут
         let mut peer_addrs: HashMap<PeerId, Vec<Multiaddr>> = HashMap::new();
         let mut pending_dials: HashSet<PeerId> = HashSet::new();
@@ -1161,27 +1139,6 @@ async fn main() -> Result<(), Box<dyn Error>> {
 
         loop {
             tokio::select! {
-                _ = hello_broadcast.tick() => {
-                    let hello = V1Packet::Hello { public_key: my_public_key.to_bytes() };
-                    if let Ok(json) = serde_json::to_vec(&hello) {
-                        let _ = swarm.behaviour_mut().gossipsub.publish(topic.clone(), json);
-                    }
-                },
-                _ = mesh_check.tick() => {
-                    let mesh = swarm.behaviour().gossipsub.all_mesh_peers().count();
-
-                    // Если меш пуст, пробуем форсировать подключение ко всем известным пирам
-                    if mesh == 0 {
-                        let connected: Vec<PeerId> = swarm.connected_peers().cloned().collect();
-                        if !connected.is_empty() {
-                            for peer_id in connected {
-                                swarm.behaviour_mut().gossipsub.add_explicit_peer(&peer_id);
-                            }
-                        }
-                    }
-
-                    let _ = event_tx.send(NetworkEvent::MeshPeers(mesh)).await;
-                },
                 cmd = command_rx.recv() => {
                     if let Some(c) = cmd {
                         match c {
@@ -1240,7 +1197,7 @@ async fn main() -> Result<(), Box<dyn Error>> {
                                       pending_dials.remove(&peer_id);
                                  }
                              }
-                            UICommand::SendMessage { sender_name, text, recipient, is_retry } => {
+                            UICommand::SendMessage { sender_name, text, recipient, is_retry: _is_retry } => {
                                 let now = chrono::Local::now().format("%H:%M:%S").to_string();
                                 println!("[{}] 📤 UI_SEND: '{}' (To: {:?})", now, text, recipient);
                                 let msg = ChatMessage {
@@ -1262,46 +1219,23 @@ async fn main() -> Result<(), Box<dyn Error>> {
                                         }
                                     } else {
                                         let hello = V1Packet::Hello { public_key: my_public_key.to_bytes() };
-                                        let h_json = serde_json::to_vec(&hello).unwrap();
-                                        let _ = swarm.behaviour_mut().gossipsub.publish(topic.clone(), h_json);
-                                        println!("[{}] 🤝 E2EE: Сессии нет, отправлен Hello пиру {}", now, &peer_id.to_string()[..8]);
+                                        let _ = swarm.behaviour_mut().request_response.send_request(&peer_id, hello);
+                                        println!("[{}] 🤝 E2EE: Сессии нет, направлен Hello пиру {}", now, &peer_id.to_string()[..8]);
                                     }
-                                }
 
-                                let final_json = serde_json::to_vec(&packet).unwrap();
-
-                                match swarm.behaviour_mut().gossipsub.publish(topic.clone(), final_json.clone()) {
-                                    Ok(id) => println!("[{}] ✅ Gossipsub: Опубликовано, ID: {:?}", now, id),
-                                    Err(e) => {
-                                        println!("[{}] ❌ Gossipsub ERROR: {:?}. Рефреш пиров...", now, e);
-                                        // Форсируем добавление всех подключенных
-                                        let connected: Vec<_> = swarm.connected_peers().cloned().collect();
-                                        for peer in connected {
-                                            swarm.behaviour_mut().gossipsub.add_explicit_peer(&peer);
-                                        }
-                                        // Пробуем еще раз через секунду, если это была ошибка пустой подписки
-                                        // Важно: swarm не может быть перемещен, так как он используется дальше в цикле.
-                                        // Вместо этого, мы можем отправить команду на повторную публикацию через command_tx (clone).
-                                        // Однако, для простоты и избежания рефакторинга всего цикла,
-                                        // мы просто отправляем повторную команду в канал.
-                                        // Если меш пуст, то это может быть `NotSubscribed` или `NoMesh`
-                                        if !is_retry && swarm.behaviour().gossipsub.all_mesh_peers().count() == 0 {
-                                            println!("[{}] ⚠️ Gossipsub: Меш пуст, повтор будет через 2с (лимит 1 раз)...", now);
-                                            let command_tx_clone = command_tx_for_mdns.clone();
-                                            let sender_name_clone = sender_name.clone();
-                                            let text_clone = text.clone();
-                                            let recipient_clone = recipient;
-                                            tokio::spawn(async move {
-                                                tokio::time::sleep(Duration::from_secs(2)).await;
-                                                let _ = command_tx_clone.send(UICommand::SendMessage {
-                                                    sender_name: sender_name_clone,
-                                                    text: text_clone,
-                                                    recipient: recipient_clone,
-                                                    is_retry: true,
-                                                }).await;
-                                            });
-                                        }
+                                    // Отправляем конкретному пиру
+                                    let _ = swarm.behaviour_mut().request_response.send_request(&peer_id, packet);
+                                    println!("[{}] 📨 RequestResponse: Отправка пиру {}", now, &peer_id.to_string()[..8]);
+                                } else {
+                                    // "Общий поток" в безмешовой сети - шлем всем ПОДКЛЮЧЕННЫМ
+                                    let connected: Vec<_> = swarm.connected_peers().cloned().collect();
+                                    if connected.is_empty() {
+                                        println!("[{}] ⚠️ Нет подключений для рассылки сообщения", now);
                                     }
+                                    for peer in connected {
+                                        let _ = swarm.behaviour_mut().request_response.send_request(&peer, packet.clone());
+                                    }
+                                    println!("[{}] 📢 Рассылка сообщения всем подключенным ({})", now, swarm.connected_peers().count());
                                 }
                                 let _ = event_tx.send(NetworkEvent::ChatMessage(msg)).await;
                             }
@@ -1313,61 +1247,28 @@ async fn main() -> Result<(), Box<dyn Error>> {
                         SwarmEvent::NewListenAddr { address, .. } => {
                             let s = address.to_string();
                             local_listen_addrs.insert(address.clone());
+                            println!("📡 СЛУШАЮ: {}", address);
+
                             if !s.contains("/ip6/") && !s.contains("/0.0.0.0") && !s.contains("/127.0.0.1") {
-                                println!("Слушаю: {}/p2p/{}", address, local_peer_id);
+                                println!("  (Внешний): {}/p2p/{}", address, local_peer_id);
                                 let _ = event_tx.send(NetworkEvent::NewListenAddr(address.clone())).await;
-                                // Объявляем адрес внешним для лучшего дискавери
                                 swarm.add_external_address(address);
+                            }
+
+                            if s.contains("p2p-circuit") {
+                                let _ = event_tx.send(NetworkEvent::Status(
+                                    "✨ СВЯЗЬ ЧЕРЕЗ RELAY: Вы доступны через посредника (за NAT)!".into()
+                                )).await;
                             }
                         },
 
                         SwarmEvent::Behaviour(ChatBehaviourEvent::Mdns(mdns::Event::Discovered(list))) => {
-                            let mut to_dial: std::collections::HashMap<libp2p::PeerId, Vec<libp2p::Multiaddr>> = std::collections::HashMap::new();
                             for (peer_id, addr) in list {
                                 if peer_id == local_peer_id { continue; }
-                                if pending_dials.contains(&peer_id) { continue; }
-
-                                // Проверяем кулдаун (5 секунд после последней неудачи)
-                                if let Some(last_fail) = dial_backoff.get(&peer_id) {
-                                    if last_fail.elapsed() < Duration::from_secs(5) {
-                                        continue;
-                                    }
-                                }
-
-                                let a_str = addr.to_string();
-                                if a_str.contains("127.0.0.1") || a_str.contains("::1") { continue; }
-
-                                // Проверяем, не подключены ли мы уже (избегаем дублей)
-                                if swarm.connected_peers().any(|p| p == &peer_id) { continue; }
-
-                                 println!("mDNS: найден {} на {}", peer_id, addr);
-                                 let _ = event_tx.send(NetworkEvent::MdnsDiscovered(peer_id, addr.clone())).await;
-                                 swarm.behaviour_mut().gossipsub.add_explicit_peer(&peer_id);
-                                 to_dial.entry(peer_id).or_default().push(addr);
-                             }
-
-                             for (peer_id, addrs) in to_dial {
-                                 let all_addrs = peer_addrs.entry(peer_id).or_default();
-                                 for a in &addrs {
-                                     if !all_addrs.contains(a) {
-                                         all_addrs.push(a.clone());
-                                     }
-                                 }
-
-                                 let is_leader = local_peer_id > peer_id;
-                                 let delay_ms = if is_leader { 300 } else { 3000 };
-
-                                 pending_dials.insert(peer_id);
-                                 let cmd_tx2 = command_tx_for_mdns.clone();
-                                 let dial_addrs = all_addrs.clone();
-
-                                 tokio::spawn(async move {
-                                     let type_str = if is_leader { "Leader" } else { "Follower" };
-                                     println!("mDNS: Dialing {} ({} delay: {}ms)", &peer_id.to_string()[..8], type_str, delay_ms);
-                                     tokio::time::sleep(Duration::from_millis(delay_ms)).await;
-                                     let _ = cmd_tx2.send(UICommand::DialPeer(peer_id, dial_addrs)).await;
-                                 });
-                             }
+                                println!("🔍 mDNS: найден пир {} на {}. (Авто-подключение ОТКЛЮЧЕНО)", &peer_id.to_string()[..8], addr);
+                                let _ = event_tx.send(NetworkEvent::MdnsDiscovered(peer_id, addr.clone())).await;
+                                peer_addrs.entry(peer_id).or_default().push(addr);
+                            }
                         }
                         SwarmEvent::Behaviour(ChatBehaviourEvent::Mdns(mdns::Event::Expired(peers))) => {
                             for (peer_id, _) in peers {
@@ -1375,77 +1276,56 @@ async fn main() -> Result<(), Box<dyn Error>> {
                             }
                         }
 
-                        SwarmEvent::Behaviour(ChatBehaviourEvent::Gossipsub(gossipsub::Event::Message { message, .. })) => {
+                        SwarmEvent::Behaviour(ChatBehaviourEvent::RequestResponse(libp2p::request_response::Event::Message { peer, message, .. })) => {
                             let now = chrono::Local::now().format("%H:%M:%S").to_string();
-                            if let Ok(packet) = serde_json::from_slice::<V1Packet>(&message.data) {
-                                match packet {
-                                    V1Packet::Hello { public_key } => {
-                                        if let Some(src) = message.source {
-                                             if src != local_peer_id {
-                                                let session_exists = sessions.contains_key(&src);
-                                                let is_initiator = local_peer_id < src;
-                                                let role_str = if is_initiator { "Initiator" } else { "Responder" };
+                            let packet = match message {
+                                libp2p::request_response::Message::Request { request, .. } => request,
+                                libp2p::request_response::Message::Response { response, .. } => response,
+                            };
 
-                                                println!("[{}] 🤝 E2EE: Получен Hello от {}. Роль: {}. Создаю сессию.", now, &src.to_string()[..8], role_str);
+                            match packet {
+                                V1Packet::Hello { public_key } => {
+                                    if peer != local_peer_id {
+                                        let session_exists = sessions.contains_key(&peer);
+                                        let is_initiator = local_peer_id < peer;
+                                        let role_str = if is_initiator { "Initiator" } else { "Responder" };
 
-                                                let remote_key = crypto::PublicKey::from(public_key);
-                                                let session = if is_initiator {
-                                                    crypto::SecureSession::new_initiator(&local_static, &remote_key)
-                                                } else {
-                                                    crypto::SecureSession::new_responder(&local_static, &remote_key)
-                                                };
-                                                sessions.insert(src, session);
+                                        println!("[{}] 🤝 E2EE: RequestResponse Hello от {}. Роль: {}. Создаю сессию.", now, &peer.to_string()[..8], role_str);
 
-                                                // Отвечаем своим Hello только если сессии с ним еще не было
-                                                if !session_exists {
-                                                    let my_hello = V1Packet::Hello { public_key: my_public_key.to_bytes() };
-                                                    let h_json = serde_json::to_vec(&my_hello).unwrap();
-                                                    let _ = swarm.behaviour_mut().gossipsub.publish(topic.clone(), h_json);
-                                                }
-                                            }
-                                        }
-                                    }
-                                    V1Packet::Encrypted { header, ciphertext } => {
-                                        if let Some(src) = message.source {
-                                            if let Some(session) = sessions.get_mut(&src) {
-                                                if let Ok(plaintext) = session.decrypt_payload(&header, &ciphertext) {
-                                                    if let Ok(msg) = serde_json::from_slice::<ChatMessage>(&plaintext) {
-                                                        println!("[{}]  E2EE: Сообщение ДЕШИФРОВАНО от {}", now, &src.to_string()[..8]);
-                                                        let _ = event_tx.send(NetworkEvent::ChatMessage(msg)).await;
-                                                    }
-                                                } else {
-                                                    println!("[{}] ❌ E2EE: Ошибка дешифровки от {}", now, &src.to_string()[..8]);
-                                                }
-                                            } else {
-                                                println!("[{}] ⚠️ E2EE: Получен шифрованный пакет, но сессия не найдена для {}", now, &src.to_string()[..8]);
-                                            }
-                                        }
-                                    }
-                                    V1Packet::Plain(msg) => {
-                                        if message.source != Some(local_peer_id) {
-                                            println!("[{}] 📖 Текст сообщения (отрытый): {}", now, msg.text);
-                                            let _ = event_tx.send(NetworkEvent::ChatMessage(msg)).await;
+                                        let remote_key = crypto::PublicKey::from(public_key);
+                                        let session = if is_initiator {
+                                            crypto::SecureSession::new_initiator(&local_static, &remote_key)
+                                        } else {
+                                            crypto::SecureSession::new_responder(&local_static, &remote_key)
+                                        };
+                                        sessions.insert(peer, session);
+
+                                        if !session_exists {
+                                            let my_hello = V1Packet::Hello { public_key: my_public_key.to_bytes() };
+                                            let _ = swarm.behaviour_mut().request_response.send_request(&peer, my_hello);
                                         }
                                     }
                                 }
-                            }
-                        }
-                        SwarmEvent::Behaviour(ChatBehaviourEvent::Gossipsub(gossipsub::Event::Subscribed { peer_id, topic })) => {
-                            println!("📡 Gossipsub: {}... ПОДПИСАЛСЯ на топик ({})", &peer_id.to_string()[..8], topic);
-                            let _ = event_tx.send(NetworkEvent::Status(
-                                format!("📡 {}... присоединился к чату ({})", &peer_id.to_string()[..8], topic)
-                            )).await;
-                        }
-
-                        SwarmEvent::Behaviour(ChatBehaviourEvent::Gossipsub(gossipsub::Event::Unsubscribed { peer_id, topic })) => {
-                            println!("📡 Gossipsub: {}... ОТПИСАЛСЯ от топика ({})", &peer_id.to_string()[..8], topic);
-                        }
-                        SwarmEvent::NewListenAddr { address, .. } => {
-                            println!("📡 СЛУШАЮ: {}", address);
-                            if address.to_string().contains("p2p-circuit") {
-                                let _ = event_tx.send(NetworkEvent::Status(
-                                    "✨ СВЯЗЬ ЧЕРЕЗ RELAY: Вы доступны через посредника (за NAT)!".into()
-                                )).await;
+                                V1Packet::Encrypted { header, ciphertext } => {
+                                    if let Some(session) = sessions.get_mut(&peer) {
+                                        if let Ok(plaintext) = session.decrypt_payload(&header, &ciphertext) {
+                                            if let Ok(msg) = serde_json::from_slice::<ChatMessage>(&plaintext) {
+                                                println!("[{}] 🔒 E2EE: Сообщение ДЕШИФРОВАНО от {}", now, &peer.to_string()[..8]);
+                                                let _ = event_tx.send(NetworkEvent::ChatMessage(msg)).await;
+                                            }
+                                        } else {
+                                            println!("[{}] ❌ E2EE: Ошибка дешифровки от {}", now, &peer.to_string()[..8]);
+                                        }
+                                    } else {
+                                        println!("[{}] ⚠️ E2EE: Получен шифрованный RR-пакет, но сессия не найдена для {}", now, &peer.to_string()[..8]);
+                                    }
+                                }
+                                V1Packet::Plain(msg) => {
+                                    if peer != local_peer_id {
+                                        println!("[{}] 📖 Текст RR (открытый): {}", now, msg.text);
+                                        let _ = event_tx.send(NetworkEvent::ChatMessage(msg)).await;
+                                    }
+                                }
                             }
                         }
                         SwarmEvent::ExternalAddrConfirmed { address } => {
@@ -1460,20 +1340,13 @@ async fn main() -> Result<(), Box<dyn Error>> {
                             pending_dials.remove(&peer_id);
 
                              if peer_id != local_peer_id {
-                                 // Принудительно добавляем и подписываем (для надежности)
-                                 swarm.behaviour_mut().gossipsub.add_explicit_peer(&peer_id);
-                                 let topic = gossipsub::IdentTopic::new("void-chat-v1");
-                                 let _ = swarm.behaviour_mut().gossipsub.subscribe(&topic);
-
                                  let _ = event_tx.send(NetworkEvent::Connected(peer_id)).await;
                              }
-                             let _ = event_tx.send(NetworkEvent::MeshPeers(connected_count)).await;
                         },
                         SwarmEvent::ConnectionClosed { peer_id, cause, .. } => {
                             let connected_count = swarm.connected_peers().count();
                             println!("❌ СОЕДИНЕНИЕ ЗАКРЫТО: {}. Причина: {:?}. Осталось: {}", peer_id, cause, connected_count);
                             let _ = event_tx.send(NetworkEvent::Disconnected(peer_id)).await;
-                            let _ = event_tx.send(NetworkEvent::MeshPeers(connected_count)).await;
                         }
                         SwarmEvent::IncomingConnection { local_addr, send_back_addr, .. } => {
                             println!("📥 Входящее соединение: from {:?} to {:?}", send_back_addr, local_addr);
@@ -1528,15 +1401,11 @@ async fn main() -> Result<(), Box<dyn Error>> {
                             let now = chrono::Local::now().format("%H:%M:%S").to_string();
                             println!("[{}] 🆔 Identify: Получено от {}: protocols={:?}", now, peer_id, info.protocols);
 
-                            // Добавляем внешние адреса пира в DHT
-                            for addr in info.listen_addrs {
-                                swarm.behaviour_mut().kad.add_address(&peer_id, addr);
-                            }
 
-                            if info.protocols.iter().any(|p| p.to_string().contains("gossipsub")) {
-                                println!("[{}] ✨ Пир {} поддерживает Gossipsub. Добавляю принудительно.", now, peer_id);
-                                swarm.behaviour_mut().gossipsub.add_explicit_peer(&peer_id);
-                            }
+                             // Добавляем внешние адреса пира в DHT
+                             for addr in info.listen_addrs {
+                                 swarm.behaviour_mut().kad.add_address(&peer_id, addr);
+                             }
                         }
                         SwarmEvent::Behaviour(ChatBehaviourEvent::Identify(identify::Event::Sent { peer_id, .. })) => {
                             println!("🆔 Identify: Отправлена информация пиру {}", peer_id);
