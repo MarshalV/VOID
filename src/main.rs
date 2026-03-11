@@ -203,8 +203,7 @@ impl App {
         event_rx: mpsc::Receiver<NetworkEvent>,
     ) -> Self {
         setup_custom_style(&cc.egui_ctx);
-        let mut messages = HashMap::new();
-        messages.insert("GLOBAL".to_string(), Vec::new());
+        let messages = HashMap::new();
 
         Self {
             local_peer_id,
@@ -215,7 +214,7 @@ impl App {
             chat_input: String::new(),
             messages,
             known_peers: HashMap::new(),
-            selected_chat: "GLOBAL".to_string(),
+            selected_chat: String::new(),
             status_log: Vec::new(),
             show_logs: false,
             show_sidebar: true,
@@ -394,13 +393,7 @@ impl App {
                                     .color(accent_color),
                             );
 
-                            let is_global = self.selected_chat == "GLOBAL";
-                            if ui
-                                .selectable_label(is_global, "🌍 Общий поток (все)")
-                                .clicked()
-                            {
-                                self.selected_chat = "GLOBAL".to_string();
-                            }
+                            // Global chat removed
 
                             ui.add_space(10.0);
                             ui.label(egui::RichText::new("ЛИЧНЫЕ").size(12.0).weak());
@@ -441,7 +434,7 @@ impl App {
                                 self.known_peers.remove(&pid);
                                 self.messages.remove(&p_str);
                                 if self.selected_chat == p_str {
-                                    self.selected_chat = "GLOBAL".to_string();
+                                    self.selected_chat = String::new();
                                 }
                             }
                         });
@@ -611,7 +604,7 @@ impl eframe::App for App {
                             None
                         }
                     } else {
-                        Some("GLOBAL".to_string())
+                        None // Ignore global messages
                     };
 
                     if let Some(b) = bucket {
@@ -849,19 +842,22 @@ impl eframe::App for App {
                                                 && ctx.input(|i| i.key_pressed(egui::Key::Enter))))
                                             && !self.chat_input.is_empty()
                                         {
-                                            let recipient = if self.selected_chat == "GLOBAL" {
+                                            let recipient = if self.selected_chat.is_empty() {
                                                 None
                                             } else {
                                                 self.selected_chat.parse::<PeerId>().ok()
                                             };
-                                            let _ =
-                                                self.command_tx.try_send(UICommand::SendMessage {
-                                                    sender_name: self.local_nickname.clone(),
-                                                    text: self.chat_input.clone(),
-                                                    recipient,
-                                                    is_retry: false,
-                                                });
-                                            self.chat_input.clear();
+                                            
+                                            if let Some(peer_id) = recipient {
+                                                let _ =
+                                                    self.command_tx.try_send(UICommand::SendMessage {
+                                                        sender_name: self.local_nickname.clone(),
+                                                        text: self.chat_input.clone(),
+                                                        recipient: Some(peer_id),
+                                                        is_retry: false,
+                                                    });
+                                                self.chat_input.clear();
+                                            }
                                         }
                                     });
                                 });
@@ -1249,15 +1245,7 @@ async fn main() -> Result<(), Box<dyn Error>> {
                                     let _ = swarm.behaviour_mut().request_response.send_request(&peer_id, packet);
                                     println!("[{}] 📨 RequestResponse: Отправка пиру {}", now, &peer_id.to_string()[..8]);
                                 } else {
-                                    // "Общий поток" в безмешовой сети - шлем всем ПОДКЛЮЧЕННЫМ
-                                    let connected: Vec<_> = swarm.connected_peers().cloned().collect();
-                                    if connected.is_empty() {
-                                        println!("[{}] ⚠️ Нет подключений для рассылки сообщения", now);
-                                    }
-                                    for peer in connected {
-                                        let _ = swarm.behaviour_mut().request_response.send_request(&peer, packet.clone());
-                                    }
-                                    println!("[{}] 📢 Рассылка сообщения всем подключенным ({})", now, swarm.connected_peers().count());
+                                    println!("[{}] ⚠️ Попытка отправить сообщение без получателя (Global Chat отключен)", now);
                                 }
                                 let _ = event_tx.send(NetworkEvent::ChatMessage(msg)).await;
                             }
