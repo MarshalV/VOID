@@ -847,15 +847,16 @@ impl eframe::App for App {
                                             } else {
                                                 self.selected_chat.parse::<PeerId>().ok()
                                             };
-                                            
+
                                             if let Some(peer_id) = recipient {
-                                                let _ =
-                                                    self.command_tx.try_send(UICommand::SendMessage {
+                                                let _ = self.command_tx.try_send(
+                                                    UICommand::SendMessage {
                                                         sender_name: self.local_nickname.clone(),
                                                         text: self.chat_input.clone(),
                                                         recipient: Some(peer_id),
                                                         is_retry: false,
-                                                    });
+                                                    },
+                                                );
                                                 self.chat_input.clear();
                                             }
                                         }
@@ -1232,8 +1233,8 @@ async fn main() -> Result<(), Box<dyn Error>> {
                                         let ephem_secret = crypto::StaticSecret::random_from_rng(&mut rand::rngs::OsRng);
                                         let ephem_pub = crypto::PublicKey::from(&ephem_secret);
                                         pending_handshakes.insert(peer_id, ephem_secret);
-                                        
-                                        let hello = V1Packet::Hello { 
+
+                                        let hello = V1Packet::Hello {
                                             public_key: my_public_key.to_bytes(),
                                             ephemeral_key: ephem_pub.to_bytes(),
                                         };
@@ -1313,18 +1314,18 @@ async fn main() -> Result<(), Box<dyn Error>> {
                                             let is_initiator = local_peer_id < peer;
                                             let role_str = if is_initiator { "Initiator" } else { "Responder" };
                                             let session_exists = sessions.contains_key(&peer);
-                                            
+
                                             if !session_exists {
                                                 let remote_static_pub = crypto::PublicKey::from(public_key);
                                                 let remote_ephem_pub = crypto::PublicKey::from(ephemeral_key);
-                                                
+
                                                 if is_initiator {
                                                     // Мы инициатор: получаем ответ от Responder
                                                     if let Some(local_ephem_secret) = pending_handshakes.remove(&peer) {
                                                         let session = crypto::SecureSession::new_initiator(
-                                                            &local_static, 
-                                                            &remote_static_pub, 
-                                                            local_ephem_secret, 
+                                                            &local_static,
+                                                            &remote_static_pub,
+                                                            local_ephem_secret,
                                                             &remote_ephem_pub
                                                         );
                                                         sessions.insert(peer, session);
@@ -1334,10 +1335,10 @@ async fn main() -> Result<(), Box<dyn Error>> {
                                                     // Мы ответчик: получаем Hello от Alice
                                                     let local_ephem_secret = crypto::StaticSecret::random_from_rng(&mut rand::rngs::OsRng);
                                                     let local_ephem_pub = crypto::PublicKey::from(&local_ephem_secret);
-                                                    
+
                                                     let session = crypto::SecureSession::new_responder(
-                                                        &local_static, 
-                                                        &remote_static_pub, 
+                                                        &local_static,
+                                                        &remote_static_pub,
                                                         &remote_ephem_pub,
                                                         local_ephem_secret
                                                     );
@@ -1345,7 +1346,7 @@ async fn main() -> Result<(), Box<dyn Error>> {
                                                     println!("[{}] 🤝 E2EE: Сессия (Responder) создана с {}", now, &peer.to_string()[..8]);
 
                                                     // Отвечаем Alice своим Hello
-                                                    let my_hello = V1Packet::Hello { 
+                                                    let my_hello = V1Packet::Hello {
                                                         public_key: my_public_key.to_bytes(),
                                                         ephemeral_key: local_ephem_pub.to_bytes(),
                                                     };
