@@ -1025,13 +1025,22 @@ async fn main() -> Result<(), Box<dyn Error>> {
             .with_tcp(
                 tcp::Config::default().nodelay(true),
                 noise::Config::new,
-                yamux::Config::default,
+                || {
+                    let mut config = yamux::Config::default();
+                    // SYNC CHECK: This should appear in your editor if synced.
+                    config.set_max_num_streams(512);
+                    config
+                },
             )
             .unwrap()
             .with_quic()
             .with_dns()
             .unwrap()
-            .with_relay_client(noise::Config::new, yamux::Config::default)
+            .with_relay_client(noise::Config::new, || {
+                let mut config = yamux::Config::default();
+                config.set_max_num_streams(512);
+                config
+            })
             .unwrap()
             .with_behaviour(|key, relay_client| {
                 let local_peer_id = key.public().to_peer_id();
@@ -1304,23 +1313,24 @@ async fn main() -> Result<(), Box<dyn Error>> {
                             match packet {
                                 V1Packet::Hello { public_key } => {
                                     if peer != local_peer_id {
-                                        let session_exists = sessions.contains_key(&peer);
                                         let is_initiator = local_peer_id < peer;
                                         let role_str = if is_initiator { "Initiator" } else { "Responder" };
-
-                                        println!("[{}] 🤝 E2EE: RequestResponse Hello от {}. Роль: {}. Создаю сессию.", now, &peer.to_string()[..8], role_str);
-
-                                        let remote_key = crypto::PublicKey::from(public_key);
-                                        let session = if is_initiator {
-                                            crypto::SecureSession::new_initiator(&local_static, &remote_key)
-                                        } else {
-                                            crypto::SecureSession::new_responder(&local_static, &remote_key)
-                                        };
-                                        sessions.insert(peer, session);
-
+                                        let session_exists = sessions.contains_key(&peer);
                                         if !session_exists {
+                                            let remote_key = crypto::PublicKey::from(public_key);
+                                            let session = if is_initiator {
+                                                crypto::SecureSession::new_initiator(&local_static, &remote_key)
+                                            } else {
+                                                crypto::SecureSession::new_responder(&local_static, &remote_key)
+                                            };
+                                            sessions.insert(peer, session);
+
+                                            println!("[{}] 🤝 E2EE: Новая сессия с {}. Роль: {}", now, &peer.to_string()[..8], role_str);
+
                                             let my_hello = V1Packet::Hello { public_key: my_public_key.to_bytes() };
                                             let _ = swarm.behaviour_mut().request_response.send_request(&peer, my_hello);
+                                        } else {
+                                            println!("[{}] 🤝 E2EE: Сессия с {} уже существует, игнорирую дубликат Hello", now, &peer.to_string()[..8]);
                                         }
                                     }
                                 }
@@ -1332,7 +1342,9 @@ async fn main() -> Result<(), Box<dyn Error>> {
                                                 let _ = event_tx.send(NetworkEvent::ChatMessage(msg)).await;
                                             }
                                         } else {
-                                            println!("[{}] ❌ E2EE: Ошибка дешифровки от {}", now, &peer.to_string()[..8]);
+                                            println!("[{}] ❌ E2EE: Ошибка дешифровки от {}. Сбрасываю сессию...", now, &peer.to_string()[..8]);
+                                            sessions.remove(&peer);
+                                            let _ = event_tx.send(NetworkEvent::Status(format!("⚠️ Ошибка E2EE от {}. Переподключение...", &peer.to_string()[..8]))).await;
                                         }
                                     } else {
                                         println!("[{}] ⚠️ E2EE: Получен шифрованный RR-пакет, но сессия не найдена для {}", now, &peer.to_string()[..8]);
