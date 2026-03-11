@@ -129,6 +129,7 @@ struct ChatMessage {
 enum V1Packet {
     Hello {
         public_key: [u8; 32],
+        ephemeral_key: [u8; 32],
     },
     Encrypted {
         header: crypto::MessageHeader,
@@ -1017,6 +1018,7 @@ async fn main() -> Result<(), Box<dyn Error>> {
         let command_tx_for_mdns = command_tx_for_mdns;
         let local_static = static_secret_net;
         let mut sessions: HashMap<PeerId, crypto::SecureSession> = HashMap::new();
+        let mut pending_handshakes: HashMap<PeerId, crypto::StaticSecret> = HashMap::new();
         let my_public_key = crypto::PublicKey::from(&local_static);
 
         // Swarm: TCP + noise + yamux + Relay Client
@@ -1231,9 +1233,16 @@ async fn main() -> Result<(), Box<dyn Error>> {
                                             println!("[{}] 🔒 E2EE: Сообщение зашифровано для {}", now, &peer_id.to_string()[..8]);
                                         }
                                     } else {
-                                        let hello = V1Packet::Hello { public_key: my_public_key.to_bytes() };
+                                        let ephem_secret = crypto::StaticSecret::random_from_rng(&mut rand::rngs::OsRng);
+                                        let ephem_pub = crypto::PublicKey::from(&ephem_secret);
+                                        pending_handshakes.insert(peer_id, ephem_secret);
+                                        
+                                        let hello = V1Packet::Hello { 
+                                            public_key: my_public_key.to_bytes(),
+                                            ephemeral_key: ephem_pub.to_bytes(),
+                                        };
                                         let _ = swarm.behaviour_mut().request_response.send_request(&peer_id, hello);
-                                        println!("[{}] 🤝 E2EE: Сессии нет, направлен Hello пиру {}", now, &peer_id.to_string()[..8]);
+                                        println!("[{}] 🤝 E2EE: Сессии нет, направлен Hello (+Ephem) пиру {}", now, &peer_id.to_string()[..8]);
                                     }
 
                                     // Отправляем конкретному пиру
@@ -1310,31 +1319,54 @@ async fn main() -> Result<(), Box<dyn Error>> {
                                 libp2p::request_response::Message::Response { response, .. } => response,
                             };
 
-                            match packet {
-                                V1Packet::Hello { public_key } => {
-                                    if peer != local_peer_id {
-                                        let is_initiator = local_peer_id < peer;
-                                        let role_str = if is_initiator { "Initiator" } else { "Responder" };
-                                        let session_exists = sessions.contains_key(&peer);
-                                        if !session_exists {
-                                            let remote_key = crypto::PublicKey::from(public_key);
-                                            let session = if is_initiator {
-                                                crypto::SecureSession::new_initiator(&local_static, &remote_key)
-                                            } else {
-                                                crypto::SecureSession::new_responder(&local_static, &remote_key)
-                                            };
-                                            sessions.insert(peer, session);
+                                match packet {
+                                    V1Packet::Hello { public_key, ephemeral_key } => {
+                                        if peer != local_peer_id {
+                                            let is_initiator = local_peer_id < peer;
+                                            let role_str = if is_initiator { "Initiator" } else { "Responder" };
+                                            let session_exists = sessions.contains_key(&peer);
+                                            
+                                            if !session_exists {
+                                                let remote_static_pub = crypto::PublicKey::from(public_key);
+                                                let remote_ephem_pub = crypto::PublicKey::from(ephemeral_key);
+                                                
+                                                if is_initiator {
+                                                    // Мы инициатор: получаем ответ от Responder
+                                                    if let Some(local_ephem_secret) = pending_handshakes.remove(&peer) {
+                                                        let session = crypto::SecureSession::new_initiator(
+                                                            &local_static, 
+                                                            &remote_static_pub, 
+                                                            local_ephem_secret, 
+                                                            &remote_ephem_pub
+                                                        );
+                                                        sessions.insert(peer, session);
+                                                        println!("[{}] 🤝 E2EE: Сессия (Initiator) создана с {}", now, &peer.to_string()[..8]);
+                                                    }
+                                                } else {
+                                                    // Мы ответчик: получаем Hello от Alice
+                                                    let local_ephem_secret = crypto::StaticSecret::random_from_rng(&mut rand::rngs::OsRng);
+                                                    let local_ephem_pub = crypto::PublicKey::from(&local_ephem_secret);
+                                                    
+                                                    let session = crypto::SecureSession::new_responder(
+                                                        &local_static, 
+                                                        &remote_static_pub, 
+                                                        &remote_ephem_pub,
+                                                        local_ephem_secret
+                                                    );
+                                                    sessions.insert(peer, session);
+                                                    println!("[{}] 🤝 E2EE: Сессия (Responder) создана с {}", now, &peer.to_string()[..8]);
 
-                                            println!("[{}] 🤝 E2EE: Новая сессия с {}. Роль: {}", now, &peer.to_string()[..8], role_str);
-
-                                            let my_hello = V1Packet::Hello { public_key: my_public_key.to_bytes() };
-                                            let _ = swarm.behaviour_mut().request_response.send_request(&peer, my_hello);
-                                        } else {
-                                            println!("[{}] 🤝 E2EE: Сессия с {} уже существует, игнорирую дубликат Hello", now, &peer.to_string()[..8]);
+                                                    // Отвечаем Alice своим Hello
+                                                    let my_hello = V1Packet::Hello { 
+                                                        public_key: my_public_key.to_bytes(),
+                                                        ephemeral_key: local_ephem_pub.to_bytes(),
+                                                    };
+                                                    let _ = swarm.behaviour_mut().request_response.send_request(&peer, my_hello);
+                                                }
+                                            }
                                         }
-                                    }
-                                }
-                                V1Packet::Encrypted { header, ciphertext } => {
+                                    },
+                                    V1Packet::Encrypted { header, ciphertext } => {
                                     if let Some(session) = sessions.get_mut(&peer) {
                                         if let Ok(plaintext) = session.decrypt_payload(&header, &ciphertext) {
                                             if let Ok(msg) = serde_json::from_slice::<ChatMessage>(&plaintext) {

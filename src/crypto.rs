@@ -75,57 +75,91 @@ pub struct SecureSession {
 
 #[allow(dead_code)]
 impl SecureSession {
-    pub fn new_initiator(local_static: &StaticSecret, remote_static: &PublicKey) -> Self {
-        let mut rng = OsRng;
-        let dhs = StaticSecret::random_from_rng(&mut rng);
-        let dhr = *remote_static;
-
-        let shared = local_static.diffie_hellman(remote_static);
+    pub fn new_initiator(
+        local_static: &StaticSecret,
+        remote_static: &PublicKey,
+        local_ephemeral: StaticSecret,
+        remote_ephemeral: &PublicKey,
+    ) -> Self {
+        let shared_static = local_static.diffie_hellman(remote_static);
         let rk: [u8; 32] = kdf(
             b"VOID_SALT".as_slice(),
-            shared.as_bytes(),
-            b"VOID_INIT_IK".as_slice(),
+            shared_static.as_bytes(),
+            b"VOID_INIT_RK".as_slice(),
             32,
         )
         .try_into()
         .unwrap();
 
-        Self {
-            dhs,
-            dhr,
+        let mut sess = Self {
+            dhs: local_ephemeral,
+            dhr: *remote_static,
             rk,
-            ck_send: Some(ChainKey { key: rk, index: 0 }),
+            ck_send: None,
             ck_recv: None,
             ns: 0,
             nr: 0,
             pn: 0,
             skipped_keys: HashMap::new(),
-        }
+        };
+
+        // 1. Ratchet send: DH(e_alice, s_bob)
+        let shared_send_static = sess.dhs.diffie_hellman(remote_static);
+        let (rk1, ck_send_key) = sess.kdf_rk(&shared_send_static);
+        sess.rk = rk1;
+        sess.ck_send = Some(ChainKey { key: ck_send_key, index: 0 });
+
+        // 2. Ratchet recv: DH(e_alice, e_bob)
+        sess.dhr = *remote_ephemeral;
+        let shared_recv_ephem = sess.dhs.diffie_hellman(&sess.dhr);
+        let (rk2, ck_recv_key) = sess.kdf_rk(&shared_recv_ephem);
+        sess.rk = rk2;
+        sess.ck_recv = Some(ChainKey { key: ck_recv_key, index: 0 });
+
+        sess
     }
 
-    pub fn new_responder(local_static: &StaticSecret, remote_static: &PublicKey) -> Self {
-        let dhr = *remote_static;
-        let shared = local_static.diffie_hellman(&dhr);
+    pub fn new_responder(
+        local_static: &StaticSecret,
+        remote_static: &PublicKey,
+        remote_ephemeral: &PublicKey,
+        local_ephemeral: StaticSecret,
+    ) -> Self {
+        let shared_static = local_static.diffie_hellman(remote_static);
         let rk: [u8; 32] = kdf(
             b"VOID_SALT".as_slice(),
-            shared.as_bytes(),
-            b"VOID_INIT_IK".as_slice(),
+            shared_static.as_bytes(),
+            b"VOID_INIT_RK".as_slice(),
             32,
         )
         .try_into()
         .unwrap();
 
-        Self {
-            dhs: StaticSecret::random_from_rng(&mut OsRng),
-            dhr,
+        let mut sess = Self {
+            dhs: local_ephemeral,
+            dhr: *remote_ephemeral,
             rk,
             ck_send: None,
-            ck_recv: Some(ChainKey { key: rk, index: 0 }),
+            ck_recv: None,
             ns: 0,
             nr: 0,
             pn: 0,
             skipped_keys: HashMap::new(),
-        }
+        };
+
+        // 1. Ratchet recv: DH(s_bob, e_alice)
+        let shared_recv_static = local_static.diffie_hellman(remote_ephemeral);
+        let (rk1, ck_recv_key) = sess.kdf_rk(&shared_recv_static);
+        sess.rk = rk1;
+        sess.ck_recv = Some(ChainKey { key: ck_recv_key, index: 0 });
+
+        // 2. Ratchet send: DH(e_bob, e_alice)
+        let shared_send_ephem = sess.dhs.diffie_hellman(remote_ephemeral);
+        let (rk2, ck_send_key) = sess.kdf_rk(&shared_send_ephem);
+        sess.rk = rk2;
+        sess.ck_send = Some(ChainKey { key: ck_send_key, index: 0 });
+
+        sess
     }
 
     pub fn encrypt_payload(&mut self, plaintext: &[u8]) -> Result<(MessageHeader, Vec<u8>)> {
@@ -247,11 +281,21 @@ mod tests {
         let bob_static = StaticSecret::random_from_rng(&mut rng);
         let bob_pub = PublicKey::from(&bob_static);
 
-        let mut alice_session = SecureSession::new_initiator(&alice_static, &bob_pub);
+        let alice_ephemeral = StaticSecret::random_from_rng(&mut rng);
+        let bob_ephemeral = StaticSecret::random_from_rng(&mut rng);
+        let bob_ephemeral_pub = PublicKey::from(&bob_ephemeral);
+        let alice_ephemeral_pub = PublicKey::from(&alice_ephemeral);
+
+        let mut alice_session = SecureSession::new_initiator(&alice_static, &bob_pub, alice_ephemeral, &bob_ephemeral_pub);
+        let mut bob_session = SecureSession::new_responder(&bob_static, &alice_pub, &alice_ephemeral_pub, bob_ephemeral);
+
         let msg = "Привет, Боб!".as_bytes();
         let (header, ciphertext) = alice_session
             .encrypt_payload(msg)
             .expect("Шифрование должно работать");
+
+        let decrypted = bob_session.decrypt_payload(&header, &ciphertext).expect("Дешифрование должно работать");
+        assert_eq!(msg, decrypted);
 
         assert_eq!(header.n, 0);
         assert!(!ciphertext.is_empty());
