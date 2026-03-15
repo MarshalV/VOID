@@ -147,6 +147,7 @@ enum NetworkEvent {
     Disconnected(PeerId),
     ChatMessage(ChatMessage),
     Status(String),
+    PublicIpConfirmed(String),
 }
 
 enum UICommand {
@@ -188,6 +189,7 @@ struct App {
     status_log: Vec<String>,
     show_logs: bool,
     show_sidebar: bool,
+    public_ip: Option<String>,
     command_tx: mpsc::Sender<UICommand>,
     event_rx: mpsc::Receiver<NetworkEvent>,
     _sessions: HashMap<libp2p::PeerId, crypto::SecureSession>,
@@ -219,6 +221,7 @@ impl App {
             status_log: Vec::new(),
             show_logs: false,
             show_sidebar: true,
+            public_ip: None,
             command_tx,
             event_rx,
             _sessions: HashMap::new(),
@@ -299,6 +302,21 @@ impl App {
                                         });
                                     }
                                 });
+
+                                if let Some(ip) = &self.public_ip {
+                                    ui.horizontal(|ui| {
+                                        ui.label("IP:");
+                                        ui.label(
+                                            egui::RichText::new(ip)
+                                                .size(12.0)
+                                                .monospace()
+                                                .color(accent_color),
+                                        );
+                                        if ui.button("📋").on_hover_text("Копировать IP").clicked() {
+                                            ui.output_mut(|o| o.copied_text = ip.clone());
+                                        }
+                                    });
+                                }
                             });
                         });
                 });
@@ -556,6 +574,9 @@ impl eframe::App for App {
         self.known_peers.remove(&self.local_peer_id);
         while let Ok(event) = self.event_rx.try_recv() {
             match event {
+                NetworkEvent::PublicIpConfirmed(ip) => {
+                    self.public_ip = Some(ip);
+                }
                 NetworkEvent::NewListenAddr(addr) => {
                     let full = format!("{}/p2p/{}", addr, self.local_peer_id);
                     if !self.listen_addrs.contains(&full) {
@@ -1266,7 +1287,18 @@ async fn main() -> Result<(), Box<dyn Error>> {
                             if is_external {
                                 println!("  (Внешний/Relay): {}/p2p/{}", address, local_peer_id);
                                 let _ = event_tx.send(NetworkEvent::NewListenAddr(address.clone())).await;
-                                swarm.add_external_address(address);
+                                swarm.add_external_address(address.clone());
+
+                                if !s.contains("p2p-circuit") {
+                                    let extracted_ip = address.iter().find_map(|p| match p {
+                                        libp2p::multiaddr::Protocol::Ip4(ip) => Some(ip.to_string()),
+                                        libp2p::multiaddr::Protocol::Ip6(ip) => Some(ip.to_string()),
+                                        _ => None,
+                                    });
+                                    if let Some(ip) = extracted_ip {
+                                        let _ = event_tx.send(NetworkEvent::PublicIpConfirmed(ip)).await;
+                                    }
+                                }
                             }
 
                             if s.contains("p2p-circuit") {
@@ -1416,6 +1448,15 @@ async fn main() -> Result<(), Box<dyn Error>> {
                             let _ = event_tx.send(NetworkEvent::Status(
                                 format!("🌍 ГЛОБАЛЬНЫЙ АДРЕС: Вы доступны из интернета!")
                             )).await;
+
+                            let extracted_ip = address.iter().find_map(|p| match p {
+                                libp2p::multiaddr::Protocol::Ip4(ip) => Some(ip.to_string()),
+                                libp2p::multiaddr::Protocol::Ip6(ip) => Some(ip.to_string()),
+                                _ => None,
+                            });
+                            if let Some(ip) = extracted_ip {
+                                let _ = event_tx.send(NetworkEvent::PublicIpConfirmed(ip)).await;
+                            }
                         }
                         SwarmEvent::ConnectionEstablished { peer_id, endpoint, .. } => {
                             let connected_count = swarm.connected_peers().count();
