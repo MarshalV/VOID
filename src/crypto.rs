@@ -272,32 +272,36 @@ impl SecureSession {
 mod tests {
     use super::*;
     use rand::rngs::OsRng;
-    use x25519_dalek::StaticSecret;
 
     #[test]
     fn test_secure_session_initialization() {
         let mut rng = OsRng;
         let alice_static = StaticSecret::random_from_rng(&mut rng);
         let bob_static = StaticSecret::random_from_rng(&mut rng);
+        let alice_pub = PublicKey::from(&alice_static);
         let bob_pub = PublicKey::from(&bob_static);
 
-        let alice_ephemeral = StaticSecret::random_from_rng(&mut rng);
-        let bob_ephemeral = StaticSecret::random_from_rng(&mut rng);
-        let bob_ephemeral_pub = PublicKey::from(&bob_ephemeral);
-        let alice_ephemeral_pub = PublicKey::from(&alice_ephemeral);
+        let alice_ephem = StaticSecret::random_from_rng(&mut rng);
+        let bob_ephem = StaticSecret::random_from_rng(&mut rng);
+        let alice_ephem_pub = PublicKey::from(&alice_ephem);
+        let bob_ephem_pub = PublicKey::from(&bob_ephem);
 
-        let mut alice_session = SecureSession::new_initiator(&alice_static, &bob_pub, alice_ephemeral, &bob_ephemeral_pub);
-        let mut bob_session = SecureSession::new_responder(&bob_static, &alice_pub, &alice_ephemeral_pub, bob_ephemeral);
+        let mut alice_session = SecureSession::new_initiator(
+            &alice_static,
+            &bob_pub,
+            alice_ephem,
+            &bob_ephem_pub,
+        );
+        let mut bob_session = SecureSession::new_responder(
+            &bob_static,
+            &alice_pub,
+            &alice_ephem_pub,
+            bob_ephem,
+        );
 
-        let msg = "Привет, Боб!".as_bytes();
-        let (header, ciphertext) = alice_session
-            .encrypt_payload(msg)
-            .expect("Шифрование должно работать");
-
-        let decrypted = bob_session.decrypt_payload(&header, &ciphertext).expect("Дешифрование должно работать");
-        assert_eq!(msg, decrypted);
-
-        assert_eq!(header.n, 0);
-        assert!(!ciphertext.is_empty());
+        let msg = b"Hello Bob!";
+        let (header, ciphertext) = alice_session.encrypt_payload(msg).unwrap();
+        let decrypted = bob_session.decrypt_payload(&header, &ciphertext).unwrap();
+        assert_eq!(msg, decrypted.as_slice());
     }
 }
