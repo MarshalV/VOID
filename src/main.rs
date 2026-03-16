@@ -1098,8 +1098,6 @@ async fn main() -> Result<(), Box<dyn Error>> {
                 let _ = kad.bootstrap();
 
                 let rr_config = libp2p::request_response::Config::default()
-                    .with_max_request_size(10 * 1024 * 1024)
-                    .with_max_response_size(10 * 1024 * 1024)
                     .with_request_timeout(Duration::from_secs(30)); // Увеличиваем тайм-аут до 30с
                 let rr_protocol = libp2p::StreamProtocol::new("/void/chat/1.0.0");
                 let rr_behaviour = libp2p::request_response::json::Behaviour::<V1Packet, V1Packet>::new(
