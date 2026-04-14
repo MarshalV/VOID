@@ -1729,7 +1729,12 @@ async fn main() -> Result<(), Box<dyn Error>> {
                             }
                         }
                         SwarmEvent::Behaviour(ChatBehaviourEvent::Kad(kad::Event::RoutingUpdated { peer, addresses, .. })) => {
-                            println!("📍 Kademlia: маршрут обновлен для {}: {:?}", peer, addresses);
+                            // Полный список адресов быстро раздувает лог (IPFS-пиры часто обновляют DHT).
+                            println!(
+                                "📍 Kademlia: маршрут для {} — {} адр.",
+                                peer,
+                                addresses.len()
+                            );
                         }
 
                         _ => {}
