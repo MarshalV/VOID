@@ -9,7 +9,7 @@ use futures::StreamExt;
 use libp2p::{
     autonat, dcutr, identify, kad, mdns, noise, ping, relay,
     swarm::{dial_opts::DialOpts, NetworkBehaviour, SwarmEvent},
-    tcp, upnp, yamux, Multiaddr, PeerId,
+    tcp, upnp, yamux, Multiaddr, PeerId, StreamProtocol,
 };
 use rand::RngCore;
 use serde::{Deserialize, Serialize};
@@ -1223,35 +1223,13 @@ async fn main() -> Result<(), Box<dyn Error>> {
             .with_behaviour(|key, relay_client| {
                 let local_peer_id = key.public().to_peer_id();
 
-                // Kademlia: хранилище в памяти
+                // Kademlia: отдельный DHT VOID (/void/kad/1.0.0), не общий IPFS (/ipfs/kad/1.0.0).
+                // Иначе в таблицу попадают тысячи чужих узлов и «поиск пира» оборачивается звонками на IPFS.
                 let kad_store = kad::store::MemoryStore::new(local_peer_id);
-                let kad_config = kad::Config::default();
+                let mut kad_config = kad::Config::new(StreamProtocol::new("/void/kad/1.0.0"));
+                kad_config.set_periodic_bootstrap_interval(None);
                 let mut kad = kad::Behaviour::with_config(local_peer_id, kad_store, kad_config);
-                // Включаем серверный режим на самом поведении
                 kad.set_mode(Some(libp2p::kad::Mode::Server));
-
-                // Бутстрап IPFS: пары /dnsaddr/bootstrap.libp2p.io/p2p/<старый PeerId> давали
-                // "No Matching Records Found" — в DNS цепочке сейчас другие peer id (см. kubo defaults).
-                let bootstrap = [
-                    "/dnsaddr/sg1.bootstrap.libp2p.io/p2p/QmcZf59bWwK5XFi76CZX8cbJ4BhTzzA3gU1ZjYZcYW3dwt",
-                    "/dnsaddr/ny5.bootstrap.libp2p.io/p2p/QmQCU2EcMqAqQPR2i9bChDtGNJchTbq5TbXJJ16u19uLTa",
-                    "/dnsaddr/am6.bootstrap.libp2p.io/p2p/QmbLHAnMoJPWSCR5Zhtx6BHJX9KiKNN6tpvbUcqanj75Nb",
-                    "/dnsaddr/sv15.bootstrap.libp2p.io/p2p/QmNnooDu7bfjPFoTZYxMNLWUQJyrVwtbZg5gBMjTezGAJN",
-                    "/ip4/15.235.144.210/tcp/4001/p2p/QmcZf59bWwK5XFi76CZX8cbJ4BhTzzA3gU1ZjYZcYW3dwt",
-                    "/ip4/51.81.93.51/tcp/4001/p2p/QmQCU2EcMqAqQPR2i9bChDtGNJchTbq5TbXJJ16u19uLTa",
-                    "/ip4/54.38.47.166/tcp/4001/p2p/QmbLHAnMoJPWSCR5Zhtx6BHJX9KiKNN6tpvbUcqanj75Nb",
-                    "/ip4/147.135.44.132/tcp/4001/p2p/QmNnooDu7bfjPFoTZYxMNLWUQJyrVwtbZg5gBMjTezGAJN",
-                ];
-                for addr in bootstrap {
-                    if let Ok(ma) = addr.parse::<Multiaddr>() {
-                        if let Some(peer_id) = ma.clone().pop().and_then(|p| {
-                            if let libp2p::multiaddr::Protocol::P2p(peer_id) = p { Some(peer_id) } else { None }
-                        }) {
-                             kad.add_address(&peer_id, ma);
-                        }
-                    }
-                }
-                let _ = kad.bootstrap();
 
                 let rr_config = libp2p::request_response::Config::default()
                     .with_request_timeout(Duration::from_secs(30)); // Увеличиваем тайм-аут до 30с
@@ -1325,11 +1303,10 @@ async fn main() -> Result<(), Box<dyn Error>> {
 
         let _ = event_tx
             .send(NetworkEvent::Status(
-                "🚀 Запущен. Ищу пиров через mDNS...".into(),
+                "🚀 Запущен. VOID DHT (LAN: mDNS; интернет: полный multiaddr контакта).".into(),
             ))
             .await;
 
-        let mut kad_bootstrap_timer = tokio::time::interval(Duration::from_secs(300)); // 5 минут
         let mut peer_addrs: HashMap<PeerId, Vec<Multiaddr>> = HashMap::new();
         let mut pending_dials: HashSet<PeerId> = HashSet::new();
         let mut dial_backoff: HashMap<PeerId, Instant> = HashMap::new();
@@ -1688,13 +1665,28 @@ async fn main() -> Result<(), Box<dyn Error>> {
 
                         SwarmEvent::Behaviour(ChatBehaviourEvent::Identify(identify::Event::Received { peer_id, info, .. })) => {
                             let now = chrono::Local::now().format("%H:%M:%S").to_string();
-                            println!("[{}] 🆔 Identify: Получено от {}: protocols={:?}", now, peer_id, info.protocols);
-
-
-                             // Добавляем внешние адреса пира в DHT
-                             for addr in info.listen_addrs {
-                                 swarm.behaviour_mut().kad.add_address(&peer_id, addr);
-                             }
+                            const VOID_CHAT: &str = "/void/chat/1.0.0";
+                            let is_void = info
+                                .protocols
+                                .iter()
+                                .any(|p| p.as_ref() == VOID_CHAT);
+                            if !is_void {
+                                println!(
+                                    "[{}] 🆔 Identify: {} не VOID-клиент (нет {}), разрываю.",
+                                    now, peer_id, VOID_CHAT
+                                );
+                                let _ = swarm.disconnect_peer_id(peer_id);
+                            } else {
+                                println!(
+                                    "[{}] 🆔 Identify: VOID-пир {} ({} listen)",
+                                    now,
+                                    peer_id,
+                                    info.listen_addrs.len()
+                                );
+                                for addr in info.listen_addrs {
+                                    swarm.behaviour_mut().kad.add_address(&peer_id, addr);
+                                }
+                            }
                         }
                         SwarmEvent::Behaviour(ChatBehaviourEvent::Identify(identify::Event::Sent { peer_id, .. })) => {
                             println!("🆔 Identify: Отправлена информация пиру {}", peer_id);
@@ -1716,14 +1708,42 @@ async fn main() -> Result<(), Box<dyn Error>> {
                         SwarmEvent::Behaviour(ChatBehaviourEvent::Kad(kad::Event::OutboundQueryProgressed { result, .. })) => {
                             match result {
                                  libp2p::kad::QueryResult::GetClosestPeers(Ok(ok)) => {
-                                    println!("🔍 Kademlia: поиск завершен. Найдено {} узлов.", ok.peers.len());
-                                    for peer in ok.peers {
-                                        if !peer.addrs.is_empty() {
-                                            println!("📍 Найдено: {} ({} адресов)", &peer.peer_id.to_string()[..8], peer.addrs.len());
-                                            // Если среди найденных есть тот, кого мы искали - подключаемся
-                                            let _ = command_tx_for_mdns.try_send(UICommand::DialPeer(peer.peer_id, peer.addrs));
+                                    println!(
+                                        "🔍 Kademlia: get_closest_peers готов (кандидатов: {}).",
+                                        ok.peers.len()
+                                    );
+                                    let wanted = PeerId::from_bytes(&ok.key).ok();
+                                    if let Some(wanted) = wanted {
+                                        if let Some(hit) = ok
+                                            .peers
+                                            .iter()
+                                            .find(|p| p.peer_id == wanted && !p.addrs.is_empty())
+                                        {
+                                            println!(
+                                                "📍 В таблице есть целевой пир {} — набираю ({} адр.)",
+                                                &wanted.to_string()[..8],
+                                                hit.addrs.len()
+                                            );
+                                            let _ = command_tx_for_mdns.try_send(UICommand::DialPeer(
+                                                hit.peer_id,
+                                                hit.addrs.clone(),
+                                            ));
+                                        } else {
+                                            println!(
+                                                "⚠️ Пир {} нет в VOID DHT с адресами — нужен multiaddr или mDNS.",
+                                                &wanted.to_string()[..12]
+                                            );
+                                            let _ = event_tx
+                                                .send(NetworkEvent::Status(format!(
+                                                    "⚠️ {} не найден в DHT. Вставьте полный /ip4/.../p2p/... адрес.",
+                                                    &wanted.to_string()[..8]
+                                                )))
+                                                .await;
                                         }
                                     }
+                                }
+                                libp2p::kad::QueryResult::GetClosestPeers(Err(e)) => {
+                                    println!("⚠️ Kademlia get_closest_peers: {:?}", e);
                                 }
                                 _ => {}
                             }
@@ -1739,9 +1759,6 @@ async fn main() -> Result<(), Box<dyn Error>> {
 
                         _ => {}
                     }
-                },
-                _ = kad_bootstrap_timer.tick() => {
-                    let _ = swarm.behaviour_mut().kad.bootstrap();
                 }
             }
         }
