@@ -20,6 +20,56 @@ use std::path::Path;
 use std::time::{Duration, Instant};
 use tokio::sync::mpsc;
 
+/// `PeerId` с конца multiaddr (`.../p2p/<id>`).
+fn peer_id_from_multiaddr(ma: &Multiaddr) -> Option<PeerId> {
+    ma.iter().last().and_then(|p| match p {
+        libp2p::multiaddr::Protocol::P2p(id) => Some(id),
+        _ => None,
+    })
+}
+
+/// Узлы для заполнения **отдельного** VOID DHT (не IPFS): сообщения по-прежнему идут напрямую между пирами.
+///
+/// Источники (оба опциональны, объединяются):
+/// - переменная окружения `VOID_BOOTSTRAP`: multiaddr через запятую;
+/// - файл `void-bootstrap.txt` в рабочей директории: одна multiaddr на строку, `#` — комментарий до конца строки.
+///
+/// Любой может поднять публичный узел VOID и дать свой `/ip4|dns.../tcp|udp/.../p2p/<PeerId>` — это не «центральный сервер чата»,
+/// а точка входа в общую таблицу маршрутов (как seed в BitTorrent).
+fn void_bootstrap_multiaddrs() -> Vec<Multiaddr> {
+    let mut out = Vec::new();
+    if let Ok(s) = std::env::var("VOID_BOOTSTRAP") {
+        for part in s.split(',') {
+            let t = part.trim();
+            if t.is_empty() {
+                continue;
+            }
+            match t.parse::<Multiaddr>() {
+                Ok(ma) => out.push(ma),
+                Err(_) => eprintln!("VOID_BOOTSTRAP: пропуск неверной multiaddr: {}", t),
+            }
+        }
+    }
+    let path = Path::new("void-bootstrap.txt");
+    if path.exists() {
+        if let Ok(txt) = std::fs::read_to_string(path) {
+            for line in txt.lines() {
+                let t = line.split('#').next().unwrap_or("").trim();
+                if t.is_empty() {
+                    continue;
+                }
+                match t.parse::<Multiaddr>() {
+                    Ok(ma) => out.push(ma),
+                    Err(_) => eprintln!("void-bootstrap.txt: пропуск строки: {}", t),
+                }
+            }
+        }
+    }
+    out.sort_by(|a, b| a.to_string().cmp(&b.to_string()));
+    out.dedup_by(|a, b| a == b);
+    out
+}
+
 #[derive(Serialize, Deserialize, Clone)]
 struct AddressBookEntry {
     peer_id: String,
@@ -309,6 +359,20 @@ impl App {
         if self.status_log.len() > 30 {
             self.status_log.remove(0);
         }
+    }
+
+    /// Личный чат не выбран, пока пользователь не нажмёт 💬. Если чат пуст — открываем первого пира (mDNS / входящее).
+    fn select_peer_if_no_chat(&mut self, peer_id: PeerId) {
+        if !self.selected_chat.is_empty() {
+            return;
+        }
+        let s = peer_id.to_string();
+        self.selected_chat = s.clone();
+        self.messages.entry(s).or_insert_with(Vec::new);
+        self.add_status(format!(
+            "Открыт чат с {} — можно отправлять сообщения.",
+            &peer_id.to_string()[..8]
+        ));
     }
 
     fn ui_sidebar(&mut self, ui: &mut egui::Ui, accent_color: egui::Color32) {
@@ -731,12 +795,12 @@ impl eframe::App for App {
                         &peer.to_string()[..8],
                         addr
                     ));
-                    // Добавляем в список известных, если это не мы сами
                     if peer != self.local_peer_id {
                         if let Entry::Vacant(e) = self.known_peers.entry(peer) {
                             e.insert(format!("Peer_{}", &peer.to_string()[..8]));
                             self.persist_vault();
                         }
+                        self.select_peer_if_no_chat(peer);
                     }
                 }
                 NetworkEvent::MdnsExpired(peer) => {
@@ -745,6 +809,9 @@ impl eframe::App for App {
                 NetworkEvent::Connected(peer) => {
                     self.connected_peers += 1;
                     self.add_status(format!("✅ Подключено: {}...", &peer.to_string()[..8]));
+                    if peer != self.local_peer_id {
+                        self.select_peer_if_no_chat(peer);
+                    }
                 }
                 NetworkEvent::Disconnected(peer) => {
                     self.connected_peers = self.connected_peers.saturating_sub(1);
@@ -901,6 +968,16 @@ impl eframe::App for App {
                                         .auto_shrink([false, false])
                                         .show(ui, |ui| {
                                             ui.set_width(ui.available_width());
+                                            if self.selected_chat.is_empty() {
+                                                ui.label(
+                                                    egui::RichText::new(
+                                                        "Чат не выбран: нажмите 💬 у контакта в «ЛИЧНЫЕ» слева, либо дождитесь VOID-пира по сети — чат откроется сам.",
+                                                    )
+                                                    .size(14.0)
+                                                    .weak(),
+                                                );
+                                                ui.add_space(12.0);
+                                            }
                                             let current_messages = self
                                                 .messages
                                                 .get(&self.selected_chat)
@@ -1018,15 +1095,28 @@ impl eframe::App for App {
                                             };
 
                                             if let Some(peer_id) = recipient {
-                                                let _ = self.command_tx.try_send(
-                                                    UICommand::SendMessage {
-                                                        sender_name: self.local_nickname.clone(),
-                                                        text: self.chat_input.clone(),
-                                                        recipient: Some(peer_id),
-                                                        is_retry: false,
-                                                    },
+                                                match self.command_tx.try_send(UICommand::SendMessage {
+                                                    sender_name: self.local_nickname.clone(),
+                                                    text: self.chat_input.clone(),
+                                                    recipient: Some(peer_id),
+                                                    is_retry: false,
+                                                }) {
+                                                    Ok(()) => self.chat_input.clear(),
+                                                    Err(_) => self.add_status(
+                                                        "⚠ Очередь к сети переполнена, повторите отправку."
+                                                            .into(),
+                                                    ),
+                                                }
+                                            } else if self.selected_chat.is_empty() {
+                                                self.add_status(
+                                                    "⚠ Сначала выберите контакт (💬 в «ЛИЧНЫЕ») или подключитесь по multiaddr — иначе некому отправлять."
+                                                        .into(),
                                                 );
-                                                self.chat_input.clear();
+                                            } else {
+                                                self.add_status(
+                                                    "⚠ Некорректный Peer ID в выбранном чате. Выберите контакт заново."
+                                                        .into(),
+                                                );
                                             }
                                         }
                                     });
@@ -1182,6 +1272,18 @@ async fn main() -> Result<(), Box<dyn Error>> {
     println!("Ваш Peer ID: {}", local_peer_id);
     println!("Ваш никнейм: {}", local_nickname);
 
+    let void_bootstraps = void_bootstrap_multiaddrs();
+    if void_bootstraps.is_empty() {
+        println!(
+            "🌐 Глобально: задайте VOID_BOOTSTRAP или void-bootstrap.txt (multiaddr узлов VOID), либо набирайте собеседника по полному адресу. mDNS — только LAN."
+        );
+    } else {
+        println!(
+            "🌐 VOID bootstrap: {} multiaddr → заполнение DHT /void/kad/1.0.0 (без IPFS).",
+            void_bootstraps.len()
+        );
+    }
+
     let (event_tx, event_rx) = mpsc::channel(256);
     let (command_tx, mut command_rx) = mpsc::channel(256);
 
@@ -1189,10 +1291,12 @@ async fn main() -> Result<(), Box<dyn Error>> {
     let command_tx_for_mdns = command_tx.clone(); // для delayed dial из mDNS
 
     let static_secret_net = static_secret.clone();
+    let void_bootstraps_for_net = void_bootstraps.clone();
     tokio::spawn(async move {
         let event_tx = event_tx_clone;
         let command_tx_for_mdns = command_tx_for_mdns;
         let local_static = static_secret_net;
+        let void_bootstraps = void_bootstraps_for_net;
         let mut sessions: HashMap<PeerId, crypto::SecureSession> = HashMap::new();
         let mut pending_handshakes: HashMap<PeerId, crypto::StaticSecret> = HashMap::new();
         let my_public_key = crypto::PublicKey::from(&local_static);
@@ -1230,6 +1334,17 @@ async fn main() -> Result<(), Box<dyn Error>> {
                 kad_config.set_periodic_bootstrap_interval(None);
                 let mut kad = kad::Behaviour::with_config(local_peer_id, kad_store, kad_config);
                 kad.set_mode(Some(libp2p::kad::Mode::Server));
+
+                for ma in &void_bootstraps {
+                    if let Some(pid) = peer_id_from_multiaddr(ma) {
+                        kad.add_address(&pid, ma.clone());
+                    } else {
+                        eprintln!("VOID bootstrap: нет /p2p/ в конце адреса, пропуск: {}", ma);
+                    }
+                }
+                if !void_bootstraps.is_empty() {
+                    let _ = kad.bootstrap();
+                }
 
                 let rr_config = libp2p::request_response::Config::default()
                     .with_request_timeout(Duration::from_secs(30)); // Увеличиваем тайм-аут до 30с
@@ -1301,11 +1416,15 @@ async fn main() -> Result<(), Box<dyn Error>> {
         // Слушаем через Relay для работы за NAT
         let _ = swarm.listen_on("/p2p-circuit".parse().unwrap());
 
-        let _ = event_tx
-            .send(NetworkEvent::Status(
-                "🚀 Запущен. VOID DHT (LAN: mDNS; интернет: полный multiaddr контакта).".into(),
-            ))
-            .await;
+        let startup_status = if void_bootstraps.is_empty() {
+            "🚀 Запущен. Интернет: полный multiaddr контакта или VOID_BOOTSTRAP / void-bootstrap.txt. LAN: mDNS.".to_string()
+        } else {
+            format!(
+                "🚀 Запущен. VOID DHT: {} bootstrap-узл(ов) (без IPFS) + mDNS в LAN.",
+                void_bootstraps.len()
+            )
+        };
+        let _ = event_tx.send(NetworkEvent::Status(startup_status)).await;
 
         let mut peer_addrs: HashMap<PeerId, Vec<Multiaddr>> = HashMap::new();
         let mut pending_dials: HashSet<PeerId> = HashSet::new();
