@@ -1472,14 +1472,14 @@ async fn main() -> Result<(), Box<dyn Error>> {
                                 // Регистрация адреса в Kademlia
                                 swarm.behaviour_mut().kad.add_address(&peer_id, addr.clone());
 
-                                // ДЕДУПЛИКАЦИЯ: пробуем подключаться ТОЛЬКО по QUIC (он быстрее и лучше за NAT)
-                                // Если это TCP, просто игнорируем авто-диал, он подхватится если QUIC не сработает
+                                // Дозваниваемся и по QUIC, и по TCP: на Windows/NAT QUIC часто на случайном UDP
+                                // (конфликт 50001), а пропуск TCP раньше оставлял LAN без соединения, если QUIC не доходил.
                                 if addr.to_string().contains("quic-v1") {
                                     println!("🔍 mDNS: найден пир {} (QUIC). Подключаюсь...", &peer_id.to_string()[..8]);
-                                    let _ = swarm.dial(addr.clone());
                                 } else {
-                                    println!("🔍 mDNS: найден пир {} (TCP). (Пропускаю авто-диал, жду QUIC)", &peer_id.to_string()[..8]);
+                                    println!("🔍 mDNS: найден пир {} (TCP). Подключаюсь...", &peer_id.to_string()[..8]);
                                 }
+                                let _ = swarm.dial(addr.clone());
 
                                 let _ = event_tx.send(NetworkEvent::MdnsDiscovered(peer_id, addr.clone())).await;
                                 peer_addrs.entry(peer_id).or_default().push(addr);
