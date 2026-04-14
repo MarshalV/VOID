@@ -1230,18 +1230,17 @@ async fn main() -> Result<(), Box<dyn Error>> {
                 // Включаем серверный режим на самом поведении
                 kad.set_mode(Some(libp2p::kad::Mode::Server));
 
-                // Добавляем бутстрап-ноды IPFS/libp2p
+                // Бутстрап IPFS: пары /dnsaddr/bootstrap.libp2p.io/p2p/<старый PeerId> давали
+                // "No Matching Records Found" — в DNS цепочке сейчас другие peer id (см. kubo defaults).
                 let bootstrap = [
-                    "/dnsaddr/bootstrap.libp2p.io/p2p/QmNQP97ZByia9h9YFmbSNoBeC7pQYQSppN1C8S2B75SXC6u",
-                    "/dnsaddr/bootstrap.libp2p.io/p2p/QmQCU2EcSTwsrmMvFUXS7uK9z1V64p99C8ndn4y2K8w8f3z",
-                    "/dnsaddr/bootstrap.libp2p.io/p2p/QmbLHAnMo9UFwv9V9QdfyLc4Dn91S2AnkkL8Vat4DTHiV4f",
-                    "/dnsaddr/bootstrap.libp2p.io/p2p/QmcZf59bWwK5XFi7U4S6n32FRV9RmrHnoz6L8N9ndBnd6u",
-                    "/ip4/104.131.131.82/tcp/4001/p2p/QmaCpDMGvLcZunBNqv9U7Z8hSAt79S99JcyG316w8nL62m9",
-                    // Дополнительные надежные ноды
-                    "/ip4/147.75.101.139/tcp/4001/p2p/QmQCU2EcSTwsrmMvFUXS7uK9z1V64p99C8ndn4y2K8w8f3z",
-                    "/ip4/147.75.83.83/tcp/4001/p2p/QmbLHAnMo9UFwv9V9QdfyLc4Dn91S2AnkkL8Vat4DTHiV4f",
-                    "/ip4/147.75.109.213/tcp/4001/p2p/QmNnoo2uR3GuwhvBqyM4tTDp6NoS7wB9G9o9wE5pS9Y6mY",
-                    "/ip4/147.75.77.187/tcp/4001/p2p/QmNQP97ZByia9h9YFmbSNoBeC7pQYQSppN1C8S2B75SXC6u",
+                    "/dnsaddr/sg1.bootstrap.libp2p.io/p2p/QmcZf59bWwK5XFi76CZX8cbJ4BhTzzA3gU1ZjYZcYW3dwt",
+                    "/dnsaddr/ny5.bootstrap.libp2p.io/p2p/QmQCU2EcMqAqQPR2i9bChDtGNJchTbq5TbXJJ16u19uLTa",
+                    "/dnsaddr/am6.bootstrap.libp2p.io/p2p/QmbLHAnMoJPWSCR5Zhtx6BHJX9KiKNN6tpvbUcqanj75Nb",
+                    "/dnsaddr/sv15.bootstrap.libp2p.io/p2p/QmNnooDu7bfjPFoTZYxMNLWUQJyrVwtbZg5gBMjTezGAJN",
+                    "/ip4/15.235.144.210/tcp/4001/p2p/QmcZf59bWwK5XFi76CZX8cbJ4BhTzzA3gU1ZjYZcYW3dwt",
+                    "/ip4/51.81.93.51/tcp/4001/p2p/QmQCU2EcMqAqQPR2i9bChDtGNJchTbq5TbXJJ16u19uLTa",
+                    "/ip4/54.38.47.166/tcp/4001/p2p/QmbLHAnMoJPWSCR5Zhtx6BHJX9KiKNN6tpvbUcqanj75Nb",
+                    "/ip4/147.135.44.132/tcp/4001/p2p/QmNnooDu7bfjPFoTZYxMNLWUQJyrVwtbZg5gBMjTezGAJN",
                 ];
                 for addr in bootstrap {
                     if let Ok(ma) = addr.parse::<Multiaddr>() {
@@ -1300,17 +1299,25 @@ async fn main() -> Result<(), Box<dyn Error>> {
                 .unwrap();
         }
 
-        // Слушаем QUIC.
-        let quic_addr: Multiaddr = "/ip4/0.0.0.0/udp/50001/quic-v1".parse().unwrap();
-        match swarm.listen_on(quic_addr.clone()) {
-            Ok(_) => println!("🚀 QUIC слушаю на 50001"),
-            Err(e) => {
-                println!(
-                    "⚠️ QUIC ошибка на 50001 ({:?}). Пробую случайный порт...",
-                    e
-                );
-                let _ = swarm.listen_on("/ip4/0.0.0.0/udp/0/quic-v1".parse().unwrap());
+        // Слушаем QUIC (50001 часто занят другим процессом на Windows — пробуем 50002, затем ОС).
+        let quic_candidates = [
+            "/ip4/0.0.0.0/udp/50001/quic-v1",
+            "/ip4/0.0.0.0/udp/50002/quic-v1",
+            "/ip4/0.0.0.0/udp/0/quic-v1",
+        ];
+        let mut quic_listening = false;
+        for addr in quic_candidates {
+            match swarm.listen_on(addr.parse::<Multiaddr>().unwrap()) {
+                Ok(_) => {
+                    println!("🚀 QUIC: {}", addr);
+                    quic_listening = true;
+                    break;
+                }
+                Err(e) => println!("⚠️ QUIC {}: {:?} — следующий вариант...", addr, e),
             }
+        }
+        if !quic_listening {
+            println!("⚠️ QUIC не поднят ни на одном порту");
         }
 
         // Слушаем через Relay для работы за NAT
