@@ -13,21 +13,34 @@ use libp2p::{
 };
 use rand::RngCore;
 use serde::{Deserialize, Serialize};
+use std::collections::hash_map::Entry;
 use std::collections::{HashMap, HashSet};
 use std::error::Error;
+use std::path::Path;
 use std::time::{Duration, Instant};
 use tokio::sync::mpsc;
+
+#[derive(Serialize, Deserialize, Clone)]
+struct AddressBookEntry {
+    peer_id: String,
+    display_name: String,
+}
 
 #[derive(Serialize, Deserialize)]
 struct StorageData {
     nickname: String,
     keypair_bytes: Vec<u8>,
     static_secret_bytes: [u8; 32],
+    /// Записная книга: PeerId и отображаемое имя (внутри того же зашифрованного vault).
+    #[serde(default)]
+    address_book: Vec<AddressBookEntry>,
 }
 
 struct Storage;
 impl Storage {
     const FILE: &'static str = "vault.bin";
+    const FILE_TMP: &'static str = "vault.bin.tmp";
+    const FILE_BAK: &'static str = "vault.bin.bak";
     const KEY_FILE: &'static str = "void.key";
 
     fn get_master_key() -> [u8; 32] {
@@ -48,31 +61,48 @@ impl Storage {
         nickname: &str,
         keypair: Option<&libp2p::identity::Keypair>,
         static_secret: Option<&crypto::StaticSecret>,
+        address_book: Option<&[AddressBookEntry]>,
     ) -> Result<(), Box<dyn Error>> {
-        let current = Self::load().ok();
+        let current_load = Self::load();
 
         let keypair_bytes = if let Some(kp) = keypair {
             kp.to_protobuf_encoding()?
+        } else if let Ok(ref c) = current_load {
+            if c.keypair_bytes.is_empty() {
+                return Err("vault: keypair в файле пустой — запись отменена".into());
+            }
+            c.keypair_bytes.clone()
         } else {
-            current
-                .as_ref()
-                .map(|c| c.keypair_bytes.clone())
-                .unwrap_or_default()
+            return Err(format!(
+                "vault: не удалось прочитать {} перед сохранением ({}). Запись отменена, чтобы не затереть ключи.",
+                Self::FILE,
+                current_load.err().map(|e| e.to_string()).unwrap_or_default()
+            )
+            .into());
         };
 
         let static_secret_bytes = if let Some(ss) = static_secret {
             ss.to_bytes()
+        } else if let Ok(ref c) = current_load {
+            c.static_secret_bytes
         } else {
-            current
+            return Err("vault: нет static_secret для сохранения".into());
+        };
+
+        let address_book_vec: Vec<AddressBookEntry> = if let Some(ab) = address_book {
+            ab.to_vec()
+        } else {
+            current_load
                 .as_ref()
-                .map(|c| c.static_secret_bytes)
-                .unwrap_or([0u8; 32])
+                .map(|c| c.address_book.clone())
+                .unwrap_or_default()
         };
 
         let data = StorageData {
             nickname: nickname.to_string(),
             keypair_bytes,
             static_secret_bytes,
+            address_book: address_book_vec,
         };
         let plaintext = serde_json::to_vec(&data)?;
 
@@ -89,7 +119,17 @@ impl Storage {
 
         let mut final_data = nonce_bytes.to_vec();
         final_data.extend(ciphertext);
-        std::fs::write(Self::FILE, final_data)?;
+
+        // Сначала пишем во временный файл, затем подменяем vault — иначе при сбое
+        // посередине fs::write остаётся усечённый vault и следующий load() ломается,
+        // после чего старый save подставлял пустой keypair и окончательно портил ключи.
+        std::fs::write(Self::FILE_TMP, &final_data)?;
+        if Path::new(Self::FILE).exists() {
+            let _ = std::fs::remove_file(Self::FILE_BAK);
+            std::fs::rename(Self::FILE, Self::FILE_BAK)?;
+        }
+        std::fs::rename(Self::FILE_TMP, Self::FILE)?;
+        let _ = std::fs::remove_file(Self::FILE_BAK);
         Ok(())
     }
 
@@ -190,6 +230,11 @@ struct App {
     show_logs: bool,
     show_sidebar: bool,
     public_ip: Option<String>,
+    /// Ручное добавление в зашифрованную записную книгу
+    add_contact_peer: String,
+    add_contact_name: String,
+    /// Черновики имён для полей ввода (иначе egui сбрасывает текст каждый кадр).
+    peer_name_edits: HashMap<PeerId, String>,
     command_tx: mpsc::Sender<UICommand>,
     event_rx: mpsc::Receiver<NetworkEvent>,
     _sessions: HashMap<libp2p::PeerId, crypto::SecureSession>,
@@ -202,6 +247,7 @@ impl App {
         local_peer_id: PeerId,
         local_nickname: String,
         local_static: crypto::StaticSecret,
+        initial_address_book: HashMap<PeerId, String>,
         command_tx: mpsc::Sender<UICommand>,
         event_rx: mpsc::Receiver<NetworkEvent>,
     ) -> Self {
@@ -216,16 +262,44 @@ impl App {
             dial_address: String::new(),
             chat_input: String::new(),
             messages,
-            known_peers: HashMap::new(),
+            known_peers: initial_address_book,
             selected_chat: String::new(),
             status_log: Vec::new(),
             show_logs: false,
             show_sidebar: true,
             public_ip: None,
+            add_contact_peer: String::new(),
+            add_contact_name: String::new(),
+            peer_name_edits: HashMap::new(),
             command_tx,
             event_rx,
             _sessions: HashMap::new(),
             _local_static: local_static,
+        }
+    }
+
+    /// Сохраняет ник и записную книгу в `vault.bin` (AES-GCM, ключ в `void.key`).
+    fn persist_vault(&self) {
+        let mut entries: Vec<AddressBookEntry> = self
+            .known_peers
+            .iter()
+            .map(|(pid, name)| AddressBookEntry {
+                peer_id: pid.to_string(),
+                display_name: name.clone(),
+            })
+            .collect();
+        entries.sort_by(|a, b| {
+            a.display_name
+                .to_lowercase()
+                .cmp(&b.display_name.to_lowercase())
+        });
+        if let Err(e) = Storage::save(
+            &self.local_nickname,
+            None,
+            None,
+            Some(&entries),
+        ) {
+            eprintln!("VOID: не удалось сохранить vault (записная книга): {}", e);
         }
     }
 
@@ -282,7 +356,7 @@ impl App {
                                         )
                                         .changed()
                                     {
-                                        let _ = Storage::save(&self.local_nickname, None, None);
+                                        self.persist_vault();
                                     }
                                 });
                                 ui.horizontal(|ui| {
@@ -406,20 +480,27 @@ impl App {
                         .show(ui, |ui| {
                             ui.set_width(ui.available_width());
                             ui.label(
-                                egui::RichText::new("ЧАТЫ")
+                                egui::RichText::new("ЧАТЫ / ЗАПИСНАЯ КНИГА")
                                     .size(14.0)
                                     .strong()
                                     .color(accent_color),
                             );
-
-                            // Global chat removed
+                            ui.label(
+                                egui::RichText::new("Контакты и имена хранятся в vault.bin (шифрование AES-GCM).")
+                                    .size(10.0)
+                                    .weak(),
+                            );
 
                             ui.add_space(10.0);
                             ui.label(egui::RichText::new("ЛИЧНЫЕ").size(12.0).weak());
 
                             let mut peers_to_remove = Vec::new();
-                            let mut known_peers_list: Vec<_> = self.known_peers.iter().collect();
-                            known_peers_list.sort_by(|a, b| a.1.cmp(b.1));
+                            let mut known_peers_list: Vec<(PeerId, String)> = self
+                                .known_peers
+                                .iter()
+                                .map(|(pid, n)| (*pid, n.clone()))
+                                .collect();
+                            known_peers_list.sort_by(|a, b| a.1.cmp(&b.1));
 
                             for (peer_id, name) in known_peers_list {
                                 let peer_str = peer_id.to_string();
@@ -427,33 +508,93 @@ impl App {
 
                                 ui.horizontal(|ui| {
                                     if ui
-                                        .selectable_label(is_selected, format!("👤 {}", name))
+                                        .selectable_label(is_selected, "💬")
+                                        .on_hover_text("Открыть чат")
                                         .clicked()
                                     {
                                         self.selected_chat = peer_str.clone();
                                         self.messages.entry(peer_str.clone()).or_insert(Vec::new());
                                     }
-                                    ui.with_layout(
-                                        egui::Layout::right_to_left(egui::Align::Center),
-                                        |ui| {
-                                            if ui
-                                                .button("🗑")
-                                                .on_hover_text("Удалить диалог")
-                                                .clicked()
-                                            {
-                                                peers_to_remove.push(*peer_id);
-                                            }
-                                        },
+                                    let buf = self
+                                        .peer_name_edits
+                                        .entry(peer_id)
+                                        .or_insert_with(|| name.clone());
+                                    let name_edit = ui.add(
+                                        egui::TextEdit::singleline(buf)
+                                            .desired_width(ui.available_width() - 36.0)
+                                            .hint_text("Имя в книге"),
                                     );
+                                    if !name_edit.has_focus() && *buf != name {
+                                        *buf = name.clone();
+                                    }
+                                    if name_edit.lost_focus() {
+                                        let trimmed = buf.trim().to_string();
+                                        if trimmed.is_empty() {
+                                            *buf = name.clone();
+                                        } else if trimmed != name {
+                                            self.known_peers.insert(peer_id, trimmed.clone());
+                                            *buf = trimmed;
+                                            self.persist_vault();
+                                        }
+                                    }
+                                    if ui
+                                        .button("🗑")
+                                        .on_hover_text("Удалить из книги и истории")
+                                        .clicked()
+                                    {
+                                        peers_to_remove.push(peer_id);
+                                    }
                                 });
                             }
 
+                            let mut did_remove = false;
                             for pid in peers_to_remove {
                                 let p_str = pid.to_string();
                                 self.known_peers.remove(&pid);
+                                self.peer_name_edits.remove(&pid);
                                 self.messages.remove(&p_str);
                                 if self.selected_chat == p_str {
                                     self.selected_chat = String::new();
+                                }
+                                did_remove = true;
+                            }
+                            if did_remove {
+                                self.persist_vault();
+                            }
+
+                            ui.add_space(10.0);
+                            ui.separator();
+                            ui.add_space(6.0);
+                            ui.label(
+                                egui::RichText::new("ДОБАВИТЬ КОНТАКТ").size(11.0).weak(),
+                            );
+                            ui.add(
+                                egui::TextEdit::singleline(&mut self.add_contact_peer)
+                                    .hint_text("Peer ID")
+                                    .desired_width(ui.available_width()),
+                            );
+                            ui.add(
+                                egui::TextEdit::singleline(&mut self.add_contact_name)
+                                    .hint_text("Имя")
+                                    .desired_width(ui.available_width()),
+                            );
+                            if ui.button("➕ В зашифрованную книгу").clicked() {
+                                let pid_trim = self.add_contact_peer.trim();
+                                let name_trim = self.add_contact_name.trim();
+                                if !pid_trim.is_empty() && !name_trim.is_empty() {
+                                    if let Ok(pid) = pid_trim.parse::<PeerId>() {
+                                        if pid != self.local_peer_id {
+                                            self.known_peers
+                                                .insert(pid, name_trim.to_string());
+                                            self.persist_vault();
+                                            self.add_contact_peer.clear();
+                                            self.add_contact_name.clear();
+                                        }
+                                    } else {
+                                        self.add_status(
+                                            "Некорректный Peer ID для записной книги".to_string(),
+                                        );
+                                    }
                                 }
                             }
                         });
@@ -592,9 +733,10 @@ impl eframe::App for App {
                     ));
                     // Добавляем в список известных, если это не мы сами
                     if peer != self.local_peer_id {
-                        self.known_peers
-                            .entry(peer)
-                            .or_insert_with(|| format!("Peer_{}", &peer.to_string()[..8]));
+                        if let Entry::Vacant(e) = self.known_peers.entry(peer) {
+                            e.insert(format!("Peer_{}", &peer.to_string()[..8]));
+                            self.persist_vault();
+                        }
                     }
                 }
                 NetworkEvent::MdnsExpired(peer) => {
@@ -612,7 +754,12 @@ impl eframe::App for App {
                     // Update known peers for display names
                     if let Ok(peer_id) = msg.sender_id.parse::<PeerId>() {
                         if peer_id != self.local_peer_id {
-                            self.known_peers.insert(peer_id, msg.sender_name.clone());
+                            let prev = self
+                                .known_peers
+                                .insert(peer_id, msg.sender_name.clone());
+                            if prev.as_ref() != Some(&msg.sender_name) {
+                                self.persist_vault();
+                            }
                         }
                     }
 
@@ -1007,18 +1154,28 @@ async fn main() -> Result<(), Box<dyn Error>> {
         println!("✅ Файрвол macOS настроен");
     }
 
-    let (local_key, local_nickname, static_secret) = if let Ok(storage) = Storage::load() {
-        let key = libp2p::identity::Keypair::from_protobuf_encoding(&storage.keypair_bytes)
-            .expect("Failed to decode saved keypair");
-        let static_secret = crypto::StaticSecret::from(storage.static_secret_bytes);
-        (key, storage.nickname, static_secret)
-    } else {
-        let key = libp2p::identity::Keypair::generate_ed25519();
-        let static_secret = crypto::StaticSecret::random_from_rng(&mut rand::rngs::OsRng);
-        let nickname = format!("User_{}", &PeerId::from(key.public()).to_string()[..4]);
-        let _ = Storage::save(&nickname, Some(&key), Some(&static_secret));
-        (key, nickname, static_secret)
-    };
+    let (local_key, local_nickname, static_secret, initial_address_book) =
+        if let Ok(storage) = Storage::load() {
+            let key = libp2p::identity::Keypair::from_protobuf_encoding(&storage.keypair_bytes)
+                .expect("Failed to decode saved keypair");
+            let static_secret = crypto::StaticSecret::from(storage.static_secret_bytes);
+            let my_id = PeerId::from(key.public());
+            let mut book = HashMap::new();
+            for entry in storage.address_book {
+                if let Ok(pid) = entry.peer_id.parse::<PeerId>() {
+                    if pid != my_id {
+                        book.insert(pid, entry.display_name);
+                    }
+                }
+            }
+            (key, storage.nickname, static_secret, book)
+        } else {
+            let key = libp2p::identity::Keypair::generate_ed25519();
+            let static_secret = crypto::StaticSecret::random_from_rng(&mut rand::rngs::OsRng);
+            let nickname = format!("User_{}", &PeerId::from(key.public()).to_string()[..4]);
+            let _ = Storage::save(&nickname, Some(&key), Some(&static_secret), None);
+            (key, nickname, static_secret, HashMap::new())
+        };
     let local_peer_id = PeerId::from(local_key.public());
 
     println!("=== VOID P2P Chat ===");
@@ -1587,6 +1744,7 @@ async fn main() -> Result<(), Box<dyn Error>> {
                 local_peer_id,
                 local_nickname,
                 static_secret,
+                initial_address_book,
                 command_tx,
                 event_rx,
             )))
