@@ -244,6 +244,8 @@ enum UICommand {
     Dial(String),
     DialPeer(PeerId, Vec<Multiaddr>),
     SearchPeer(PeerId),
+    /// Добавить адреса в VOID DHT и вызвать bootstrap (без перезапуска).
+    ApplyVoidBootstrap(Vec<Multiaddr>),
     SendMessage {
         sender_name: String,
         text: String,
@@ -285,6 +287,8 @@ struct App {
     add_contact_name: String,
     /// Черновики имён для полей ввода (иначе egui сбрасывает текст каждый кадр).
     peer_name_edits: HashMap<PeerId, String>,
+    /// Редактор `void-bootstrap.txt` (одна multiaddr на строку); «Применить» шлёт в сеть.
+    void_bootstrap_draft: String,
     command_tx: mpsc::Sender<UICommand>,
     event_rx: mpsc::Receiver<NetworkEvent>,
     _sessions: HashMap<libp2p::PeerId, crypto::SecureSession>,
@@ -321,6 +325,8 @@ impl App {
             add_contact_peer: String::new(),
             add_contact_name: String::new(),
             peer_name_edits: HashMap::new(),
+            void_bootstrap_draft: std::fs::read_to_string(Path::new("void-bootstrap.txt"))
+                .unwrap_or_default(),
             command_tx,
             event_rx,
             _sessions: HashMap::new(),
@@ -659,6 +665,94 @@ impl App {
                                             "Некорректный Peer ID для записной книги".to_string(),
                                         );
                                     }
+                                }
+                            }
+                        });
+                });
+
+            ui.add_space(15.0);
+
+            // --- SECTION: VOID BOOTSTRAP (глобальный DHT, не IPFS) ---
+            egui::Frame::none()
+                .fill(bg_color)
+                .rounding(15.0)
+                .shadow(egui::Shadow {
+                    offset: egui::vec2(-3.0, -3.0),
+                    blur: 8.0,
+                    spread: 0.0,
+                    color: shadow_light,
+                })
+                .show(ui, |ui| {
+                    egui::Frame::none()
+                        .fill(bg_color)
+                        .rounding(15.0)
+                        .shadow(egui::Shadow {
+                            offset: egui::vec2(3.0, 3.0),
+                            blur: 6.0,
+                            spread: 0.0,
+                            color: shadow_dark,
+                        })
+                        .inner_margin(12.0)
+                        .show(ui, |ui| {
+                            ui.set_width(ui.available_width());
+                            ui.label(
+                                egui::RichText::new("VOID BOOTSTRAP (DHT)")
+                                    .size(14.0)
+                                    .strong()
+                                    .color(accent_color),
+                            );
+                            ui.label(
+                                egui::RichText::new(
+                                    "Одна /ip4…/tcp…/p2p/… на строку (# — комментарий). Сохраняет void-bootstrap.txt и сразу кормит Kademlia.",
+                                )
+                                .size(10.0)
+                                .weak(),
+                            );
+                            ui.add(
+                                egui::TextEdit::multiline(&mut self.void_bootstrap_draft)
+                                    .desired_width(ui.available_width())
+                                    .desired_rows(4)
+                                    .font(egui::TextStyle::Monospace),
+                            );
+                            if ui.button("💾 Сохранить и применить к DHT").clicked() {
+                                let mut addrs: Vec<Multiaddr> = Vec::new();
+                                let mut bad_lines: Vec<String> = Vec::new();
+                                for line in self.void_bootstrap_draft.lines() {
+                                    let t = line.split('#').next().unwrap_or("").trim();
+                                    if t.is_empty() {
+                                        continue;
+                                    }
+                                    match t.parse::<Multiaddr>() {
+                                        Ok(ma) => addrs.push(ma),
+                                        Err(_) => bad_lines.push(t.chars().take(48).collect()),
+                                    }
+                                }
+                                for b in bad_lines {
+                                    self.add_status(format!("⚠ Пропуск неверной строки bootstrap: {}", b));
+                                }
+                                addrs.sort_by(|a, b| a.to_string().cmp(&b.to_string()));
+                                addrs.dedup_by(|a, b| a == b);
+                                if addrs.is_empty() {
+                                    self.add_status(
+                                        "⚠ Нет ни одной валидной multiaddr для bootstrap.".into(),
+                                    );
+                                } else if let Err(e) =
+                                    std::fs::write("void-bootstrap.txt", &self.void_bootstrap_draft)
+                                {
+                                    self.add_status(format!("⚠ Не удалось записать файл: {}", e));
+                                } else if let Err(e) = self
+                                    .command_tx
+                                    .try_send(UICommand::ApplyVoidBootstrap(addrs.clone()))
+                                {
+                                    self.add_status(format!(
+                                        "⚠ Очередь к сети переполнена (bootstrap): {}",
+                                        e
+                                    ));
+                                } else {
+                                    self.add_status(format!(
+                                        "Отправлено {} bootstrap-адрес(ов) в сеть…",
+                                        addrs.len()
+                                    ));
                                 }
                             }
                         });
@@ -1491,6 +1585,23 @@ async fn main() -> Result<(), Box<dyn Error>> {
                                       pending_dials.remove(&peer_id);
                                  }
                              }
+                            UICommand::ApplyVoidBootstrap(addrs) => {
+                                for ma in &addrs {
+                                    if let Some(pid) = peer_id_from_multiaddr(ma) {
+                                        swarm.behaviour_mut().kad.add_address(&pid, ma.clone());
+                                        let _ = swarm.dial(ma.clone());
+                                    }
+                                }
+                                if !addrs.is_empty() {
+                                    let _ = swarm.behaviour_mut().kad.bootstrap();
+                                    let _ = event_tx
+                                        .send(NetworkEvent::Status(format!(
+                                            "🌐 VOID bootstrap: применено {} адр. (DHT + dial).",
+                                            addrs.len()
+                                        )))
+                                        .await;
+                                }
+                            }
                             UICommand::SendMessage { sender_name, text, recipient, is_retry: _is_retry } => {
                                 let now = chrono::Local::now().format("%H:%M:%S").to_string();
                                 println!("[{}] 📤 UI_SEND: '{}' (To: {:?})", now, text, recipient);
@@ -1784,27 +1895,17 @@ async fn main() -> Result<(), Box<dyn Error>> {
 
                         SwarmEvent::Behaviour(ChatBehaviourEvent::Identify(identify::Event::Received { peer_id, info, .. })) => {
                             let now = chrono::Local::now().format("%H:%M:%S").to_string();
-                            const VOID_CHAT: &str = "/void/chat/1.0.0";
-                            let is_void = info
-                                .protocols
-                                .iter()
-                                .any(|p| p.as_ref() == VOID_CHAT);
-                            if !is_void {
-                                println!(
-                                    "[{}] 🆔 Identify: {} не VOID-клиент (нет {}), разрываю.",
-                                    now, peer_id, VOID_CHAT
-                                );
-                                let _ = swarm.disconnect_peer_id(peer_id);
-                            } else {
-                                println!(
-                                    "[{}] 🆔 Identify: VOID-пир {} ({} listen)",
-                                    now,
-                                    peer_id,
-                                    info.listen_addrs.len()
-                                );
-                                for addr in info.listen_addrs {
-                                    swarm.behaviour_mut().kad.add_address(&peer_id, addr);
-                                }
+                            // Не фильтруем по `/void/chat/1.0.0`: в rust-libp2p список protocols в Identify
+                            // не обязан совпадать с request-response; иначе рвём соединение с нормальным VOID-пиром.
+                            println!(
+                                "[{}] 🆔 Identify: {} — {} listen, {} протоколов",
+                                now,
+                                peer_id,
+                                info.listen_addrs.len(),
+                                info.protocols.len()
+                            );
+                            for addr in info.listen_addrs {
+                                swarm.behaviour_mut().kad.add_address(&peer_id, addr);
                             }
                         }
                         SwarmEvent::Behaviour(ChatBehaviourEvent::Identify(identify::Event::Sent { peer_id, .. })) => {
