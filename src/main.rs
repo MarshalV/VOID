@@ -70,6 +70,24 @@ fn void_bootstrap_multiaddrs() -> Vec<Multiaddr> {
     out
 }
 
+/// Адреса пира из **локальной** Kademlia-таблицы (без сетевого запроса).
+fn kad_local_addrs_for_peer(
+    kad: &mut kad::Behaviour<kad::store::MemoryStore>,
+    target: PeerId,
+) -> Option<Vec<Multiaddr>> {
+    for bucket in kad.kbuckets() {
+        for ent in bucket.iter() {
+            if *ent.node.key.preimage() == target {
+                let v: Vec<Multiaddr> = ent.node.value.iter().cloned().collect();
+                if !v.is_empty() {
+                    return Some(v);
+                }
+            }
+        }
+    }
+    None
+}
+
 #[derive(Serialize, Deserialize, Clone)]
 struct AddressBookEntry {
     peer_id: String,
@@ -432,7 +450,7 @@ impl App {
                                 ui.horizontal(|ui| {
                                     ui.label(
                                         egui::RichText::new(&self.local_peer_id.to_string()[..16])
-                                            .size(12.0)
+                                            .size(15.0)
                                             .monospace()
                                             .weak(),
                                     );
@@ -452,7 +470,7 @@ impl App {
                                         ui.label("IP:");
                                         ui.label(
                                             egui::RichText::new(ip)
-                                                .size(12.0)
+                                                .size(15.0)
                                                 .monospace()
                                                 .color(accent_color),
                                         );
@@ -492,7 +510,7 @@ impl App {
                             ui.set_width(ui.available_width());
                             ui.label(
                                 egui::RichText::new("СЕТЬ")
-                                    .size(14.0)
+                                    .size(17.0)
                                     .strong()
                                     .color(accent_color),
                             );
@@ -501,7 +519,7 @@ impl App {
                             if !self.listen_addrs.is_empty() {
                                 ui.add_space(5.0);
                                 egui::CollapsingHeader::new(
-                                    egui::RichText::new("📍 МОИ АДРЕСА").size(12.0).weak(),
+                                    egui::RichText::new("📍 МОИ АДРЕСА").size(15.0).weak(),
                                 )
                                 .show(ui, |ui| {
                                     for addr in &self.listen_addrs {
@@ -551,18 +569,18 @@ impl App {
                             ui.set_width(ui.available_width());
                             ui.label(
                                 egui::RichText::new("ЧАТЫ / ЗАПИСНАЯ КНИГА")
-                                    .size(14.0)
+                                    .size(17.0)
                                     .strong()
                                     .color(accent_color),
                             );
                             ui.label(
                                 egui::RichText::new("Контакты и имена хранятся в vault.bin (шифрование AES-GCM).")
-                                    .size(10.0)
+                                    .size(13.0)
                                     .weak(),
                             );
 
                             ui.add_space(10.0);
-                            ui.label(egui::RichText::new("ЛИЧНЫЕ").size(12.0).weak());
+                            ui.label(egui::RichText::new("ЛИЧНЫЕ").size(15.0).weak());
 
                             let mut peers_to_remove = Vec::new();
                             let mut known_peers_list: Vec<(PeerId, String)> = self
@@ -636,7 +654,7 @@ impl App {
                             ui.separator();
                             ui.add_space(6.0);
                             ui.label(
-                                egui::RichText::new("ДОБАВИТЬ КОНТАКТ").size(11.0).weak(),
+                                egui::RichText::new("ДОБАВИТЬ КОНТАКТ").size(14.0).weak(),
                             );
                             ui.add(
                                 egui::TextEdit::singleline(&mut self.add_contact_peer)
@@ -697,7 +715,7 @@ impl App {
                             ui.set_width(ui.available_width());
                             ui.label(
                                 egui::RichText::new("VOID BOOTSTRAP (DHT)")
-                                    .size(14.0)
+                                    .size(17.0)
                                     .strong()
                                     .color(accent_color),
                             );
@@ -705,7 +723,7 @@ impl App {
                                 egui::RichText::new(
                                     "Одна /ip4…/tcp…/p2p/… на строку (# — комментарий). Сохраняет void-bootstrap.txt и сразу кормит Kademlia.",
                                 )
-                                .size(10.0)
+                                .size(13.0)
                                 .weak(),
                             );
                             ui.add(
@@ -785,7 +803,7 @@ impl App {
                             ui.set_width(ui.available_width());
                             ui.label(
                                 egui::RichText::new("ПОДКЛЮЧЕНИЕ")
-                                    .size(14.0)
+                                    .size(17.0)
                                     .strong()
                                     .color(accent_color),
                             );
@@ -798,16 +816,22 @@ impl App {
                             ui.horizontal(|ui| {
                                 if ui
                                     .add(egui::Button::new(
-                                        egui::RichText::new("ПОДКЛЮЧИТЬ").size(14.0),
+                                        egui::RichText::new("ПОДКЛЮЧИТЬ").size(17.0),
                                     ))
                                     .clicked()
                                     && !self.dial_address.is_empty()
                                 {
                                     let input = self.dial_address.trim().to_string();
                                     if let Ok(peer_id) = input.parse::<PeerId>() {
-                                        let _ = self
-                                            .command_tx
-                                            .try_send(UICommand::SearchPeer(peer_id));
+                                        if peer_id == self.local_peer_id {
+                                            self.add_status(
+                                                "Это ваш собственный PeerId — набирайте собеседника по его multiaddr или дождитесь mDNS.".into(),
+                                            );
+                                        } else {
+                                            let _ = self
+                                                .command_tx
+                                                .try_send(UICommand::SearchPeer(peer_id));
+                                        }
                                     } else {
                                         let _ = self.command_tx.try_send(UICommand::Dial(input));
                                     }
@@ -826,7 +850,7 @@ impl App {
             ui.add_space(20.0);
             if ui
                 .add(egui::Button::new(
-                    egui::RichText::new("📋 СИСТЕМНАЯ КОНСОЛЬ").size(14.0),
+                    egui::RichText::new("📋 СИСТЕМНАЯ КОНСОЛЬ").size(17.0),
                 ))
                 .clicked()
             {
@@ -837,6 +861,8 @@ impl App {
 }
 
 fn setup_custom_style(ctx: &egui::Context) {
+    use egui::{FontFamily, FontId, TextStyle};
+
     let mut visuals = egui::Visuals::dark();
     let bg_color = egui::Color32::from_rgb(26, 26, 28); // #1A1A1C
     let text_color = egui::Color32::from_rgb(209, 209, 209); // #D1D1D1
@@ -862,9 +888,17 @@ fn setup_custom_style(ctx: &egui::Context) {
     ctx.set_visuals(visuals);
 
     let mut style = (*ctx.style()).clone();
+    style.text_styles = [
+        (TextStyle::Small, FontId::new(12.0, FontFamily::Proportional)),
+        (TextStyle::Body, FontId::new(17.0, FontFamily::Proportional)),
+        (TextStyle::Monospace, FontId::new(15.0, FontFamily::Monospace)),
+        (TextStyle::Button, FontId::new(17.0, FontFamily::Proportional)),
+        (TextStyle::Heading, FontId::new(24.0, FontFamily::Proportional)),
+    ]
+    .into();
     style.spacing.item_spacing = egui::vec2(15.0, 15.0);
     style.spacing.window_margin = egui::Margin::same(30.0);
-    style.spacing.button_padding = egui::vec2(12.0, 8.0);
+    style.spacing.button_padding = egui::vec2(14.0, 10.0);
     ctx.set_style(style);
 }
 
@@ -980,7 +1014,7 @@ impl eframe::App for App {
                         .id_salt("log_scroll")
                         .show(ui, |ui| {
                             for log in &self.status_log {
-                                ui.label(egui::RichText::new(log).size(11.0).weak());
+                                ui.label(egui::RichText::new(log).size(14.0).weak());
                             }
                         });
                 });
@@ -994,7 +1028,7 @@ impl eframe::App for App {
                     if ui
                         .add(egui::Button::new(
                             egui::RichText::new(if self.show_sidebar { "⬅" } else { "☰" })
-                                .size(22.0),
+                                .size(26.0),
                         ))
                         .clicked()
                     {
@@ -1004,7 +1038,7 @@ impl eframe::App for App {
                     ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                         ui.label(
                             egui::RichText::new("VOID P2P DARK")
-                                .size(32.0)
+                                .size(38.0)
                                 .color(accent_color)
                                 .strong(),
                         );
@@ -1017,8 +1051,8 @@ impl eframe::App for App {
             egui::SidePanel::left("sidebar")
                 .frame(egui::Frame::none().fill(bg_color).inner_margin(20.0))
                 .resizable(true)
-                .default_width(280.0)
-                .width_range(200.0..=400.0)
+                .default_width(310.0)
+                .width_range(220.0..=460.0)
                 .show(ctx, |ui| {
                     egui::ScrollArea::vertical().show(ui, |ui| {
                         self.ui_sidebar(ui, accent_color);
@@ -1067,7 +1101,7 @@ impl eframe::App for App {
                                                     egui::RichText::new(
                                                         "Чат не выбран: нажмите 💬 у контакта в «ЛИЧНЫЕ» слева, либо дождитесь VOID-пира по сети — чат откроется сам.",
                                                     )
-                                                    .size(14.0)
+                                                    .size(17.0)
                                                     .weak(),
                                                 );
                                                 ui.add_space(12.0);
@@ -1101,14 +1135,14 @@ impl eframe::App for App {
                                                                         egui::RichText::new(
                                                                             &msg.sender_name,
                                                                         )
-                                                                        .size(14.0)
+                                                                        .size(17.0)
                                                                         .color(accent_color)
                                                                         .strong(),
                                                                     );
                                                                 }
                                                                 ui.label(
                                                                     egui::RichText::new(&msg.text)
-                                                                        .size(20.0)
+                                                                        .size(24.0)
                                                                         .color(text_color),
                                                                 );
                                                                 ui.with_layout(
@@ -1120,7 +1154,7 @@ impl eframe::App for App {
                                                                             egui::RichText::new(
                                                                                 &msg.timestamp,
                                                                             )
-                                                                            .size(11.0)
+                                                                            .size(14.0)
                                                                             .weak(),
                                                                         );
                                                                     },
@@ -1166,15 +1200,15 @@ impl eframe::App for App {
                                         let res = ui.add(
                                             egui::TextEdit::singleline(&mut self.chat_input)
                                                 .hint_text("Сообщение...")
-                                                .desired_width(ui.available_width() - 110.0)
+                                                .desired_width(ui.available_width() - 130.0)
                                                 .font(egui::TextStyle::Body),
                                         );
 
                                         if (ui
                                             .add_sized(
-                                                [100.0, 40.0],
+                                                [120.0, 46.0],
                                                 egui::Button::new(
-                                                    egui::RichText::new("ОТПРАВИТЬ").size(16.0),
+                                                    egui::RichText::new("ОТПРАВИТЬ").size(19.0),
                                                 ),
                                             )
                                             .clicked()
@@ -1555,10 +1589,33 @@ async fn main() -> Result<(), Box<dyn Error>> {
                                 }
                             }
                             UICommand::SearchPeer(peer_id) => {
-                                let _ = event_tx.send(NetworkEvent::Status(
-                                    format!("🔍 Ищу пира {} в Kademlia...", &peer_id.to_string()[..16])
-                                )).await;
-                                swarm.behaviour_mut().kad.get_closest_peers(peer_id);
+                                if peer_id == local_peer_id {
+                                    let _ = event_tx
+                                        .send(NetworkEvent::Status(
+                                            "⚠ Подключение к своему PeerId бессмысленно.".into(),
+                                        ))
+                                        .await;
+                                } else if let Some(addrs) = kad_local_addrs_for_peer(
+                                    &mut swarm.behaviour_mut().kad,
+                                    peer_id,
+                                ) {
+                                    let _ = event_tx
+                                        .send(NetworkEvent::Status(format!(
+                                            "📍 Пир {} найден в локальной таблице Kademlia ({} адр.) — набор.",
+                                            &peer_id.to_string()[..12],
+                                            addrs.len()
+                                        )))
+                                        .await;
+                                    let _ = command_tx_for_mdns.try_send(UICommand::DialPeer(
+                                        peer_id,
+                                        addrs,
+                                    ));
+                                } else {
+                                    let _ = event_tx.send(NetworkEvent::Status(
+                                        format!("🔍 Запрос DHT: {}… (если кандидатов 0 — задайте VOID bootstrap или полный multiaddr)", &peer_id.to_string()[..16])
+                                    )).await;
+                                    swarm.behaviour_mut().kad.get_closest_peers(peer_id);
+                                }
                             }
                             UICommand::DialPeer(peer_id, addrs) => {
                                  let short = &peer_id.to_string()[..16];
@@ -1948,14 +2005,25 @@ async fn main() -> Result<(), Box<dyn Error>> {
                                                 hit.peer_id,
                                                 hit.addrs.clone(),
                                             ));
-                                        } else {
+                                        } else if ok.peers.is_empty() {
                                             println!(
-                                                "⚠️ Пир {} нет в VOID DHT с адресами — нужен multiaddr или mDNS.",
+                                                "⚠️ Kademlia: 0 кандидатов для {} — пустая таблица DHT (нет bootstrap).",
                                                 &wanted.to_string()[..12]
                                             );
                                             let _ = event_tx
                                                 .send(NetworkEvent::Status(format!(
-                                                    "⚠️ {} не найден в DHT. Вставьте полный /ip4/.../p2p/... адрес.",
+                                                    "⚠ DHT пуст (запрос к {}): добавьте seed в «VOID BOOTSTRAP» или VOID_BOOTSTRAP, либо полный multiaddr. Один PeerId без таблицы маршрутов в интернете не наберётся.",
+                                                    &wanted.to_string()[..12]
+                                                )))
+                                                .await;
+                                        } else {
+                                            println!(
+                                                "⚠️ Пир {} нет среди ответов DHT с адресами — нужен multiaddr, bootstrap или mDNS (LAN).",
+                                                &wanted.to_string()[..12]
+                                            );
+                                            let _ = event_tx
+                                                .send(NetworkEvent::Status(format!(
+                                                    "⚠ {}: в DHT нет маршрута с адресами. Полный multiaddr собеседника или общий VOID bootstrap.",
                                                     &wanted.to_string()[..8]
                                                 )))
                                                 .await;
@@ -1964,6 +2032,24 @@ async fn main() -> Result<(), Box<dyn Error>> {
                                 }
                                 libp2p::kad::QueryResult::GetClosestPeers(Err(e)) => {
                                     println!("⚠️ Kademlia get_closest_peers: {:?}", e);
+                                    let key = e.key();
+                                    if let Some(wanted) = PeerId::from_bytes(key).ok() {
+                                        if let Some(addrs) = kad_local_addrs_for_peer(
+                                            &mut swarm.behaviour_mut().kad,
+                                            wanted,
+                                        ) {
+                                            let _ = event_tx
+                                                .send(NetworkEvent::Status(format!(
+                                                    "⏱ DHT timeout для {} — пробую адреса из локальной таблицы ({}).",
+                                                    &wanted.to_string()[..8],
+                                                    addrs.len()
+                                                )))
+                                                .await;
+                                            let _ = command_tx_for_mdns.try_send(
+                                                UICommand::DialPeer(wanted, addrs),
+                                            );
+                                        }
+                                    }
                                 }
                                 _ => {}
                             }
