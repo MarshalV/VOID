@@ -95,6 +95,32 @@ fn fetch_void_bootstrap_list(url: &str) -> Option<String> {
     }
 }
 
+/// Разбирает ввод «войти в сеть»: полный multiaddr, `IP`, `IP:PORT`. Возвращает multiaddr и (опц.) PeerId.
+fn parse_seed_input(raw: &str) -> Option<(Multiaddr, Option<PeerId>)> {
+    let t = raw.trim();
+    if t.is_empty() {
+        return None;
+    }
+    if t.starts_with('/') {
+        let ma: Multiaddr = t.parse().ok()?;
+        let pid = peer_id_from_multiaddr(&ma);
+        return Some((ma, pid));
+    }
+    let (host, port) = if let Some((h, p)) = t.rsplit_once(':') {
+        let port: u16 = p.parse().ok()?;
+        (h.to_string(), port)
+    } else {
+        (t.to_string(), 4001u16)
+    };
+    let ip: std::net::IpAddr = host.parse().ok()?;
+    let base = match ip {
+        std::net::IpAddr::V4(v4) => format!("/ip4/{}/tcp/{}", v4, port),
+        std::net::IpAddr::V6(v6) => format!("/ip6/{}/tcp/{}", v6, port),
+    };
+    let ma: Multiaddr = base.parse().ok()?;
+    Some((ma, None))
+}
+
 fn void_bootstrap_multiaddrs() -> Vec<Multiaddr> {
     let mut out = Vec::new();
 
@@ -357,10 +383,10 @@ enum UICommand {
     Dial(String),
     DialPeer(PeerId, Vec<Multiaddr>),
     SearchPeer(PeerId),
-    /// Добавить адреса в VOID DHT и вызвать bootstrap (без перезапуска).
-    ApplyVoidBootstrap(Vec<Multiaddr>),
     /// Перечитать `VOID_BOOTSTRAP` / файл / встроенные / URL и снова подать в Kad (как при старте).
     ReloadBootstrapFromSources,
+    /// Войти в сеть через один узел: IP, IP:PORT или полный multiaddr; после коннекта — kad.bootstrap.
+    JoinViaNode(String),
     /// Собрать PeerId из kbuckets и отправить в UI.
     SnapshotDhtRoutingPeers,
     SendMessage {
@@ -867,62 +893,45 @@ impl App {
                         .show(ui, |ui| {
                             ui.set_width(ui.available_width());
                             ui.label(
-                                egui::RichText::new("VOID BOOTSTRAP (DHT)")
+                                egui::RichText::new("ВОЙТИ В СЕТЬ ЧЕРЕЗ УЗЕЛ")
                                     .size(17.0)
                                     .strong()
                                     .color(accent_color),
                             );
                             ui.label(
                                 egui::RichText::new(
-                                    "Одна /ip4…/tcp…/p2p/… на строку (# — комментарий). Сохраняет void-bootstrap.txt и сразу кормит Kademlia. При старте список уже может подмешиваться из встроенных seed и VOID_BOOTSTRAP_URL / публичного URL в коде.",
+                                    "IP, IP:PORT или полный multiaddr любой VOID-ноды. Клиент дозвонится, возьмёт её PeerId и через Kademlia подтянет остальную сеть.",
                                 )
-                                .size(13.0)
+                                .size(12.0)
                                 .weak(),
                             );
                             ui.add(
-                                egui::TextEdit::multiline(&mut self.void_bootstrap_draft)
+                                egui::TextEdit::singleline(&mut self.void_bootstrap_draft)
+                                    .hint_text("например: 157.22.192.234 или 157.22.192.234:4001")
                                     .desired_width(ui.available_width())
-                                    .desired_rows(4)
                                     .font(egui::TextStyle::Monospace),
                             );
-                            if ui.button("💾 Сохранить и применить к DHT").clicked() {
-                                let mut addrs: Vec<Multiaddr> = Vec::new();
-                                let mut bad_lines: Vec<String> = Vec::new();
-                                for line in self.void_bootstrap_draft.lines() {
-                                    let t = line.split('#').next().unwrap_or("").trim();
-                                    if t.is_empty() {
-                                        continue;
-                                    }
-                                    match t.parse::<Multiaddr>() {
-                                        Ok(ma) => addrs.push(ma),
-                                        Err(_) => bad_lines.push(t.chars().take(48).collect()),
-                                    }
-                                }
-                                for b in bad_lines {
-                                    self.add_status(format!("⚠ Пропуск неверной строки bootstrap: {}", b));
-                                }
-                                addrs.sort_by(|a, b| a.to_string().cmp(&b.to_string()));
-                                addrs.dedup_by(|a, b| a == b);
-                                if addrs.is_empty() {
-                                    self.add_status(
-                                        "⚠ Нет ни одной валидной multiaddr для bootstrap.".into(),
-                                    );
-                                } else if let Err(e) =
-                                    std::fs::write("void-bootstrap.txt", &self.void_bootstrap_draft)
-                                {
-                                    self.add_status(format!("⚠ Не удалось записать файл: {}", e));
+                            if ui
+                                .add(egui::Button::new(
+                                    egui::RichText::new("🌐 ВОЙТИ В СЕТЬ").size(17.0),
+                                ))
+                                .clicked()
+                            {
+                                let input = self.void_bootstrap_draft.trim().to_string();
+                                if input.is_empty() {
+                                    self.add_status("⚠ Введите IP/адрес узла.".into());
                                 } else if let Err(e) = self
                                     .command_tx
-                                    .try_send(UICommand::ApplyVoidBootstrap(addrs.clone()))
+                                    .try_send(UICommand::JoinViaNode(input.clone()))
                                 {
                                     self.add_status(format!(
-                                        "⚠ Очередь к сети переполнена (bootstrap): {}",
+                                        "⚠ Очередь к сети переполнена: {}",
                                         e
                                     ));
                                 } else {
                                     self.add_status(format!(
-                                        "Отправлено {} bootstrap-адрес(ов) в сеть…",
-                                        addrs.len()
+                                        "🌐 Вход в сеть через {} …",
+                                        input
                                     ));
                                 }
                             }
@@ -1716,6 +1725,9 @@ async fn main() -> Result<(), Box<dyn Error>> {
         let mut pending_dials: HashSet<PeerId> = HashSet::new();
         let mut dial_backoff: HashMap<PeerId, Instant> = HashMap::new();
         let mut local_listen_addrs: HashSet<Multiaddr> = HashSet::new();
+        // Пиры-«seed», к которым мы дозвонились через JoinViaNode: после Identify запускаем DHT-bootstrap.
+        let mut pending_seed_peers: HashSet<PeerId> = HashSet::new();
+        let mut pending_seed_bare: bool = false;
 
         loop {
             tokio::select! {
@@ -1800,21 +1812,43 @@ async fn main() -> Result<(), Box<dyn Error>> {
                                       pending_dials.remove(&peer_id);
                                  }
                              }
-                            UICommand::ApplyVoidBootstrap(addrs) => {
-                                for ma in &addrs {
-                                    if let Some(pid) = peer_id_from_multiaddr(ma) {
-                                        swarm.behaviour_mut().kad.add_address(&pid, ma.clone());
-                                        let _ = swarm.dial(ma.clone());
+                            UICommand::JoinViaNode(input) => {
+                                let parsed = parse_seed_input(&input);
+                                match parsed {
+                                    Some((ma, peer_id_opt)) => {
+                                        if let Some(pid) = peer_id_opt {
+                                            swarm.behaviour_mut().kad.add_address(&pid, ma.clone());
+                                            pending_seed_peers.insert(pid);
+                                        } else {
+                                            pending_seed_bare = true;
+                                        }
+                                        match swarm.dial(ma.clone()) {
+                                            Ok(_) => {
+                                                let _ = event_tx
+                                                    .send(NetworkEvent::Status(format!(
+                                                        "📞 Вход в сеть: дозваниваюсь до {}…",
+                                                        ma
+                                                    )))
+                                                    .await;
+                                            }
+                                            Err(e) => {
+                                                let _ = event_tx
+                                                    .send(NetworkEvent::Status(format!(
+                                                        "❌ Не дозвониться до {}: {}",
+                                                        ma, e
+                                                    )))
+                                                    .await;
+                                            }
+                                        }
                                     }
-                                }
-                                if !addrs.is_empty() {
-                                    let _ = swarm.behaviour_mut().kad.bootstrap();
-                                    let _ = event_tx
-                                        .send(NetworkEvent::Status(format!(
-                                            "🌐 VOID bootstrap: применено {} адр. (DHT + dial).",
-                                            addrs.len()
-                                        )))
-                                        .await;
+                                    None => {
+                                        let _ = event_tx
+                                            .send(NetworkEvent::Status(format!(
+                                                "⚠ Не понял адрес: {}. Нужен IP, IP:PORT или /ip4/…/tcp/…[/p2p/…]",
+                                                input
+                                            )))
+                                            .await;
+                                    }
                                 }
                             }
                             UICommand::ReloadBootstrapFromSources => {
@@ -2158,6 +2192,17 @@ async fn main() -> Result<(), Box<dyn Error>> {
                             );
                             for addr in info.listen_addrs {
                                 swarm.behaviour_mut().kad.add_address(&peer_id, addr);
+                            }
+                            let was_seed = pending_seed_peers.remove(&peer_id);
+                            if was_seed || pending_seed_bare {
+                                pending_seed_bare = false;
+                                let _ = swarm.behaviour_mut().kad.bootstrap();
+                                let _ = event_tx
+                                    .send(NetworkEvent::Status(format!(
+                                        "🌐 Вход в сеть через {}: DHT-bootstrap запущен.",
+                                        &peer_id.to_string()[..12]
+                                    )))
+                                    .await;
                             }
                         }
                         SwarmEvent::Behaviour(ChatBehaviourEvent::Identify(identify::Event::Sent { peer_id, .. })) => {
