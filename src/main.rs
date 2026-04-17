@@ -168,6 +168,19 @@ fn kad_local_addrs_for_peer(
     None
 }
 
+/// Все PeerId из **локальной** таблицы Kademlia (маршрутизация XOR, не «все люди в мире»).
+fn kad_routing_peer_ids(kad: &mut kad::Behaviour<kad::store::MemoryStore>) -> Vec<PeerId> {
+    let mut set: HashSet<PeerId> = HashSet::new();
+    for bucket in kad.kbuckets() {
+        for ent in bucket.iter() {
+            set.insert(*ent.node.key.preimage());
+        }
+    }
+    let mut v: Vec<PeerId> = set.into_iter().collect();
+    v.sort_by_key(|p| p.to_string());
+    v
+}
+
 #[derive(Serialize, Deserialize, Clone)]
 struct AddressBookEntry {
     peer_id: String,
@@ -336,6 +349,8 @@ enum NetworkEvent {
     ChatMessage(ChatMessage),
     Status(String),
     PublicIpConfirmed(String),
+    /// Снимок PeerId в локальной таблице Kademlia (для UI «узлы сети»).
+    DhtRoutingPeers { total: usize, lines: Vec<String> },
 }
 
 enum UICommand {
@@ -344,6 +359,10 @@ enum UICommand {
     SearchPeer(PeerId),
     /// Добавить адреса в VOID DHT и вызвать bootstrap (без перезапуска).
     ApplyVoidBootstrap(Vec<Multiaddr>),
+    /// Перечитать `VOID_BOOTSTRAP` / файл / встроенные / URL и снова подать в Kad (как при старте).
+    ReloadBootstrapFromSources,
+    /// Собрать PeerId из kbuckets и отправить в UI.
+    SnapshotDhtRoutingPeers,
     SendMessage {
         sender_name: String,
         text: String,
@@ -387,6 +406,9 @@ struct App {
     peer_name_edits: HashMap<PeerId, String>,
     /// Редактор `void-bootstrap.txt` (одна multiaddr на строку); «Применить» шлёт в сеть.
     void_bootstrap_draft: String,
+    /// Последний снимок таблицы Kademlia (не полный каталог пользователей).
+    dht_routing_lines: Vec<String>,
+    dht_routing_total: usize,
     command_tx: mpsc::Sender<UICommand>,
     event_rx: mpsc::Receiver<NetworkEvent>,
     _sessions: HashMap<libp2p::PeerId, crypto::SecureSession>,
@@ -425,6 +447,8 @@ impl App {
             peer_name_edits: HashMap::new(),
             void_bootstrap_draft: std::fs::read_to_string(Path::new("void-bootstrap.txt"))
                 .unwrap_or_default(),
+            dht_routing_lines: Vec::new(),
+            dht_routing_total: 0,
             command_tx,
             event_rx,
             _sessions: HashMap::new(),
@@ -595,6 +619,55 @@ impl App {
                                     .color(accent_color),
                             );
                             ui.label(format!("🌐 Подключено: {}", self.connected_peers));
+
+                            ui.add_space(6.0);
+                            if ui
+                                .button("🔄 Войти в VOID (переприменить seed)")
+                                .on_hover_text(
+                                    "Ещё раз подхватывает VOID_BOOTSTRAP, void-bootstrap.txt, встроенные seed и URL — как при запуске. Один клик без ручного ввода, если seed заданы в сборке/файле.",
+                                )
+                                .clicked()
+                            {
+                                let _ = self
+                                    .command_tx
+                                    .try_send(UICommand::ReloadBootstrapFromSources);
+                                self.add_status(
+                                    "Переподключение к seed… (если список пуст — задайте его в сборке или void-bootstrap.txt)."
+                                        .into(),
+                                );
+                            }
+                            if ui
+                                .button("📡 Узлы в моей таблице DHT")
+                                .on_hover_text(
+                                    "Показывает PeerId из локальной Kademlia (маршрутизация). Это не «все пользователи мира» — как в Bitcoin: тысячи узлов в сети, но таблица у каждого своя.",
+                                )
+                                .clicked()
+                            {
+                                let _ = self
+                                    .command_tx
+                                    .try_send(UICommand::SnapshotDhtRoutingPeers);
+                            }
+                            if self.dht_routing_total > 0 {
+                                ui.label(
+                                    egui::RichText::new(format!(
+                                        "Маршрутизация DHT: {} узл. (фрагмент)",
+                                        self.dht_routing_total
+                                    ))
+                                    .small()
+                                    .weak(),
+                                );
+                                egui::ScrollArea::vertical()
+                                    .max_height(140.0)
+                                    .show(ui, |ui| {
+                                        for line in &self.dht_routing_lines {
+                                            ui.label(
+                                                egui::RichText::new(line)
+                                                    .size(11.0)
+                                                    .monospace(),
+                                            );
+                                        }
+                                    });
+                            }
 
                             if !self.listen_addrs.is_empty() {
                                 ui.add_space(5.0);
@@ -1057,6 +1130,11 @@ impl eframe::App for App {
                 }
                 NetworkEvent::Status(msg) => {
                     self.add_status(msg);
+                }
+                NetworkEvent::DhtRoutingPeers { total, lines } => {
+                    self.dht_routing_total = total;
+                    self.dht_routing_lines = lines;
+                    self.add_status(format!("DHT: в таблице маршрутов {} узл.", total));
                 }
             }
         }
@@ -1738,6 +1816,43 @@ async fn main() -> Result<(), Box<dyn Error>> {
                                         )))
                                         .await;
                                 }
+                            }
+                            UICommand::ReloadBootstrapFromSources => {
+                                let addrs = void_bootstrap_multiaddrs();
+                                if addrs.is_empty() {
+                                    let _ = event_tx
+                                        .send(NetworkEvent::Status(
+                                            "Нет seed: задайте BUILTIN/URL в коде, VOID_BOOTSTRAP или void-bootstrap.txt."
+                                                .into(),
+                                        ))
+                                        .await;
+                                } else {
+                                    for ma in &addrs {
+                                        if let Some(pid) = peer_id_from_multiaddr(ma) {
+                                            swarm.behaviour_mut().kad.add_address(&pid, ma.clone());
+                                            let _ = swarm.dial(ma.clone());
+                                        }
+                                    }
+                                    let _ = swarm.behaviour_mut().kad.bootstrap();
+                                    let _ = event_tx
+                                        .send(NetworkEvent::Status(format!(
+                                            "🌐 VOID: переподключение к {} seed (источники как при старте).",
+                                            addrs.len()
+                                        )))
+                                        .await;
+                                }
+                            }
+                            UICommand::SnapshotDhtRoutingPeers => {
+                                let ids = kad_routing_peer_ids(&mut swarm.behaviour_mut().kad);
+                                let total = ids.len();
+                                let lines: Vec<String> = ids
+                                    .iter()
+                                    .take(256)
+                                    .map(|p| p.to_string())
+                                    .collect();
+                                let _ = event_tx
+                                    .send(NetworkEvent::DhtRoutingPeers { total, lines })
+                                    .await;
                             }
                             UICommand::SendMessage { sender_name, text, recipient, is_retry: _is_retry } => {
                                 let now = chrono::Local::now().format("%H:%M:%S").to_string();
