@@ -28,43 +28,123 @@ fn peer_id_from_multiaddr(ma: &Multiaddr) -> Option<PeerId> {
     })
 }
 
+/// Встроенные seed-адреса в бинарнике (пользователи ничего не вводят). Достаточно нескольких — дальше Kademlia сама находит тысячи пиров.
+/// Формат: полный multiaddr с `/p2p/<PeerId>` в конце.
+const BUILTIN_VOID_BOOTSTRAP: &[&str] = &[];
+
+/// Публичный URL со списком seed (как `void-bootstrap.txt`: одна multiaddr на строку, `#` — комментарий).
+/// Замените на свой endpoint один раз на релиз; клиенты подтянут список при старте.
+const VOID_BOOTSTRAP_PUBLIC_LIST_URL: &str = "";
+
 /// Узлы для заполнения **отдельного** VOID DHT (не IPFS): сообщения по-прежнему идут напрямую между пирами.
 ///
-/// Источники (оба опциональны, объединяются):
-/// - переменная окружения `VOID_BOOTSTRAP`: multiaddr через запятую;
-/// - файл `void-bootstrap.txt` в рабочей директории: одна multiaddr на строку, `#` — комментарий до конца строки.
+/// Источники (все опциональны, объединяются и дедуплицируются):
+/// - `BUILTIN_VOID_BOOTSTRAP` и сборка с `VOID_BUILTIN_BOOTSTRAP=/ip4/.../p2p/...,...` (вшито в exe);
+/// - HTTP(S): `VOID_BOOTSTRAP_URL` и/или `VOID_BOOTSTRAP_PUBLIC_LIST_URL` (если не пустой и не задан `VOID_SKIP_PUBLIC_BOOTSTRAP_LIST`);
+/// - переменная `VOID_BOOTSTRAP`: multiaddr через запятую;
+/// - файл `void-bootstrap.txt`: одна multiaddr на строку.
 ///
-/// Любой может поднять публичный узел VOID и дать свой `/ip4|dns.../tcp|udp/.../p2p/<PeerId>` — это не «центральный сервер чата»,
-/// а точка входа в общую таблицу маршрутов (как seed в BitTorrent).
-fn void_bootstrap_multiaddrs() -> Vec<Multiaddr> {
-    let mut out = Vec::new();
-    if let Ok(s) = std::env::var("VOID_BOOTSTRAP") {
-        for part in s.split(',') {
-            let t = part.trim();
-            if t.is_empty() {
-                continue;
-            }
-            match t.parse::<Multiaddr>() {
-                Ok(ma) => out.push(ma),
-                Err(_) => eprintln!("VOID_BOOTSTRAP: пропуск неверной multiaddr: {}", t),
-            }
+/// Любой может поднять публичный узел VOID — это не «центральный сервер чата», а точка входа в DHT (как у torrent).
+fn append_bootstraps_from_lines(out: &mut Vec<Multiaddr>, text: &str, source: &str) {
+    for line in text.lines() {
+        let t = line.split('#').next().unwrap_or("").trim();
+        if t.is_empty() {
+            continue;
+        }
+        match t.parse::<Multiaddr>() {
+            Ok(ma) => out.push(ma),
+            Err(_) => eprintln!("{}: пропуск строки: {}", source, t),
         }
     }
+}
+
+fn append_bootstraps_from_comma_separated(out: &mut Vec<Multiaddr>, s: &str, source: &str) {
+    for part in s.split(',') {
+        let t = part.trim();
+        if t.is_empty() {
+            continue;
+        }
+        match t.parse::<Multiaddr>() {
+            Ok(ma) => out.push(ma),
+            Err(_) => eprintln!("{}: пропуск неверной multiaddr: {}", source, t),
+        }
+    }
+}
+
+fn fetch_void_bootstrap_list(url: &str) -> Option<String> {
+    let client = reqwest::blocking::Client::builder()
+        .timeout(Duration::from_secs(12))
+        .build()
+        .ok()?;
+    match client.get(url).send() {
+        Ok(resp) => {
+            if !resp.status().is_success() {
+                eprintln!(
+                    "VOID bootstrap URL {}: HTTP {}",
+                    url,
+                    resp.status()
+                );
+                return None;
+            }
+            resp.text().ok()
+        }
+        Err(e) => {
+            eprintln!("VOID bootstrap URL {}: {}", url, e);
+            None
+        }
+    }
+}
+
+fn void_bootstrap_multiaddrs() -> Vec<Multiaddr> {
+    let mut out = Vec::new();
+
+    for s in BUILTIN_VOID_BOOTSTRAP {
+        let t = s.trim();
+        if t.is_empty() {
+            continue;
+        }
+        match t.parse::<Multiaddr>() {
+            Ok(ma) => out.push(ma),
+            Err(_) => eprintln!("BUILTIN_VOID_BOOTSTRAP: пропуск: {}", t),
+        }
+    }
+
+    if let Some(s) = option_env!("VOID_BUILTIN_BOOTSTRAP") {
+        append_bootstraps_from_comma_separated(&mut out, s, "VOID_BUILTIN_BOOTSTRAP (сборка)");
+    }
+
+    let mut urls: Vec<String> = Vec::new();
+    if let Ok(u) = std::env::var("VOID_BOOTSTRAP_URL") {
+        let t = u.trim().to_string();
+        if !t.is_empty() {
+            urls.push(t);
+        }
+    }
+    if std::env::var("VOID_SKIP_PUBLIC_BOOTSTRAP_LIST").is_err() {
+        let u = VOID_BOOTSTRAP_PUBLIC_LIST_URL.trim();
+        if !u.is_empty() {
+            urls.push(u.to_string());
+        }
+    }
+    urls.sort();
+    urls.dedup();
+    for url in urls {
+        if let Some(body) = fetch_void_bootstrap_list(&url) {
+            append_bootstraps_from_lines(&mut out, &body, &format!("GET {}", url));
+        }
+    }
+
     let path = Path::new("void-bootstrap.txt");
     if path.exists() {
         if let Ok(txt) = std::fs::read_to_string(path) {
-            for line in txt.lines() {
-                let t = line.split('#').next().unwrap_or("").trim();
-                if t.is_empty() {
-                    continue;
-                }
-                match t.parse::<Multiaddr>() {
-                    Ok(ma) => out.push(ma),
-                    Err(_) => eprintln!("void-bootstrap.txt: пропуск строки: {}", t),
-                }
-            }
+            append_bootstraps_from_lines(&mut out, &txt, "void-bootstrap.txt");
         }
     }
+
+    if let Ok(s) = std::env::var("VOID_BOOTSTRAP") {
+        append_bootstraps_from_comma_separated(&mut out, &s, "VOID_BOOTSTRAP");
+    }
+
     out.sort_by(|a, b| a.to_string().cmp(&b.to_string()));
     out.dedup_by(|a, b| a == b);
     out
@@ -721,7 +801,7 @@ impl App {
                             );
                             ui.label(
                                 egui::RichText::new(
-                                    "Одна /ip4…/tcp…/p2p/… на строку (# — комментарий). Сохраняет void-bootstrap.txt и сразу кормит Kademlia.",
+                                    "Одна /ip4…/tcp…/p2p/… на строку (# — комментарий). Сохраняет void-bootstrap.txt и сразу кормит Kademlia. При старте список уже может подмешиваться из встроенных seed и VOID_BOOTSTRAP_URL / публичного URL в коде.",
                                 )
                                 .size(13.0)
                                 .weak(),
@@ -1403,7 +1483,7 @@ async fn main() -> Result<(), Box<dyn Error>> {
     let void_bootstraps = void_bootstrap_multiaddrs();
     if void_bootstraps.is_empty() {
         println!(
-            "🌐 Глобально: задайте VOID_BOOTSTRAP или void-bootstrap.txt (multiaddr узлов VOID), либо набирайте собеседника по полному адресу. mDNS — только LAN."
+            "🌐 Глобально: нет seed для DHT — задайте BUILTIN_VOID_BOOTSTRAP / VOID_BOOTSTRAP_PUBLIC_LIST_URL в коде, VOID_BOOTSTRAP_URL, VOID_BOOTSTRAP, void-bootstrap.txt, либо полный multiaddr собеседника. mDNS — только LAN."
         );
     } else {
         println!(
@@ -1545,7 +1625,7 @@ async fn main() -> Result<(), Box<dyn Error>> {
         let _ = swarm.listen_on("/p2p-circuit".parse().unwrap());
 
         let startup_status = if void_bootstraps.is_empty() {
-            "🚀 Запущен. Интернет: полный multiaddr контакта или VOID_BOOTSTRAP / void-bootstrap.txt. LAN: mDNS.".to_string()
+            "🚀 Запущен. Интернет: полный multiaddr контакта или встроенный/URL seed (см. код), VOID_BOOTSTRAP, void-bootstrap.txt. LAN: mDNS.".to_string()
         } else {
             format!(
                 "🚀 Запущен. VOID DHT: {} bootstrap-узл(ов) (без IPFS) + mDNS в LAN.",
