@@ -893,21 +893,21 @@ impl App {
                         .show(ui, |ui| {
                             ui.set_width(ui.available_width());
                             ui.label(
-                                egui::RichText::new("ВОЙТИ В СЕТЬ ЧЕРЕЗ УЗЕЛ")
+                                egui::RichText::new("ВОЙТИ В СЕТЬ")
                                     .size(17.0)
                                     .strong()
                                     .color(accent_color),
                             );
                             ui.label(
                                 egui::RichText::new(
-                                    "IP, IP:PORT или полный multiaddr любой VOID-ноды. Клиент дозвонится, возьмёт её PeerId и через Kademlia подтянет остальную сеть.",
+                                    "IP любой VOID-ноды. Клиент сам дозвонится и через Kademlia подтянет всю сеть.",
                                 )
                                 .size(12.0)
                                 .weak(),
                             );
                             ui.add(
                                 egui::TextEdit::singleline(&mut self.void_bootstrap_draft)
-                                    .hint_text("например: 157.22.192.234 или 157.22.192.234:4001")
+                                    .hint_text("157.22.192.234")
                                     .desired_width(ui.available_width())
                                     .font(egui::TextStyle::Monospace),
                             );
