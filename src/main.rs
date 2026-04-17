@@ -2124,6 +2124,30 @@ async fn main() -> Result<(), Box<dyn Error>> {
                                  let _ = event_tx.send(NetworkEvent::Connected(peer_id)).await;
                                  let _ = event_tx.send(NetworkEvent::Status(format!("✅ СОЕДИНЕНО: {}", &peer_id.to_string()[..8]))).await;
                              }
+
+                            // Если мы звонили этому пиру как seed (вход в сеть через IP) — страховка:
+                            // добавляем dialed-адрес в Kademlia и запускаем DHT-bootstrap сразу после коннекта,
+                            // не дожидаясь Identify. На bootstrap без Identify Identify::Received никогда не придёт,
+                            // а DHT хотя бы попробует найти маршруты через этого пира.
+                            let is_seed = pending_seed_peers.contains(&peer_id) || pending_seed_bare;
+                            if is_seed {
+                                let addr = match endpoint {
+                                    libp2p::core::ConnectedPoint::Dialer { ref address, .. } => Some(address.clone()),
+                                    _ => None,
+                                };
+                                if let Some(addr) = addr {
+                                    swarm.behaviour_mut().kad.add_address(&peer_id, addr);
+                                }
+                                pending_seed_bare = false;
+                                pending_seed_peers.remove(&peer_id);
+                                let _ = swarm.behaviour_mut().kad.bootstrap();
+                                let _ = event_tx
+                                    .send(NetworkEvent::Status(format!(
+                                        "🌐 Seed подхвачен ({}): DHT-bootstrap запущен.",
+                                        &peer_id.to_string()[..12]
+                                    )))
+                                    .await;
+                            }
                         },
                         SwarmEvent::ConnectionClosed { peer_id, cause, .. } => {
                             let connected_count = swarm.connected_peers().count();
