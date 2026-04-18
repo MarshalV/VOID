@@ -424,6 +424,7 @@ struct App {
     status_log: Vec<String>,
     show_logs: bool,
     show_sidebar: bool,
+    sidebar_width: f32,
     public_ip: Option<String>,
     /// Ручное добавление в зашифрованную записную книгу
     add_contact_peer: String,
@@ -467,6 +468,7 @@ impl App {
             status_log: Vec::new(),
             show_logs: false,
             show_sidebar: true,
+            sidebar_width: 300.0,
             public_ip: None,
             add_contact_peer: String::new(),
             add_contact_name: String::new(),
@@ -529,538 +531,746 @@ impl App {
         ));
     }
 
-    fn ui_sidebar(&mut self, ui: &mut egui::Ui, accent_color: egui::Color32) {
-        let shadow_light = egui::Color32::from_rgba_premultiplied(45, 45, 48, 255);
-        let shadow_dark = egui::Color32::from_rgba_premultiplied(12, 12, 14, 255);
-        let bg_color = egui::Color32::from_rgb(26, 26, 28);
+    // =====================================================================
+    //  НОВЫЙ Telegram-подобный sidebar (космическая палитра)
+    // =====================================================================
+    fn ui_sidebar(&mut self, ui: &mut egui::Ui) {
+        let avail = ui.available_width();
 
-        ui.vertical(|ui| {
-            // --- SECTION: IDENTITY ---
-            egui::Frame::none()
-                .fill(bg_color)
-                .rounding(15.0)
-                .shadow(egui::Shadow {
-                    offset: egui::vec2(-3.0, -3.0),
-                    blur: 8.0,
-                    spread: 0.0,
-                    color: shadow_light,
-                })
-                .show(ui, |ui| {
-                    egui::Frame::none()
-                        .fill(bg_color)
-                        .rounding(15.0)
-                        .shadow(egui::Shadow {
-                            offset: egui::vec2(3.0, 3.0),
-                            blur: 6.0,
-                            spread: 0.0,
-                            color: shadow_dark,
-                        })
-                        .inner_margin(12.0)
-                        .show(ui, |ui| {
-                            ui.set_width(ui.available_width());
-                            egui::CollapsingHeader::new(
-                                egui::RichText::new("👤 МОЙ ПРОФИЛЬ")
-                                    .strong()
-                                    .color(accent_color),
+        // -------- Шапка профиля --------
+        egui::Frame::none()
+            .fill(palette::BG_PANEL)
+            .inner_margin(egui::Margin {
+                left: 16.0,
+                right: 16.0,
+                top: 16.0,
+                bottom: 12.0,
+            })
+            .show(ui, |ui| {
+                ui.horizontal(|ui| {
+                    draw_avatar(
+                        ui,
+                        &self.local_peer_id.to_string(),
+                        &self.local_nickname,
+                        46.0,
+                        Some(true),
+                    );
+                    ui.add_space(12.0);
+                    ui.vertical(|ui| {
+                        let inner_w = (avail - 78.0).max(60.0);
+                        ui.set_width(inner_w);
+                        let nick_resp = ui.add(
+                            egui::TextEdit::singleline(&mut self.local_nickname)
+                                .desired_width(inner_w)
+                                .frame(false)
+                                .font(egui::TextStyle::Heading),
+                        );
+                        if nick_resp.lost_focus() {
+                            self.persist_vault();
+                        }
+                        let pid = self.local_peer_id.to_string();
+                        let short = format!("{}…", &pid[..pid.len().min(16)]);
+                        let r = ui.add(
+                            egui::Label::new(
+                                egui::RichText::new(short)
+                                    .size(11.5)
+                                    .monospace()
+                                    .color(palette::TEXT_MUTED),
                             )
-                            .default_open(false)
-                            .show(ui, |ui| {
-                                ui.horizontal(|ui| {
-                                    ui.label("Имя:");
-                                    if ui
-                                        .add(
-                                            egui::TextEdit::singleline(&mut self.local_nickname)
-                                                .desired_width(120.0),
-                                        )
-                                        .changed()
-                                    {
-                                        self.persist_vault();
-                                    }
-                                });
-                                ui.horizontal(|ui| {
-                                    ui.label(
-                                        egui::RichText::new(&self.local_peer_id.to_string()[..16])
-                                            .size(15.0)
-                                            .monospace()
-                                            .weak(),
-                                    );
-                                    if ui
-                                        .button("📋")
-                                        .on_hover_text("Копировать Peer ID")
-                                        .clicked()
-                                    {
-                                        ui.output_mut(|o| {
-                                            o.copied_text = self.local_peer_id.to_string()
-                                        });
-                                    }
-                                });
+                            .sense(egui::Sense::click()),
+                        )
+                        .on_hover_text("Клик — копировать Peer ID");
+                        if r.clicked() {
+                            ui.output_mut(|o| o.copied_text = pid);
+                            self.add_status("Скопирован Peer ID".into());
+                        }
+                        if let Some(ip) = &self.public_ip {
+                            ui.label(
+                                egui::RichText::new(format!("◐ {ip}"))
+                                    .size(11.0)
+                                    .color(palette::ACCENT_2),
+                            );
+                        }
+                    });
+                });
+            });
 
-                                if let Some(ip) = &self.public_ip {
+        // -------- Поиск --------
+        egui::Frame::none()
+            .inner_margin(egui::Margin {
+                left: 12.0,
+                right: 12.0,
+                top: 0.0,
+                bottom: 8.0,
+            })
+            .show(ui, |ui| {
+                let id = egui::Id::new("void_search_query");
+                let mut buf: String =
+                    ui.memory_mut(|m| m.data.get_temp::<String>(id).unwrap_or_default());
+                let resp = ui.add(
+                    egui::TextEdit::singleline(&mut buf)
+                        .hint_text("🔍   Поиск контактов")
+                        .desired_width(f32::INFINITY),
+                );
+                if resp.changed() {
+                    ui.memory_mut(|m| m.data.insert_temp(id, buf.clone()));
+                }
+            });
+
+        // тонкий разделитель
+        let sep_rect = ui
+            .allocate_space(egui::vec2(ui.available_width(), 1.0))
+            .1;
+        ui.painter().rect_filled(sep_rect, 0.0, palette::DIVIDER);
+
+        // -------- Список контактов --------
+        let search: String = ui
+            .memory(|m| m.data.get_temp::<String>(egui::Id::new("void_search_query")))
+            .unwrap_or_default()
+            .to_lowercase();
+
+        egui::ScrollArea::vertical()
+            .id_salt("contacts_scroll")
+            .auto_shrink([false, false])
+            .show(ui, |ui| {
+                ui.add_space(4.0);
+
+                let mut peers: Vec<(PeerId, String)> = self
+                    .known_peers
+                    .iter()
+                    .map(|(p, n)| (*p, n.clone()))
+                    .collect();
+                peers.sort_by(|a, b| a.1.to_lowercase().cmp(&b.1.to_lowercase()));
+
+                let mut to_remove: Vec<PeerId> = Vec::new();
+                let me_str = self.local_peer_id.to_string();
+
+                if peers.is_empty() {
+                    ui.add_space(40.0);
+                    ui.vertical_centered(|ui| {
+                        ui.label(
+                            egui::RichText::new("✦")
+                                .size(40.0)
+                                .color(palette::ACCENT_2),
+                        );
+                        ui.add_space(8.0);
+                        ui.label(
+                            egui::RichText::new("Контактов пока нет")
+                                .color(palette::TEXT)
+                                .strong(),
+                        );
+                        ui.label(
+                            egui::RichText::new("Войдите в сеть VOID или\nдобавьте Peer ID вручную")
+                                .color(palette::TEXT_MUTED)
+                                .size(12.0),
+                        );
+                    });
+                    ui.add_space(20.0);
+                }
+
+                for (peer_id, name) in &peers {
+                    if !search.is_empty()
+                        && !name.to_lowercase().contains(&search)
+                        && !peer_id.to_string().to_lowercase().contains(&search)
+                    {
+                        continue;
+                    }
+                    let peer_str = peer_id.to_string();
+                    let is_selected = self.selected_chat == peer_str;
+
+                    let last_msg: Option<&ChatMessage> =
+                        self.messages.get(&peer_str).and_then(|v| v.last());
+                    let preview = match last_msg {
+                        Some(m) if m.sender_id == me_str => format!("Вы: {}", m.text),
+                        Some(m) => m.text.clone(),
+                        None => "Нажмите, чтобы написать…".to_string(),
+                    };
+                    let time_str = last_msg
+                        .map(|m| short_time(&m.timestamp))
+                        .unwrap_or_default();
+
+                    let bg = if is_selected {
+                        palette::BG_SELECTED
+                    } else {
+                        egui::Color32::TRANSPARENT
+                    };
+
+                    let inner = egui::Frame::none()
+                        .fill(bg)
+                        .rounding(10.0)
+                        .inner_margin(egui::Margin {
+                            left: 10.0,
+                            right: 10.0,
+                            top: 8.0,
+                            bottom: 8.0,
+                        })
+                        .show(ui, |ui| {
+                            ui.set_width(ui.available_width());
+                            ui.horizontal(|ui| {
+                                draw_avatar(ui, &peer_str, name, 42.0, None);
+                                ui.add_space(10.0);
+                                ui.vertical(|ui| {
+                                    ui.set_width(ui.available_width());
                                     ui.horizontal(|ui| {
-                                        ui.label("IP:");
                                         ui.label(
-                                            egui::RichText::new(ip)
-                                                .size(15.0)
-                                                .monospace()
-                                                .color(accent_color),
+                                            egui::RichText::new(name)
+                                                .strong()
+                                                .color(palette::TEXT)
+                                                .size(14.5),
                                         );
-                                        if ui.button("📋").on_hover_text("Копировать IP").clicked() {
-                                            ui.output_mut(|o| o.copied_text = ip.clone());
-                                        }
+                                        ui.with_layout(
+                                            egui::Layout::right_to_left(egui::Align::Center),
+                                            |ui| {
+                                                ui.label(
+                                                    egui::RichText::new(&time_str)
+                                                        .size(10.5)
+                                                        .color(palette::TEXT_MUTED),
+                                                );
+                                            },
+                                        );
                                     });
-                                }
-                            });
-                        });
-                });
-
-            ui.add_space(15.0);
-
-            // --- SECTION: NETWORK ---
-            egui::Frame::none()
-                .fill(bg_color)
-                .rounding(15.0)
-                .shadow(egui::Shadow {
-                    offset: egui::vec2(-3.0, -3.0),
-                    blur: 8.0,
-                    spread: 0.0,
-                    color: shadow_light,
-                })
-                .show(ui, |ui| {
-                    egui::Frame::none()
-                        .fill(bg_color)
-                        .rounding(15.0)
-                        .shadow(egui::Shadow {
-                            offset: egui::vec2(3.0, 3.0),
-                            blur: 6.0,
-                            spread: 0.0,
-                            color: shadow_dark,
-                        })
-                        .inner_margin(12.0)
-                        .show(ui, |ui| {
-                            ui.set_width(ui.available_width());
-                            ui.label(
-                                egui::RichText::new("СЕТЬ")
-                                    .size(17.0)
-                                    .strong()
-                                    .color(accent_color),
-                            );
-                            ui.label(format!("🌐 Подключено: {}", self.connected_peers));
-
-                            ui.add_space(6.0);
-                            if ui
-                                .button("🔄 Войти в VOID (переприменить seed)")
-                                .on_hover_text(
-                                    "Ещё раз подхватывает VOID_BOOTSTRAP, void-bootstrap.txt, встроенные seed и URL — как при запуске. Один клик без ручного ввода, если seed заданы в сборке/файле.",
-                                )
-                                .clicked()
-                            {
-                                let _ = self
-                                    .command_tx
-                                    .try_send(UICommand::ReloadBootstrapFromSources);
-                                self.add_status(
-                                    "Переподключение к seed… (если список пуст — задайте его в сборке или void-bootstrap.txt)."
-                                        .into(),
-                                );
-                            }
-                            if ui
-                                .button("📡 Узлы в моей таблице DHT")
-                                .on_hover_text(
-                                    "Показывает PeerId из локальной Kademlia (маршрутизация). Это не «все пользователи мира» — как в Bitcoin: тысячи узлов в сети, но таблица у каждого своя.",
-                                )
-                                .clicked()
-                            {
-                                let _ = self
-                                    .command_tx
-                                    .try_send(UICommand::SnapshotDhtRoutingPeers);
-                            }
-                            if self.dht_routing_total > 0 {
-                                ui.label(
-                                    egui::RichText::new(format!(
-                                        "Маршрутизация DHT: {} узл. (фрагмент)",
-                                        self.dht_routing_total
-                                    ))
-                                    .small()
-                                    .weak(),
-                                );
-                                egui::ScrollArea::vertical()
-                                    .max_height(140.0)
-                                    .show(ui, |ui| {
-                                        for line in &self.dht_routing_lines {
-                                            ui.label(
-                                                egui::RichText::new(line)
-                                                    .size(11.0)
-                                                    .monospace(),
-                                            );
-                                        }
-                                    });
-                            }
-
-                            if !self.listen_addrs.is_empty() {
-                                ui.add_space(5.0);
-                                egui::CollapsingHeader::new(
-                                    egui::RichText::new("📍 МОИ АДРЕСА").size(15.0).weak(),
-                                )
-                                .show(ui, |ui| {
-                                    for addr in &self.listen_addrs {
-                                        ui.horizontal(|ui| {
-                                            let short_addr = if addr.len() > 20 {
-                                                format!("{}...", &addr[..17])
-                                            } else {
-                                                addr.clone()
-                                            };
-                                            ui.label(
-                                                egui::RichText::new(short_addr).small().weak(),
-                                            );
-                                            if ui.button("📋").clicked() {
-                                                ui.output_mut(|o| o.copied_text = addr.clone());
-                                            }
-                                        });
-                                    }
-                                });
-                            }
-                        });
-                });
-
-            ui.add_space(15.0);
-
-            // --- SECTION: CHATS ---
-            egui::Frame::none()
-                .fill(bg_color)
-                .rounding(15.0)
-                .shadow(egui::Shadow {
-                    offset: egui::vec2(-3.0, -3.0),
-                    blur: 8.0,
-                    spread: 0.0,
-                    color: shadow_light,
-                })
-                .show(ui, |ui| {
-                    egui::Frame::none()
-                        .fill(bg_color)
-                        .rounding(15.0)
-                        .shadow(egui::Shadow {
-                            offset: egui::vec2(3.0, 3.0),
-                            blur: 6.0,
-                            spread: 0.0,
-                            color: shadow_dark,
-                        })
-                        .inner_margin(12.0)
-                        .show(ui, |ui| {
-                            ui.set_width(ui.available_width());
-                            ui.label(
-                                egui::RichText::new("ЧАТЫ / ЗАПИСНАЯ КНИГА")
-                                    .size(17.0)
-                                    .strong()
-                                    .color(accent_color),
-                            );
-                            ui.label(
-                                egui::RichText::new("Контакты и имена хранятся в vault.bin (шифрование AES-GCM).")
-                                    .size(13.0)
-                                    .weak(),
-                            );
-
-                            ui.add_space(10.0);
-                            ui.label(egui::RichText::new("ЛИЧНЫЕ").size(15.0).weak());
-
-                            let mut peers_to_remove = Vec::new();
-                            let mut known_peers_list: Vec<(PeerId, String)> = self
-                                .known_peers
-                                .iter()
-                                .map(|(pid, n)| (*pid, n.clone()))
-                                .collect();
-                            known_peers_list.sort_by(|a, b| a.1.cmp(&b.1));
-
-                            for (peer_id, name) in known_peers_list {
-                                let peer_str = peer_id.to_string();
-                                let is_selected = self.selected_chat == peer_str;
-
-                                ui.horizontal(|ui| {
-                                    if ui
-                                        .selectable_label(is_selected, "💬")
-                                        .on_hover_text("Открыть чат")
-                                        .clicked()
-                                    {
-                                        self.selected_chat = peer_str.clone();
-                                        self.messages.entry(peer_str.clone()).or_insert(Vec::new());
-                                    }
-                                    let buf = self
-                                        .peer_name_edits
-                                        .entry(peer_id)
-                                        .or_insert_with(|| name.clone());
-                                    let name_edit = ui.add(
-                                        egui::TextEdit::singleline(buf)
-                                            .desired_width(ui.available_width() - 36.0)
-                                            .hint_text("Имя в книге"),
+                                    ui.label(
+                                        egui::RichText::new(truncate_text(&preview, 40))
+                                            .color(palette::TEXT_MUTED)
+                                            .size(12.5),
                                     );
-                                    if !name_edit.has_focus() && *buf != name {
-                                        *buf = name.clone();
-                                    }
-                                    if name_edit.lost_focus() {
-                                        let trimmed = buf.trim().to_string();
-                                        if trimmed.is_empty() {
-                                            *buf = name.clone();
-                                        } else if trimmed != name {
-                                            self.known_peers.insert(peer_id, trimmed.clone());
-                                            *buf = trimmed;
-                                            self.persist_vault();
-                                        }
-                                    }
-                                    if ui
-                                        .button("🗑")
-                                        .on_hover_text("Удалить из книги и истории")
-                                        .clicked()
-                                    {
-                                        peers_to_remove.push(peer_id);
-                                    }
                                 });
-                            }
+                            });
+                        })
+                        .response;
 
-                            let mut did_remove = false;
-                            for pid in peers_to_remove {
-                                let p_str = pid.to_string();
-                                self.known_peers.remove(&pid);
-                                self.peer_name_edits.remove(&pid);
-                                self.messages.remove(&p_str);
-                                if self.selected_chat == p_str {
-                                    self.selected_chat = String::new();
-                                }
-                                did_remove = true;
-                            }
-                            if did_remove {
+                    let click = inner.interact(egui::Sense::click());
+                    if click.clicked() {
+                        self.selected_chat = peer_str.clone();
+                        self.messages.entry(peer_str.clone()).or_insert_with(Vec::new);
+                    }
+                    click.context_menu(|ui| {
+                        ui.label(
+                            egui::RichText::new("Контакт")
+                                .color(palette::TEXT_MUTED)
+                                .size(11.0),
+                        );
+                        ui.separator();
+                        let buf = self
+                            .peer_name_edits
+                            .entry(*peer_id)
+                            .or_insert_with(|| name.clone());
+                        let r = ui.add(
+                            egui::TextEdit::singleline(buf)
+                                .desired_width(220.0)
+                                .hint_text("Новое имя"),
+                        );
+                        if r.lost_focus() {
+                            let trimmed = buf.trim().to_string();
+                            if !trimmed.is_empty() && trimmed != *name {
+                                self.known_peers.insert(*peer_id, trimmed.clone());
+                                *buf = trimmed;
                                 self.persist_vault();
                             }
+                            ui.close_menu();
+                        }
+                        if ui.button("📋 Копировать Peer ID").clicked() {
+                            ui.output_mut(|o| o.copied_text = peer_str.clone());
+                            ui.close_menu();
+                        }
+                        if ui.button("🗑 Удалить контакт").clicked() {
+                            to_remove.push(*peer_id);
+                            ui.close_menu();
+                        }
+                    });
+                }
 
-                            ui.add_space(10.0);
-                            ui.separator();
-                            ui.add_space(6.0);
-                            ui.label(
-                                egui::RichText::new("ДОБАВИТЬ КОНТАКТ").size(14.0).weak(),
-                            );
-                            ui.add(
-                                egui::TextEdit::singleline(&mut self.add_contact_peer)
-                                    .hint_text("Peer ID")
-                                    .desired_width(ui.available_width()),
-                            );
-                            ui.add(
-                                egui::TextEdit::singleline(&mut self.add_contact_name)
-                                    .hint_text("Имя")
-                                    .desired_width(ui.available_width()),
-                            );
-                            if ui.button("➕ В зашифрованную книгу").clicked() {
-                                let pid_trim = self.add_contact_peer.trim();
-                                let name_trim = self.add_contact_name.trim();
-                                if !pid_trim.is_empty() && !name_trim.is_empty() {
-                                    if let Ok(pid) = pid_trim.parse::<PeerId>() {
-                                        if pid != self.local_peer_id {
-                                            self.known_peers
-                                                .insert(pid, name_trim.to_string());
-                                            self.persist_vault();
-                                            self.add_contact_peer.clear();
-                                            self.add_contact_name.clear();
-                                        }
-                                    } else {
-                                        self.add_status(
-                                            "Некорректный Peer ID для записной книги".to_string(),
-                                        );
+                if !to_remove.is_empty() {
+                    for pid in to_remove {
+                        let p = pid.to_string();
+                        self.known_peers.remove(&pid);
+                        self.peer_name_edits.remove(&pid);
+                        self.messages.remove(&p);
+                        if self.selected_chat == p {
+                            self.selected_chat.clear();
+                        }
+                    }
+                    self.persist_vault();
+                }
+
+                ui.add_space(14.0);
+                ui.separator();
+                ui.add_space(8.0);
+
+                // -------- ➕ Добавить контакт --------
+                ui.collapsing(
+                    egui::RichText::new("➕  Добавить контакт")
+                        .color(palette::ACCENT)
+                        .strong(),
+                    |ui| {
+                        ui.add(
+                            egui::TextEdit::singleline(&mut self.add_contact_peer)
+                                .hint_text("Peer ID")
+                                .desired_width(f32::INFINITY),
+                        );
+                        ui.add_space(4.0);
+                        ui.add(
+                            egui::TextEdit::singleline(&mut self.add_contact_name)
+                                .hint_text("Имя в записной книге")
+                                .desired_width(f32::INFINITY),
+                        );
+                        ui.add_space(8.0);
+                        let save = ui.add_sized(
+                            [ui.available_width(), 34.0],
+                            egui::Button::new(
+                                egui::RichText::new("Сохранить (зашифровано)")
+                                    .color(palette::TEXT)
+                                    .strong(),
+                            )
+                            .fill(palette::ACCENT),
+                        );
+                        if save.clicked() {
+                            let pid_t = self.add_contact_peer.trim().to_string();
+                            let name_t = self.add_contact_name.trim().to_string();
+                            if !pid_t.is_empty() && !name_t.is_empty() {
+                                if let Ok(pid) = pid_t.parse::<PeerId>() {
+                                    if pid != self.local_peer_id {
+                                        self.known_peers.insert(pid, name_t);
+                                        self.persist_vault();
+                                        self.add_contact_peer.clear();
+                                        self.add_contact_name.clear();
                                     }
+                                } else {
+                                    self.add_status("Некорректный Peer ID".into());
                                 }
                             }
+                        }
+                    },
+                );
+
+                ui.add_space(6.0);
+
+                // -------- 🛰  Сеть VOID --------
+                ui.collapsing(
+                    egui::RichText::new("🛰   Сеть VOID")
+                        .color(palette::ACCENT_2)
+                        .strong(),
+                    |ui| {
+                        ui.horizontal(|ui| {
+                            ui.label(
+                                egui::RichText::new("Подключено:")
+                                    .color(palette::TEXT_MUTED)
+                                    .size(12.0),
+                            );
+                            ui.label(
+                                egui::RichText::new(format!("{}", self.connected_peers))
+                                    .color(palette::ONLINE)
+                                    .strong(),
+                            );
                         });
-                });
-
-            ui.add_space(15.0);
-
-            // --- SECTION: VOID BOOTSTRAP (глобальный DHT, не IPFS) ---
-            egui::Frame::none()
-                .fill(bg_color)
-                .rounding(15.0)
-                .shadow(egui::Shadow {
-                    offset: egui::vec2(-3.0, -3.0),
-                    blur: 8.0,
-                    spread: 0.0,
-                    color: shadow_light,
-                })
-                .show(ui, |ui| {
-                    egui::Frame::none()
-                        .fill(bg_color)
-                        .rounding(15.0)
-                        .shadow(egui::Shadow {
-                            offset: egui::vec2(3.0, 3.0),
-                            blur: 6.0,
-                            spread: 0.0,
-                            color: shadow_dark,
-                        })
-                        .inner_margin(12.0)
-                        .show(ui, |ui| {
-                            ui.set_width(ui.available_width());
+                        ui.horizontal(|ui| {
                             ui.label(
-                                egui::RichText::new("ВОЙТИ В СЕТЬ")
-                                    .size(17.0)
-                                    .strong()
-                                    .color(accent_color),
+                                egui::RichText::new("DHT-таблица:")
+                                    .color(palette::TEXT_MUTED)
+                                    .size(12.0),
                             );
                             ui.label(
-                                egui::RichText::new(
-                                    "IP любой VOID-ноды. Клиент сам дозвонится и через Kademlia подтянет всю сеть.",
-                                )
-                                .size(12.0)
-                                .weak(),
+                                egui::RichText::new(format!("{} узл.", self.dht_routing_total))
+                                    .color(palette::ACCENT_2),
                             );
-                            ui.add(
-                                egui::TextEdit::singleline(&mut self.void_bootstrap_draft)
-                                    .hint_text("157.22.192.234")
-                                    .desired_width(ui.available_width())
-                                    .font(egui::TextStyle::Monospace),
-                            );
+                        });
+                        ui.add_space(8.0);
+                        ui.label(
+                            egui::RichText::new("Войти в сеть через IP")
+                                .color(palette::TEXT_MUTED)
+                                .size(11.5),
+                        );
+                        ui.add(
+                            egui::TextEdit::singleline(&mut self.void_bootstrap_draft)
+                                .hint_text("157.22.192.234")
+                                .desired_width(f32::INFINITY)
+                                .font(egui::TextStyle::Monospace),
+                        );
+                        ui.add_space(6.0);
+                        let join = ui.add_sized(
+                            [ui.available_width(), 32.0],
+                            egui::Button::new(
+                                egui::RichText::new("🌐 Войти в VOID")
+                                    .color(palette::TEXT)
+                                    .strong(),
+                            )
+                            .fill(palette::ACCENT),
+                        );
+                        if join.clicked() {
+                            let input = self.void_bootstrap_draft.trim().to_string();
+                            if input.is_empty() {
+                                self.add_status("⚠ Введите IP другой ноды".into());
+                            } else {
+                                let _ = self
+                                    .command_tx
+                                    .try_send(UICommand::JoinViaNode(input.clone()));
+                                self.add_status(format!("Вход в сеть через {input}…"));
+                            }
+                        }
+                        ui.add_space(4.0);
+                        if ui
+                            .button(
+                                egui::RichText::new("Переподключить seed").color(palette::TEXT),
+                            )
+                            .clicked()
+                        {
+                            let _ = self
+                                .command_tx
+                                .try_send(UICommand::ReloadBootstrapFromSources);
+                        }
+                        if ui
+                            .button(egui::RichText::new("Снимок DHT").color(palette::TEXT))
+                            .clicked()
+                        {
+                            let _ = self
+                                .command_tx
+                                .try_send(UICommand::SnapshotDhtRoutingPeers);
+                        }
+                    },
+                );
+
+                ui.add_space(6.0);
+
+                // -------- 🔌 Прямое подключение --------
+                ui.collapsing(
+                    egui::RichText::new("🔌  Прямое подключение")
+                        .color(palette::ACCENT_2)
+                        .strong(),
+                    |ui| {
+                        ui.add(
+                            egui::TextEdit::singleline(&mut self.dial_address)
+                                .hint_text("Peer ID или Multiaddr")
+                                .desired_width(f32::INFINITY),
+                        );
+                        ui.add_space(6.0);
+                        ui.horizontal(|ui| {
                             if ui
-                                .add(egui::Button::new(
-                                    egui::RichText::new("🌐 ВОЙТИ В СЕТЬ").size(17.0),
-                                ))
+                                .add(
+                                    egui::Button::new(
+                                        egui::RichText::new("Подключить")
+                                            .color(palette::TEXT),
+                                    )
+                                    .fill(palette::BG_HOVER),
+                                )
+                                .clicked()
+                                && !self.dial_address.is_empty()
+                            {
+                                let input = self.dial_address.trim().to_string();
+                                if let Ok(pid) = input.parse::<PeerId>() {
+                                    if pid == self.local_peer_id {
+                                        self.add_status(
+                                            "Это ваш собственный PeerId.".into(),
+                                        );
+                                    } else {
+                                        let _ =
+                                            self.command_tx.try_send(UICommand::SearchPeer(pid));
+                                    }
+                                } else {
+                                    let _ = self.command_tx.try_send(UICommand::Dial(input));
+                                }
+                                self.dial_address.clear();
+                            }
+                            if ui
+                                .button(
+                                    egui::RichText::new("📋 Свой ID").color(palette::TEXT),
+                                )
                                 .clicked()
                             {
-                                let input = self.void_bootstrap_draft.trim().to_string();
-                                if input.is_empty() {
-                                    self.add_status("⚠ Введите IP/адрес узла.".into());
-                                } else if let Err(e) = self
-                                    .command_tx
-                                    .try_send(UICommand::JoinViaNode(input.clone()))
-                                {
-                                    self.add_status(format!(
-                                        "⚠ Очередь к сети переполнена: {}",
-                                        e
-                                    ));
-                                } else {
-                                    self.add_status(format!(
-                                        "🌐 Вход в сеть через {} …",
-                                        input
-                                    ));
-                                }
+                                ui.output_mut(|o| {
+                                    o.copied_text = self.local_peer_id.to_string()
+                                });
                             }
                         });
-                });
+                    },
+                );
 
-            ui.add_space(15.0);
-
-            // --- SECTION: DIAL ---
-            egui::Frame::none()
-                .fill(bg_color)
-                .rounding(15.0)
-                .shadow(egui::Shadow {
-                    offset: egui::vec2(-3.0, -3.0),
-                    blur: 8.0,
-                    spread: 0.0,
-                    color: shadow_light,
-                })
-                .show(ui, |ui| {
-                    egui::Frame::none()
-                        .fill(bg_color)
-                        .rounding(15.0)
-                        .shadow(egui::Shadow {
-                            offset: egui::vec2(3.0, 3.0),
-                            blur: 6.0,
-                            spread: 0.0,
-                            color: shadow_dark,
-                        })
-                        .inner_margin(12.0)
-                        .show(ui, |ui| {
-                            ui.set_width(ui.available_width());
-                            ui.label(
-                                egui::RichText::new("ПОДКЛЮЧЕНИЕ")
-                                    .size(17.0)
-                                    .strong()
-                                    .color(accent_color),
-                            );
-                            ui.add(
-                                egui::TextEdit::singleline(&mut self.dial_address)
-                                    .hint_text("Peer ID или Multiaddr")
-                                    .desired_width(ui.available_width()),
-                            );
-                            ui.add_space(8.0);
-                            ui.horizontal(|ui| {
-                                if ui
-                                    .add(egui::Button::new(
-                                        egui::RichText::new("ПОДКЛЮЧИТЬ").size(17.0),
-                                    ))
-                                    .clicked()
-                                    && !self.dial_address.is_empty()
-                                {
-                                    let input = self.dial_address.trim().to_string();
-                                    if let Ok(peer_id) = input.parse::<PeerId>() {
-                                        if peer_id == self.local_peer_id {
-                                            self.add_status(
-                                                "Это ваш собственный PeerId — набирайте собеседника по его multiaddr или дождитесь mDNS.".into(),
-                                            );
-                                        } else {
-                                            let _ = self
-                                                .command_tx
-                                                .try_send(UICommand::SearchPeer(peer_id));
-                                        }
-                                    } else {
-                                        let _ = self.command_tx.try_send(UICommand::Dial(input));
-                                    }
-                                    self.dial_address.clear();
-                                }
-
-                                if ui.button("📋 СВОЙ ID").clicked() {
-                                    ui.output_mut(|o| {
-                                        o.copied_text = self.local_peer_id.to_string()
-                                    });
-                                }
-                            });
-                        });
-                });
-
-            ui.add_space(20.0);
-            if ui
-                .add(egui::Button::new(
-                    egui::RichText::new("📋 СИСТЕМНАЯ КОНСОЛЬ").size(17.0),
-                ))
-                .clicked()
-            {
-                self.show_logs = true;
-            }
-        });
+                ui.add_space(14.0);
+            });
     }
+}
+
+// ============================================================
+//  ВИЗУАЛ: космическая палитра + helpers (Telegram-like layout)
+// ============================================================
+
+mod palette {
+    use eframe::egui::Color32;
+    pub const BG_DEEP:       Color32 = Color32::from_rgb(0x05, 0x07, 0x16); // глубокий космос
+    pub const BG_PANEL:      Color32 = Color32::from_rgb(0x0b, 0x0f, 0x22); // sidebar
+    pub const BG_CHAT:       Color32 = Color32::from_rgb(0x0b, 0x0f, 0x22); // чат — единый тон с sidebar
+    pub const BG_CARD:       Color32 = Color32::from_rgb(0x12, 0x17, 0x30); // карточки/инпуты
+    pub const BG_HOVER:      Color32 = Color32::from_rgb(0x18, 0x1d, 0x3a);
+    pub const BG_SELECTED:   Color32 = Color32::from_rgb(0x1e, 0x26, 0x4a);
+    pub const DIVIDER:       Color32 = Color32::from_rgb(0x2a, 0x32, 0x58);
+    pub const TEXT:          Color32 = Color32::from_rgb(0xe8, 0xec, 0xf8);
+    pub const TEXT_MUTED:    Color32 = Color32::from_rgb(0x7d, 0x86, 0xa8);
+    pub const ACCENT:        Color32 = Color32::from_rgb(0x7c, 0x5c, 0xff); // cosmic violet
+    pub const ACCENT_2:      Color32 = Color32::from_rgb(0x5c, 0xc7, 0xff); // starlight cyan
+    pub const BUBBLE_ME:     Color32 = Color32::from_rgb(0x32, 0x3f, 0x88);
+    pub const BUBBLE_THEM:   Color32 = Color32::from_rgb(0x14, 0x18, 0x33);
+    pub const ONLINE:        Color32 = Color32::from_rgb(0x3a, 0xd6, 0x8b);
+    pub const NEBULA_VIOLET: Color32 = Color32::from_rgba_premultiplied(0x55, 0x28, 0x88, 170);
+    pub const NEBULA_BLUE:   Color32 = Color32::from_rgba_premultiplied(0x18, 0x40, 0x90, 140);
+    pub const STAR:          Color32 = Color32::from_rgb(0xd8, 0xe0, 0xf0);
+}
+
+fn hsv_to_rgb(h: f32, s: f32, v: f32) -> egui::Color32 {
+    let c = v * s;
+    let hh = (h / 60.0).rem_euclid(6.0);
+    let x = c * (1.0 - (hh.rem_euclid(2.0) - 1.0).abs());
+    let (r, g, b) = if hh < 1.0 { (c, x, 0.0) }
+        else if hh < 2.0 { (x, c, 0.0) }
+        else if hh < 3.0 { (0.0, c, x) }
+        else if hh < 4.0 { (0.0, x, c) }
+        else if hh < 5.0 { (x, 0.0, c) }
+        else             { (c, 0.0, x) };
+    let m = v - c;
+    egui::Color32::from_rgb(
+        (((r + m) * 255.0) as u32).min(255) as u8,
+        (((g + m) * 255.0) as u32).min(255) as u8,
+        (((b + m) * 255.0) as u32).min(255) as u8,
+    )
+}
+
+/// Цвет, выводимый детерминированно из строки (peer_id) — для аватаров.
+fn deterministic_color(seed: &str) -> egui::Color32 {
+    let mut h: u64 = 0x9e37_79b9_7f4a_7c15;
+    for b in seed.bytes() {
+        h ^= b as u64;
+        h = h.wrapping_mul(0x100_0000_01b3);
+    }
+    // диапазон оттенков 200..360 + 0..40 = холодный край (синий → фиолетовый → магента)
+    let raw = (h % 200) as f32; // 0..200
+    let hue = (200.0 + raw) % 360.0;
+    hsv_to_rgb(hue, 0.55, 0.78)
+}
+
+/// Кружок-аватар с инициалом и (опц.) индикатором онлайна.
+fn draw_avatar(
+    ui: &mut egui::Ui,
+    seed: &str,
+    label: &str,
+    size: f32,
+    online: Option<bool>,
+) -> egui::Response {
+    let (rect, resp) = ui.allocate_exact_size(egui::vec2(size, size), egui::Sense::hover());
+    if !ui.is_rect_visible(rect) {
+        return resp;
+    }
+    let painter = ui.painter();
+    let bg = deterministic_color(seed);
+    // мягкое свечение
+    painter.circle_filled(
+        rect.center(),
+        size / 2.0 + 2.5,
+        egui::Color32::from_rgba_premultiplied(bg.r(), bg.g(), bg.b(), 50),
+    );
+    painter.circle_filled(rect.center(), size / 2.0, bg);
+    let initial: String = label
+        .trim()
+        .chars()
+        .next()
+        .map(|c| c.to_uppercase().to_string())
+        .unwrap_or_else(|| "?".into());
+    painter.text(
+        rect.center(),
+        egui::Align2::CENTER_CENTER,
+        initial,
+        egui::FontId::new(size * 0.46, egui::FontFamily::Proportional),
+        palette::TEXT,
+    );
+    if let Some(true) = online {
+        let dot_r = (size * 0.16).max(4.0);
+        let dot_pos = egui::pos2(rect.right() - dot_r, rect.bottom() - dot_r);
+        painter.circle_filled(dot_pos, dot_r + 1.6, palette::BG_PANEL);
+        painter.circle_filled(dot_pos, dot_r, palette::ONLINE);
+    }
+    resp
+}
+
+/// Один раз генерируемое случайное «звёздное небо» (нормализованные координаты).
+fn starfield() -> &'static [(f32, f32, f32, u8)] {
+    use std::sync::OnceLock;
+    static STARS: OnceLock<Vec<(f32, f32, f32, u8)>> = OnceLock::new();
+    STARS.get_or_init(|| {
+        use rand::Rng;
+        let mut rng = rand::thread_rng();
+        (0..240)
+            .map(|_| {
+                (
+                    rng.gen::<f32>(),
+                    rng.gen::<f32>(),
+                    rng.gen_range(0.6_f32..2.2),
+                    rng.gen_range(110_u8..245),
+                )
+            })
+            .collect()
+    })
+}
+
+/// Звёзды + две туманности, рисуем как фон чата.
+fn draw_starfield(painter: &egui::Painter, rect: egui::Rect) {
+    // туманности (несколько концентрических кругов с убывающей альфой = soft glow)
+    let blob = |c: egui::Pos2, r: f32, color: egui::Color32| {
+        for i in 0..9 {
+            let alpha = ((color.a() as f32) / (i as f32 + 1.4)) as u8;
+            painter.circle_filled(
+                c,
+                r * (i as f32 / 9.0 + 0.3),
+                egui::Color32::from_rgba_premultiplied(color.r(), color.g(), color.b(), alpha),
+            );
+        }
+    };
+    let nebula1 = egui::pos2(
+        rect.left() + rect.width() * 0.22,
+        rect.top() + rect.height() * 0.24,
+    );
+    let nebula2 = egui::pos2(
+        rect.left() + rect.width() * 0.78,
+        rect.top() + rect.height() * 0.72,
+    );
+    let scale = rect.width().min(rect.height());
+    blob(nebula1, scale * 0.55, palette::NEBULA_VIOLET);
+    blob(nebula2, scale * 0.45, palette::NEBULA_BLUE);
+
+    // звёзды
+    for (xf, yf, r, a) in starfield() {
+        let pos = egui::pos2(rect.left() + xf * rect.width(), rect.top() + yf * rect.height());
+        painter.circle_filled(
+            pos,
+            *r,
+            egui::Color32::from_rgba_premultiplied(
+                palette::STAR.r(),
+                palette::STAR.g(),
+                palette::STAR.b(),
+                *a,
+            ),
+        );
+    }
+}
+
+fn truncate_text(s: &str, max_chars: usize) -> String {
+    let mut count = 0usize;
+    let mut out = String::new();
+    for ch in s.chars() {
+        if count >= max_chars {
+            out.push('…');
+            return out;
+        }
+        out.push(ch);
+        count += 1;
+    }
+    out
+}
+
+/// Из "2026-04-18 14:30:45" берём "14:30".
+fn short_time(ts: &str) -> String {
+    let last = ts.split_whitespace().last().unwrap_or(ts);
+    last.split(':').take(2).collect::<Vec<_>>().join(":")
 }
 
 fn setup_custom_style(ctx: &egui::Context) {
     use egui::{FontFamily, FontId, TextStyle};
 
+    // ----- Шрифты: добавляем системный emoji-шрифт как fallback,
+    // чтобы такие глифы как ☰, ⋯, 🛰, 🔌, 🔍, ➤ не превращались в □ -----
+    let mut fonts = egui::FontDefinitions::default();
+    let candidates: &[&str] = &[
+        #[cfg(target_os = "windows")]
+        "C:/Windows/Fonts/seguiemj.ttf",
+        #[cfg(target_os = "windows")]
+        "C:/Windows/Fonts/seguisym.ttf",
+        #[cfg(target_os = "windows")]
+        "C:/Windows/Fonts/segoeui.ttf",
+        #[cfg(target_os = "macos")]
+        "/System/Library/Fonts/Apple Color Emoji.ttc",
+        #[cfg(target_os = "linux")]
+        "/usr/share/fonts/truetype/noto/NotoColorEmoji.ttf",
+    ];
+    for path in candidates {
+        if let Ok(bytes) = std::fs::read(path) {
+            let name = format!("sysfont_{}", path);
+            fonts
+                .font_data
+                .insert(name.clone(), egui::FontData::from_owned(bytes));
+            fonts
+                .families
+                .entry(FontFamily::Proportional)
+                .or_default()
+                .push(name.clone());
+            fonts
+                .families
+                .entry(FontFamily::Monospace)
+                .or_default()
+                .push(name);
+        }
+    }
+    ctx.set_fonts(fonts);
+
     let mut visuals = egui::Visuals::dark();
-    let bg_color = egui::Color32::from_rgb(26, 26, 28); // #1A1A1C
-    let text_color = egui::Color32::from_rgb(209, 209, 209); // #D1D1D1
-    let accent_color = egui::Color32::from_rgb(0, 195, 255); // Cyan accent
 
-    visuals.panel_fill = bg_color;
-    visuals.window_fill = bg_color;
-    visuals.widgets.noninteractive.bg_fill = bg_color;
-    visuals.widgets.inactive.bg_fill = bg_color;
-    visuals.widgets.hovered.bg_fill = egui::Color32::from_rgb(34, 34, 37);
-    visuals.widgets.active.bg_fill = egui::Color32::from_rgb(18, 18, 20);
+    visuals.override_text_color = Some(palette::TEXT);
+    visuals.panel_fill          = palette::BG_PANEL;
+    visuals.window_fill         = palette::BG_PANEL;
+    visuals.extreme_bg_color    = palette::BG_DEEP;
+    visuals.faint_bg_color      = palette::BG_CARD;
 
-    visuals.widgets.noninteractive.fg_stroke = egui::Stroke::new(1.0, text_color);
-    visuals.widgets.inactive.fg_stroke = egui::Stroke::new(1.0, text_color);
-    visuals.widgets.hovered.fg_stroke = egui::Stroke::new(1.5, accent_color);
-    visuals.widgets.active.fg_stroke = egui::Stroke::new(1.5, accent_color);
+    visuals.widgets.noninteractive.bg_fill      = palette::BG_PANEL;
+    visuals.widgets.noninteractive.weak_bg_fill = palette::BG_PANEL;
+    visuals.widgets.noninteractive.bg_stroke    = egui::Stroke::new(1.0, palette::DIVIDER);
+    visuals.widgets.noninteractive.fg_stroke    = egui::Stroke::new(1.0, palette::TEXT);
+    visuals.widgets.noninteractive.rounding     = 12.0.into();
 
-    visuals.selection.bg_fill = egui::Color32::from_rgb(60, 60, 70);
-    visuals.window_rounding = 40.0.into();
-    visuals.widgets.noninteractive.rounding = 15.0.into();
-    visuals.widgets.inactive.rounding = 15.0.into();
+    visuals.widgets.inactive.bg_fill      = palette::BG_CARD;
+    visuals.widgets.inactive.weak_bg_fill = palette::BG_CARD;
+    visuals.widgets.inactive.bg_stroke    = egui::Stroke::new(1.0, palette::DIVIDER);
+    visuals.widgets.inactive.fg_stroke    = egui::Stroke::new(1.0, palette::TEXT);
+    visuals.widgets.inactive.rounding     = 12.0.into();
+
+    visuals.widgets.hovered.bg_fill      = palette::BG_HOVER;
+    visuals.widgets.hovered.weak_bg_fill = palette::BG_HOVER;
+    visuals.widgets.hovered.bg_stroke    = egui::Stroke::new(1.0, palette::ACCENT);
+    visuals.widgets.hovered.fg_stroke    = egui::Stroke::new(1.4, palette::ACCENT_2);
+    visuals.widgets.hovered.rounding     = 12.0.into();
+
+    visuals.widgets.active.bg_fill      = palette::BG_SELECTED;
+    visuals.widgets.active.weak_bg_fill = palette::BG_SELECTED;
+    visuals.widgets.active.bg_stroke    = egui::Stroke::new(1.4, palette::ACCENT);
+    visuals.widgets.active.fg_stroke    = egui::Stroke::new(1.4, palette::ACCENT);
+    visuals.widgets.active.rounding     = 12.0.into();
+
+    visuals.widgets.open.bg_fill      = palette::BG_HOVER;
+    visuals.widgets.open.weak_bg_fill = palette::BG_HOVER;
+    visuals.widgets.open.rounding     = 12.0.into();
+
+    visuals.selection.bg_fill = palette::ACCENT;
+    visuals.selection.stroke  = egui::Stroke::new(1.0, palette::TEXT);
+    visuals.hyperlink_color   = palette::ACCENT_2;
+
+    visuals.window_rounding = 14.0.into();
+    visuals.window_shadow = egui::epaint::Shadow {
+        offset: egui::vec2(0.0, 6.0),
+        blur:   28.0,
+        spread: 0.0,
+        color:  egui::Color32::from_rgba_premultiplied(0, 0, 0, 140),
+    };
+    visuals.popup_shadow = visuals.window_shadow;
 
     ctx.set_visuals(visuals);
 
     let mut style = (*ctx.style()).clone();
     style.text_styles = [
-        (TextStyle::Small, FontId::new(12.0, FontFamily::Proportional)),
-        (TextStyle::Body, FontId::new(17.0, FontFamily::Proportional)),
-        (TextStyle::Monospace, FontId::new(15.0, FontFamily::Monospace)),
-        (TextStyle::Button, FontId::new(17.0, FontFamily::Proportional)),
-        (TextStyle::Heading, FontId::new(24.0, FontFamily::Proportional)),
+        (TextStyle::Small,     FontId::new(11.5, FontFamily::Proportional)),
+        (TextStyle::Body,      FontId::new(14.5, FontFamily::Proportional)),
+        (TextStyle::Monospace, FontId::new(13.0, FontFamily::Monospace)),
+        (TextStyle::Button,    FontId::new(14.5, FontFamily::Proportional)),
+        (TextStyle::Heading,   FontId::new(20.0, FontFamily::Proportional)),
     ]
     .into();
-    style.spacing.item_spacing = egui::vec2(15.0, 15.0);
-    style.spacing.window_margin = egui::Margin::same(30.0);
-    style.spacing.button_padding = egui::vec2(14.0, 10.0);
+    style.spacing.item_spacing    = egui::vec2(8.0, 6.0);
+    style.spacing.window_margin   = egui::Margin::same(0.0);
+    style.spacing.button_padding  = egui::vec2(12.0, 8.0);
+    style.spacing.menu_margin     = egui::Margin::same(8.0);
     ctx.set_style(style);
 }
 
@@ -1148,26 +1358,39 @@ impl eframe::App for App {
             }
         }
 
-        let bg_color = egui::Color32::from_rgb(26, 26, 28);
-        let text_color = egui::Color32::from_rgb(209, 209, 209);
-        let shadow_light = egui::Color32::from_rgba_premultiplied(45, 45, 48, 255);
-        let shadow_dark = egui::Color32::from_rgba_premultiplied(12, 12, 14, 255);
-        let accent_color = egui::Color32::from_rgb(0, 195, 255);
-
-        // --- Log Window ---
+        // ===== Системная консоль (overlay-окно) =====
         if self.show_logs {
-            egui::Window::new("СИСТЕМНАЯ КОНСОЛЬ")
+            egui::Window::new("Системная консоль")
                 .open(&mut self.show_logs)
                 .resizable(true)
-                .default_size([400.0, 300.0])
+                .default_size([460.0, 360.0])
+                .frame(
+                    egui::Frame::none()
+                        .fill(palette::BG_PANEL)
+                        .stroke(egui::Stroke::new(1.0, palette::DIVIDER))
+                        .rounding(12.0)
+                        .inner_margin(16.0)
+                        .shadow(egui::epaint::Shadow {
+                            offset: egui::vec2(0.0, 6.0),
+                            blur: 24.0,
+                            spread: 0.0,
+                            color: egui::Color32::from_rgba_premultiplied(0, 0, 0, 160),
+                        }),
+                )
                 .show(ctx, |ui| {
                     ui.label(
                         egui::RichText::new("ЛОКАЛЬНЫЕ АДРЕСА")
                             .strong()
-                            .color(accent_color),
+                            .size(12.0)
+                            .color(palette::ACCENT_2),
                     );
                     for addr in &self.listen_addrs {
-                        ui.label(egui::RichText::new(addr).small().monospace());
+                        ui.label(
+                            egui::RichText::new(addr)
+                                .small()
+                                .monospace()
+                                .color(palette::TEXT_MUTED),
+                        );
                     }
                     ui.add_space(8.0);
                     ui.separator();
@@ -1175,249 +1398,427 @@ impl eframe::App for App {
                     ui.label(
                         egui::RichText::new("ЛОГ СОБЫТИЙ")
                             .strong()
-                            .color(accent_color),
+                            .size(12.0)
+                            .color(palette::ACCENT),
                     );
                     egui::ScrollArea::vertical()
                         .id_salt("log_scroll")
+                        .auto_shrink([false, false])
                         .show(ui, |ui| {
                             for log in &self.status_log {
-                                ui.label(egui::RichText::new(log).size(14.0).weak());
+                                ui.label(
+                                    egui::RichText::new(log)
+                                        .size(12.5)
+                                        .color(palette::TEXT_MUTED),
+                                );
                             }
                         });
                 });
         }
 
-        // --- Top Bar (Header) ---
-        egui::TopBottomPanel::top("header")
-            .frame(egui::Frame::none().fill(bg_color).inner_margin(20.0))
+        // ===== Левая панель: контакты (Telegram-стиль) =====
+        if self.show_sidebar {
+            let screen_w = ctx.screen_rect().width();
+            let min_w = 80.0_f32;
+            let max_w = (screen_w - 320.0).max(min_w + 40.0);
+            self.sidebar_width = self.sidebar_width.clamp(min_w, max_w);
+
+            egui::SidePanel::left("sb_v6_fixed")
+                .frame(egui::Frame::none().fill(palette::BG_PANEL))
+                .resizable(false)
+                .exact_width(self.sidebar_width)
+                .show(ctx, |ui| {
+                    let panel_rect = ui.max_rect();
+
+                    // 1) Контент сидебара (с правым отступом под ручку).
+                    let content_rect = egui::Rect::from_min_max(
+                        panel_rect.min,
+                        egui::pos2(panel_rect.right() - 8.0, panel_rect.bottom()),
+                    );
+                    let mut content_ui = ui.new_child(
+                        egui::UiBuilder::new()
+                            .max_rect(content_rect)
+                            .layout(egui::Layout::top_down(egui::Align::Min)),
+                    );
+                    self.ui_sidebar(&mut content_ui);
+
+                    // 2) Drag-ручка строго на правом краю панели (внутри её rect).
+                    let handle_rect = egui::Rect::from_min_max(
+                        egui::pos2(panel_rect.right() - 8.0, panel_rect.top()),
+                        egui::pos2(panel_rect.right(), panel_rect.bottom()),
+                    );
+                    let handle_resp = ui.interact(
+                        handle_rect,
+                        egui::Id::new("sb_v6_drag"),
+                        egui::Sense::click_and_drag(),
+                    );
+
+                    if handle_resp.dragged() {
+                        self.sidebar_width += handle_resp.drag_delta().x;
+                        self.sidebar_width = self.sidebar_width.clamp(min_w, max_w);
+                    }
+                    if handle_resp.hovered() || handle_resp.dragged() {
+                        ui.ctx().set_cursor_icon(egui::CursorIcon::ResizeHorizontal);
+                    }
+
+                    let active = handle_resp.hovered() || handle_resp.dragged();
+                    let stroke_color = if handle_resp.dragged() {
+                        palette::ACCENT
+                    } else if active {
+                        palette::ACCENT_2
+                    } else {
+                        palette::DIVIDER
+                    };
+                    let stroke_w = if active { 3.0 } else { 2.0 };
+                    ui.painter().vline(
+                        panel_rect.right() - 1.5,
+                        panel_rect.y_range(),
+                        egui::Stroke::new(stroke_w, stroke_color),
+                    );
+                });
+        }
+
+        // ===== Шапка активного чата =====
+        egui::TopBottomPanel::top("chat_header")
+            .frame(
+                egui::Frame::none()
+                    .fill(palette::BG_CHAT)
+                    .stroke(egui::Stroke::new(1.0, palette::DIVIDER))
+                    .inner_margin(egui::Margin {
+                        left: 22.0,
+                        right: 18.0,
+                        top: 12.0,
+                        bottom: 12.0,
+                    }),
+            )
             .show(ctx, |ui| {
                 ui.horizontal(|ui| {
+                    let toggle_label = if self.show_sidebar { "≡" } else { "≡" };
                     if ui
-                        .add(egui::Button::new(
-                            egui::RichText::new(if self.show_sidebar { "⬅" } else { "☰" })
-                                .size(26.0),
-                        ))
+                        .add(
+                            egui::Button::new(
+                                egui::RichText::new(toggle_label)
+                                    .size(18.0)
+                                    .color(palette::TEXT),
+                            )
+                            .fill(egui::Color32::TRANSPARENT)
+                            .stroke(egui::Stroke::NONE),
+                        )
+                        .on_hover_text(if self.show_sidebar {
+                            "Скрыть список контактов"
+                        } else {
+                            "Показать список контактов"
+                        })
                         .clicked()
                     {
                         self.show_sidebar = !self.show_sidebar;
                     }
+                    ui.add_space(8.0);
 
-                    ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                    if !self.selected_chat.is_empty() {
+                        let display_name = self
+                            .selected_chat
+                            .parse::<PeerId>()
+                            .ok()
+                            .and_then(|pid| self.known_peers.get(&pid).cloned())
+                            .unwrap_or_else(|| {
+                                let n = self.selected_chat.len().min(8);
+                                format!("Peer {}", &self.selected_chat[..n])
+                            });
+                        draw_avatar(ui, &self.selected_chat, &display_name, 40.0, None);
+                        ui.add_space(12.0);
+                        ui.vertical(|ui| {
+                            ui.label(
+                                egui::RichText::new(&display_name)
+                                    .strong()
+                                    .size(16.0)
+                                    .color(palette::TEXT),
+                            );
+                            let id_short = {
+                                let n = self.selected_chat.len().min(20);
+                                format!("{}…", &self.selected_chat[..n])
+                            };
+                            ui.label(
+                                egui::RichText::new(id_short)
+                                    .size(11.0)
+                                    .monospace()
+                                    .color(palette::TEXT_MUTED),
+                            );
+                        });
+                    } else {
                         ui.label(
-                            egui::RichText::new("VOID P2P DARK")
-                                .size(38.0)
-                                .color(accent_color)
-                                .strong(),
+                            egui::RichText::new("✦ VOID")
+                                .size(20.0)
+                                .strong()
+                                .color(palette::ACCENT),
+                        );
+                        ui.add_space(8.0);
+                        ui.label(
+                            egui::RichText::new("выберите контакт слева")
+                                .color(palette::TEXT_MUTED),
+                        );
+                    }
+                    ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                        if ui
+                            .add(
+                                egui::Button::new(
+                                    egui::RichText::new("⋯")
+                                        .size(22.0)
+                                        .color(palette::TEXT),
+                                )
+                                .fill(egui::Color32::TRANSPARENT)
+                                .stroke(egui::Stroke::NONE),
+                            )
+                            .on_hover_text("Системная консоль")
+                            .clicked()
+                        {
+                            self.show_logs = !self.show_logs;
+                        }
+                        ui.label(
+                            egui::RichText::new(format!(
+                                "● {} в сети",
+                                self.connected_peers
+                            ))
+                            .size(11.5)
+                            .color(if self.connected_peers > 0 {
+                                palette::ONLINE
+                            } else {
+                                palette::TEXT_MUTED
+                            }),
                         );
                     });
                 });
             });
 
-        // --- Sidebar (Collapsible) ---
-        if self.show_sidebar {
-            egui::SidePanel::left("sidebar")
-                .frame(egui::Frame::none().fill(bg_color).inner_margin(20.0))
-                .resizable(true)
-                .default_width(310.0)
-                .width_range(220.0..=460.0)
-                .show(ctx, |ui| {
-                    egui::ScrollArea::vertical().show(ui, |ui| {
-                        self.ui_sidebar(ui, accent_color);
-                    });
-                });
-        }
-
-        // --- Main Chat Area ---
-        egui::CentralPanel::default()
-            .frame(egui::Frame::none().fill(bg_color).inner_margin(20.0))
+        // ===== Поле ввода (нижняя панель) =====
+        egui::TopBottomPanel::bottom("chat_input")
+            .frame(
+                egui::Frame::none()
+                    .fill(palette::BG_CHAT)
+                    .inner_margin(egui::Margin {
+                        left: 18.0,
+                        right: 18.0,
+                        top: 10.0,
+                        bottom: 14.0,
+                    }),
+            )
             .show(ctx, |ui| {
-                ui.vertical(|ui| {
-                    // Chat bubbles container
-                    egui::Frame::none()
-                        .fill(bg_color)
-                        .rounding(30.0)
-                        .shadow(egui::Shadow {
-                            offset: egui::vec2(-6.0, -6.0),
-                            blur: 16.0,
-                            spread: 0.0,
-                            color: shadow_light,
-                        })
-                        .show(ui, |ui| {
-                            egui::Frame::none()
-                                .fill(bg_color)
-                                .rounding(30.0)
-                                .shadow(egui::Shadow {
-                                    offset: egui::vec2(6.0, 6.0),
-                                    blur: 12.0,
-                                    spread: 0.0,
-                                    color: shadow_dark,
-                                })
-                                .inner_margin(30.0)
-                                .show(ui, |ui| {
-                                    ui.set_width(ui.available_width());
-                                    ui.set_height(ui.available_height() - 100.0);
+                egui::Frame::none()
+                    .fill(palette::BG_CARD)
+                    .stroke(egui::Stroke::new(1.0, palette::DIVIDER))
+                    .rounding(24.0)
+                    .inner_margin(egui::Margin {
+                        left: 18.0,
+                        right: 6.0,
+                        top: 4.0,
+                        bottom: 4.0,
+                    })
+                    .show(ui, |ui| {
+                        ui.horizontal(|ui| {
+                            let text_w = (ui.available_width() - 56.0).max(80.0);
+                            let edit = ui.add(
+                                egui::TextEdit::singleline(&mut self.chat_input)
+                                    .hint_text("Сообщение…")
+                                    .desired_width(text_w)
+                                    .frame(false)
+                                    .font(egui::TextStyle::Body),
+                            );
 
-                                    egui::ScrollArea::vertical()
-                                        .id_salt("chat_stream")
-                                        .stick_to_bottom(true)
-                                        .auto_shrink([false, false])
-                                        .show(ui, |ui| {
-                                            ui.set_width(ui.available_width());
-                                            if self.selected_chat.is_empty() {
+                            let send_clicked = ui
+                                .add_sized(
+                                    egui::vec2(44.0, 44.0),
+                                    egui::Button::new(
+                                        egui::RichText::new("➤")
+                                            .size(18.0)
+                                            .color(palette::TEXT),
+                                    )
+                                    .fill(palette::ACCENT)
+                                    .rounding(22.0),
+                                )
+                                .clicked();
+
+                            let enter_pressed = edit.lost_focus()
+                                && ctx.input(|i| i.key_pressed(egui::Key::Enter));
+
+                            if (send_clicked || enter_pressed) && !self.chat_input.is_empty() {
+                                let recipient = if self.selected_chat.is_empty() {
+                                    None
+                                } else {
+                                    self.selected_chat.parse::<PeerId>().ok()
+                                };
+                                if let Some(peer_id) = recipient {
+                                    match self.command_tx.try_send(UICommand::SendMessage {
+                                        sender_name: self.local_nickname.clone(),
+                                        text: self.chat_input.clone(),
+                                        recipient: Some(peer_id),
+                                        is_retry: false,
+                                    }) {
+                                        Ok(()) => self.chat_input.clear(),
+                                        Err(_) => self.add_status(
+                                            "⚠ Очередь к сети переполнена, повторите отправку."
+                                                .into(),
+                                        ),
+                                    }
+                                } else if self.selected_chat.is_empty() {
+                                    self.add_status(
+                                        "⚠ Выберите контакт слева, чтобы отправить сообщение."
+                                            .into(),
+                                    );
+                                } else {
+                                    self.add_status(
+                                        "⚠ Некорректный Peer ID в выбранном чате.".into(),
+                                    );
+                                }
+                                if enter_pressed {
+                                    edit.request_focus();
+                                }
+                            }
+                        });
+                    });
+            });
+
+        // ===== История чата (звёздное небо + bubbles) =====
+        egui::CentralPanel::default()
+            .frame(egui::Frame::none().fill(palette::BG_CHAT))
+            .show(ctx, |ui| {
+                let bg_rect = ui.max_rect();
+                draw_starfield(ui.painter(), bg_rect);
+
+                if self.selected_chat.is_empty() {
+                    ui.allocate_ui_with_layout(
+                        ui.available_size(),
+                        egui::Layout::centered_and_justified(egui::Direction::TopDown),
+                        |ui| {
+                            ui.vertical_centered(|ui| {
+                                ui.add_space(80.0);
+                                ui.label(
+                                    egui::RichText::new("✦")
+                                        .size(96.0)
+                                        .color(palette::ACCENT_2),
+                                );
+                                ui.add_space(14.0);
+                                ui.label(
+                                    egui::RichText::new("Тишина в эфире")
+                                        .size(22.0)
+                                        .strong()
+                                        .color(palette::TEXT),
+                                );
+                                ui.add_space(6.0);
+                                ui.label(
+                                    egui::RichText::new(
+                                        "Выберите контакт слева — и начнём сеанс связи через VOID.",
+                                    )
+                                    .color(palette::TEXT_MUTED),
+                                );
+                            });
+                        },
+                    );
+                    return;
+                }
+
+                let messages = self
+                    .messages
+                    .get(&self.selected_chat)
+                    .cloned()
+                    .unwrap_or_default();
+                let me_str = self.local_peer_id.to_string();
+
+                egui::ScrollArea::vertical()
+                    .id_salt("chat_stream")
+                    .stick_to_bottom(true)
+                    .auto_shrink([false, false])
+                    .show(ui, |ui| {
+                        ui.add_space(12.0);
+
+                        if messages.is_empty() {
+                            ui.add_space(40.0);
+                            ui.vertical_centered(|ui| {
+                                ui.label(
+                                    egui::RichText::new(
+                                        "Сообщений пока нет — отправьте первое ↓",
+                                    )
+                                    .color(palette::TEXT_MUTED),
+                                );
+                            });
+                        }
+
+                        for msg in &messages {
+                            let is_me = msg.sender_id == me_str;
+                            ui.add_space(6.0);
+                            ui.horizontal(|ui| {
+                                let avail = ui.available_width();
+                                let max_w = (avail * 0.66).min(560.0).max(180.0);
+
+                                if is_me {
+                                    ui.add_space((avail - max_w - 28.0).max(0.0));
+                                } else {
+                                    ui.add_space(20.0);
+                                    draw_avatar(
+                                        ui,
+                                        &msg.sender_id,
+                                        &msg.sender_name,
+                                        30.0,
+                                        None,
+                                    );
+                                    ui.add_space(8.0);
+                                }
+
+                                let bubble_bg = if is_me {
+                                    palette::BUBBLE_ME
+                                } else {
+                                    palette::BUBBLE_THEM
+                                };
+
+                                egui::Frame::none()
+                                    .fill(bubble_bg)
+                                    .rounding(egui::Rounding {
+                                        nw: 16.0,
+                                        ne: 16.0,
+                                        sw: if is_me { 16.0 } else { 4.0 },
+                                        se: if is_me { 4.0 } else { 16.0 },
+                                    })
+                                    .inner_margin(egui::Margin {
+                                        left: 14.0,
+                                        right: 14.0,
+                                        top: 8.0,
+                                        bottom: 6.0,
+                                    })
+                                    .show(ui, |ui| {
+                                        ui.set_max_width(max_w);
+                                        ui.vertical(|ui| {
+                                            if !is_me {
                                                 ui.label(
-                                                    egui::RichText::new(
-                                                        "Чат не выбран: нажмите 💬 у контакта в «ЛИЧНЫЕ» слева, либо дождитесь VOID-пира по сети — чат откроется сам.",
-                                                    )
-                                                    .size(17.0)
-                                                    .weak(),
+                                                    egui::RichText::new(&msg.sender_name)
+                                                        .size(12.5)
+                                                        .strong()
+                                                        .color(palette::ACCENT_2),
                                                 );
-                                                ui.add_space(12.0);
                                             }
-                                            let current_messages = self
-                                                .messages
-                                                .get(&self.selected_chat)
-                                                .cloned()
-                                                .unwrap_or_default();
-                                            for msg in &current_messages {
-                                                let is_me =
-                                                    msg.sender_id == self.local_peer_id.to_string();
-                                                ui.add_space(20.0);
-                                                ui.horizontal(|ui| {
-                                                    if is_me {
-                                                        ui.add_space(ui.available_width() * 0.1);
-                                                    }
-
-                                                    egui::Frame::none()
-                                                        .fill(if is_me {
-                                                            egui::Color32::from_rgb(45, 45, 50)
-                                                        } else {
-                                                            egui::Color32::from_rgb(33, 33, 36)
-                                                        })
-                                                        .rounding(22.0)
-                                                        .inner_margin(18.0)
-                                                        .show(ui, |ui| {
-                                                            ui.vertical(|ui| {
-                                                                if !is_me {
-                                                                    ui.label(
-                                                                        egui::RichText::new(
-                                                                            &msg.sender_name,
-                                                                        )
-                                                                        .size(17.0)
-                                                                        .color(accent_color)
-                                                                        .strong(),
-                                                                    );
-                                                                }
-                                                                ui.label(
-                                                                    egui::RichText::new(&msg.text)
-                                                                        .size(24.0)
-                                                                        .color(text_color),
-                                                                );
-                                                                ui.with_layout(
-                                                                    egui::Layout::right_to_left(
-                                                                        egui::Align::BOTTOM,
-                                                                    ),
-                                                                    |ui| {
-                                                                        ui.label(
-                                                                            egui::RichText::new(
-                                                                                &msg.timestamp,
-                                                                            )
-                                                                            .size(14.0)
-                                                                            .weak(),
-                                                                        );
-                                                                    },
-                                                                );
-                                                            });
-                                                        });
-
-                                                    if !is_me {
-                                                        ui.add_space(ui.available_width() * 0.1);
-                                                    }
-                                                });
-                                            }
-                                        });
-                                });
-                        });
-
-                    ui.add_space(20.0);
-
-                    // --- Input Bar ---
-                    egui::Frame::none()
-                        .fill(bg_color)
-                        .rounding(30.0)
-                        .shadow(egui::Shadow {
-                            offset: egui::vec2(-6.0, -6.0),
-                            blur: 16.0,
-                            spread: 0.0,
-                            color: shadow_light,
-                        })
-                        .show(ui, |ui| {
-                            egui::Frame::none()
-                                .fill(bg_color)
-                                .rounding(30.0)
-                                .shadow(egui::Shadow {
-                                    offset: egui::vec2(6.0, 6.0),
-                                    blur: 12.0,
-                                    spread: 0.0,
-                                    color: shadow_dark,
-                                })
-                                .inner_margin(18.0)
-                                .show(ui, |ui| {
-                                    ui.set_width(ui.available_width());
-                                    ui.horizontal(|ui| {
-                                        let res = ui.add(
-                                            egui::TextEdit::singleline(&mut self.chat_input)
-                                                .hint_text("Сообщение...")
-                                                .desired_width(ui.available_width() - 130.0)
-                                                .font(egui::TextStyle::Body),
-                                        );
-
-                                        if (ui
-                                            .add_sized(
-                                                [120.0, 46.0],
-                                                egui::Button::new(
-                                                    egui::RichText::new("ОТПРАВИТЬ").size(19.0),
+                                            ui.label(
+                                                egui::RichText::new(&msg.text)
+                                                    .size(14.5)
+                                                    .color(palette::TEXT),
+                                            );
+                                            ui.with_layout(
+                                                egui::Layout::right_to_left(
+                                                    egui::Align::Center,
                                                 ),
-                                            )
-                                            .clicked()
-                                            || (res.lost_focus()
-                                                && ctx.input(|i| i.key_pressed(egui::Key::Enter))))
-                                            && !self.chat_input.is_empty()
-                                        {
-                                            let recipient = if self.selected_chat.is_empty() {
-                                                None
-                                            } else {
-                                                self.selected_chat.parse::<PeerId>().ok()
-                                            };
-
-                                            if let Some(peer_id) = recipient {
-                                                match self.command_tx.try_send(UICommand::SendMessage {
-                                                    sender_name: self.local_nickname.clone(),
-                                                    text: self.chat_input.clone(),
-                                                    recipient: Some(peer_id),
-                                                    is_retry: false,
-                                                }) {
-                                                    Ok(()) => self.chat_input.clear(),
-                                                    Err(_) => self.add_status(
-                                                        "⚠ Очередь к сети переполнена, повторите отправку."
-                                                            .into(),
-                                                    ),
-                                                }
-                                            } else if self.selected_chat.is_empty() {
-                                                self.add_status(
-                                                    "⚠ Сначала выберите контакт (💬 в «ЛИЧНЫЕ») или подключитесь по multiaddr — иначе некому отправлять."
-                                                        .into(),
-                                                );
-                                            } else {
-                                                self.add_status(
-                                                    "⚠ Некорректный Peer ID в выбранном чате. Выберите контакт заново."
-                                                        .into(),
-                                                );
-                                            }
-                                        }
+                                                |ui| {
+                                                    ui.label(
+                                                        egui::RichText::new(short_time(
+                                                            &msg.timestamp,
+                                                        ))
+                                                        .size(10.5)
+                                                        .color(palette::TEXT_MUTED),
+                                                    );
+                                                },
+                                            );
+                                        });
                                     });
-                                });
-                        });
-                });
+                            });
+                        }
+                        ui.add_space(12.0);
+                    });
             });
 
         ctx.request_repaint_after(Duration::from_millis(100));
@@ -2334,9 +2735,17 @@ async fn main() -> Result<(), Box<dyn Error>> {
         }
     });
 
+    let viewport = egui::ViewportBuilder::default()
+        .with_inner_size([1280.0, 820.0])
+        .with_min_inner_size([820.0, 540.0])
+        .with_title(format!("VOID Chat [{}]", &local_peer_id.to_string()[..8]));
+
     eframe::run_native(
         &format!("VOID Chat [{}]", local_peer_id.to_string()[..8].to_string()),
-        eframe::NativeOptions::default(),
+        eframe::NativeOptions {
+            viewport,
+            ..Default::default()
+        },
         Box::new(move |cc| {
             Ok(Box::new(App::new(
                 cc,
