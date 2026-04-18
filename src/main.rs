@@ -377,6 +377,8 @@ enum NetworkEvent {
     PublicIpConfirmed(String),
     /// Снимок PeerId в локальной таблице Kademlia (для UI «узлы сети»).
     DhtRoutingPeers { total: usize, lines: Vec<String> },
+    /// Отправка пиру упала с DialFailure — UI должен сделать DHT-lookup и retry.
+    SendFailedDial(PeerId),
 }
 
 enum UICommand {
@@ -410,6 +412,42 @@ struct ChatBehaviour {
     upnp: upnp::tokio::Behaviour,
 }
 
+/// Сообщение в очереди ожидания доставки. Если в течение `RESEND_GRACE` после
+/// последней попытки прилетел `SendFailedDial` (или просто прошло столько же
+/// времени без подтверждения), запускаем DHT-lookup и через `RESEND_DELAY`
+/// отправляем повторно. После `MAX_ATTEMPTS` попыток сдаёмся с toast'ом.
+struct PendingSend {
+    peer: PeerId,
+    text: String,
+    last_send_at: Instant,
+    /// Был ли уже запущен DHT-поиск для текущей попытки.
+    dht_kicked: bool,
+    /// Когда был запущен DHT-поиск (для отсчёта `RESEND_DELAY`).
+    dht_kicked_at: Option<Instant>,
+    /// Сколько раз отправка уже улетала в сеть (1 = только начальная).
+    attempts: u8,
+}
+
+/// Плавающее уведомление в правом верхнем углу.
+struct Toast {
+    text: String,
+    expires_at: Instant,
+    kind: ToastKind,
+}
+
+#[derive(Clone, Copy)]
+enum ToastKind {
+    Info,
+    Warn,
+    Error,
+}
+
+const RESEND_GRACE: Duration = Duration::from_secs(3);
+const RESEND_DELAY: Duration = Duration::from_secs(5);
+const MAX_ATTEMPTS: u8 = 2;
+const TOAST_TTL_SHORT: Duration = Duration::from_secs(4);
+const TOAST_TTL_LONG: Duration = Duration::from_secs(7);
+
 struct App {
     local_peer_id: PeerId,
     local_nickname: String,
@@ -440,6 +478,10 @@ struct App {
     event_rx: mpsc::Receiver<NetworkEvent>,
     _sessions: HashMap<libp2p::PeerId, crypto::SecureSession>,
     _local_static: crypto::StaticSecret,
+    /// Сообщения, доставку которых мы пытаемся повторить при DialFailure.
+    pending_sends: Vec<PendingSend>,
+    /// Плавающие уведомления (рендерятся в правом верхнем углу).
+    toasts: Vec<Toast>,
 }
 
 impl App {
@@ -481,6 +523,8 @@ impl App {
             event_rx,
             _sessions: HashMap::new(),
             _local_static: local_static,
+            pending_sends: Vec::new(),
+            toasts: Vec::new(),
         }
     }
 
@@ -507,6 +551,194 @@ impl App {
         ) {
             eprintln!("VOID: не удалось сохранить vault (записная книга): {}", e);
         }
+    }
+
+    /// Машина состояний для повторных отправок: 3 сек ждём DialFailure / тишину →
+    /// дёргаем `SearchPeer` (kad.get_closest_peers), 5 сек ждём → ретраим
+    /// `SendMessage`. После `MAX_ATTEMPTS` попыток — toast и снимаем.
+    fn tick_pending_sends(&mut self) {
+        let now = Instant::now();
+        let mut to_drop: Vec<usize> = Vec::new();
+        let mut search_cmds: Vec<PeerId> = Vec::new();
+        let mut resend_cmds: Vec<(PeerId, String)> = Vec::new();
+        let mut toasts: Vec<(String, ToastKind, Duration)> = Vec::new();
+
+        for (idx, p) in self.pending_sends.iter_mut().enumerate() {
+            // Финальная сдача — после исчерпания попыток.
+            if p.attempts >= MAX_ATTEMPTS {
+                if let Some(kicked_at) = p.dht_kicked_at {
+                    if now.duration_since(kicked_at) >= RESEND_DELAY {
+                        let name_short = format!("{}…", &p.peer.to_string()[..10]);
+                        toasts.push((
+                            format!(
+                                "✖ Не удалось доставить «{}» пиру {}",
+                                truncate_text(&p.text, 32),
+                                name_short
+                            ),
+                            ToastKind::Error,
+                            TOAST_TTL_LONG,
+                        ));
+                        to_drop.push(idx);
+                    }
+                }
+                continue;
+            }
+
+            // Фаза 1: ждём `RESEND_GRACE` после последней попытки, потом дёргаем DHT.
+            if !p.dht_kicked && now.duration_since(p.last_send_at) >= RESEND_GRACE {
+                let name_short = format!("{}…", &p.peer.to_string()[..10]);
+                toasts.push((
+                    format!("⏳ Ищу пира {} через DHT…", name_short),
+                    ToastKind::Info,
+                    TOAST_TTL_SHORT,
+                ));
+                search_cmds.push(p.peer);
+                p.dht_kicked = true;
+                p.dht_kicked_at = Some(now);
+            }
+
+            // Фаза 2: после DHT-поиска ждём `RESEND_DELAY` и шлём повторно.
+            if let Some(kicked_at) = p.dht_kicked_at {
+                if now.duration_since(kicked_at) >= RESEND_DELAY {
+                    resend_cmds.push((p.peer, p.text.clone()));
+                    p.attempts = p.attempts.saturating_add(1);
+                    p.last_send_at = now;
+                    p.dht_kicked = false;
+                    p.dht_kicked_at = None;
+
+                    if p.attempts >= MAX_ATTEMPTS {
+                        // Сразу запустим финальный таймер «сдачи» (см. ветку выше
+                        // — сработает, когда снова пройдёт RESEND_DELAY).
+                        p.dht_kicked_at = Some(now);
+                    } else {
+                        let name_short = format!("{}…", &p.peer.to_string()[..10]);
+                        toasts.push((
+                            format!(
+                                "↻ Повтор #{} → {}",
+                                p.attempts,
+                                name_short
+                            ),
+                            ToastKind::Warn,
+                            TOAST_TTL_SHORT,
+                        ));
+                    }
+                }
+            }
+        }
+
+        // Удаляем сданные (с конца, чтобы индексы не съехали).
+        for idx in to_drop.iter().rev() {
+            self.pending_sends.swap_remove(*idx);
+        }
+
+        // Применяем накопленные команды и toast'ы (борем borrow checker).
+        for (text, kind, ttl) in toasts {
+            self.push_toast(text, kind, ttl);
+        }
+        for peer in search_cmds {
+            let _ = self.command_tx.try_send(UICommand::SearchPeer(peer));
+        }
+        for (peer, text) in resend_cmds {
+            let _ = self.command_tx.try_send(UICommand::SendMessage {
+                sender_name: self.local_nickname.clone(),
+                text,
+                recipient: Some(peer),
+                is_retry: true,
+            });
+        }
+    }
+
+    /// Рендерит активные toast'ы как floating Area в правом верхнем углу,
+    /// стопкой сверху вниз. Каждый toast — закруглённая «пилюля» с акцент-цветом
+    /// слева и подписью.
+    fn draw_toasts(&mut self, ctx: &egui::Context) {
+        if self.toasts.is_empty() {
+            return;
+        }
+        let screen = ctx.screen_rect();
+        let anchor = egui::pos2(screen.right() - 16.0, screen.top() + 72.0);
+        let now = Instant::now();
+
+        for (i, t) in self.toasts.iter().enumerate() {
+            // Прозрачность: плавное затухание в последнюю секунду жизни.
+            let remaining = t.expires_at.saturating_duration_since(now).as_secs_f32();
+            let alpha = (remaining.min(1.0) * 255.0).clamp(40.0, 255.0) as u8;
+            let (accent, bg) = match t.kind {
+                ToastKind::Info => (palette::ACCENT_2, palette::BG_CARD),
+                ToastKind::Warn => (palette::ACCENT, palette::BG_CARD),
+                ToastKind::Error => (
+                    egui::Color32::from_rgb(0xff, 0x6a, 0x88),
+                    palette::BG_CARD,
+                ),
+            };
+            let accent = egui::Color32::from_rgba_unmultiplied(
+                accent.r(),
+                accent.g(),
+                accent.b(),
+                alpha,
+            );
+            let bg = egui::Color32::from_rgba_unmultiplied(bg.r(), bg.g(), bg.b(), alpha);
+
+            egui::Area::new(egui::Id::new(("toast_area", i)))
+                .order(egui::Order::Tooltip)
+                .anchor(
+                    egui::Align2::RIGHT_TOP,
+                    egui::vec2(
+                        anchor.x - screen.right(),
+                        anchor.y - screen.top() + (i as f32) * 56.0,
+                    ),
+                )
+                .interactable(false)
+                .show(ctx, |ui| {
+                    egui::Frame::none()
+                        .fill(bg)
+                        .stroke(egui::Stroke::new(1.0, accent))
+                        .rounding(10.0)
+                        .inner_margin(egui::Margin::symmetric(14.0, 10.0))
+                        .shadow(egui::epaint::Shadow {
+                            offset: egui::vec2(0.0, 4.0),
+                            blur: 18.0,
+                            spread: 0.0,
+                            color: egui::Color32::from_rgba_premultiplied(0, 0, 0, 120),
+                        })
+                        .show(ui, |ui| {
+                            ui.set_max_width(360.0);
+                            ui.horizontal(|ui| {
+                                ui.painter().rect_filled(
+                                    egui::Rect::from_min_size(
+                                        ui.cursor().left_top(),
+                                        egui::vec2(3.0, 18.0),
+                                    ),
+                                    1.5,
+                                    accent,
+                                );
+                                ui.add_space(10.0);
+                                ui.label(
+                                    egui::RichText::new(&t.text)
+                                        .size(13.0)
+                                        .color(egui::Color32::from_rgba_unmultiplied(
+                                            palette::TEXT.r(),
+                                            palette::TEXT.g(),
+                                            palette::TEXT.b(),
+                                            alpha,
+                                        )),
+                                );
+                            });
+                        });
+                });
+        }
+    }
+
+    /// Кладёт toast в очередь рендера. Дубликаты с тем же текстом не накапливаем.
+    fn push_toast(&mut self, text: String, kind: ToastKind, ttl: Duration) {
+        if self.toasts.iter().any(|t| t.text == text) {
+            return;
+        }
+        self.toasts.push(Toast {
+            text,
+            expires_at: Instant::now() + ttl,
+            kind,
+        });
     }
 
     fn add_status(&mut self, msg: String) {
@@ -1355,7 +1587,31 @@ impl eframe::App for App {
                     self.dht_routing_lines = lines;
                     self.add_status(format!("DHT: в таблице маршрутов {} узл.", total));
                 }
+                NetworkEvent::SendFailedDial(peer) => {
+                    // Сразу подталкиваем самое раннее ожидающее сообщение
+                    // этому пиру к фазе DHT-lookup (сдвигаем `last_send_at`
+                    // в прошлое — следующий tick запустит retry-логику).
+                    if let Some(p) = self
+                        .pending_sends
+                        .iter_mut()
+                        .find(|p| p.peer == peer && !p.dht_kicked)
+                    {
+                        p.last_send_at = Instant::now()
+                            .checked_sub(RESEND_GRACE + Duration::from_millis(50))
+                            .unwrap_or_else(Instant::now);
+                    }
+                }
             }
+        }
+
+        // ===== Tick: повторные отправки + истечение toast'ов =====
+        self.tick_pending_sends();
+        let now = Instant::now();
+        self.toasts.retain(|t| t.expires_at > now);
+
+        // Чтобы фоновые таймеры (retry/toast) тикали без активности пользователя.
+        if !self.pending_sends.is_empty() || !self.toasts.is_empty() {
+            ctx.request_repaint_after(Duration::from_millis(250));
         }
 
         // ===== Системная консоль (overlay-окно) =====
@@ -1647,13 +1903,27 @@ impl eframe::App for App {
                                     self.selected_chat.parse::<PeerId>().ok()
                                 };
                                 if let Some(peer_id) = recipient {
+                                    let text_to_send = self.chat_input.clone();
                                     match self.command_tx.try_send(UICommand::SendMessage {
                                         sender_name: self.local_nickname.clone(),
-                                        text: self.chat_input.clone(),
+                                        text: text_to_send.clone(),
                                         recipient: Some(peer_id),
                                         is_retry: false,
                                     }) {
-                                        Ok(()) => self.chat_input.clear(),
+                                        Ok(()) => {
+                                            self.chat_input.clear();
+                                            // Помечаем сообщение как «в полёте» — следим
+                                            // за DialFailure и при необходимости
+                                            // дёрнем DHT + retry.
+                                            self.pending_sends.push(PendingSend {
+                                                peer: peer_id,
+                                                text: text_to_send,
+                                                last_send_at: Instant::now(),
+                                                dht_kicked: false,
+                                                dht_kicked_at: None,
+                                                attempts: 1,
+                                            });
+                                        }
                                         Err(_) => self.add_status(
                                             "⚠ Очередь к сети переполнена, повторите отправку."
                                                 .into(),
@@ -1820,6 +2090,9 @@ impl eframe::App for App {
                         ui.add_space(12.0);
                     });
             });
+
+        // ===== Toasts (поверх всего, правый верхний угол) =====
+        self.draw_toasts(ctx);
 
         ctx.request_repaint_after(Duration::from_millis(100));
     }
@@ -2497,6 +2770,9 @@ async fn main() -> Result<(), Box<dyn Error>> {
                         }
                         SwarmEvent::Behaviour(ChatBehaviourEvent::RequestResponse(libp2p::request_response::Event::OutboundFailure { peer, error, .. })) => {
                             println!("⚠️ [RR] OutFailure пиру {}: {:?}", peer, error);
+                            if matches!(error, libp2p::request_response::OutboundFailure::DialFailure) {
+                                let _ = event_tx.send(NetworkEvent::SendFailedDial(peer)).await;
+                            }
                         }
                         SwarmEvent::Behaviour(ChatBehaviourEvent::RequestResponse(libp2p::request_response::Event::InboundFailure { peer, error, .. })) => {
                             println!("⚠️ [RR] InFailure от пира {}: {:?}", peer, error);
