@@ -379,6 +379,9 @@ enum NetworkEvent {
     DhtRoutingPeers { total: usize, lines: Vec<String> },
     /// Отправка пиру упала с DialFailure — UI должен сделать DHT-lookup и retry.
     SendFailedDial(PeerId),
+    /// Получен Response (Ack/прочее) на ранее отправленное сообщение пиру —
+    /// сигнал UI снять одно ожидание из `pending_sends` и не показывать ошибку.
+    MessageDelivered(PeerId),
 }
 
 enum UICommand {
@@ -1587,6 +1590,17 @@ impl eframe::App for App {
                     self.dht_routing_lines = lines;
                     self.add_status(format!("DHT: в таблице маршрутов {} узл.", total));
                 }
+                NetworkEvent::MessageDelivered(peer) => {
+                    // Снимаем самое раннее ожидание этого пира: ретрая не будет,
+                    // ошибочный toast «✖ Не удалось доставить…» тоже не появится.
+                    if let Some(idx) = self
+                        .pending_sends
+                        .iter()
+                        .position(|p| p.peer == peer)
+                    {
+                        self.pending_sends.remove(idx);
+                    }
+                }
                 NetworkEvent::SendFailedDial(peer) => {
                     // Сразу подталкиваем самое раннее ожидающее сообщение
                     // этому пиру к фазе DHT-lookup (сдвигаем `last_send_at`
@@ -2397,6 +2411,10 @@ async fn main() -> Result<(), Box<dyn Error>> {
 
         let mut peer_addrs: HashMap<PeerId, Vec<Multiaddr>> = HashMap::new();
         let mut pending_dials: HashSet<PeerId> = HashSet::new();
+        // RequestId → PeerId для сообщений (Plain/Encrypted), чтобы по ответу
+        // (Ack/прочее) однозначно подтвердить доставку конкретному пиру и снять
+        // pending-ретраи в UI. Hello-handshake'ы сюда НЕ попадают.
+        let mut outbound_msg_requests: HashMap<libp2p::request_response::OutboundRequestId, PeerId> = HashMap::new();
         let mut dial_backoff: HashMap<PeerId, Instant> = HashMap::new();
         let mut local_listen_addrs: HashSet<Multiaddr> = HashSet::new();
         // Пиры-«seed», к которым мы дозвонились через JoinViaNode: после Identify запускаем DHT-bootstrap.
@@ -2595,8 +2613,10 @@ async fn main() -> Result<(), Box<dyn Error>> {
                                         println!("[{}] 🤝 E2EE: Сессии нет, направлен Hello (+Ephem) пиру {}", now, &peer_id.to_string()[..8]);
                                     }
 
-                                    // Отправляем конкретному пиру
-                                    let _ = swarm.behaviour_mut().request_response.send_request(&peer_id, packet);
+                                    // Отправляем конкретному пиру и запоминаем RequestId,
+                                    // чтобы по входящему Response отметить доставку и не ретраить.
+                                    let req_id = swarm.behaviour_mut().request_response.send_request(&peer_id, packet);
+                                    outbound_msg_requests.insert(req_id, peer_id);
                                     println!("[{}] 📨 RequestResponse: Отправка пиру {}", now, &peer_id.to_string()[..8]);
                                 } else {
                                     println!("[{}] ⚠️ Попытка отправить сообщение без получателя (Global Chat отключен)", now);
@@ -2736,7 +2756,14 @@ async fn main() -> Result<(), Box<dyn Error>> {
                                         }
                                     }
                                 }
-                                libp2p::request_response::Message::Response { response, .. } => {
+                                libp2p::request_response::Message::Response { request_id, response } => {
+                                    // Если это ответ на наше отправленное сообщение (Plain/Encrypted),
+                                    // считаем доставку подтверждённой и сообщаем UI, чтобы он снял
+                                    // соответствующий pending-ретрай и не показывал ошибку.
+                                    if let Some(delivered_peer) = outbound_msg_requests.remove(&request_id) {
+                                        println!("[{}] ✅ RR: Доставка подтверждена пиром {}", now, &delivered_peer.to_string()[..8]);
+                                        let _ = event_tx.send(NetworkEvent::MessageDelivered(delivered_peer)).await;
+                                    }
                                     match response {
                                         V1Packet::Hello { public_key, ephemeral_key } => {
                                             if peer != local_peer_id {
@@ -2768,8 +2795,11 @@ async fn main() -> Result<(), Box<dyn Error>> {
                                 }
                             }
                         }
-                        SwarmEvent::Behaviour(ChatBehaviourEvent::RequestResponse(libp2p::request_response::Event::OutboundFailure { peer, error, .. })) => {
+                        SwarmEvent::Behaviour(ChatBehaviourEvent::RequestResponse(libp2p::request_response::Event::OutboundFailure { peer, request_id, error, .. })) => {
                             println!("⚠️ [RR] OutFailure пиру {}: {:?}", peer, error);
+                            // Сообщение точно не доставлено — освобождаем запись, чтобы не словить
+                            // ложный «доставлено» при последующем reuse RequestId.
+                            outbound_msg_requests.remove(&request_id);
                             if matches!(error, libp2p::request_response::OutboundFailure::DialFailure) {
                                 let _ = event_tx.send(NetworkEvent::SendFailedDial(peer)).await;
                             }
