@@ -485,6 +485,9 @@ struct App {
     pending_sends: Vec<PendingSend>,
     /// Плавающие уведомления (рендерятся в правом верхнем углу).
     toasts: Vec<Toast>,
+    /// Лениво загружаемая текстура фона области диалогов (`static/icon.png`,
+    /// вшит в бинарь через `include_bytes!`).
+    chat_bg_texture: Option<egui::TextureHandle>,
 }
 
 impl App {
@@ -528,7 +531,35 @@ impl App {
             _local_static: local_static,
             pending_sends: Vec::new(),
             toasts: Vec::new(),
+            chat_bg_texture: None,
         }
+    }
+
+    /// Лениво грузит `static/icon.png` в GPU-текстуру и возвращает её id.
+    /// PNG вшит в бинарь, так что отдельный файл при запуске не нужен.
+    fn ensure_chat_bg(&mut self, ctx: &egui::Context) -> Option<egui::TextureId> {
+        if self.chat_bg_texture.is_none() {
+            const BYTES: &[u8] = include_bytes!("../static/icon.png");
+            match image::load_from_memory(BYTES) {
+                Ok(img) => {
+                    let rgba = img.to_rgba8();
+                    let size = [rgba.width() as usize, rgba.height() as usize];
+                    let pixels = rgba.into_raw();
+                    let color_image =
+                        egui::ColorImage::from_rgba_unmultiplied(size, &pixels);
+                    let handle = ctx.load_texture(
+                        "chat_bg_icon",
+                        color_image,
+                        egui::TextureOptions::LINEAR,
+                    );
+                    self.chat_bg_texture = Some(handle);
+                }
+                Err(e) => {
+                    eprintln!("VOID: не удалось декодировать static/icon.png: {}", e);
+                }
+            }
+        }
+        self.chat_bg_texture.as_ref().map(|h| h.id())
     }
 
     /// Сохраняет ник и записную книгу в `vault.bin` (AES-GCM, ключ в `void.key`).
@@ -804,19 +835,22 @@ impl App {
                             self.persist_vault();
                         }
                         let pid = self.local_peer_id.to_string();
-                        let short = format!("{}…", &pid[..pid.len().min(16)]);
+                        // Полный Peer ID: выделяется мышью (Ctrl+C работает штатно),
+                        // переносится по ширине карточки, клик копирует всё целиком.
                         let r = ui.add(
                             egui::Label::new(
-                                egui::RichText::new(short)
+                                egui::RichText::new(&pid)
                                     .size(11.5)
                                     .monospace()
                                     .color(palette::TEXT_MUTED),
                             )
+                            .wrap()
+                            .selectable(true)
                             .sense(egui::Sense::click()),
                         )
-                        .on_hover_text("Клик — копировать Peer ID");
+                        .on_hover_text("Клик — копировать Peer ID целиком");
                         if r.clicked() {
-                            ui.output_mut(|o| o.copied_text = pid);
+                            ui.output_mut(|o| o.copied_text = pid.clone());
                             self.add_status("Скопирован Peer ID".into());
                         }
                         if let Some(ip) = &self.public_ip {
@@ -1230,13 +1264,15 @@ impl App {
 
 mod palette {
     use eframe::egui::Color32;
-    pub const BG_DEEP:       Color32 = Color32::from_rgb(0x05, 0x07, 0x16); // глубокий космос
-    pub const BG_PANEL:      Color32 = Color32::from_rgb(0x0b, 0x0f, 0x22); // sidebar
-    pub const BG_CHAT:       Color32 = Color32::from_rgb(0x0b, 0x0f, 0x22); // чат — единый тон с sidebar
-    pub const BG_CARD:       Color32 = Color32::from_rgb(0x12, 0x17, 0x30); // карточки/инпуты
-    pub const BG_HOVER:      Color32 = Color32::from_rgb(0x18, 0x1d, 0x3a);
-    pub const BG_SELECTED:   Color32 = Color32::from_rgb(0x1e, 0x26, 0x4a);
-    pub const DIVIDER:       Color32 = Color32::from_rgb(0x2a, 0x32, 0x58);
+    // База фона: #16232B — взято с пользовательского эталона. Остальные оттенки
+    // выведены из неё, чтобы сохранить «лестницу» глубина→панель→карточка→hover→selected.
+    pub const BG_DEEP:       Color32 = Color32::from_rgb(0x0f, 0x1b, 0x22); // глубокий тон под панелями
+    pub const BG_PANEL:      Color32 = Color32::from_rgb(0x16, 0x23, 0x2b); // sidebar / главный фон
+    pub const BG_CHAT:       Color32 = Color32::from_rgb(0x16, 0x23, 0x2b); // чат — единый тон с sidebar
+    pub const BG_CARD:       Color32 = Color32::from_rgb(0x1c, 0x2d, 0x38); // карточки/инпуты
+    pub const BG_HOVER:      Color32 = Color32::from_rgb(0x23, 0x36, 0x46);
+    pub const BG_SELECTED:   Color32 = Color32::from_rgb(0x2a, 0x40, 0x53);
+    pub const DIVIDER:       Color32 = Color32::from_rgb(0x34, 0x4c, 0x61);
     pub const TEXT:          Color32 = Color32::from_rgb(0xe8, 0xec, 0xf8);
     pub const TEXT_MUTED:    Color32 = Color32::from_rgb(0x7d, 0x86, 0xa8);
     pub const ACCENT:        Color32 = Color32::from_rgb(0x7c, 0x5c, 0xff); // cosmic violet
@@ -1341,6 +1377,32 @@ fn starfield() -> &'static [(f32, f32, f32, u8)] {
             })
             .collect()
     })
+}
+
+/// Рисует `static/icon.png` как фон области диалогов в режиме «cover»:
+/// картинка центрируется и масштабируется так, чтобы заполнить всю область
+/// без пустых полей; clip самой панели обрежет лишнее. Поверх кладётся
+/// лёгкое затемнение для читаемости пузырей сообщений.
+fn draw_chat_bg_image(
+    painter: &egui::Painter,
+    rect: egui::Rect,
+    tex_id: egui::TextureId,
+    tex_size: egui::Vec2,
+) {
+    if tex_size.x <= 0.0 || tex_size.y <= 0.0 || rect.width() <= 0.0 || rect.height() <= 0.0 {
+        return;
+    }
+    let scale = (rect.width() / tex_size.x).max(rect.height() / tex_size.y);
+    let scaled = egui::vec2(tex_size.x * scale, tex_size.y * scale);
+    let img_rect = egui::Rect::from_center_size(rect.center(), scaled);
+    let uv = egui::Rect::from_min_max(egui::pos2(0.0, 0.0), egui::pos2(1.0, 1.0));
+    painter.image(tex_id, img_rect, uv, egui::Color32::WHITE);
+    // Затемняющая вуаль — без неё bubbles теряются на ярких участках обоев.
+    painter.rect_filled(
+        rect,
+        0.0,
+        egui::Color32::from_rgba_unmultiplied(0, 0, 0, 110),
+    );
 }
 
 /// Звёзды + две туманности, рисуем как фон чата.
@@ -1961,12 +2023,22 @@ impl eframe::App for App {
                     });
             });
 
-        // ===== История чата (звёздное небо + bubbles) =====
+        // ===== История чата (фоновое изображение + bubbles) =====
+        let bg_tex = self.ensure_chat_bg(ctx);
+        let bg_tex_size = self
+            .chat_bg_texture
+            .as_ref()
+            .map(|h| h.size_vec2())
+            .unwrap_or(egui::Vec2::ZERO);
         egui::CentralPanel::default()
             .frame(egui::Frame::none().fill(palette::BG_CHAT))
             .show(ctx, |ui| {
                 let bg_rect = ui.max_rect();
-                draw_starfield(ui.painter(), bg_rect);
+                if let Some(tex_id) = bg_tex {
+                    draw_chat_bg_image(ui.painter(), bg_rect, tex_id, bg_tex_size);
+                } else {
+                    draw_starfield(ui.painter(), bg_rect);
+                }
 
                 if self.selected_chat.is_empty() {
                     ui.allocate_ui_with_layout(
