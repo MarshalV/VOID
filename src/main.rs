@@ -207,10 +207,15 @@ fn kad_routing_peer_ids(kad: &mut kad::Behaviour<kad::store::MemoryStore>) -> Ve
     v
 }
 
-#[derive(Serialize, Deserialize, Clone)]
+#[derive(Serialize, Deserialize, Clone, Default)]
 struct AddressBookEntry {
     peer_id: String,
     display_name: String,
+    /// Последние известные multiaddr собеседника — прогреваем kbuckets Kademlia
+    /// на старте, чтобы «написать контакту» работало без предварительного
+    /// дозвона. Старые vault'ы без этого поля читаются нормально.
+    #[serde(default)]
+    addrs: Vec<String>,
 }
 
 #[derive(Serialize, Deserialize)]
@@ -461,6 +466,9 @@ struct App {
     // Storage: "GLOBAL" or PeerId string
     messages: HashMap<String, Vec<ChatMessage>>,
     known_peers: HashMap<PeerId, String>,
+    /// Известные multiaddr контактов из зашифрованного vault. При старте
+    /// подаются в Kademlia; при добавлении контакта — сразу Dial + Kad.
+    contact_addrs: HashMap<PeerId, Vec<Multiaddr>>,
     selected_chat: String, // "GLOBAL" or PeerId string
     status_log: Vec<String>,
     show_logs: bool,
@@ -497,6 +505,7 @@ impl App {
         local_nickname: String,
         local_static: crypto::StaticSecret,
         initial_address_book: HashMap<PeerId, String>,
+        initial_contact_addrs: HashMap<PeerId, Vec<Multiaddr>>,
         command_tx: mpsc::Sender<UICommand>,
         event_rx: mpsc::Receiver<NetworkEvent>,
     ) -> Self {
@@ -512,6 +521,7 @@ impl App {
             chat_input: String::new(),
             messages,
             known_peers: initial_address_book,
+            contact_addrs: initial_contact_addrs,
             selected_chat: String::new(),
             status_log: Vec::new(),
             show_logs: false,
@@ -567,9 +577,17 @@ impl App {
         let mut entries: Vec<AddressBookEntry> = self
             .known_peers
             .iter()
-            .map(|(pid, name)| AddressBookEntry {
-                peer_id: pid.to_string(),
-                display_name: name.clone(),
+            .map(|(pid, name)| {
+                let addrs = self
+                    .contact_addrs
+                    .get(pid)
+                    .map(|v| v.iter().map(|a| a.to_string()).collect::<Vec<_>>())
+                    .unwrap_or_default();
+                AddressBookEntry {
+                    peer_id: pid.to_string(),
+                    display_name: name.clone(),
+                    addrs,
+                }
             })
             .collect();
         entries.sort_by(|a, b| {
@@ -1074,8 +1092,9 @@ impl App {
                     |ui| {
                         ui.add(
                             egui::TextEdit::singleline(&mut self.add_contact_peer)
-                                .hint_text("Peer ID")
-                                .desired_width(f32::INFINITY),
+                                .hint_text("/ip4/1.2.3.4/tcp/4001/p2p/12D3Koo…  или  IP[:PORT]/p2p/…")
+                                .desired_width(f32::INFINITY)
+                                .font(egui::TextStyle::Monospace),
                         );
                         ui.add_space(4.0);
                         ui.add(
@@ -1083,29 +1102,66 @@ impl App {
                                 .hint_text("Имя в записной книге")
                                 .desired_width(f32::INFINITY),
                         );
+                        ui.add_space(4.0);
+                        ui.label(
+                            egui::RichText::new(
+                                "Нужен multiaddr целиком, с /p2p/<PeerId> в конце — \
+                                 без адреса кнопка «Сохранить» не дозвонится.",
+                            )
+                            .color(palette::TEXT_MUTED)
+                            .size(11.0),
+                        );
                         ui.add_space(8.0);
                         let save = ui.add_sized(
                             [ui.available_width(), 34.0],
                             egui::Button::new(
-                                egui::RichText::new("Сохранить (зашифровано)")
+                                egui::RichText::new("Сохранить и подключиться")
                                     .color(palette::TEXT)
                                     .strong(),
                             )
                             .fill(palette::ACCENT),
                         );
                         if save.clicked() {
-                            let pid_t = self.add_contact_peer.trim().to_string();
+                            let addr_t = self.add_contact_peer.trim().to_string();
                             let name_t = self.add_contact_name.trim().to_string();
-                            if !pid_t.is_empty() && !name_t.is_empty() {
-                                if let Ok(pid) = pid_t.parse::<PeerId>() {
-                                    if pid != self.local_peer_id {
+                            if addr_t.is_empty() || name_t.is_empty() {
+                                self.add_status(
+                                    "⚠ Заполните и адрес, и имя контакта.".into(),
+                                );
+                            } else {
+                                match parse_seed_input(&addr_t) {
+                                    Some((ma, Some(pid))) if pid != self.local_peer_id => {
                                         self.known_peers.insert(pid, name_t);
+                                        let addrs =
+                                            self.contact_addrs.entry(pid).or_default();
+                                        if !addrs.iter().any(|a| a == &ma) {
+                                            addrs.push(ma.clone());
+                                        }
                                         self.persist_vault();
+                                        let _ = self.command_tx.try_send(
+                                            UICommand::DialPeer(pid, vec![ma]),
+                                        );
+                                        self.add_status(format!(
+                                            "✅ Контакт сохранён, подключаюсь к {}…",
+                                            &pid.to_string()[..12]
+                                        ));
                                         self.add_contact_peer.clear();
                                         self.add_contact_name.clear();
                                     }
-                                } else {
-                                    self.add_status("Некорректный Peer ID".into());
+                                    Some((_, Some(_))) => self.add_status(
+                                        "⚠ Это ваш собственный PeerId — контакт не добавлен."
+                                            .into(),
+                                    ),
+                                    Some((_, None)) => self.add_status(
+                                        "⚠ В multiaddr обязательно должен быть \
+                                         /p2p/<PeerId> в конце."
+                                            .into(),
+                                    ),
+                                    None => self.add_status(
+                                        "⚠ Некорректный multiaddr. Пример: \
+                                         /ip4/1.2.3.4/tcp/4001/p2p/12D3Koo…"
+                                            .into(),
+                                    ),
                                 }
                             }
                         }
@@ -2299,27 +2355,42 @@ async fn main() -> Result<(), Box<dyn Error>> {
         println!("✅ Файрвол macOS настроен");
     }
 
-    let (local_key, local_nickname, static_secret, initial_address_book) =
+    let (local_key, local_nickname, static_secret, initial_address_book, initial_contact_addrs) =
         if let Ok(storage) = Storage::load() {
             let key = libp2p::identity::Keypair::from_protobuf_encoding(&storage.keypair_bytes)
                 .expect("Failed to decode saved keypair");
             let static_secret = crypto::StaticSecret::from(storage.static_secret_bytes);
             let my_id = PeerId::from(key.public());
             let mut book = HashMap::new();
+            let mut addrs_map: HashMap<PeerId, Vec<Multiaddr>> = HashMap::new();
             for entry in storage.address_book {
                 if let Ok(pid) = entry.peer_id.parse::<PeerId>() {
                     if pid != my_id {
                         book.insert(pid, entry.display_name);
+                        let mut parsed: Vec<Multiaddr> = entry
+                            .addrs
+                            .iter()
+                            .filter_map(|s| s.parse::<Multiaddr>().ok())
+                            .collect();
+                        if !parsed.is_empty() {
+                            addrs_map.entry(pid).or_default().append(&mut parsed);
+                        }
                     }
                 }
             }
-            (key, storage.nickname, static_secret, book)
+            (key, storage.nickname, static_secret, book, addrs_map)
         } else {
             let key = libp2p::identity::Keypair::generate_ed25519();
             let static_secret = crypto::StaticSecret::random_from_rng(&mut rand::rngs::OsRng);
             let nickname = format!("User_{}", &PeerId::from(key.public()).to_string()[..4]);
             let _ = Storage::save(&nickname, Some(&key), Some(&static_secret), None);
-            (key, nickname, static_secret, HashMap::new())
+            (
+                key,
+                nickname,
+                static_secret,
+                HashMap::new(),
+                HashMap::new(),
+            )
         };
     let local_peer_id = PeerId::from(local_key.public());
 
@@ -2347,11 +2418,16 @@ async fn main() -> Result<(), Box<dyn Error>> {
 
     let static_secret_net = static_secret.clone();
     let void_bootstraps_for_net = void_bootstraps.clone();
+    let contact_addrs_for_net: Vec<(PeerId, Multiaddr)> = initial_contact_addrs
+        .iter()
+        .flat_map(|(pid, addrs)| addrs.iter().cloned().map(move |a| (*pid, a)))
+        .collect();
     tokio::spawn(async move {
         let event_tx = event_tx_clone;
         let command_tx_for_mdns = command_tx_for_mdns;
         let local_static = static_secret_net;
         let void_bootstraps = void_bootstraps_for_net;
+        let contact_seed_addrs = contact_addrs_for_net;
         let mut sessions: HashMap<PeerId, crypto::SecureSession> = HashMap::new();
         let mut pending_handshakes: HashMap<PeerId, crypto::StaticSecret> = HashMap::new();
         let my_public_key = crypto::PublicKey::from(&local_static);
@@ -2386,7 +2462,10 @@ async fn main() -> Result<(), Box<dyn Error>> {
                 // Иначе в таблицу попадают тысячи чужих узлов и «поиск пира» оборачивается звонками на IPFS.
                 let kad_store = kad::store::MemoryStore::new(local_peer_id);
                 let mut kad_config = kad::Config::new(StreamProtocol::new("/void/kad/1.0.0"));
-                kad_config.set_periodic_bootstrap_interval(None);
+                // Переосвежаем routing table каждые 5 минут: без этого узел со временем
+                // «проваливается» из DHT и новые контакты перестают находиться.
+                kad_config.set_periodic_bootstrap_interval(Some(Duration::from_secs(5 * 60)));
+                kad_config.set_query_timeout(Duration::from_secs(60));
                 let mut kad = kad::Behaviour::with_config(local_peer_id, kad_store, kad_config);
                 kad.set_mode(Some(libp2p::kad::Mode::Server));
 
@@ -2396,6 +2475,11 @@ async fn main() -> Result<(), Box<dyn Error>> {
                     } else {
                         eprintln!("VOID bootstrap: нет /p2p/ в конце адреса, пропуск: {}", ma);
                     }
+                }
+                // Прогреваем kbuckets адресами контактов из vault — тогда
+                // `send_request` к ним работает без предварительного ручного dial.
+                for (pid, ma) in &contact_seed_addrs {
+                    kad.add_address(pid, ma.clone());
                 }
                 if !void_bootstraps.is_empty() {
                     let _ = kad.bootstrap();
@@ -2480,6 +2564,22 @@ async fn main() -> Result<(), Box<dyn Error>> {
             )
         };
         let _ = event_tx.send(NetworkEvent::Status(startup_status)).await;
+
+        // Сразу пробуем дозвониться до сохранённых контактов: если они онлайн и
+        // их адрес не сменился — связь появится в первые же секунды без
+        // ручного «ПОДКЛЮЧИТЬ».
+        for (pid, ma) in &contact_seed_addrs {
+            let opts = DialOpts::peer_id(*pid)
+                .condition(libp2p::swarm::dial_opts::PeerCondition::DisconnectedAndNotDialing)
+                .addresses(vec![ma.clone()])
+                .build();
+            if let Err(e) = swarm.dial(opts) {
+                let s = format!("{:?}", e);
+                if !s.contains("Condition") {
+                    eprintln!("contact dial {} ({}): {:?}", pid, ma, e);
+                }
+            }
+        }
 
         let mut peer_addrs: HashMap<PeerId, Vec<Multiaddr>> = HashMap::new();
         let mut pending_dials: HashSet<PeerId> = HashSet::new();
@@ -3131,6 +3231,7 @@ async fn main() -> Result<(), Box<dyn Error>> {
                 local_nickname,
                 static_secret,
                 initial_address_book,
+                initial_contact_addrs,
                 command_tx,
                 event_rx,
             )))
