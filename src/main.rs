@@ -28,6 +28,77 @@ fn peer_id_from_multiaddr(ma: &Multiaddr) -> Option<PeerId> {
     })
 }
 
+/// Подсети «виртуальных» интерфейсов, которые не должны попадать в список
+/// своих listen-адресов / объявляться соседям / подниматься через mDNS.
+/// Эти адреса недостижимы для **чужих** хостов и только мешают dial'ам.
+///
+/// - `192.168.56.0/24` — VirtualBox Host-Only (`vboxnet0`).
+/// - `172.17.0.0/16`   — Docker default bridge (часто проваливается в WSL2).
+/// - `172.18–25.0/16`  — доп. bridge-сети Docker/Podman.
+/// - `169.254.0.0/16`  — APIPA link-local (когда DHCP не выдал IP).
+/// - Loopback/unspec оставляем для случаев, когда адрес пришёл без фильтра.
+///
+/// Расширяется через `VOID_SKIP_SUBNETS` (CIDR через запятую: `10.8.0.0/24,...`).
+fn is_junk_addr(ma: &Multiaddr) -> bool {
+    let ip = ma.iter().find_map(|p| match p {
+        libp2p::multiaddr::Protocol::Ip4(v4) => Some(std::net::IpAddr::V4(v4)),
+        libp2p::multiaddr::Protocol::Ip6(v6) => Some(std::net::IpAddr::V6(v6)),
+        _ => None,
+    });
+    let ip = match ip {
+        Some(x) => x,
+        None => return false,
+    };
+    match ip {
+        std::net::IpAddr::V4(v4) => {
+            if v4.is_loopback() || v4.is_unspecified() || v4.is_link_local() {
+                return true;
+            }
+            let oct = v4.octets();
+            // VirtualBox Host-Only
+            if oct[0] == 192 && oct[1] == 168 && oct[2] == 56 {
+                return true;
+            }
+            // Docker/Podman bridge'ы
+            if oct[0] == 172 && (17..=25).contains(&oct[1]) {
+                return true;
+            }
+            // Пользовательский список
+            if let Ok(s) = std::env::var("VOID_SKIP_SUBNETS") {
+                for part in s.split(',') {
+                    if cidr_match_v4(part.trim(), v4) {
+                        return true;
+                    }
+                }
+            }
+            false
+        }
+        std::net::IpAddr::V6(v6) => {
+            v6.is_loopback() || v6.is_unspecified()
+        }
+    }
+}
+
+/// Минимальная проверка IPv4 против CIDR-маски `a.b.c.d/nn`.
+fn cidr_match_v4(cidr: &str, ip: std::net::Ipv4Addr) -> bool {
+    let (addr, bits) = match cidr.split_once('/') {
+        Some((a, b)) => (a, b.parse::<u32>().ok()),
+        None => return false,
+    };
+    let Some(bits) = bits else { return false };
+    if bits > 32 {
+        return false;
+    }
+    let Ok(net) = addr.parse::<std::net::Ipv4Addr>() else {
+        return false;
+    };
+    if bits == 0 {
+        return true;
+    }
+    let mask: u32 = !0u32 << (32 - bits);
+    (u32::from(ip) & mask) == (u32::from(net) & mask)
+}
+
 /// Встроенные seed-адреса в бинарнике (пользователи ничего не вводят). Достаточно нескольких — дальше Kademlia сама находит тысячи пиров.
 /// Формат: полный multiaddr с `/p2p/<PeerId>` в конце.
 const BUILTIN_VOID_BOOTSTRAP: &[&str] = &[];
@@ -384,6 +455,17 @@ enum NetworkEvent {
     DhtRoutingPeers { total: usize, lines: Vec<String> },
     /// Отправка пиру упала с DialFailure — UI должен сделать DHT-lookup и retry.
     SendFailedDial(PeerId),
+    /// Отправка упала с `UnsupportedProtocols`: пир не поддерживает
+    /// `/void/chat/1.0.0`. Он НЕ собеседник (это bootstrap/relay/чужая версия
+    /// VOID). UI должен удалить его из контактов и не ретраить.
+    SendFailedUnsupported(PeerId),
+    /// Identify подтвердил, что пир не объявляет `/void/chat/1.0.0`.
+    /// UI должен пометить его как DHT-узел и вычистить из `known_peers`.
+    PeerIsNotVoidChat(PeerId),
+    /// Мы только что узнали рабочий адрес пира (после успешного dial / Identify
+    /// / входящего коннекта). UI сохранит его в `contact_addrs` — тогда после
+    /// рестарта связь с этим контактом поднимется сама.
+    PeerAddress(PeerId, Multiaddr),
     /// Получен Response (Ack/прочее) на ранее отправленное сообщение пиру —
     /// сигнал UI снять одно ожидание из `pending_sends` и не показывать ошибку.
     MessageDelivered(PeerId),
@@ -1092,7 +1174,7 @@ impl App {
                     |ui| {
                         ui.add(
                             egui::TextEdit::singleline(&mut self.add_contact_peer)
-                                .hint_text("/ip4/1.2.3.4/tcp/4001/p2p/12D3Koo…  или  IP[:PORT]/p2p/…")
+                                .hint_text("PeerId (12D3Koo…)  или  /ip4/.../p2p/…")
                                 .desired_width(f32::INFINITY)
                                 .font(egui::TextStyle::Monospace),
                         );
@@ -1105,8 +1187,8 @@ impl App {
                         ui.add_space(4.0);
                         ui.label(
                             egui::RichText::new(
-                                "Нужен multiaddr целиком, с /p2p/<PeerId> в конце — \
-                                 без адреса кнопка «Сохранить» не дозвонится.",
+                                "По PeerId — клиент найдёт адрес через DHT (нужен живой \
+                                 bootstrap). По multiaddr — подключится напрямую сразу.",
                             )
                             .color(palette::TEXT_MUTED)
                             .size(11.0),
@@ -1122,14 +1204,34 @@ impl App {
                             .fill(palette::ACCENT),
                         );
                         if save.clicked() {
-                            let addr_t = self.add_contact_peer.trim().to_string();
+                            let input = self.add_contact_peer.trim().to_string();
                             let name_t = self.add_contact_name.trim().to_string();
-                            if addr_t.is_empty() || name_t.is_empty() {
+                            if input.is_empty() || name_t.is_empty() {
                                 self.add_status(
-                                    "⚠ Заполните и адрес, и имя контакта.".into(),
+                                    "⚠ Заполните и адрес/PeerId, и имя контакта.".into(),
                                 );
+                            } else if let Ok(pid) = input.parse::<PeerId>() {
+                                // Голый PeerId — DHT-поиск.
+                                if pid == self.local_peer_id {
+                                    self.add_status(
+                                        "⚠ Это ваш собственный PeerId.".into(),
+                                    );
+                                } else {
+                                    self.known_peers.insert(pid, name_t);
+                                    self.persist_vault();
+                                    let _ = self
+                                        .command_tx
+                                        .try_send(UICommand::SearchPeer(pid));
+                                    self.add_status(format!(
+                                        "🔍 Контакт сохранён, ищу {} через DHT…",
+                                        &pid.to_string()[..12]
+                                    ));
+                                    self.add_contact_peer.clear();
+                                    self.add_contact_name.clear();
+                                }
                             } else {
-                                match parse_seed_input(&addr_t) {
+                                // Возможно multiaddr / IP[:PORT]/p2p/...
+                                match parse_seed_input(&input) {
                                     Some((ma, Some(pid))) if pid != self.local_peer_id => {
                                         self.known_peers.insert(pid, name_t);
                                         let addrs =
@@ -1153,13 +1255,13 @@ impl App {
                                             .into(),
                                     ),
                                     Some((_, None)) => self.add_status(
-                                        "⚠ В multiaddr обязательно должен быть \
-                                         /p2p/<PeerId> в конце."
+                                        "⚠ В multiaddr нет /p2p/<PeerId> — укажите PeerId \
+                                         или полный адрес с /p2p/… в конце."
                                             .into(),
                                     ),
                                     None => self.add_status(
-                                        "⚠ Некорректный multiaddr. Пример: \
-                                         /ip4/1.2.3.4/tcp/4001/p2p/12D3Koo…"
+                                        "⚠ Не PeerId и не multiaddr. Примеры: \
+                                         12D3Koo… или /ip4/1.2.3.4/tcp/4001/p2p/12D3Koo…"
                                             .into(),
                                     ),
                                 }
@@ -1731,6 +1833,75 @@ impl eframe::App for App {
                         p.last_send_at = Instant::now()
                             .checked_sub(RESEND_GRACE + Duration::from_millis(50))
                             .unwrap_or_else(Instant::now);
+                    }
+                }
+                NetworkEvent::SendFailedUnsupported(peer) => {
+                    // Пир физически не поддерживает чат. Ретраить бессмысленно —
+                    // снимаем все ожидания ему и удаляем из контактов.
+                    self.pending_sends.retain(|p| p.peer != peer);
+                    let removed_name = self.known_peers.remove(&peer);
+                    self.contact_addrs.remove(&peer);
+                    if self.selected_chat == peer.to_string() {
+                        self.selected_chat.clear();
+                    }
+                    self.persist_vault();
+                    let label = removed_name
+                        .unwrap_or_else(|| format!("{}…", &peer.to_string()[..10]));
+                    self.push_toast(
+                        format!(
+                            "✖ {} — не VOID-чат (bootstrap/другая версия). Удалён из контактов.",
+                            label
+                        ),
+                        ToastKind::Error,
+                        TOAST_TTL_LONG,
+                    );
+                }
+                NetworkEvent::PeerIsNotVoidChat(peer) => {
+                    // Identify показал, что у пира нет /void/chat/1.0.0.
+                    // Подчищаем его из контактов заранее, не дожидаясь попытки
+                    // отправки. Чаще всего это bootstrap из void-bootstrap.txt.
+                    if self.known_peers.remove(&peer).is_some() {
+                        self.contact_addrs.remove(&peer);
+                        if self.selected_chat == peer.to_string() {
+                            self.selected_chat.clear();
+                        }
+                        self.persist_vault();
+                        self.push_toast(
+                            format!(
+                                "ℹ️ {}… — DHT/bootstrap-узел, не собеседник. Убран из контактов.",
+                                &peer.to_string()[..10]
+                            ),
+                            ToastKind::Info,
+                            TOAST_TTL_SHORT,
+                        );
+                    }
+                }
+                NetworkEvent::PeerAddress(peer, ma) => {
+                    // Пир засветился с рабочим адресом: если он уже контакт —
+                    // обновляем запись; если нет, но это явно реальный VOID-
+                    // клиент (Identify/Connected), добавляем как Peer_XXXX.
+                    if peer == self.local_peer_id {
+                        continue;
+                    }
+                    let entry = self.contact_addrs.entry(peer).or_default();
+                    let is_new = !entry.iter().any(|a| a == &ma);
+                    if is_new {
+                        entry.push(ma);
+                        // Ограничиваем 4 последними адресами на контакта.
+                        if entry.len() > 4 {
+                            let excess = entry.len() - 4;
+                            entry.drain(0..excess);
+                        }
+                        let mut changed = true;
+                        if let Entry::Vacant(e) = self.known_peers.entry(peer) {
+                            e.insert(format!("Peer_{}", &peer.to_string()[..8]));
+                        } else {
+                            // Обновили только адреса — всё равно persist.
+                            changed = true;
+                        }
+                        if changed {
+                            self.persist_vault();
+                        }
                     }
                 }
             }
@@ -2653,14 +2824,27 @@ async fn main() -> Result<(), Box<dyn Error>> {
                             }
                             UICommand::DialPeer(peer_id, addrs) => {
                                  let short = &peer_id.to_string()[..16];
+                                 // Выкидываем loopback и виртуальные интерфейсы — чтобы
+                                 // не тратить время на заведомо пустой dial.
+                                 let addrs: Vec<Multiaddr> = addrs
+                                     .into_iter()
+                                     .filter(|addr| !is_junk_addr(addr))
+                                     .collect();
                                  println!("🔌 UI_COMMAND: DialPeer {} ({} addresses)", short, addrs.len());
 
-                                 // Добавляем только не-loopback адреса в Kad
                                  for addr in &addrs {
-                                     let s = addr.to_string();
-                                     if !s.contains("127.0.0.1") && !s.contains("::1") {
-                                         swarm.behaviour_mut().kad.add_address(&peer_id, addr.clone());
-                                     }
+                                     swarm.behaviour_mut().kad.add_address(&peer_id, addr.clone());
+                                 }
+
+                                 if addrs.is_empty() {
+                                     let _ = event_tx
+                                         .send(NetworkEvent::Status(format!(
+                                             "🔍 У {} нет годных адресов — ищу через DHT…",
+                                             short
+                                         )))
+                                         .await;
+                                     swarm.behaviour_mut().kad.get_closest_peers(peer_id);
+                                     continue;
                                  }
 
                                   let opts = DialOpts::peer_id(peer_id)
@@ -2803,6 +2987,14 @@ async fn main() -> Result<(), Box<dyn Error>> {
                         SwarmEvent::NewListenAddr { address, .. } => {
                             let s = address.to_string();
                             local_listen_addrs.insert(address.clone());
+                            // Фильтруем виртуальные интерфейсы (VirtualBox 192.168.56.*,
+                            // Docker 172.17.*, link-local 169.254.*) — это адреса, до
+                            // которых никто извне не достучится, они только засоряют
+                            // список и провоцируют бесполезные dial'ы у соседей.
+                            if is_junk_addr(&address) && !s.contains("p2p-circuit") {
+                                println!("🚫 Пропуск виртуального интерфейса: {}", address);
+                                continue;
+                            }
                             println!("📡 СЛУШАЮ: {}", address);
 
                             let is_external = !s.contains("/ip6/") && !s.contains("/0.0.0.0") && !s.contains("/127.0.0.1") || s.contains("p2p-circuit");
@@ -2834,6 +3026,16 @@ async fn main() -> Result<(), Box<dyn Error>> {
                         SwarmEvent::Behaviour(ChatBehaviourEvent::Mdns(mdns::Event::Discovered(list))) => {
                             for (peer_id, addr) in list {
                                 if peer_id == local_peer_id { continue; }
+                                // Не трогаем анонсы из виртуальных интерфейсов — они не
+                                // ведут к рабочей LAN-связи, только тратят время Dial'а.
+                                if is_junk_addr(&addr) {
+                                    println!(
+                                        "🚫 mDNS: пропуск виртуального адреса {} (peer {})",
+                                        addr,
+                                        &peer_id.to_string()[..8]
+                                    );
+                                    continue;
+                                }
 
                                 // Регистрация адреса в Kademlia
                                 swarm.behaviour_mut().kad.add_address(&peer_id, addr.clone());
@@ -2969,11 +3171,17 @@ async fn main() -> Result<(), Box<dyn Error>> {
                         }
                         SwarmEvent::Behaviour(ChatBehaviourEvent::RequestResponse(libp2p::request_response::Event::OutboundFailure { peer, request_id, error, .. })) => {
                             println!("⚠️ [RR] OutFailure пиру {}: {:?}", peer, error);
-                            // Сообщение точно не доставлено — освобождаем запись, чтобы не словить
-                            // ложный «доставлено» при последующем reuse RequestId.
                             outbound_msg_requests.remove(&request_id);
-                            if matches!(error, libp2p::request_response::OutboundFailure::DialFailure) {
-                                let _ = event_tx.send(NetworkEvent::SendFailedDial(peer)).await;
+                            match error {
+                                libp2p::request_response::OutboundFailure::DialFailure => {
+                                    let _ = event_tx.send(NetworkEvent::SendFailedDial(peer)).await;
+                                }
+                                libp2p::request_response::OutboundFailure::UnsupportedProtocols => {
+                                    let _ = event_tx
+                                        .send(NetworkEvent::SendFailedUnsupported(peer))
+                                        .await;
+                                }
+                                _ => {}
                             }
                         }
                         SwarmEvent::Behaviour(ChatBehaviourEvent::RequestResponse(libp2p::request_response::Event::InboundFailure { peer, error, .. })) => {
@@ -2994,7 +3202,7 @@ async fn main() -> Result<(), Box<dyn Error>> {
                                 let _ = event_tx.send(NetworkEvent::PublicIpConfirmed(ip)).await;
                             }
                         }
-                        SwarmEvent::ConnectionEstablished { peer_id, endpoint, .. } => {
+                        SwarmEvent::ConnectionEstablished { peer_id, ref endpoint, .. } => {
                             let connected_count = swarm.connected_peers().count();
                             println!("✅ СОЕДИНЕНО: {}. Endpoint: {:?}. Всего пиров: {}", peer_id, endpoint, connected_count);
                             pending_dials.remove(&peer_id);
@@ -3002,6 +3210,26 @@ async fn main() -> Result<(), Box<dyn Error>> {
                              if peer_id != local_peer_id {
                                  let _ = event_tx.send(NetworkEvent::Connected(peer_id)).await;
                                  let _ = event_tx.send(NetworkEvent::Status(format!("✅ СОЕДИНЕНО: {}", &peer_id.to_string()[..8]))).await;
+                                 // Передаём рабочий multiaddr в UI: для Dialer — кого набирали,
+                                 // для Listener — кто пришёл (send_back_addr + /p2p/peer_id).
+                                 // UI сохранит его в контактную книгу.
+                                 let learned: Option<Multiaddr> = match endpoint {
+                                     libp2p::core::ConnectedPoint::Dialer { address, .. } => {
+                                         Some(address.clone())
+                                     }
+                                     libp2p::core::ConnectedPoint::Listener { send_back_addr, .. } => {
+                                         let mut a = send_back_addr.clone();
+                                         a.push(libp2p::multiaddr::Protocol::P2p(peer_id));
+                                         Some(a)
+                                     }
+                                 };
+                                 if let Some(addr) = learned {
+                                     if !is_junk_addr(&addr) {
+                                         let _ = event_tx
+                                             .send(NetworkEvent::PeerAddress(peer_id, addr))
+                                             .await;
+                                     }
+                                 }
                              }
 
                             // Если мы звонили этому пиру как seed (вход в сеть через IP) — страховка:
@@ -3084,17 +3312,45 @@ async fn main() -> Result<(), Box<dyn Error>> {
 
                         SwarmEvent::Behaviour(ChatBehaviourEvent::Identify(identify::Event::Received { peer_id, info, .. })) => {
                             let now = chrono::Local::now().format("%H:%M:%S").to_string();
-                            // Не фильтруем по `/void/chat/1.0.0`: в rust-libp2p список protocols в Identify
-                            // не обязан совпадать с request-response; иначе рвём соединение с нормальным VOID-пиром.
+                            let has_chat = info
+                                .protocols
+                                .iter()
+                                .any(|p| p.as_ref() == "/void/chat/1.0.0");
                             println!(
-                                "[{}] 🆔 Identify: {} — {} listen, {} протоколов",
+                                "[{}] 🆔 Identify: {} — {} listen, {} протоколов{}",
                                 now,
                                 peer_id,
                                 info.listen_addrs.len(),
-                                info.protocols.len()
+                                info.protocols.len(),
+                                if has_chat { "" } else { "  ⚠️ БЕЗ /void/chat/1.0.0 (bootstrap/чужая версия)" }
                             );
+                            if !has_chat && peer_id != local_peer_id {
+                                let _ = event_tx
+                                    .send(NetworkEvent::PeerIsNotVoidChat(peer_id))
+                                    .await;
+                            }
                             for addr in info.listen_addrs {
-                                swarm.behaviour_mut().kad.add_address(&peer_id, addr);
+                                // Не тащим к себе заведомо-невалидные адреса пира
+                                // (VirtualBox/Docker/link-local). Они только
+                                // провоцируют долгие таймауты в dial.
+                                if is_junk_addr(&addr) {
+                                    continue;
+                                }
+                                swarm.behaviour_mut().kad.add_address(&peer_id, addr.clone());
+                                // Если это настоящий VOID-клиент — сохраним один его
+                                // listen-адрес в контактной книге, чтобы связь поднялась
+                                // после рестарта без ручного ПОДКЛЮЧИТЬ.
+                                if has_chat && peer_id != local_peer_id {
+                                    let mut a = addr.clone();
+                                    // Если в addr нет /p2p/<peer_id>, добавим — иначе Dial потом
+                                    // не свяжет адрес с PeerId.
+                                    if !a.iter().any(|p| matches!(p, libp2p::multiaddr::Protocol::P2p(_))) {
+                                        a.push(libp2p::multiaddr::Protocol::P2p(peer_id));
+                                    }
+                                    let _ = event_tx
+                                        .send(NetworkEvent::PeerAddress(peer_id, a))
+                                        .await;
+                                }
                             }
                             let was_seed = pending_seed_peers.remove(&peer_id);
                             if was_seed || pending_seed_bare {
