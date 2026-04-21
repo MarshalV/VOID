@@ -377,30 +377,49 @@ impl App {
                                 .size(11.0),
                         );
                         ui.separator();
-                        let buf = self
-                            .peer_name_edits
-                            .entry(*peer_id)
-                            .or_insert_with(|| name.clone());
-                        let r = ui.add(
-                            egui::TextEdit::singleline(buf)
-                                .desired_width(220.0)
-                                .hint_text("Новое имя"),
-                        );
-                        if r.lost_focus() {
-                            let trimmed = buf.trim().to_string();
-                            if !trimmed.is_empty() && trimmed != *name {
-                                self.known_peers.insert(*peer_id, trimmed.clone());
-                                *buf = trimmed;
-                                self.persist_vault();
-                            }
-                            ui.close_menu();
-                        }
                         if ui.button("📋 Копировать Peer ID").clicked() {
                             ui.output_mut(|o| o.copied_text = peer_str.clone());
                             ui.close_menu();
                         }
                         if ui.button("🗑 Удалить контакт").clicked() {
                             to_remove.push(*peer_id);
+                            ui.close_menu();
+                        }
+                        ui.separator();
+                        ui.label(
+                            egui::RichText::new("✎  Переименовать")
+                                .color(palette::TEXT_MUTED)
+                                .size(11.0),
+                        );
+                        let buf = self
+                            .peer_name_edits
+                            .entry(*peer_id)
+                            .or_insert_with(|| name.clone());
+                        let edit = ui.add(
+                            egui::TextEdit::singleline(buf)
+                                .desired_width(220.0)
+                                .hint_text("Новое имя"),
+                        );
+                        let enter_pressed = edit.lost_focus()
+                            && ui.input(|i| i.key_pressed(egui::Key::Enter));
+                        let save_clicked = ui
+                            .add_sized(
+                                [ui.available_width(), 28.0],
+                                egui::Button::new(
+                                    egui::RichText::new("Сохранить имя")
+                                        .color(palette::TEXT)
+                                        .strong(),
+                                )
+                                .fill(palette::ACCENT),
+                            )
+                            .clicked();
+                        if enter_pressed || save_clicked {
+                            let trimmed = buf.trim().to_string();
+                            if !trimmed.is_empty() && trimmed != *name {
+                                self.known_peers.insert(*peer_id, trimmed.clone());
+                                *buf = trimmed;
+                                self.persist_vault();
+                            }
                             ui.close_menu();
                         }
                     });
