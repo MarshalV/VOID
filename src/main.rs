@@ -1124,6 +1124,11 @@ async fn main() -> Result<(), Box<dyn Error>> {
         // pending-ретраи в UI. Hello-handshake'ы сюда НЕ попадают.
         let mut outbound_msg_requests: HashMap<libp2p::request_response::OutboundRequestId, PeerId> = HashMap::new();
         let mut dial_backoff: HashMap<PeerId, Instant> = HashMap::new();
+        // Схлопываем подряд идущие `OutFailure` одному пиру: при отправке
+        // сообщения без сессии мы шлём Hello + packet, и на DialFailure
+        // оба улетают в лог дубликатом. Храним время последнего лога,
+        // чтобы в UI и консоль ушло по одному «сообщение не доставлено».
+        let mut last_rr_outfail: HashMap<PeerId, Instant> = HashMap::new();
         let mut local_listen_addrs: HashSet<Multiaddr> = HashSet::new();
         // Пиры-«seed», к которым мы дозвонились через JoinViaNode: после Identify запускаем DHT-bootstrap.
         let mut pending_seed_peers: HashSet<PeerId> = HashSet::new();
@@ -1535,16 +1540,31 @@ async fn main() -> Result<(), Box<dyn Error>> {
                             }
                         }
                         SwarmEvent::Behaviour(ChatBehaviourEvent::RequestResponse(libp2p::request_response::Event::OutboundFailure { peer, request_id, error, .. })) => {
-                            println!("⚠️ [RR] OutFailure пиру {}: {:?}", peer, error);
                             outbound_msg_requests.remove(&request_id);
+                            // Дедуп: если тому же пиру прилетел такой же fail
+                            // меньше секунды назад — это Hello+packet пара,
+                            // логировать оба смысла нет.
+                            let now_inst = Instant::now();
+                            let is_dup = last_rr_outfail
+                                .get(&peer)
+                                .map(|t| now_inst.duration_since(*t) < Duration::from_secs(1))
+                                .unwrap_or(false);
+                            last_rr_outfail.insert(peer, now_inst);
+                            if !is_dup {
+                                println!("⚠️ [RR] OutFailure пиру {}: {:?}", peer, error);
+                            }
                             match error {
                                 libp2p::request_response::OutboundFailure::DialFailure => {
-                                    let _ = event_tx.send(NetworkEvent::SendFailedDial(peer)).await;
+                                    if !is_dup {
+                                        let _ = event_tx.send(NetworkEvent::SendFailedDial(peer)).await;
+                                    }
                                 }
                                 libp2p::request_response::OutboundFailure::UnsupportedProtocols => {
-                                    let _ = event_tx
-                                        .send(NetworkEvent::SendFailedUnsupported(peer))
-                                        .await;
+                                    if !is_dup {
+                                        let _ = event_tx
+                                            .send(NetworkEvent::SendFailedUnsupported(peer))
+                                            .await;
+                                    }
                                 }
                                 _ => {}
                             }

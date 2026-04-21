@@ -349,15 +349,20 @@ impl App {
                                             44.0
                                         };
                                         let name_w = (inner_w - time_slot - 6.0).max(40.0);
-                                        ui.add_sized(
-                                            [name_w, 18.0],
-                                            egui::Label::new(
-                                                egui::RichText::new(name)
-                                                    .strong()
-                                                    .color(palette::TEXT)
-                                                    .size(14.5),
-                                            )
-                                            .truncate(),
+                                        ui.allocate_ui_with_layout(
+                                            egui::vec2(name_w, 18.0),
+                                            egui::Layout::left_to_right(egui::Align::Center),
+                                            |ui| {
+                                                ui.add(
+                                                    egui::Label::new(
+                                                        egui::RichText::new(name)
+                                                            .strong()
+                                                            .color(palette::TEXT)
+                                                            .size(14.5),
+                                                    )
+                                                    .truncate(),
+                                                );
+                                            },
                                         );
                                         ui.with_layout(
                                             egui::Layout::right_to_left(egui::Align::Center),
@@ -1061,6 +1066,35 @@ impl eframe::App for App {
                     if peer != self.local_peer_id {
                         self.select_peer_if_no_chat(peer);
                     }
+                    // Коннект появился — немедленно переотправляем зависшие
+                    // сообщения этому пиру, не дожидаясь `RESEND_GRACE`/
+                    // `RESEND_DELAY`. Без этого пользователь видит, что пир
+                    // уже в сети, но сообщение уходит только через 8+ сек.
+                    let mut to_resend: Vec<(usize, PeerId, String)> = Vec::new();
+                    for (idx, p) in self.pending_sends.iter().enumerate() {
+                        if p.peer == peer {
+                            to_resend.push((idx, p.peer, p.text.clone()));
+                        }
+                    }
+                    if !to_resend.is_empty() {
+                        let now = Instant::now();
+                        for (idx, _, _) in &to_resend {
+                            if let Some(p) = self.pending_sends.get_mut(*idx) {
+                                p.attempts = p.attempts.saturating_add(1);
+                                p.last_send_at = now;
+                                p.dht_kicked = false;
+                                p.dht_kicked_at = None;
+                            }
+                        }
+                        for (_, peer, text) in to_resend {
+                            let _ = self.command_tx.try_send(UICommand::SendMessage {
+                                sender_name: self.local_nickname.clone(),
+                                text,
+                                recipient: Some(peer),
+                                is_retry: true,
+                            });
+                        }
+                    }
                 }
                 NetworkEvent::Disconnected(peer) => {
                     self.connected_peers = self.connected_peers.saturating_sub(1);
@@ -1127,6 +1161,20 @@ impl eframe::App for App {
                         p.last_send_at = Instant::now()
                             .checked_sub(RESEND_GRACE + Duration::from_millis(50))
                             .unwrap_or_else(Instant::now);
+                    }
+                    // Параллельно: если у контакта есть сохранённые multiaddr
+                    // (mDNS/Identify/из vault) — сразу пытаемся дозвониться до
+                    // них напрямую, не ждём 3 сек DHT-грейс. На Windows dial
+                    // через request_response часто падает с WSAEADDRINUSE
+                    // (10048) из-за port-reuse; ручной DialPeer по LAN-адресам
+                    // обычно проходит.
+                    if let Some(addrs) = self.contact_addrs.get(&peer) {
+                        if !addrs.is_empty() {
+                            let _ = self.command_tx.try_send(UICommand::DialPeer(
+                                peer,
+                                addrs.clone(),
+                            ));
+                        }
                     }
                 }
                 NetworkEvent::SendFailedUnsupported(peer) => {
