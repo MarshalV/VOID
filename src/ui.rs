@@ -326,7 +326,7 @@ impl App {
                         .rounding(10.0)
                         .inner_margin(egui::Margin {
                             left: 10.0,
-                            right: 10.0,
+                            right: 14.0,
                             top: 8.0,
                             bottom: 8.0,
                         })
@@ -336,13 +336,28 @@ impl App {
                                 draw_avatar(ui, &peer_str, name, 42.0, None);
                                 ui.add_space(10.0);
                                 ui.vertical(|ui| {
-                                    ui.set_width(ui.available_width());
+                                    let inner_w = ui.available_width();
+                                    ui.set_width(inner_w);
                                     ui.horizontal(|ui| {
-                                        ui.label(
-                                            egui::RichText::new(name)
-                                                .strong()
-                                                .color(palette::TEXT)
-                                                .size(14.5),
+                                        ui.set_width(inner_w);
+                                        // Резервируем место под время справа,
+                                        // чтобы длинное имя не выталкивало его
+                                        // за край / под скроллбар.
+                                        let time_slot = if time_str.is_empty() {
+                                            0.0
+                                        } else {
+                                            44.0
+                                        };
+                                        let name_w = (inner_w - time_slot - 6.0).max(40.0);
+                                        ui.add_sized(
+                                            [name_w, 18.0],
+                                            egui::Label::new(
+                                                egui::RichText::new(name)
+                                                    .strong()
+                                                    .color(palette::TEXT)
+                                                    .size(14.5),
+                                            )
+                                            .truncate(),
                                         );
                                         ui.with_layout(
                                             egui::Layout::right_to_left(egui::Align::Center),
@@ -355,10 +370,13 @@ impl App {
                                             },
                                         );
                                     });
-                                    ui.label(
-                                        egui::RichText::new(truncate_text(&preview, 40))
-                                            .color(palette::TEXT_MUTED)
-                                            .size(12.5),
+                                    ui.add(
+                                        egui::Label::new(
+                                            egui::RichText::new(truncate_text(&preview, 40))
+                                                .color(palette::TEXT_MUTED)
+                                                .size(12.5),
+                                        )
+                                        .truncate(),
                                     );
                                 });
                             });

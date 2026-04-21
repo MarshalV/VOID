@@ -1022,7 +1022,11 @@ async fn main() -> Result<(), Box<dyn Error>> {
                     request_response: rr_behaviour,
                     mdns: mdns::tokio::Behaviour::new(mdns::Config::default(), local_peer_id)
                         .unwrap(),
-                    ping: ping::Behaviour::default(),
+                    ping: ping::Behaviour::new(
+                        ping::Config::new()
+                            .with_interval(Duration::from_secs(20))
+                            .with_timeout(Duration::from_secs(20)),
+                    ),
                     identify: identify::Behaviour::new(identify::Config::new(
                         "/void/v1".into(), // Фиксируем версию для всех
                         key.public(),
@@ -1036,7 +1040,14 @@ async fn main() -> Result<(), Box<dyn Error>> {
             })
             .unwrap()
             .with_swarm_config(|c| {
-                c.with_idle_connection_timeout(Duration::from_secs(120)) // 2 минуты покоя
+                // Не закрываем idle-коннекты по таймеру: в мессенджере между
+                // сообщениями легко проходят часы, а ping / identify / kad в
+                // libp2p 0.56 не считаются «keep-alive» для свома. Старое
+                // значение 120s давало каскад KeepAliveTimeout → реконнект →
+                // `Os 48 AddrInUse` (TIME_WAIT на macOS). Закрытия мёртвых
+                // коннектов мы всё равно получаем через transport-ошибки
+                // стримов (ping/request-response) и TCP keepalive ОС.
+                c.with_idle_connection_timeout(Duration::MAX)
                     .with_per_connection_event_buffer_size(256)
             })
             .build();
