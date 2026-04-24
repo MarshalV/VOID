@@ -255,9 +255,15 @@ impl App {
             .unwrap_or_default()
             .to_lowercase();
 
+        // Резервируем низ сидебара под кнопку «Системная консоль»:
+        // ScrollArea контактов не должна перекрывать её.
+        let bottom_bar_h: f32 = 56.0;
+        let contacts_max_h = (ui.available_height() - bottom_bar_h).max(80.0);
+
         egui::ScrollArea::vertical()
             .id_salt("contacts_scroll")
             .auto_shrink([false, false])
+            .max_height(contacts_max_h)
             .show(ui, |ui| {
                 ui.add_space(4.0);
 
