@@ -11,7 +11,8 @@ use std::collections::hash_map::Entry;
 use std::time::{Duration, Instant};
 
 use crate::{
-    parse_seed_input, App, ChatMessage, NetworkEvent, PendingSend, UICommand, RESEND_GRACE,
+    file_transfer, parse_seed_input, App, ChatMessage, FileTransferProgress, NetworkEvent,
+    PendingSend, UICommand, RESEND_GRACE,
 };
 
 /// TTL для коротких системных toast'ов.
@@ -1224,6 +1225,97 @@ impl eframe::App for App {
                         );
                     }
                 }
+                // ─── Файловый sub-протокол ──────────────────────────────────
+                NetworkEvent::FileOffer {
+                    transfer_id,
+                    from,
+                    filename,
+                    total_size,
+                    kind,
+                } => {
+                    self.incoming_file_offers.push(file_transfer::PendingFileOffer {
+                        transfer_id,
+                        from,
+                        filename: filename.clone(),
+                        total_size,
+                        kind,
+                    });
+                    self.push_toast(
+                        format!(
+                            "📥 {} «{}» ({}) от {}…",
+                            kind.label(),
+                            filename,
+                            file_transfer::fmt_size(total_size),
+                            &from.to_string()[..8]
+                        ),
+                        ToastKind::Info,
+                        TOAST_TTL_LONG,
+                    );
+                }
+                NetworkEvent::FileProgress {
+                    transfer_id,
+                    sent_chunks,
+                    total_chunks,
+                    filename,
+                    total_size,
+                    is_outgoing,
+                    peer,
+                    kind,
+                } => {
+                    self.active_file_transfers
+                        .entry(transfer_id)
+                        .and_modify(|p| {
+                            p.sent_chunks = sent_chunks;
+                            p.total_chunks = total_chunks;
+                        })
+                        .or_insert_with(|| FileTransferProgress {
+                            filename: filename.clone(),
+                            total_size,
+                            sent_chunks,
+                            total_chunks,
+                            is_outgoing,
+                            completed: false,
+                            saved_to: String::new(),
+                            peer,
+                            kind,
+                        });
+                    // Запрашиваем перерисовку, пока идёт передача.
+                    ctx.request_repaint_after(Duration::from_millis(200));
+                }
+                NetworkEvent::FileComplete {
+                    transfer_id,
+                    filename,
+                    saved_to,
+                    is_outgoing,
+                    peer: _,
+                } => {
+                    if let Some(p) = self.active_file_transfers.get_mut(&transfer_id) {
+                        p.completed = true;
+                        p.saved_to = saved_to.clone();
+                        p.sent_chunks = p.total_chunks;
+                    }
+                    if is_outgoing {
+                        self.push_toast(
+                            format!("✅ Файл «{}» успешно отправлен.", filename),
+                            ToastKind::Info,
+                            TOAST_TTL_LONG,
+                        );
+                    } else {
+                        self.push_toast(
+                            format!("✅ Файл «{}» сохранён → {}", filename, saved_to),
+                            ToastKind::Info,
+                            TOAST_TTL_LONG,
+                        );
+                    }
+                }
+                NetworkEvent::FileError { transfer_id, reason } => {
+                    self.active_file_transfers.remove(&transfer_id);
+                    self.push_toast(
+                        format!("❌ Файл: {}", reason),
+                        ToastKind::Error,
+                        TOAST_TTL_LONG,
+                    );
+                }
                 NetworkEvent::PeerAddress(peer, ma) => {
                     // Пир засветился с рабочим адресом: если он уже контакт —
                     // обновляем запись; если нет, но это явно реальный VOID-
@@ -1497,6 +1589,219 @@ impl eframe::App for App {
                 });
             });
 
+        // ===== Панель файловых предложений и прогресса =====
+        // Показываем только если есть что отобразить и выбран чат.
+        let selected_peer_opt = self.selected_chat.parse::<PeerId>().ok();
+        let has_offers = selected_peer_opt
+            .map(|p| self.incoming_file_offers.iter().any(|o| o.from == p))
+            .unwrap_or(false);
+        let has_active = !self.active_file_transfers.is_empty();
+
+        if (has_offers || has_active) && !self.selected_chat.is_empty() {
+            egui::TopBottomPanel::top("file_panel")
+                .frame(
+                    egui::Frame::none()
+                        .fill(palette::BG_PANEL)
+                        .stroke(egui::Stroke::new(1.0, palette::DIVIDER))
+                        .inner_margin(egui::Margin {
+                            left: 18.0,
+                            right: 18.0,
+                            top: 8.0,
+                            bottom: 8.0,
+                        }),
+                )
+                .show(ctx, |ui| {
+                    // ── Входящие предложения файлов ──────────────────────────
+                    let sel_peer = selected_peer_opt;
+                    let mut to_accept: Vec<[u8; 16]> = Vec::new();
+                    let mut to_reject: Vec<[u8; 16]> = Vec::new();
+
+                    for offer in self.incoming_file_offers.iter().filter(|o| {
+                        sel_peer.map(|p| o.from == p).unwrap_or(false)
+                    }) {
+                        egui::Frame::none()
+                            .fill(palette::BG_CARD)
+                            .rounding(8.0)
+                            .inner_margin(egui::Margin::symmetric(10.0, 6.0))
+                            .show(ui, |ui| {
+                                ui.horizontal(|ui| {
+                                    ui.label(
+                                        egui::RichText::new(offer.kind.icon())
+                                            .size(22.0),
+                                    );
+                                    ui.add_space(6.0);
+                                    ui.vertical(|ui| {
+                                        ui.label(
+                                            egui::RichText::new(&offer.filename)
+                                                .strong()
+                                                .color(palette::TEXT),
+                                        );
+                                        ui.label(
+                                            egui::RichText::new(format!(
+                                                "{} · {}",
+                                                offer.kind.label(),
+                                                file_transfer::fmt_size(offer.total_size)
+                                            ))
+                                            .size(11.5)
+                                            .color(palette::TEXT_MUTED),
+                                        );
+                                    });
+                                    ui.with_layout(
+                                        egui::Layout::right_to_left(egui::Align::Center),
+                                        |ui| {
+                                            if ui
+                                                .add(
+                                                    egui::Button::new(
+                                                        egui::RichText::new("✖ Отклонить")
+                                                            .size(12.0)
+                                                            .color(palette::TEXT),
+                                                    )
+                                                    .fill(
+                                                        egui::Color32::from_rgb(0xa0, 0x30, 0x30),
+                                                    )
+                                                    .rounding(6.0),
+                                                )
+                                                .clicked()
+                                            {
+                                                to_reject.push(offer.transfer_id);
+                                            }
+                                            ui.add_space(6.0);
+                                            if ui
+                                                .add(
+                                                    egui::Button::new(
+                                                        egui::RichText::new("✔ Принять")
+                                                            .size(12.0)
+                                                            .color(palette::TEXT),
+                                                    )
+                                                    .fill(palette::ACCENT)
+                                                    .rounding(6.0),
+                                                )
+                                                .clicked()
+                                            {
+                                                to_accept.push(offer.transfer_id);
+                                            }
+                                        },
+                                    );
+                                });
+                            });
+                        ui.add_space(4.0);
+                    }
+
+                    // Применяем Accept/Reject после итерации.
+                    for tid in to_accept {
+                        if let Some(offer) = self
+                            .incoming_file_offers
+                            .iter()
+                            .find(|o| o.transfer_id == tid)
+                            .cloned()
+                        {
+                            let _ = self.command_tx.try_send(UICommand::AcceptFile {
+                                transfer_id: tid,
+                                from: offer.from,
+                            });
+                            self.incoming_file_offers.retain(|o| o.transfer_id != tid);
+                        }
+                    }
+                    for tid in to_reject {
+                        if let Some(offer) = self
+                            .incoming_file_offers
+                            .iter()
+                            .find(|o| o.transfer_id == tid)
+                            .cloned()
+                        {
+                            let _ = self.command_tx.try_send(UICommand::RejectFile {
+                                transfer_id: tid,
+                                from: offer.from,
+                                reason: "Пользователь отклонил.".into(),
+                            });
+                            self.incoming_file_offers.retain(|o| o.transfer_id != tid);
+                        }
+                    }
+
+                    // ── Прогресс активных передач ────────────────────────────
+                    let transfers: Vec<([u8; 16], &FileTransferProgress)> = self
+                        .active_file_transfers
+                        .iter()
+                        .filter(|(_, t)| {
+                            sel_peer.map(|p| t.peer == p).unwrap_or(false)
+                        })
+                        .map(|(k, v)| (*k, v))
+                        .collect();
+
+                    for (_, t) in &transfers {
+                        let frac = if t.total_chunks > 0 {
+                            t.sent_chunks as f32 / t.total_chunks as f32
+                        } else {
+                            0.0
+                        };
+                        // Иконка = направление + тип
+                        let arrow = if t.is_outgoing { "↑" } else { "↓" };
+                        let type_icon = t.kind.icon();
+                        let status = if t.completed {
+                            if t.is_outgoing {
+                                "Отправлен ✓".to_string()
+                            } else {
+                                format!("Сохранён: {}", t.saved_to)
+                            }
+                        } else {
+                            let pct = (frac * 100.0) as u32;
+                            format!(
+                                "{}%  ·  {}/{}  ·  {}",
+                                pct,
+                                t.sent_chunks,
+                                t.total_chunks,
+                                file_transfer::fmt_size(t.total_size)
+                            )
+                        };
+
+                        ui.horizontal(|ui| {
+                            ui.label(
+                                egui::RichText::new(format!(
+                                    "{}{} «{}»",
+                                    type_icon, arrow, t.filename
+                                ))
+                                .color(palette::TEXT)
+                                .size(13.0),
+                            );
+                            ui.with_layout(
+                                egui::Layout::right_to_left(egui::Align::Center),
+                                |ui| {
+                                    ui.label(
+                                        egui::RichText::new(&status)
+                                            .size(11.5)
+                                            .color(palette::TEXT_MUTED),
+                                    );
+                                },
+                            );
+                        });
+                        // Прогресс-бар.
+                        let (bar_resp, _painter) =
+                            ui.allocate_painter(egui::vec2(ui.available_width(), 6.0), egui::Sense::hover());
+                        let bar_r = bar_resp.rect;
+                        ui.painter().rect_filled(bar_r, 3.0, palette::DIVIDER);
+                        let filled_w = bar_r.width() * frac.clamp(0.0, 1.0);
+                        let filled_rect = egui::Rect::from_min_size(
+                            bar_r.min,
+                            egui::vec2(filled_w, bar_r.height()),
+                        );
+                        let bar_color = if t.completed {
+                            palette::ONLINE
+                        } else {
+                            palette::ACCENT
+                        };
+                        ui.painter().rect_filled(filled_rect, 3.0, bar_color);
+                        ui.add_space(4.0);
+                    }
+
+                    // Убираем завершённые передачи старше 5 секунд.
+                    // (Делаем это вне итерации, через retain.)
+                });
+
+            // Чистим завершённые передачи (не во время итерации выше).
+            self.active_file_transfers
+                .retain(|_, t| !t.completed);
+        }
+
         // ===== Поле ввода (нижняя панель) =====
         egui::TopBottomPanel::bottom("chat_input")
             .frame(
@@ -1522,6 +1827,129 @@ impl eframe::App for App {
                     })
                     .show(ui, |ui| {
                         ui.horizontal(|ui| {
+                            // ── Кнопка прикрепления (📎) + popup-меню типов ──
+                            let attach_id = egui::Id::new("attach_popup");
+                            let attach_btn = ui
+                                .add_sized(
+                                    egui::vec2(36.0, 36.0),
+                                    egui::Button::new(
+                                        egui::RichText::new("📎")
+                                            .size(18.0)
+                                            .color(if self.show_attach_menu {
+                                                palette::ACCENT
+                                            } else {
+                                                palette::TEXT_MUTED
+                                            }),
+                                    )
+                                    .fill(egui::Color32::TRANSPARENT)
+                                    .stroke(egui::Stroke::NONE),
+                                )
+                                .on_hover_text("Прикрепить файл");
+
+                            if attach_btn.clicked() {
+                                if self.selected_chat.parse::<PeerId>().is_ok() {
+                                    self.show_attach_menu = !self.show_attach_menu;
+                                } else {
+                                    self.add_status(
+                                        "⚠ Выберите контакт для отправки файла.".into(),
+                                    );
+                                }
+                            }
+
+                            // Popup-меню с тремя кнопками типов.
+                            if self.show_attach_menu {
+                                if let Some(peer_id) = self.selected_chat.parse::<PeerId>().ok() {
+                                    let popup_pos = attach_btn.rect.left_top()
+                                        - egui::vec2(0.0, 128.0);
+
+                                    egui::Area::new(attach_id)
+                                        .order(egui::Order::Foreground)
+                                        .fixed_pos(popup_pos)
+                                        .show(ctx, |ui| {
+                                            egui::Frame::none()
+                                                .fill(palette::BG_PANEL)
+                                                .stroke(egui::Stroke::new(
+                                                    1.0,
+                                                    palette::DIVIDER,
+                                                ))
+                                                .rounding(12.0)
+                                                .inner_margin(egui::Margin::same(8.0))
+                                                .shadow(egui::epaint::Shadow {
+                                                    offset: egui::vec2(0.0, 4.0),
+                                                    blur: 16.0,
+                                                    spread: 0.0,
+                                                    color: egui::Color32::from_rgba_premultiplied(
+                                                        0, 0, 0, 140,
+                                                    ),
+                                                })
+                                                .show(ui, |ui| {
+                                                    ui.set_min_width(140.0);
+
+                                                    // Три кнопки: Image / Audio / File
+                                                    let kinds = [
+                                                        (file_transfer::FileKind::Image,  "🖼  Изображение"),
+                                                        (file_transfer::FileKind::Audio,  "🎵  Аудио"),
+                                                        (file_transfer::FileKind::Other,  "📄  Файл"),
+                                                    ];
+                                                    let mut picked: Option<file_transfer::FileKind> = None;
+                                                    for (kind, label) in kinds {
+                                                        if ui
+                                                            .add(
+                                                                egui::Button::new(
+                                                                    egui::RichText::new(label)
+                                                                        .size(13.5)
+                                                                        .color(palette::TEXT),
+                                                                )
+                                                                .fill(egui::Color32::TRANSPARENT)
+                                                                .min_size(egui::vec2(124.0, 32.0)),
+                                                            )
+                                                            .clicked()
+                                                        {
+                                                            picked = Some(kind);
+                                                        }
+                                                    }
+
+                                                    if let Some(kind) = picked {
+                                                        self.show_attach_menu = false;
+                                                        let cmd_tx = self.command_tx.clone();
+                                                        // Открываем нативный диалог с фильтрами типа.
+                                                        std::thread::spawn(move || {
+                                                            let mut dialog =
+                                                                rfd::FileDialog::new();
+                                                            let exts = kind.extensions();
+                                                            if !exts.is_empty() {
+                                                                dialog = dialog.add_filter(
+                                                                    kind.label(),
+                                                                    exts,
+                                                                );
+                                                            }
+                                                            if let Some(path) =
+                                                                dialog.pick_file()
+                                                            {
+                                                                let _ = cmd_tx.try_send(
+                                                                    UICommand::SendFile {
+                                                                        recipient: peer_id,
+                                                                        path: path
+                                                                            .display()
+                                                                            .to_string(),
+                                                                        kind,
+                                                                    },
+                                                                );
+                                                            }
+                                                        });
+                                                    }
+                                                });
+                                        });
+
+                                    // Закрываем popup при клике в другом месте.
+                                    if ctx.input(|i| i.pointer.any_click())
+                                        && !attach_btn.clicked()
+                                    {
+                                        self.show_attach_menu = false;
+                                    }
+                                }
+                            }
+
                             let text_w = (ui.available_width() - 56.0).max(80.0);
                             let edit = ui.add(
                                 egui::TextEdit::singleline(&mut self.chat_input)

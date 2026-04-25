@@ -1,4 +1,5 @@
 mod crypto;
+mod file_transfer;
 mod ui;
 use aes_gcm::{
     aead::{Aead, KeyInit},
@@ -444,6 +445,19 @@ enum V1Packet {
     Ack,
 }
 
+/// Прогресс активной передачи файла (для UI).
+pub(crate) struct FileTransferProgress {
+    pub filename: String,
+    pub total_size: u64,
+    pub sent_chunks: u32,
+    pub total_chunks: u32,
+    pub is_outgoing: bool,
+    pub completed: bool,
+    pub saved_to: String,
+    pub peer: PeerId,
+    pub kind: file_transfer::FileKind,
+}
+
 enum NetworkEvent {
     NewListenAddr(Multiaddr),
     MdnsDiscovered(PeerId, Multiaddr),
@@ -471,6 +485,40 @@ enum NetworkEvent {
     /// Получен Response (Ack/прочее) на ранее отправленное сообщение пиру —
     /// сигнал UI снять одно ожидание из `pending_sends` и не показывать ошибку.
     MessageDelivered(PeerId),
+    // ─── Файловый sub-протокол ──────────────────────────────────────────────
+    /// Входящее предложение файла — пользователь должен принять или отклонить.
+    FileOffer {
+        transfer_id: [u8; 16],
+        from: PeerId,
+        filename: String,
+        total_size: u64,
+        kind: file_transfer::FileKind,
+    },
+    /// Обновление прогресса передачи.
+    FileProgress {
+        transfer_id: [u8; 16],
+        sent_chunks: u32,
+        total_chunks: u32,
+        filename: String,
+        total_size: u64,
+        is_outgoing: bool,
+        peer: PeerId,
+        kind: file_transfer::FileKind,
+    },
+    /// Передача завершена.
+    FileComplete {
+        transfer_id: [u8; 16],
+        filename: String,
+        saved_to: String,
+        is_outgoing: bool,
+        #[allow(dead_code)]
+        peer: PeerId,
+    },
+    /// Передача прервана или ошибка.
+    FileError {
+        transfer_id: [u8; 16],
+        reason: String,
+    },
 }
 
 enum UICommand {
@@ -489,11 +537,34 @@ enum UICommand {
         recipient: Option<PeerId>,
         is_retry: bool,
     },
+    // ─── Файловый sub-протокол ──────────────────────────────────────────────
+    /// Отправить файл пиру. Сетевой таск читает файл и инициирует Offer.
+    SendFile {
+        recipient: PeerId,
+        path: String,
+        kind: file_transfer::FileKind,
+    },
+    /// Пользователь принял входящее предложение файла.
+    AcceptFile {
+        transfer_id: [u8; 16],
+        from: PeerId,
+    },
+    /// Пользователь отклонил входящее предложение файла.
+    RejectFile {
+        transfer_id: [u8; 16],
+        from: PeerId,
+        reason: String,
+    },
 }
 
 #[derive(NetworkBehaviour)]
 struct ChatBehaviour {
     request_response: libp2p::request_response::json::Behaviour<V1Packet, V1Packet>,
+    /// Отдельный sub-протокол для передачи файлов (/void/file/1.0.0).
+    file_rr: libp2p::request_response::json::Behaviour<
+        file_transfer::FilePacket,
+        file_transfer::FilePacket,
+    >,
     mdns: mdns::tokio::Behaviour,
     ping: ping::Behaviour,
     identify: identify::Behaviour,
@@ -564,6 +635,13 @@ struct App {
     /// Лениво загружаемая текстура фона области диалогов (`static/icon.png`,
     /// вшит в бинарь через `include_bytes!`).
     chat_bg_texture: Option<egui::TextureHandle>,
+    // ─── Файловый sub-протокол ──────────────────────────────────────────────
+    /// Входящие предложения файлов, ожидающие ответа пользователя.
+    pub(crate) incoming_file_offers: Vec<file_transfer::PendingFileOffer>,
+    /// Активные передачи (исходящие и входящие).
+    pub(crate) active_file_transfers: HashMap<[u8; 16], FileTransferProgress>,
+    /// Флаг: показывать popup-меню выбора типа вложения.
+    pub(crate) show_attach_menu: bool,
 }
 
 impl App {
@@ -610,6 +688,9 @@ impl App {
             pending_sends: Vec::new(),
             toasts: Vec::new(),
             chat_bg_texture: None,
+            incoming_file_offers: Vec::new(),
+            active_file_transfers: HashMap::new(),
+            show_attach_menu: false,
         }
     }
 
@@ -1015,11 +1096,29 @@ async fn main() -> Result<(), Box<dyn Error>> {
                 let rr_protocol = libp2p::StreamProtocol::new("/void/chat/1.0.0");
                 let rr_behaviour = libp2p::request_response::json::Behaviour::<V1Packet, V1Packet>::new(
                     [(rr_protocol, libp2p::request_response::ProtocolSupport::Full)],
-                    rr_config,
+                    rr_config.clone(),
+                );
+
+                // Отдельный request-response для файлового sub-протокола.
+                // Тайм-аут 5 мин: большие файлы через relay могут идти долго.
+                let file_rr_config = libp2p::request_response::Config::default()
+                    .with_request_timeout(Duration::from_secs(300));
+                let file_rr_protocol =
+                    libp2p::StreamProtocol::new(file_transfer::FILE_PROTOCOL_ID);
+                let file_rr_behaviour = libp2p::request_response::json::Behaviour::<
+                    file_transfer::FilePacket,
+                    file_transfer::FilePacket,
+                >::new(
+                    [(
+                        file_rr_protocol,
+                        libp2p::request_response::ProtocolSupport::Full,
+                    )],
+                    file_rr_config,
                 );
 
                 Ok(ChatBehaviour {
                     request_response: rr_behaviour,
+                    file_rr: file_rr_behaviour,
                     mdns: mdns::tokio::Behaviour::new(mdns::Config::default(), local_peer_id)
                         .unwrap(),
                     ping: ping::Behaviour::new(
@@ -1119,6 +1218,17 @@ async fn main() -> Result<(), Box<dyn Error>> {
 
         let mut peer_addrs: HashMap<PeerId, Vec<Multiaddr>> = HashMap::new();
         let mut pending_dials: HashSet<PeerId> = HashSet::new();
+        // ─── Файловый sub-протокол ──────────────────────────────────────────
+        // Пиры, подключённые через relay (p2p-circuit). К ним применяется rate-limit.
+        let mut relay_peers: HashSet<PeerId> = HashSet::new();
+        // Исходящие передачи: transfer_id → состояние.
+        let mut outgoing_transfers: HashMap<[u8; 16], file_transfer::OutgoingTransfer> =
+            HashMap::new();
+        // Входящие передачи: transfer_id → состояние.
+        let mut incoming_transfers: HashMap<[u8; 16], file_transfer::IncomingTransfer> =
+            HashMap::new();
+        // Ticker для отправки чанков (с учётом rate-limit на relay).
+        let mut chunk_tick = tokio::time::interval(Duration::from_millis(20));
         // RequestId → PeerId для сообщений (Plain/Encrypted), чтобы по ответу
         // (Ack/прочее) однозначно подтвердить доставку конкретному пиру и снять
         // pending-ретраи в UI. Hello-handshake'ы сюда НЕ попадают.
@@ -1136,6 +1246,73 @@ async fn main() -> Result<(), Box<dyn Error>> {
 
         loop {
             tokio::select! {
+                // ─── Tick: отправка очередных чанков с rate-limit ───────────
+                _ = chunk_tick.tick() => {
+                    // Ищем одну исходящую передачу, готовую к отправке чанка.
+                    let to_send: Option<([u8; 16], u32, Vec<u8>, PeerId)> = {
+                        let mut found = None;
+                        for (tid, t) in outgoing_transfers.iter_mut() {
+                            if t.ready_to_send() {
+                                let idx = t.next_chunk as u32;
+                                let data = t.chunks[t.next_chunk].clone();
+                                t.next_chunk += 1;
+                                t.last_chunk_at = Instant::now();
+                                found = Some((*tid, idx, data, t.peer));
+                                break;
+                            }
+                        }
+                        found
+                    };
+                    if let Some((tid, chunk_idx, data, peer)) = to_send {
+                        let packet = file_transfer::FilePacket::Chunk {
+                            transfer_id: tid,
+                            chunk_index: chunk_idx,
+                            data,
+                        };
+                        swarm.behaviour_mut().file_rr.send_request(&peer, packet);
+
+                        if let Some(t) = outgoing_transfers.get(&tid) {
+                            let sent = t.next_chunk as u32;
+                            let total = t.total_chunks();
+                            let fname = t.filename.clone();
+                            let sz = t.total_size;
+                            let is_relay = t.is_relay;
+                            let fkind = t.kind;
+                            let all_sent = t.next_chunk >= t.chunks.len();
+                            let _ = event_tx
+                                .send(NetworkEvent::FileProgress {
+                                    transfer_id: tid,
+                                    sent_chunks: sent,
+                                    total_chunks: total,
+                                    filename: fname.clone(),
+                                    total_size: sz,
+                                    is_outgoing: true,
+                                    peer,
+                                    kind: fkind,
+                                })
+                                .await;
+                            if all_sent {
+                                println!(
+                                    "📤 FILE[{}]: все {} чанк(ов) «{}» отправлены{}.",
+                                    fkind.label(),
+                                    total,
+                                    fname,
+                                    if is_relay { " (через relay)" } else { "" }
+                                );
+                                let _ = event_tx
+                                    .send(NetworkEvent::FileComplete {
+                                        transfer_id: tid,
+                                        filename: fname,
+                                        saved_to: String::new(),
+                                        is_outgoing: true,
+                                        peer,
+                                    })
+                                    .await;
+                                outgoing_transfers.remove(&tid);
+                            }
+                        }
+                    }
+                }
                 cmd = command_rx.recv() => {
                     if let Some(c) = cmd {
                         match c {
@@ -1348,6 +1525,114 @@ async fn main() -> Result<(), Box<dyn Error>> {
                                     println!("[{}] ⚠️ Попытка отправить сообщение без получателя (Global Chat отключен)", now);
                                 }
                                 let _ = event_tx.send(NetworkEvent::ChatMessage(msg)).await;
+                            }
+                            // ─── Файловый sub-протокол ──────────────────────
+                            UICommand::SendFile { recipient, path, kind } => {
+                                let now = chrono::Local::now().format("%H:%M:%S").to_string();
+                                match std::fs::read(&path) {
+                                    Err(e) => {
+                                        let _ = event_tx
+                                            .send(NetworkEvent::Status(format!(
+                                                "❌ Не удалось прочитать файл «{}»: {}",
+                                                path, e
+                                            )))
+                                            .await;
+                                    }
+                                    Ok(data) => {
+                                        if data.len() as u64 > file_transfer::MAX_FILE_SIZE {
+                                            let _ = event_tx
+                                                .send(NetworkEvent::Status(format!(
+                                                    "❌ Файл слишком большой (> {} МБ)",
+                                                    file_transfer::MAX_FILE_SIZE / 1024 / 1024
+                                                )))
+                                                .await;
+                                        } else {
+                                            let sha256 = file_transfer::hash_file(&data);
+                                            let chunks = file_transfer::split_into_chunks(&data);
+                                            let total_chunks = chunks.len() as u32;
+                                            let total_size = data.len() as u64;
+                                            let filename = file_transfer::safe_filename(&path);
+                                            // Уточняем тип по реальному расширению файла
+                                            let file_kind = if kind == file_transfer::FileKind::Other {
+                                                file_transfer::FileKind::from_filename(&filename)
+                                            } else {
+                                                kind
+                                            };
+
+                                            let mut tid = [0u8; 16];
+                                            rand::RngCore::fill_bytes(&mut rand::thread_rng(), &mut tid);
+
+                                            let is_relay = relay_peers.contains(&recipient);
+                                            let offer = file_transfer::FilePacket::Offer {
+                                                transfer_id: tid,
+                                                filename: filename.clone(),
+                                                total_size,
+                                                total_chunks,
+                                                sha256,
+                                                kind: file_kind,
+                                            };
+                                            swarm.behaviour_mut().file_rr.send_request(&recipient, offer);
+
+                                            let transfer = file_transfer::OutgoingTransfer {
+                                                peer: recipient,
+                                                transfer_id: tid,
+                                                filename: filename.clone(),
+                                                chunks,
+                                                next_chunk: 0,
+                                                total_size,
+                                                is_relay,
+                                                last_chunk_at: Instant::now(),
+                                                accepted: false,
+                                                kind: file_kind,
+                                            };
+                                            outgoing_transfers.insert(tid, transfer);
+
+                                            println!(
+                                                "[{}] 📤 FILE[{}]: Offer «{}» → {} ({} чанков{})",
+                                                now,
+                                                file_kind.label(),
+                                                filename,
+                                                &recipient.to_string()[..8],
+                                                total_chunks,
+                                                if is_relay { ", relay rate-limit" } else { "" }
+                                            );
+                                            let _ = event_tx
+                                                .send(NetworkEvent::FileProgress {
+                                                    transfer_id: tid,
+                                                    sent_chunks: 0,
+                                                    total_chunks,
+                                                    filename,
+                                                    total_size,
+                                                    is_outgoing: true,
+                                                    peer: recipient,
+                                                    kind: file_kind,
+                                                })
+                                                .await;
+                                        }
+                                    }
+                                }
+                            }
+                            UICommand::AcceptFile { transfer_id, from } => {
+                                let packet = file_transfer::FilePacket::Accept { transfer_id };
+                                swarm.behaviour_mut().file_rr.send_request(&from, packet);
+                                println!(
+                                    "✅ FILE: Accept transfer {:x?} от {}",
+                                    &transfer_id[..4],
+                                    &from.to_string()[..8]
+                                );
+                            }
+                            UICommand::RejectFile { transfer_id, from, reason } => {
+                                let packet = file_transfer::FilePacket::Reject {
+                                    transfer_id,
+                                    reason: reason.clone(),
+                                };
+                                swarm.behaviour_mut().file_rr.send_request(&from, packet);
+                                incoming_transfers.remove(&transfer_id);
+                                println!(
+                                    "✖ FILE: Reject transfer {:x?} ({})",
+                                    &transfer_id[..4],
+                                    reason
+                                );
                             }
                         }
                     }
@@ -1592,6 +1877,25 @@ async fn main() -> Result<(), Box<dyn Error>> {
                             println!("✅ СОЕДИНЕНО: {}. Endpoint: {:?}. Всего пиров: {}", peer_id, endpoint, connected_count);
                             pending_dials.remove(&peer_id);
 
+                            // Определяем, идёт ли соединение через relay.
+                            let is_relay_conn = match endpoint {
+                                libp2p::core::ConnectedPoint::Dialer { address, .. } => {
+                                    address.to_string().contains("p2p-circuit")
+                                }
+                                libp2p::core::ConnectedPoint::Listener { local_addr, .. } => {
+                                    local_addr.to_string().contains("p2p-circuit")
+                                }
+                            };
+                            if is_relay_conn {
+                                relay_peers.insert(peer_id);
+                                println!(
+                                    "📡 FILE rate-limit: {} подключён через relay.",
+                                    &peer_id.to_string()[..8]
+                                );
+                            } else {
+                                relay_peers.remove(&peer_id);
+                            }
+
                              if peer_id != local_peer_id {
                                  let _ = event_tx.send(NetworkEvent::Connected(peer_id)).await;
                                  let _ = event_tx.send(NetworkEvent::Status(format!("✅ СОЕДИНЕНО: {}", &peer_id.to_string()[..8]))).await;
@@ -1644,6 +1948,7 @@ async fn main() -> Result<(), Box<dyn Error>> {
                         SwarmEvent::ConnectionClosed { peer_id, cause, .. } => {
                             let connected_count = swarm.connected_peers().count();
                             println!("❌ СОЕДИНЕНИЕ ЗАКРЫТО: {}. Причина: {:?}. Осталось: {}", peer_id, cause, connected_count);
+                            relay_peers.remove(&peer_id);
                             let _ = event_tx.send(NetworkEvent::Disconnected(peer_id)).await;
                         }
                         SwarmEvent::IncomingConnection { local_addr, send_back_addr, .. } => {
@@ -1844,6 +2149,255 @@ async fn main() -> Result<(), Box<dyn Error>> {
                                 "📍 Kademlia: маршрут для {} — {} адр.",
                                 peer,
                                 addresses.len()
+                            );
+                        }
+
+                        // ─── Файловый sub-протокол /void/file/1.0.0 ─────────
+                        SwarmEvent::Behaviour(ChatBehaviourEvent::FileRr(
+                            libp2p::request_response::Event::Message { peer, message, .. },
+                        )) => {
+                            let now = chrono::Local::now().format("%H:%M:%S").to_string();
+                            match message {
+                                libp2p::request_response::Message::Request {
+                                    request,
+                                    channel,
+                                    ..
+                                } => {
+                                    use file_transfer::FilePacket;
+                                    match request {
+                                        FilePacket::Offer {
+                                            transfer_id,
+                                            filename,
+                                            total_size,
+                                            total_chunks,
+                                            sha256,
+                                            kind,
+                                        } => {
+                                            println!(
+                                                "[{}] 📥 FILE[{}]: Offer «{}» от {} ({} чанков, {} байт)",
+                                                now,
+                                                kind.label(),
+                                                filename,
+                                                &peer.to_string()[..8],
+                                                total_chunks,
+                                                total_size
+                                            );
+                                            let safe = file_transfer::safe_filename(&filename);
+                                            let incoming = file_transfer::IncomingTransfer::new(
+                                                peer,
+                                                transfer_id,
+                                                safe.clone(),
+                                                total_size,
+                                                total_chunks,
+                                                sha256,
+                                                kind,
+                                            );
+                                            incoming_transfers.insert(transfer_id, incoming);
+                                            let _ = swarm
+                                                .behaviour_mut()
+                                                .file_rr
+                                                .send_response(channel, FilePacket::Ack);
+                                            let _ = event_tx
+                                                .send(NetworkEvent::FileOffer {
+                                                    transfer_id,
+                                                    from: peer,
+                                                    filename: safe,
+                                                    total_size,
+                                                    kind,
+                                                })
+                                                .await;
+                                        }
+                                        FilePacket::Accept { transfer_id } => {
+                                            println!(
+                                                "[{}] ✅ FILE: Accept от {} для {:x?}",
+                                                now,
+                                                &peer.to_string()[..8],
+                                                &transfer_id[..4]
+                                            );
+                                            if let Some(t) =
+                                                outgoing_transfers.get_mut(&transfer_id)
+                                            {
+                                                t.accepted = true;
+                                                t.last_chunk_at =
+                                                    Instant::now() - file_transfer::DIRECT_CHUNK_DELAY;
+                                            }
+                                            let _ = swarm
+                                                .behaviour_mut()
+                                                .file_rr
+                                                .send_response(channel, FilePacket::Ack);
+                                        }
+                                        FilePacket::Reject { transfer_id, reason } => {
+                                            println!(
+                                                "[{}] ✖ FILE: Reject от {}: {}",
+                                                now,
+                                                &peer.to_string()[..8],
+                                                reason
+                                            );
+                                            outgoing_transfers.remove(&transfer_id);
+                                            let _ = swarm
+                                                .behaviour_mut()
+                                                .file_rr
+                                                .send_response(channel, FilePacket::Ack);
+                                            let _ = event_tx
+                                                .send(NetworkEvent::FileError {
+                                                    transfer_id,
+                                                    reason: format!(
+                                                        "Отклонено: {}",
+                                                        reason
+                                                    ),
+                                                })
+                                                .await;
+                                        }
+                                        FilePacket::Chunk {
+                                            transfer_id,
+                                            chunk_index,
+                                            data,
+                                        } => {
+                                            let _ = swarm
+                                                .behaviour_mut()
+                                                .file_rr
+                                                .send_response(channel, FilePacket::Ack);
+                                            let done = if let Some(inc) =
+                                                incoming_transfers.get_mut(&transfer_id)
+                                            {
+                                                inc.receive_chunk(chunk_index, data)
+                                            } else {
+                                                false
+                                            };
+
+                                            if let Some(inc) =
+                                                incoming_transfers.get(&transfer_id)
+                                            {
+                                                let recv = inc.received_count;
+                                                let total = inc.total_chunks;
+                                                let fname = inc.filename.clone();
+                                                let sz = inc.total_size;
+                                                let fkind = inc.kind;
+                                                let _ = event_tx
+                                                    .send(NetworkEvent::FileProgress {
+                                                        transfer_id,
+                                                        sent_chunks: recv,
+                                                        total_chunks: total,
+                                                        filename: fname.clone(),
+                                                        total_size: sz,
+                                                        is_outgoing: false,
+                                                        peer,
+                                                        kind: fkind,
+                                                    })
+                                                    .await;
+
+                                                if done {
+                                                    // Проверяем хэш и сохраняем файл.
+                                                    let sha_expected = inc.sha256;
+                                                    let maybe_data = inc.assemble();
+                                                    if let Some(data) = maybe_data {
+                                                        let sha_actual =
+                                                            file_transfer::hash_file(&data);
+                                                        if sha_actual != sha_expected {
+                                                            println!(
+                                                                "[{}] ❌ FILE: хэш не совпадает для «{}»!",
+                                                                now, fname
+                                                            );
+                                                            let _ = event_tx
+                                                                .send(NetworkEvent::FileError {
+                                                                    transfer_id,
+                                                                    reason: format!(
+                                                                        "Ошибка целостности файла «{}»",
+                                                                        fname
+                                                                    ),
+                                                                })
+                                                                .await;
+                                                        } else {
+                                                            let save_path =
+                                                                file_transfer::unique_download_path(
+                                                                    &fname,
+                                                                );
+                                                            let saved_to =
+                                                                save_path.display().to_string();
+                                                            match std::fs::write(&save_path, &data) {
+                                                                Ok(_) => {
+                                                                    println!(
+                                                                        "[{}] ✅ FILE: «{}» сохранён → {}",
+                                                                        now, fname, saved_to
+                                                                    );
+                                                                    let _ = event_tx
+                                                                        .send(
+                                                                            NetworkEvent::FileComplete {
+                                                                                transfer_id,
+                                                                                filename: fname,
+                                                                                saved_to,
+                                                                                is_outgoing: false,
+                                                                                peer,
+                                                                            },
+                                                                        )
+                                                                        .await;
+                                                                }
+                                                                Err(e) => {
+                                                                    let _ = event_tx
+                                                                        .send(NetworkEvent::FileError {
+                                                                            transfer_id,
+                                                                            reason: format!(
+                                                                                "Не удалось сохранить «{}»: {}",
+                                                                                fname, e
+                                                                            ),
+                                                                        })
+                                                                        .await;
+                                                                }
+                                                            }
+                                                        }
+                                                    }
+                                                    incoming_transfers.remove(&transfer_id);
+                                                }
+                                            }
+                                        }
+                                        FilePacket::Cancel { transfer_id } => {
+                                            incoming_transfers.remove(&transfer_id);
+                                            outgoing_transfers.remove(&transfer_id);
+                                            let _ = swarm
+                                                .behaviour_mut()
+                                                .file_rr
+                                                .send_response(channel, FilePacket::Ack);
+                                            let _ = event_tx
+                                                .send(NetworkEvent::FileError {
+                                                    transfer_id,
+                                                    reason: "Передача отменена собеседником."
+                                                        .into(),
+                                                })
+                                                .await;
+                                        }
+                                        FilePacket::Ack => {
+                                            let _ = swarm
+                                                .behaviour_mut()
+                                                .file_rr
+                                                .send_response(channel, FilePacket::Ack);
+                                        }
+                                    }
+                                }
+                                libp2p::request_response::Message::Response { .. } => {
+                                    // Ack на наши запросы — ничего не делаем.
+                                }
+                            }
+                        }
+                        SwarmEvent::Behaviour(ChatBehaviourEvent::FileRr(
+                            libp2p::request_response::Event::OutboundFailure {
+                                peer,
+                                error,
+                                ..
+                            },
+                        )) => {
+                            println!(
+                                "⚠️ [FILE RR] OutFailure пиру {}: {:?}",
+                                &peer.to_string()[..8],
+                                error
+                            );
+                        }
+                        SwarmEvent::Behaviour(ChatBehaviourEvent::FileRr(
+                            libp2p::request_response::Event::InboundFailure { peer, error, .. },
+                        )) => {
+                            println!(
+                                "⚠️ [FILE RR] InFailure от {}: {:?}",
+                                &peer.to_string()[..8],
+                                error
                             );
                         }
 
