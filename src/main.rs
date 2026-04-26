@@ -548,6 +548,8 @@ enum UICommand {
     AcceptFile {
         transfer_id: [u8; 16],
         from: PeerId,
+        /// Директория сохранения, выбранная пользователем. `None` → `void_downloads/`.
+        save_dir: Option<String>,
     },
     /// Пользователь отклонил входящее предложение файла.
     RejectFile {
@@ -642,6 +644,13 @@ struct App {
     pub(crate) active_file_transfers: HashMap<[u8; 16], FileTransferProgress>,
     /// Флаг: показывать popup-меню выбора типа вложения.
     pub(crate) show_attach_menu: bool,
+    /// Ожидаемый результат выбора папки сохранения: `(rx, transfer_id, from_peer)`.
+    /// Поллим `try_recv()` каждый кадр; `None` = выбор не идёт.
+    pub(crate) pending_accept: Option<(
+        std::sync::mpsc::Receiver<Option<String>>,
+        [u8; 16],
+        PeerId,
+    )>,
 }
 
 impl App {
@@ -691,6 +700,7 @@ impl App {
             incoming_file_offers: Vec::new(),
             active_file_transfers: HashMap::new(),
             show_attach_menu: false,
+            pending_accept: None,
         }
     }
 
@@ -1612,13 +1622,18 @@ async fn main() -> Result<(), Box<dyn Error>> {
                                     }
                                 }
                             }
-                            UICommand::AcceptFile { transfer_id, from } => {
+                            UICommand::AcceptFile { transfer_id, from, save_dir } => {
+                                // Сохраняем выбранную директорию в состояние передачи.
+                                if let Some(t) = incoming_transfers.get_mut(&transfer_id) {
+                                    t.save_dir = save_dir.clone();
+                                }
                                 let packet = file_transfer::FilePacket::Accept { transfer_id };
                                 swarm.behaviour_mut().file_rr.send_request(&from, packet);
                                 println!(
-                                    "✅ FILE: Accept transfer {:x?} от {}",
+                                    "✅ FILE: Accept transfer {:x?} от {} → {}",
                                     &transfer_id[..4],
-                                    &from.to_string()[..8]
+                                    &from.to_string()[..8],
+                                    save_dir.as_deref().unwrap_or("void_downloads/")
                                 );
                             }
                             UICommand::RejectFile { transfer_id, from, reason } => {
@@ -2308,10 +2323,19 @@ async fn main() -> Result<(), Box<dyn Error>> {
                                                                 })
                                                                 .await;
                                                         } else {
-                                                            let save_path =
+                                                            let save_path = if let Some(ref dir) =
+                                                                incoming_transfers
+                                                                    .get(&transfer_id)
+                                                                    .and_then(|t| t.save_dir.clone())
+                                                            {
+                                                                file_transfer::unique_download_path_in(
+                                                                    dir, &fname,
+                                                                )
+                                                            } else {
                                                                 file_transfer::unique_download_path(
                                                                     &fname,
-                                                                );
+                                                                )
+                                                            };
                                                             let saved_to =
                                                                 save_path.display().to_string();
                                                             match std::fs::write(&save_path, &data) {

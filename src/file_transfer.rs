@@ -184,6 +184,8 @@ pub struct IncomingTransfer {
     pub chunks: Vec<Option<Vec<u8>>>,
     pub received_count: u32,
     pub kind: FileKind,
+    /// Директория сохранения, выбранная пользователем. `None` → `void_downloads/`.
+    pub save_dir: Option<String>,
 }
 
 impl IncomingTransfer {
@@ -206,6 +208,7 @@ impl IncomingTransfer {
             chunks: vec![None; total_chunks as usize],
             received_count: 0,
             kind,
+            save_dir: None,
         }
     }
 
@@ -278,9 +281,15 @@ pub fn safe_filename(raw: &str) -> String {
 /// Формирует уникальный путь к файлу в DOWNLOADS_DIR,
 /// добавляя суффикс _(1), _(2)… если файл уже существует.
 pub fn unique_download_path(filename: &str) -> std::path::PathBuf {
-    let dir = std::path::Path::new(DOWNLOADS_DIR);
-    let _ = std::fs::create_dir_all(dir);
-    let path = dir.join(filename);
+    unique_download_path_in(DOWNLOADS_DIR, filename)
+}
+
+/// Формирует уникальный путь к файлу в указанной директории.
+/// Создаёт директорию при необходимости.
+pub fn unique_download_path_in(dir: &str, filename: &str) -> std::path::PathBuf {
+    let dir_path = std::path::Path::new(dir);
+    let _ = std::fs::create_dir_all(dir_path);
+    let path = dir_path.join(filename);
     if !path.exists() {
         return path;
     }
@@ -294,9 +303,9 @@ pub fn unique_download_path(filename: &str) -> std::path::PathBuf {
         .unwrap_or("");
     for i in 1u32.. {
         let candidate = if ext.is_empty() {
-            dir.join(format!("{}_({i})", stem))
+            dir_path.join(format!("{}_({i})", stem))
         } else {
-            dir.join(format!("{}_({i}).{}", stem, ext))
+            dir_path.join(format!("{}_({i}).{}", stem, ext))
         };
         if !candidate.exists() {
             return candidate;

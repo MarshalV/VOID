@@ -1038,6 +1038,42 @@ pub(crate) fn setup_custom_style(ctx: &egui::Context) {
 impl eframe::App for App {
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
         self.known_peers.remove(&self.local_peer_id);
+
+        // ── Поллинг результата выбора папки сохранения ────────────────────
+        // Проверяем, не вернул ли пользователь результат из диалога папки.
+        let accept_result: Option<(Option<String>, [u8; 16], PeerId)> =
+            if let Some((ref rx, tid, from)) = self.pending_accept {
+                match rx.try_recv() {
+                    Ok(dir_opt) => Some((dir_opt, tid, from)),
+                    Err(std::sync::mpsc::TryRecvError::Empty) => None,
+                    Err(std::sync::mpsc::TryRecvError::Disconnected) => {
+                        // Поток завершился без отправки (паника и т.п.) — закрываем.
+                        Some((None, tid, from))
+                    }
+                }
+            } else {
+                None
+            };
+        if let Some((dir_opt, tid, from)) = accept_result {
+            self.pending_accept = None;
+            if let Some(dir) = dir_opt {
+                // Пользователь выбрал папку → принять файл.
+                let _ = self.command_tx.try_send(UICommand::AcceptFile {
+                    transfer_id: tid,
+                    from,
+                    save_dir: Some(dir),
+                });
+                self.incoming_file_offers.retain(|o| o.transfer_id != tid);
+            }
+            // Если dir_opt == None — пользователь отменил выбор папки,
+            // оффер остаётся в списке: он может попробовать снова.
+        }
+        // Запрашиваем перерисовку пока ждём ответа диалога (иначе egui
+        // «засыпает» и канал не опрашивается вовремя).
+        if self.pending_accept.is_some() {
+            ctx.request_repaint_after(Duration::from_millis(50));
+        }
+
         while let Ok(event) = self.event_rx.try_recv() {
             match event {
                 NetworkEvent::PublicIpConfirmed(ip) => {
@@ -1613,12 +1649,19 @@ impl eframe::App for App {
                 .show(ctx, |ui| {
                     // ── Входящие предложения файлов ──────────────────────────
                     let sel_peer = selected_peer_opt;
-                    let mut to_accept: Vec<[u8; 16]> = Vec::new();
                     let mut to_reject: Vec<[u8; 16]> = Vec::new();
+                    // tid оффера, для которого нужно открыть диалог папки.
+                    let mut launch_picker: Option<([u8; 16], PeerId)> = None;
+
+                    // transfer_id оффера, для которого уже открыт диалог.
+                    let waiting_tid: Option<[u8; 16]> =
+                        self.pending_accept.as_ref().map(|(_, tid, _)| *tid);
 
                     for offer in self.incoming_file_offers.iter().filter(|o| {
                         sel_peer.map(|p| o.from == p).unwrap_or(false)
                     }) {
+                        let is_waiting = waiting_tid == Some(offer.transfer_id);
+
                         egui::Frame::none()
                             .fill(palette::BG_CARD)
                             .rounding(8.0)
@@ -1626,8 +1669,7 @@ impl eframe::App for App {
                             .show(ui, |ui| {
                                 ui.horizontal(|ui| {
                                     ui.label(
-                                        egui::RichText::new(offer.kind.icon())
-                                            .size(22.0),
+                                        egui::RichText::new(offer.kind.icon()).size(22.0),
                                     );
                                     ui.add_space(6.0);
                                     ui.vertical(|ui| {
@@ -1649,36 +1691,54 @@ impl eframe::App for App {
                                     ui.with_layout(
                                         egui::Layout::right_to_left(egui::Align::Center),
                                         |ui| {
-                                            if ui
-                                                .add(
-                                                    egui::Button::new(
-                                                        egui::RichText::new("✖ Отклонить")
-                                                            .size(12.0)
-                                                            .color(palette::TEXT),
+                                            if is_waiting {
+                                                // Диалог папки открыт — показываем индикатор.
+                                                ui.label(
+                                                    egui::RichText::new("📂 Выбор папки…")
+                                                        .size(12.0)
+                                                        .color(palette::ACCENT_2),
+                                                );
+                                            } else {
+                                                // Кнопка «Отклонить».
+                                                if ui
+                                                    .add(
+                                                        egui::Button::new(
+                                                            egui::RichText::new("✖ Отклонить")
+                                                                .size(12.0)
+                                                                .color(palette::TEXT),
+                                                        )
+                                                        .fill(egui::Color32::from_rgb(
+                                                            0xa0, 0x30, 0x30,
+                                                        ))
+                                                        .rounding(6.0),
                                                     )
-                                                    .fill(
-                                                        egui::Color32::from_rgb(0xa0, 0x30, 0x30),
+                                                    .clicked()
+                                                {
+                                                    to_reject.push(offer.transfer_id);
+                                                }
+                                                ui.add_space(6.0);
+                                                // Кнопка «Принять» → открывает диалог папки.
+                                                let accept_enabled =
+                                                    self.pending_accept.is_none();
+                                                if ui
+                                                    .add_enabled(
+                                                        accept_enabled,
+                                                        egui::Button::new(
+                                                            egui::RichText::new("✔ Принять")
+                                                                .size(12.0)
+                                                                .color(palette::TEXT),
+                                                        )
+                                                        .fill(palette::ACCENT)
+                                                        .rounding(6.0),
                                                     )
-                                                    .rounding(6.0),
-                                                )
-                                                .clicked()
-                                            {
-                                                to_reject.push(offer.transfer_id);
-                                            }
-                                            ui.add_space(6.0);
-                                            if ui
-                                                .add(
-                                                    egui::Button::new(
-                                                        egui::RichText::new("✔ Принять")
-                                                            .size(12.0)
-                                                            .color(palette::TEXT),
+                                                    .on_hover_text(
+                                                        "Выбрать папку и сохранить файл",
                                                     )
-                                                    .fill(palette::ACCENT)
-                                                    .rounding(6.0),
-                                                )
-                                                .clicked()
-                                            {
-                                                to_accept.push(offer.transfer_id);
+                                                    .clicked()
+                                                {
+                                                    launch_picker =
+                                                        Some((offer.transfer_id, offer.from));
+                                                }
                                             }
                                         },
                                     );
@@ -1687,21 +1747,19 @@ impl eframe::App for App {
                         ui.add_space(4.0);
                     }
 
-                    // Применяем Accept/Reject после итерации.
-                    for tid in to_accept {
-                        if let Some(offer) = self
-                            .incoming_file_offers
-                            .iter()
-                            .find(|o| o.transfer_id == tid)
-                            .cloned()
-                        {
-                            let _ = self.command_tx.try_send(UICommand::AcceptFile {
-                                transfer_id: tid,
-                                from: offer.from,
-                            });
-                            self.incoming_file_offers.retain(|o| o.transfer_id != tid);
-                        }
+                    // Запускаем диалог выбора папки (если пользователь нажал «Принять»).
+                    if let Some((tid, from)) = launch_picker {
+                        let (tx, rx) = std::sync::mpsc::channel::<Option<String>>();
+                        self.pending_accept = Some((rx, tid, from));
+                        std::thread::spawn(move || {
+                            let picked = rfd::FileDialog::new()
+                                .set_title("Выберите папку для сохранения файла")
+                                .pick_folder();
+                            let _ = tx.send(picked.map(|p| p.display().to_string()));
+                        });
                     }
+
+                    // Применяем Reject.
                     for tid in to_reject {
                         if let Some(offer) = self
                             .incoming_file_offers
