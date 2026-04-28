@@ -59,7 +59,6 @@ pub struct MessageHeader {
 }
 
 #[allow(dead_code)]
-#[derive(Zeroize, ZeroizeOnDrop)]
 pub struct SecureSession {
     dhs: StaticSecret, // Our DH ratchet key (private)
     dhr: PublicKey,    // Their DH ratchet key (public)
@@ -69,8 +68,32 @@ pub struct SecureSession {
     ns: u32, // Number of messages sent in current chain
     nr: u32, // Number of messages received in current chain
     pn: u32, // Number of messages in previous sending chain
-    #[zeroize(skip)]
     skipped_keys: HashMap<([u8; 32], u32), [u8; 32]>, // (DH_pub, index) -> MessageKey
+}
+
+impl Zeroize for SecureSession {
+    fn zeroize(&mut self) {
+        self.rk.zeroize();
+        self.ck_send.zeroize();
+        self.ck_recv.zeroize();
+        self.ns.zeroize();
+        self.nr.zeroize();
+        self.pn.zeroize();
+        // Manually zeroize every message key stored for out-of-order delivery,
+        // then clear the map so the (DH_pub, index) slots are also released.
+        for mk in self.skipped_keys.values_mut() {
+            mk.zeroize();
+        }
+        self.skipped_keys.clear();
+        // dhs (StaticSecret) is ZeroizeOnDrop — zeroed when it is dropped.
+        // dhr (PublicKey) is non-secret public material.
+    }
+}
+
+impl Drop for SecureSession {
+    fn drop(&mut self) {
+        self.zeroize();
+    }
 }
 
 #[allow(dead_code)]

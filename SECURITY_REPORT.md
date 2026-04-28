@@ -95,20 +95,17 @@ fn get_master_key() -> [u8; 32] {
 
 ---
 
-### 🟠 ВЫСОКОЕ — `skipped_keys` не зероизируются
+### ✅ ИСПРАВЛЕНО — `skipped_keys` не зероизировались
 
-**Файл:** `src/crypto.rs`, строки 72-73  
+**Файл:** `src/crypto.rs`  
 **Описание:**
 
-```
-#[zeroize(skip)]
-skipped_keys: HashMap<([u8; 32], u32), [u8; 32]>,
-```
-
-Message keys для out-of-order сообщений хранятся в HashMap с пометкой `#[zeroize(skip)]`. При уничтожении сессии через `Drop` они **не затираются** из RAM.
+Message keys для out-of-order сообщений хранились в `HashMap` с пометкой `#[zeroize(skip)]`. При уничтожении сессии через `Drop` они **не затирались** из RAM.
 
 **Риск:** Дамп памяти процесса (crash dump, pagefile.sys/swap, cold-boot attack) содержит живые ключи сообщений.  
-**Исправление:** Убрать `#[zeroize(skip)]` и реализовать `Zeroize` для HashMap вручную, либо заменить на структуру с ручной очисткой.
+**Исправление применено:** Убраны derive-макросы `Zeroize`/`ZeroizeOnDrop` с `SecureSession`. Реализованы вручную:
+- `impl Zeroize for SecureSession` — итерирует по всем значениям HashMap, зероизирует каждый ключ `[u8; 32]`, затем очищает карту; все остальные секретные поля обнуляются явно.
+- `impl Drop for SecureSession` — вызывает `self.zeroize()`, гарантируя очистку при выходе из области видимости.
 
 ---
 
