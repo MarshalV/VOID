@@ -1136,10 +1136,17 @@ async fn main() -> Result<(), Box<dyn Error>> {
                             .with_interval(Duration::from_secs(20))
                             .with_timeout(Duration::from_secs(20)),
                     ),
-                    identify: identify::Behaviour::new(identify::Config::new(
-                        "/void/v1".into(), // Фиксируем версию для всех
-                        key.public(),
-                    )),
+                    identify: identify::Behaviour::new(
+                        identify::Config::new(
+                            "/void/v1".into(), // Фиксируем версию для всех
+                            key.public(),
+                        )
+                        // Рассылаем пирам (в т.ч. bootstrap-ноде) обновлённые
+                        // listen-адреса при их изменении (UPnP, autonat, relay).
+                        // Без этого после смены внешнего IP bootstrap-нода хранит
+                        // устаревший адрес и другие пиры не могут нас найти в DHT.
+                        .with_push_listen_addr_updates(true),
+                    ),
                     kad,
                     relay: relay_client,
                     dcutr: dcutr::Behaviour::new(local_peer_id),
@@ -1213,15 +1220,31 @@ async fn main() -> Result<(), Box<dyn Error>> {
         // Сразу пробуем дозвониться до сохранённых контактов: если они онлайн и
         // их адрес не сменился — связь появится в первые же секунды без
         // ручного «ПОДКЛЮЧИТЬ».
-        for (pid, ma) in &contact_seed_addrs {
-            let opts = DialOpts::peer_id(*pid)
-                .condition(libp2p::swarm::dial_opts::PeerCondition::DisconnectedAndNotDialing)
-                .addresses(vec![ma.clone()])
-                .build();
-            if let Err(e) = swarm.dial(opts) {
-                let s = format!("{:?}", e);
-                if !s.contains("Condition") {
-                    eprintln!("contact dial {} ({}): {:?}", pid, ma, e);
+        //
+        // ВАЖНО: все адреса одного пира собираем в ОДИН DialOpts, иначе второй
+        // и третий вызовы отклоняются условием DisconnectedAndNotDialing (пир уже
+        // "Dialing"), и при устаревшем первом адресе подключение молча падает —
+        // libp2p не пробует следующий адрес из другого DialOpts.
+        {
+            let mut grouped: HashMap<PeerId, Vec<Multiaddr>> = HashMap::new();
+            for (pid, ma) in &contact_seed_addrs {
+                grouped.entry(*pid).or_default().push(ma.clone());
+            }
+            for (pid, addrs) in &grouped {
+                println!(
+                    "📇 Стартовый dial контакта {} ({} адр.)",
+                    &pid.to_string()[..8],
+                    addrs.len()
+                );
+                let opts = DialOpts::peer_id(*pid)
+                    .condition(libp2p::swarm::dial_opts::PeerCondition::DisconnectedAndNotDialing)
+                    .addresses(addrs.clone())
+                    .build();
+                if let Err(e) = swarm.dial(opts) {
+                    let s = format!("{:?}", e);
+                    if !s.contains("Condition") {
+                        eprintln!("contact dial {}: {:?}", pid, e);
+                    }
                 }
             }
         }
@@ -1254,8 +1277,89 @@ async fn main() -> Result<(), Box<dyn Error>> {
         let mut pending_seed_peers: HashSet<PeerId> = HashSet::new();
         let mut pending_seed_bare: bool = false;
 
+        // ─── Автоматическое переподключение к контактам из vault ─────────────
+        //
+        // reconnect_targets: PeerId → список multiaddr (пополняется через Identify
+        //   и DialPeer, чтобы использовать актуальные адреса после рестарта).
+        // reconnect_queue:   PeerId → (когда_следующая_попытка, номер_попытки).
+        //   Заполняется при ConnectionClosed; очищается при ConnectionEstablished.
+        // Экспоненциальная выдержка: 5 с → 20 с → 60 с → 5 мин → 5 мин …
+        let mut reconnect_targets: HashMap<PeerId, Vec<Multiaddr>> = {
+            let mut m: HashMap<PeerId, Vec<Multiaddr>> = HashMap::new();
+            // Контакты из vault.
+            for (pid, ma) in &contact_seed_addrs {
+                m.entry(*pid).or_default().push(ma.clone());
+            }
+            // Bootstrap-ноды: их адреса известны заранее из конфига/файла,
+            // поэтому добавляем сразу — реконнект к ним будет автоматическим
+            // при обрыве соединения (NAT-timeout, перезагрузка ноды и т.п.).
+            for ma in &void_bootstraps {
+                if let Some(pid) = peer_id_from_multiaddr(ma) {
+                    m.entry(pid).or_default().push(ma.clone());
+                }
+            }
+            m
+        };
+        let mut reconnect_queue: HashMap<PeerId, (Instant, u32)> = HashMap::new();
+        let mut reconnect_tick = tokio::time::interval(Duration::from_secs(15));
+        reconnect_tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+
         loop {
             tokio::select! {
+                // ─── Tick: переподключение к контактам (15 с) ────────────────
+                _ = reconnect_tick.tick() => {
+                    let now = Instant::now();
+                    let connected: HashSet<PeerId> = swarm.connected_peers().copied().collect();
+                    let to_dial: Vec<(PeerId, Vec<Multiaddr>)> = reconnect_queue
+                        .iter()
+                        .filter(|(pid, (when, _))| now >= *when && !connected.contains(*pid))
+                        .filter_map(|(pid, _)| {
+                            reconnect_targets.get(pid).map(|addrs| (*pid, addrs.clone()))
+                        })
+                        .collect();
+
+                    for (pid, addrs) in to_dial {
+                        let clean: Vec<Multiaddr> = addrs
+                            .into_iter()
+                            .filter(|a| !is_junk_addr(a))
+                            .collect();
+                        if clean.is_empty() {
+                            continue;
+                        }
+                        let attempt = reconnect_queue
+                            .get(&pid)
+                            .map(|(_, a)| *a)
+                            .unwrap_or(1);
+                        println!(
+                            "🔄 Автореконнект: {} ({} адр., попытка {}).",
+                            &pid.to_string()[..8],
+                            clean.len(),
+                            attempt
+                        );
+                        let opts = DialOpts::peer_id(pid)
+                            .condition(
+                                libp2p::swarm::dial_opts::PeerCondition::DisconnectedAndNotDialing,
+                            )
+                            .addresses(clean)
+                            .build();
+                        if let Err(e) = swarm.dial(opts) {
+                            let s = format!("{:?}", e);
+                            if !s.contains("Condition") {
+                                // Обновляем время следующей попытки (следующий backoff-шаг).
+                                if let Some(entry) = reconnect_queue.get_mut(&pid) {
+                                    let next_delay = match entry.1 {
+                                        0..=1 => Duration::from_secs(20),
+                                        2 => Duration::from_secs(60),
+                                        _ => Duration::from_secs(300),
+                                    };
+                                    entry.0 = Instant::now() + next_delay;
+                                    entry.1 += 1;
+                                }
+                                eprintln!("reconnect dial {}: {:?}", &pid.to_string()[..8], e);
+                            }
+                        }
+                    }
+                }
                 // ─── Tick: отправка очередных чанков с rate-limit ───────────
                 _ = chunk_tick.tick() => {
                     // Ищем одну исходящую передачу, готовую к отправке чанка.
@@ -1391,6 +1495,12 @@ async fn main() -> Result<(), Box<dyn Error>> {
 
                                  for addr in &addrs {
                                      swarm.behaviour_mut().kad.add_address(&peer_id, addr.clone());
+                                     // Сохраняем адрес в таблице реконнекта: пир, до которого
+                                     // явно дозванивались, — кандидат на автопереподключение.
+                                     let list = reconnect_targets.entry(peer_id).or_default();
+                                     if !list.contains(addr) {
+                                         list.push(addr.clone());
+                                     }
                                  }
 
                                  if addrs.is_empty() {
@@ -1712,12 +1822,18 @@ async fn main() -> Result<(), Box<dyn Error>> {
 
                                 // Дозваниваемся и по QUIC, и по TCP: на Windows/NAT QUIC часто на случайном UDP
                                 // (конфликт 50001), а пропуск TCP раньше оставлял LAN без соединения, если QUIC не доходил.
+                                // Используем DialOpts с NotDialing, чтобы mDNS не дублировал попытки
+                                // при нескольких событиях для одного пира.
                                 if addr.to_string().contains("quic-v1") {
                                     println!("🔍 mDNS: найден пир {} (QUIC). Подключаюсь...", &peer_id.to_string()[..8]);
                                 } else {
                                     println!("🔍 mDNS: найден пир {} (TCP). Подключаюсь...", &peer_id.to_string()[..8]);
                                 }
-                                let _ = swarm.dial(addr.clone());
+                                let mdns_opts = DialOpts::peer_id(peer_id)
+                                    .condition(libp2p::swarm::dial_opts::PeerCondition::NotDialing)
+                                    .addresses(vec![addr.clone()])
+                                    .build();
+                                let _ = swarm.dial(mdns_opts);
 
                                 let _ = event_tx.send(NetworkEvent::MdnsDiscovered(peer_id, addr.clone())).await;
                                 peer_addrs.entry(peer_id).or_default().push(addr);
@@ -1891,6 +2007,8 @@ async fn main() -> Result<(), Box<dyn Error>> {
                             let connected_count = swarm.connected_peers().count();
                             println!("✅ СОЕДИНЕНО: {}. Endpoint: {:?}. Всего пиров: {}", peer_id, endpoint, connected_count);
                             pending_dials.remove(&peer_id);
+                            // Соединение установлено — снимаем задание на реконнект.
+                            reconnect_queue.remove(&peer_id);
 
                             // Определяем, идёт ли соединение через relay.
                             let is_relay_conn = match endpoint {
@@ -1927,10 +2045,16 @@ async fn main() -> Result<(), Box<dyn Error>> {
                                          Some(a)
                                      }
                                  };
-                                 if let Some(addr) = learned {
-                                     if !is_junk_addr(&addr) {
+                                 if let Some(ref addr) = learned {
+                                     if !is_junk_addr(addr) {
+                                         // Обновляем таблицу реконнекта: ставим рабочий адрес первым,
+                                         // чтобы следующая попытка начиналась с него.
+                                         let list = reconnect_targets.entry(peer_id).or_default();
+                                         list.retain(|a| a != addr);
+                                         list.insert(0, addr.clone());
+
                                          let _ = event_tx
-                                             .send(NetworkEvent::PeerAddress(peer_id, addr))
+                                             .send(NetworkEvent::PeerAddress(peer_id, addr.clone()))
                                              .await;
                                      }
                                  }
@@ -1964,6 +2088,33 @@ async fn main() -> Result<(), Box<dyn Error>> {
                             let connected_count = swarm.connected_peers().count();
                             println!("❌ СОЕДИНЕНИЕ ЗАКРЫТО: {}. Причина: {:?}. Осталось: {}", peer_id, cause, connected_count);
                             relay_peers.remove(&peer_id);
+
+                            // Планируем переподключение для контактов из vault.
+                            // Backoff: 5 с → 20 с → 60 с → 5 мин (и далее 5 мин).
+                            if reconnect_targets.contains_key(&peer_id) {
+                                // Не накапливаем reconnect-очередь для уже-диалящихся (swarm сам retry).
+                                let attempt = reconnect_queue
+                                    .get(&peer_id)
+                                    .map(|(_, a)| *a)
+                                    .unwrap_or(0);
+                                let delay = match attempt {
+                                    0 => Duration::from_secs(5),
+                                    1 => Duration::from_secs(20),
+                                    2 => Duration::from_secs(60),
+                                    _ => Duration::from_secs(300),
+                                };
+                                reconnect_queue.insert(
+                                    peer_id,
+                                    (Instant::now() + delay, attempt + 1),
+                                );
+                                println!(
+                                    "🔄 Реконнект запланирован: {} через {}с (попытка {}).",
+                                    &peer_id.to_string()[..8],
+                                    delay.as_secs(),
+                                    attempt + 1
+                                );
+                            }
+
                             let _ = event_tx.send(NetworkEvent::Disconnected(peer_id)).await;
                         }
                         SwarmEvent::IncomingConnection { local_addr, send_back_addr, .. } => {
@@ -2042,16 +2193,26 @@ async fn main() -> Result<(), Box<dyn Error>> {
                                     continue;
                                 }
                                 swarm.behaviour_mut().kad.add_address(&peer_id, addr.clone());
-                                // Если это настоящий VOID-клиент — сохраним один его
+
+                                // Нормализуем адрес: добавляем /p2p/<peer_id> если нет.
+                                let mut a = addr.clone();
+                                if !a.iter().any(|p| matches!(p, libp2p::multiaddr::Protocol::P2p(_))) {
+                                    a.push(libp2p::multiaddr::Protocol::P2p(peer_id));
+                                }
+
+                                // Обновляем таблицу реконнекта: при следующем disconnet/restart
+                                // dial будет по актуальным listen-адресам, а не по устаревшим.
+                                if peer_id != local_peer_id {
+                                    let list = reconnect_targets.entry(peer_id).or_default();
+                                    if !list.contains(&a) {
+                                        list.push(a.clone());
+                                    }
+                                }
+
+                                // Если это настоящий VOID-клиент — сохраним его
                                 // listen-адрес в контактной книге, чтобы связь поднялась
                                 // после рестарта без ручного ПОДКЛЮЧИТЬ.
                                 if has_chat && peer_id != local_peer_id {
-                                    let mut a = addr.clone();
-                                    // Если в addr нет /p2p/<peer_id>, добавим — иначе Dial потом
-                                    // не свяжет адрес с PeerId.
-                                    if !a.iter().any(|p| matches!(p, libp2p::multiaddr::Protocol::P2p(_))) {
-                                        a.push(libp2p::multiaddr::Protocol::P2p(peer_id));
-                                    }
                                     let _ = event_tx
                                         .send(NetworkEvent::PeerAddress(peer_id, a))
                                         .await;
