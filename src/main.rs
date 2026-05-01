@@ -1046,6 +1046,7 @@ async fn main() -> Result<(), Box<dyn Error>> {
         let contact_seed_addrs = contact_addrs_for_net;
         let mut sessions: HashMap<PeerId, crypto::SecureSession> = HashMap::new();
         let mut pending_handshakes: HashMap<PeerId, crypto::StaticSecret> = HashMap::new();
+        let mut pending_messages: HashMap<PeerId, Vec<Vec<u8>>> = HashMap::new();
         let my_public_key = crypto::PublicKey::from(&local_static);
 
         // Swarm: TCP + noise + yamux + Relay Client
@@ -1615,32 +1616,34 @@ async fn main() -> Result<(), Box<dyn Error>> {
                                 };
 
                                 let json_data = serde_json::to_vec(&msg).unwrap();
-                                let mut packet = V1Packet::Plain(msg.clone());
 
                                 if let Some(peer_id) = recipient {
                                     if let Some(session) = sessions.get_mut(&peer_id) {
                                         if let Ok((header, ciphertext)) = session.encrypt_payload(json_data.as_slice()) {
-                                            packet = V1Packet::Encrypted { header, ciphertext };
+                                            let packet = V1Packet::Encrypted { header, ciphertext };
                                             println!("[{}] 🔒 E2EE: Сообщение зашифровано для {}", now, &peer_id.to_string()[..8]);
+                                            let req_id = swarm.behaviour_mut().request_response.send_request(&peer_id, packet);
+                                            outbound_msg_requests.insert(req_id, peer_id);
+                                            println!("[{}] 📨 RequestResponse: Отправка пиру {}", now, &peer_id.to_string()[..8]);
                                         }
                                     } else {
-                                        let ephem_secret = crypto::StaticSecret::random_from_rng(&mut rand::rngs::OsRng);
-                                        let ephem_pub = crypto::PublicKey::from(&ephem_secret);
-                                        pending_handshakes.insert(peer_id, ephem_secret);
+                                        // Нет сессии — инициируем хендшейк (если ещё не начат)
+                                        // и буферизуем сообщение до завершения E2EE.
+                                        if !pending_handshakes.contains_key(&peer_id) {
+                                            let ephem_secret = crypto::StaticSecret::random_from_rng(&mut rand::rngs::OsRng);
+                                            let ephem_pub = crypto::PublicKey::from(&ephem_secret);
+                                            pending_handshakes.insert(peer_id, ephem_secret);
 
-                                        let hello = V1Packet::Hello {
-                                            public_key: my_public_key.to_bytes(),
-                                            ephemeral_key: ephem_pub.to_bytes(),
-                                        };
-                                        let _ = swarm.behaviour_mut().request_response.send_request(&peer_id, hello);
-                                        println!("[{}] 🤝 E2EE: Сессии нет, направлен Hello (+Ephem) пиру {}", now, &peer_id.to_string()[..8]);
+                                            let hello = V1Packet::Hello {
+                                                public_key: my_public_key.to_bytes(),
+                                                ephemeral_key: ephem_pub.to_bytes(),
+                                            };
+                                            let _ = swarm.behaviour_mut().request_response.send_request(&peer_id, hello);
+                                            println!("[{}] 🤝 E2EE: Сессии нет, направлен Hello (+Ephem) пиру {}", now, &peer_id.to_string()[..8]);
+                                        }
+                                        pending_messages.entry(peer_id).or_default().push(json_data);
+                                        println!("[{}] ⏳ E2EE: Сообщение буферизовано до хендшейка с {}", now, &peer_id.to_string()[..8]);
                                     }
-
-                                    // Отправляем конкретному пиру и запоминаем RequestId,
-                                    // чтобы по входящему Response отметить доставку и не ретраить.
-                                    let req_id = swarm.behaviour_mut().request_response.send_request(&peer_id, packet);
-                                    outbound_msg_requests.insert(req_id, peer_id);
-                                    println!("[{}] 📨 RequestResponse: Отправка пиру {}", now, &peer_id.to_string()[..8]);
                                 } else {
                                     println!("[{}] ⚠️ Попытка отправить сообщение без получателя (Global Chat отключен)", now);
                                 }
@@ -1867,6 +1870,18 @@ async fn main() -> Result<(), Box<dyn Error>> {
                                                             let session = crypto::SecureSession::new_initiator(&local_static, &remote_static_pub, local_ephem_secret, &remote_ephem_pub);
                                                             sessions.insert(peer, session);
                                                             println!("[{}] 🤝 E2EE: Сессия (Alice/Req) создана с {}", now, &peer.to_string()[..8]);
+                                                            if let Some(buffered) = pending_messages.remove(&peer) {
+                                                                if let Some(sess) = sessions.get_mut(&peer) {
+                                                                    for data in buffered {
+                                                                        if let Ok((header, ciphertext)) = sess.encrypt_payload(&data) {
+                                                                            let pkt = V1Packet::Encrypted { header, ciphertext };
+                                                                            let req_id = swarm.behaviour_mut().request_response.send_request(&peer, pkt);
+                                                                            outbound_msg_requests.insert(req_id, peer);
+                                                                            println!("[{}] 📨 E2EE: Буферизованное сообщение отправлено {}", now, &peer.to_string()[..8]);
+                                                                        }
+                                                                    }
+                                                                }
+                                                            }
                                                         }
                                                         let _ = swarm.behaviour_mut().request_response.send_response(channel, V1Packet::Ack);
                                                     } else {
@@ -1877,6 +1892,18 @@ async fn main() -> Result<(), Box<dyn Error>> {
                                                         let session = crypto::SecureSession::new_responder(&local_static, &remote_static_pub, &remote_ephem_pub, local_ephem_secret);
                                                         sessions.insert(peer, session);
                                                         println!("[{}] 🤝 E2EE: Сессия (Bob/Res) создана с {}", now, &peer.to_string()[..8]);
+                                                        if let Some(buffered) = pending_messages.remove(&peer) {
+                                                            if let Some(sess) = sessions.get_mut(&peer) {
+                                                                for data in buffered {
+                                                                    if let Ok((header, ciphertext)) = sess.encrypt_payload(&data) {
+                                                                        let pkt = V1Packet::Encrypted { header, ciphertext };
+                                                                        let req_id = swarm.behaviour_mut().request_response.send_request(&peer, pkt);
+                                                                        outbound_msg_requests.insert(req_id, peer);
+                                                                        println!("[{}] 📨 E2EE: Буферизованное сообщение отправлено {}", now, &peer.to_string()[..8]);
+                                                                    }
+                                                                }
+                                                            }
+                                                        }
 
                                                         // Боб отвечает своим Hello
                                                         let my_hello = V1Packet::Hello {
@@ -1937,6 +1964,18 @@ async fn main() -> Result<(), Box<dyn Error>> {
                                                         let session = crypto::SecureSession::new_initiator(&local_static, &remote_static_pub, local_ephem_secret, &remote_ephem_pub);
                                                         sessions.insert(peer, session);
                                                         println!("[{}] 🤝 E2EE: Сессия (Alice/Res) создана с {}", now, &peer.to_string()[..8]);
+                                                        if let Some(buffered) = pending_messages.remove(&peer) {
+                                                            if let Some(sess) = sessions.get_mut(&peer) {
+                                                                for data in buffered {
+                                                                    if let Ok((header, ciphertext)) = sess.encrypt_payload(&data) {
+                                                                        let pkt = V1Packet::Encrypted { header, ciphertext };
+                                                                        let req_id = swarm.behaviour_mut().request_response.send_request(&peer, pkt);
+                                                                        outbound_msg_requests.insert(req_id, peer);
+                                                                        println!("[{}] 📨 E2EE: Буферизованное сообщение отправлено {}", now, &peer.to_string()[..8]);
+                                                                    }
+                                                                }
+                                                            }
+                                                        }
                                                     }
                                                 }
                                             }

@@ -203,15 +203,18 @@ impl SecureSession {
             .as_mut()
             .ok_or_else(|| anyhow!("No sending chain"))?;
         let mk = ck.step();
+        let ns = self.ns;
         let header = MessageHeader {
             dh_pub: PublicKey::from(&self.dhs).to_bytes(),
             pn: self.pn,
-            n: self.ns,
+            n: ns,
         };
         self.ns += 1;
 
         let cipher = ChaCha20Poly1305::new(mk.as_slice().into());
-        let nonce = Nonce::from_slice(&[0u8; 12]);
+        let mut nonce_bytes = [0u8; 12];
+        nonce_bytes[..4].copy_from_slice(&ns.to_le_bytes());
+        let nonce = Nonce::from_slice(&nonce_bytes);
         let ciphertext = cipher
             .encrypt(nonce, plaintext)
             .map_err(|_| anyhow!("Encryption failed"))?;
@@ -225,7 +228,7 @@ impl SecureSession {
         ciphertext: &[u8],
     ) -> Result<Vec<u8>> {
         if let Some(mk) = self.skipped_keys.remove(&(header.dh_pub, header.n)) {
-            return self.decrypt_with_key(&mk, ciphertext);
+            return self.decrypt_with_key(&mk, header.n, ciphertext);
         }
 
         if header.dh_pub != self.dhr.to_bytes() {
@@ -242,12 +245,14 @@ impl SecureSession {
         let mk = ck.step();
         self.nr += 1;
 
-        self.decrypt_with_key(&mk, ciphertext)
+        self.decrypt_with_key(&mk, header.n, ciphertext)
     }
 
-    fn decrypt_with_key(&self, mk: &[u8; 32], ciphertext: &[u8]) -> Result<Vec<u8>> {
+    fn decrypt_with_key(&self, mk: &[u8; 32], n: u32, ciphertext: &[u8]) -> Result<Vec<u8>> {
         let cipher = ChaCha20Poly1305::new(mk.as_slice().into());
-        let nonce = Nonce::from_slice(&[0u8; 12]);
+        let mut nonce_bytes = [0u8; 12];
+        nonce_bytes[..4].copy_from_slice(&n.to_le_bytes());
+        let nonce = Nonce::from_slice(&nonce_bytes);
         cipher
             .decrypt(nonce, ciphertext)
             .map_err(|_| anyhow!("Decryption failed"))
