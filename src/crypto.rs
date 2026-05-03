@@ -1,24 +1,24 @@
 use anyhow::{anyhow, Result};
-use blake2::{Blake2b512, Digest};
 use chacha20poly1305::{
     aead::{Aead, KeyInit},
     ChaCha20Poly1305, Nonce,
 };
+use hkdf::Hkdf;
 use rand::rngs::OsRng;
+use sha2::Sha256;
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 #[allow(dead_code)]
 pub use x25519_dalek::{PublicKey, SharedSecret, StaticSecret};
 use zeroize::{Zeroize, ZeroizeOnDrop};
 
-/// KDF (Key Derivation Function) на базе BLAKE2b
-fn kdf(salt: &[u8], ikm: &[u8], info: &[u8], output_len: usize) -> Vec<u8> {
-    let mut hasher = Blake2b512::new();
-    hasher.update(salt);
-    hasher.update(ikm);
-    hasher.update(info);
-    let result = hasher.finalize();
-    result[..output_len].to_vec()
+/// HKDF-SHA256 по RFC 5869: positional args совпадают с прежним API —
+/// `salt` → HKDF-Extract salt, `ikm` → input keying material, `info` → HKDF-Expand info.
+fn hkdf_sha256_derive(salt: &[u8], ikm: &[u8], info: &[u8], output_len: usize) -> Vec<u8> {
+    let hk = Hkdf::<Sha256>::new(Some(salt), ikm);
+    let mut okm = vec![0u8; output_len];
+    hk.expand(info, &mut okm).expect("HKDF output_len within SHA256 limit");
+    okm
 }
 
 #[derive(Serialize, Deserialize, Zeroize, ZeroizeOnDrop)]
@@ -29,13 +29,13 @@ struct ChainKey {
 
 impl ChainKey {
     fn step(&mut self) -> [u8; 32] {
-        let message_key = kdf(
+        let message_key = hkdf_sha256_derive(
             self.key.as_slice(),
             b"message_key",
             &self.index.to_be_bytes(),
             32,
         );
-        self.key = kdf(
+        self.key = hkdf_sha256_derive(
             self.key.as_slice(),
             b"chain_key",
             &self.index.to_be_bytes(),
@@ -105,7 +105,7 @@ impl SecureSession {
         remote_ephemeral: &PublicKey,
     ) -> Self {
         let shared_static = local_static.diffie_hellman(remote_static);
-        let rk: [u8; 32] = kdf(
+        let rk: [u8; 32] = hkdf_sha256_derive(
             b"VOID_SALT".as_slice(),
             shared_static.as_bytes(),
             b"VOID_INIT_RK".as_slice(),
@@ -155,7 +155,7 @@ impl SecureSession {
         local_ephemeral: StaticSecret,
     ) -> Self {
         let shared_static = local_static.diffie_hellman(remote_static);
-        let rk: [u8; 32] = kdf(
+        let rk: [u8; 32] = hkdf_sha256_derive(
             b"VOID_SALT".as_slice(),
             shared_static.as_bytes(),
             b"VOID_INIT_RK".as_slice(),
@@ -286,7 +286,7 @@ impl SecureSession {
     }
 
     fn kdf_rk(&self, shared: &SharedSecret) -> ([u8; 32], [u8; 32]) {
-        let out = kdf(self.rk.as_slice(), shared.as_bytes(), b"dr_ratchet", 64);
+        let out = hkdf_sha256_derive(self.rk.as_slice(), shared.as_bytes(), b"dr_ratchet", 64);
         (
             out[0..32].try_into().unwrap(),
             out[32..64].try_into().unwrap(),
