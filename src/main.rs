@@ -521,6 +521,99 @@ enum NetworkEvent {
     },
 }
 
+/// Одна машина состояний для приёма чанков (E2EE `/void/chat` и устаревший plain `Chunk` по `/void/file`).
+async fn apply_incoming_file_chunk(
+    transfer_id: [u8; 16],
+    chunk_index: u32,
+    data: Vec<u8>,
+    peer: PeerId,
+    now: &str,
+    incoming_transfers: &mut HashMap<[u8; 16], file_transfer::IncomingTransfer>,
+    event_tx: &mpsc::Sender<NetworkEvent>,
+) {
+    let done = if let Some(inc) = incoming_transfers.get_mut(&transfer_id) {
+        inc.receive_chunk(chunk_index, data)
+    } else {
+        false
+    };
+
+    if let Some(inc) = incoming_transfers.get(&transfer_id) {
+        let recv = inc.received_count;
+        let total = inc.total_chunks;
+        let fname = inc.filename.clone();
+        let sz = inc.total_size;
+        let fkind = inc.kind;
+        let _ = event_tx
+            .send(NetworkEvent::FileProgress {
+                transfer_id,
+                sent_chunks: recv,
+                total_chunks: total,
+                filename: fname.clone(),
+                total_size: sz,
+                is_outgoing: false,
+                peer,
+                kind: fkind,
+            })
+            .await;
+
+        if done {
+            let sha_expected = inc.sha256;
+            let maybe_data = inc.assemble();
+            if let Some(data) = maybe_data {
+                let sha_actual = file_transfer::hash_file(&data);
+                if sha_actual != sha_expected {
+                    println!(
+                        "[{}] ❌ FILE: хэш не совпадает для «{}»!",
+                        now, fname
+                    );
+                    let _ = event_tx
+                        .send(NetworkEvent::FileError {
+                            transfer_id,
+                            reason: format!("Ошибка целостности файла «{}»", fname),
+                        })
+                        .await;
+                } else {
+                    let save_path = if let Some(ref dir) = incoming_transfers
+                        .get(&transfer_id)
+                        .and_then(|t| t.save_dir.clone())
+                    {
+                        file_transfer::unique_download_path_in(dir, &fname)
+                    } else {
+                        file_transfer::unique_download_path(&fname)
+                    };
+                    let saved_to = save_path.display().to_string();
+                    match std::fs::write(&save_path, &data) {
+                        Ok(_) => {
+                            println!(
+                                "[{}] ✅ FILE: «{}» сохранён → {}",
+                                now, fname, saved_to
+                            );
+                            let _ = event_tx
+                                .send(NetworkEvent::FileComplete {
+                                    transfer_id,
+                                    filename: fname,
+                                    saved_to,
+                                    is_outgoing: false,
+                                    peer,
+                                })
+                                .await;
+                        }
+                        Err(e) => {
+                            let _ = event_tx
+                                .send(NetworkEvent::FileError {
+                                    transfer_id,
+                                    reason: format!("Не удалось сохранить «{}»: {}", fname, e),
+                                })
+                                .await;
+                        }
+                    }
+                }
+            }
+            incoming_transfers.remove(&transfer_id);
+        }
+    }
+}
+
 enum UICommand {
     Dial(String),
     DialPeer(PeerId, Vec<Multiaddr>),
@@ -1366,12 +1459,10 @@ async fn main() -> Result<(), Box<dyn Error>> {
                     // Ищем одну исходящую передачу, готовую к отправке чанка.
                     let to_send: Option<([u8; 16], u32, Vec<u8>, PeerId)> = {
                         let mut found = None;
-                        for (tid, t) in outgoing_transfers.iter_mut() {
+                        for (tid, t) in outgoing_transfers.iter() {
                             if t.ready_to_send() {
                                 let idx = t.next_chunk as u32;
                                 let data = t.chunks[t.next_chunk].clone();
-                                t.next_chunk += 1;
-                                t.last_chunk_at = Instant::now();
                                 found = Some((*tid, idx, data, t.peer));
                                 break;
                             }
@@ -1379,52 +1470,83 @@ async fn main() -> Result<(), Box<dyn Error>> {
                         found
                     };
                     if let Some((tid, chunk_idx, data, peer)) = to_send {
-                        let packet = file_transfer::FilePacket::Chunk {
-                            transfer_id: tid,
-                            chunk_index: chunk_idx,
-                            data,
-                        };
-                        swarm.behaviour_mut().file_rr.send_request(&peer, packet);
+                        let frame =
+                            file_transfer::encode_e2ee_file_chunk_frame(&tid, chunk_idx, &data);
+                        let encrypted_ok = sessions
+                            .get_mut(&peer)
+                            .and_then(|session| session.encrypt_payload(&frame).ok())
+                            .map(|(header, ciphertext)| {
+                                let pkt = V1Packet::Encrypted {
+                                    header,
+                                    ciphertext,
+                                };
+                                swarm
+                                    .behaviour_mut()
+                                    .request_response
+                                    .send_request(&peer, pkt);
+                            })
+                            .is_some();
 
-                        if let Some(t) = outgoing_transfers.get(&tid) {
-                            let sent = t.next_chunk as u32;
-                            let total = t.total_chunks();
-                            let fname = t.filename.clone();
-                            let sz = t.total_size;
-                            let is_relay = t.is_relay;
-                            let fkind = t.kind;
-                            let all_sent = t.next_chunk >= t.chunks.len();
-                            let _ = event_tx
-                                .send(NetworkEvent::FileProgress {
-                                    transfer_id: tid,
-                                    sent_chunks: sent,
-                                    total_chunks: total,
-                                    filename: fname.clone(),
-                                    total_size: sz,
-                                    is_outgoing: true,
-                                    peer,
-                                    kind: fkind,
-                                })
-                                .await;
-                            if all_sent {
-                                println!(
-                                    "📤 FILE[{}]: все {} чанк(ов) «{}» отправлены{}.",
-                                    fkind.label(),
-                                    total,
-                                    fname,
-                                    if is_relay { " (через relay)" } else { "" }
-                                );
+                        if encrypted_ok {
+                            if let Some(t) = outgoing_transfers.get_mut(&tid) {
+                                t.next_chunk += 1;
+                                t.last_chunk_at = Instant::now();
+                            }
+                            if let Some(t) = outgoing_transfers.get(&tid) {
+                                let sent = t.next_chunk as u32;
+                                let total = t.total_chunks();
+                                let fname = t.filename.clone();
+                                let sz = t.total_size;
+                                let is_relay = t.is_relay;
+                                let fkind = t.kind;
+                                let all_sent = t.next_chunk >= t.chunks.len();
                                 let _ = event_tx
-                                    .send(NetworkEvent::FileComplete {
+                                    .send(NetworkEvent::FileProgress {
                                         transfer_id: tid,
-                                        filename: fname,
-                                        saved_to: String::new(),
+                                        sent_chunks: sent,
+                                        total_chunks: total,
+                                        filename: fname.clone(),
+                                        total_size: sz,
                                         is_outgoing: true,
                                         peer,
+                                        kind: fkind,
                                     })
                                     .await;
-                                outgoing_transfers.remove(&tid);
+                                if all_sent {
+                                    println!(
+                                        "📤 FILE[{}]: все {} чанк(ов) «{}» отправлены через E2EE{}.",
+                                        fkind.label(),
+                                        total,
+                                        fname,
+                                        if is_relay { " (relay rate-limit)" } else { "" }
+                                    );
+                                    let _ = event_tx
+                                        .send(NetworkEvent::FileComplete {
+                                            transfer_id: tid,
+                                            filename: fname,
+                                            saved_to: String::new(),
+                                            is_outgoing: true,
+                                            peer,
+                                        })
+                                        .await;
+                                    outgoing_transfers.remove(&tid);
+                                }
                             }
+                        } else {
+                            println!(
+                                "⚠️ FILE: не удалось зашифровать чанк {} для {} (нет E2EE-сессии).",
+                                chunk_idx,
+                                &peer.to_string()[..8]
+                            );
+                            let _ = event_tx
+                                .send(NetworkEvent::FileError {
+                                    transfer_id: tid,
+                                    reason:
+                                        "Передача файла прервана: нет активной E2EE-сессии с пиром."
+                                            .into(),
+                                })
+                                .await;
+                            outgoing_transfers.remove(&tid);
                         }
                     }
                 }
@@ -1668,6 +1790,13 @@ async fn main() -> Result<(), Box<dyn Error>> {
                                                     "❌ Файл слишком большой (> {} МБ)",
                                                     file_transfer::MAX_FILE_SIZE / 1024 / 1024
                                                 )))
+                                                .await;
+                                        } else if !sessions.contains_key(&recipient) {
+                                            let _ = event_tx
+                                                .send(NetworkEvent::Status(
+                                                    "❌ Файл: сначала установите зашифрованный чат с этим контактом (E2EE-сессия)."
+                                                        .into(),
+                                                ))
                                                 .await;
                                         } else {
                                             let sha256 = file_transfer::hash_file(&data);
@@ -1919,14 +2048,46 @@ async fn main() -> Result<(), Box<dyn Error>> {
                                         }
                                         V1Packet::Encrypted { header, ciphertext } => {
                                             if let Some(session) = sessions.get_mut(&peer) {
-                                                if let Ok(plaintext) = session.decrypt_payload(&header, &ciphertext) {
-                                                    if let Ok(msg) = serde_json::from_slice::<ChatMessage>(&plaintext) {
-                                                        println!("[{}] 🔒 E2EE: Сообщение ДЕШИФРОВАНО от {}", now, &peer.to_string()[..8]);
-                                                        let _ = event_tx.send(NetworkEvent::ChatMessage(msg)).await;
+                                                match session.decrypt_payload(&header, &ciphertext) {
+                                                    Ok(plaintext) => {
+                                                        if let Some((tid, idx, pdata)) =
+                                                            file_transfer::try_decode_e2ee_file_chunk_frame(
+                                                                &plaintext,
+                                                            )
+                                                        {
+                                                            apply_incoming_file_chunk(
+                                                                tid,
+                                                                idx,
+                                                                pdata,
+                                                                peer,
+                                                                &now,
+                                                                &mut incoming_transfers,
+                                                                &event_tx,
+                                                            )
+                                                            .await;
+                                                        } else if let Ok(msg) =
+                                                            serde_json::from_slice::<ChatMessage>(
+                                                                &plaintext,
+                                                            )
+                                                        {
+                                                            println!(
+                                                                "[{}] 🔒 E2EE: Сообщение ДЕШИФРОВАНО от {}",
+                                                                now,
+                                                                &peer.to_string()[..8]
+                                                            );
+                                                            let _ = event_tx
+                                                                .send(NetworkEvent::ChatMessage(msg))
+                                                                .await;
+                                                        }
                                                     }
-                                                } else {
-                                                    println!("[{}] ❌ E2EE: Ошибка дешифровки от {}. Сбрасываю...", now, &peer.to_string()[..8]);
-                                                    sessions.remove(&peer);
+                                                    Err(_) => {
+                                                        println!(
+                                                            "[{}] ❌ E2EE: Ошибка дешифровки от {}. Сбрасываю...",
+                                                            now,
+                                                            &peer.to_string()[..8]
+                                                        );
+                                                        sessions.remove(&peer);
+                                                    }
                                                 }
                                             }
                                             let _ = swarm.behaviour_mut().request_response.send_response(channel, V1Packet::Ack);
@@ -1982,9 +2143,31 @@ async fn main() -> Result<(), Box<dyn Error>> {
                                         }
                                         V1Packet::Encrypted { header, ciphertext } => {
                                             if let Some(session) = sessions.get_mut(&peer) {
-                                                if let Ok(plaintext) = session.decrypt_payload(&header, &ciphertext) {
-                                                    if let Ok(msg) = serde_json::from_slice::<ChatMessage>(&plaintext) {
-                                                        let _ = event_tx.send(NetworkEvent::ChatMessage(msg)).await;
+                                                if let Ok(plaintext) = session.decrypt_payload(&header, &ciphertext)
+                                                {
+                                                    if let Some((tid, idx, pdata)) =
+                                                        file_transfer::try_decode_e2ee_file_chunk_frame(
+                                                            &plaintext,
+                                                        )
+                                                    {
+                                                        apply_incoming_file_chunk(
+                                                            tid,
+                                                            idx,
+                                                            pdata,
+                                                            peer,
+                                                            &now,
+                                                            &mut incoming_transfers,
+                                                            &event_tx,
+                                                        )
+                                                        .await;
+                                                    } else if let Ok(msg) =
+                                                        serde_json::from_slice::<ChatMessage>(
+                                                            &plaintext,
+                                                        )
+                                                    {
+                                                        let _ = event_tx
+                                                            .send(NetworkEvent::ChatMessage(msg))
+                                                            .await;
                                                     }
                                                 }
                                             }
@@ -2472,107 +2655,17 @@ async fn main() -> Result<(), Box<dyn Error>> {
                                                 .behaviour_mut()
                                                 .file_rr
                                                 .send_response(channel, FilePacket::Ack);
-                                            let done = if let Some(inc) =
-                                                incoming_transfers.get_mut(&transfer_id)
-                                            {
-                                                inc.receive_chunk(chunk_index, data)
-                                            } else {
-                                                false
-                                            };
-
-                                            if let Some(inc) =
-                                                incoming_transfers.get(&transfer_id)
-                                            {
-                                                let recv = inc.received_count;
-                                                let total = inc.total_chunks;
-                                                let fname = inc.filename.clone();
-                                                let sz = inc.total_size;
-                                                let fkind = inc.kind;
-                                                let _ = event_tx
-                                                    .send(NetworkEvent::FileProgress {
-                                                        transfer_id,
-                                                        sent_chunks: recv,
-                                                        total_chunks: total,
-                                                        filename: fname.clone(),
-                                                        total_size: sz,
-                                                        is_outgoing: false,
-                                                        peer,
-                                                        kind: fkind,
-                                                    })
-                                                    .await;
-
-                                                if done {
-                                                    // Проверяем хэш и сохраняем файл.
-                                                    let sha_expected = inc.sha256;
-                                                    let maybe_data = inc.assemble();
-                                                    if let Some(data) = maybe_data {
-                                                        let sha_actual =
-                                                            file_transfer::hash_file(&data);
-                                                        if sha_actual != sha_expected {
-                                                            println!(
-                                                                "[{}] ❌ FILE: хэш не совпадает для «{}»!",
-                                                                now, fname
-                                                            );
-                                                            let _ = event_tx
-                                                                .send(NetworkEvent::FileError {
-                                                                    transfer_id,
-                                                                    reason: format!(
-                                                                        "Ошибка целостности файла «{}»",
-                                                                        fname
-                                                                    ),
-                                                                })
-                                                                .await;
-                                                        } else {
-                                                            let save_path = if let Some(ref dir) =
-                                                                incoming_transfers
-                                                                    .get(&transfer_id)
-                                                                    .and_then(|t| t.save_dir.clone())
-                                                            {
-                                                                file_transfer::unique_download_path_in(
-                                                                    dir, &fname,
-                                                                )
-                                                            } else {
-                                                                file_transfer::unique_download_path(
-                                                                    &fname,
-                                                                )
-                                                            };
-                                                            let saved_to =
-                                                                save_path.display().to_string();
-                                                            match std::fs::write(&save_path, &data) {
-                                                                Ok(_) => {
-                                                                    println!(
-                                                                        "[{}] ✅ FILE: «{}» сохранён → {}",
-                                                                        now, fname, saved_to
-                                                                    );
-                                                                    let _ = event_tx
-                                                                        .send(
-                                                                            NetworkEvent::FileComplete {
-                                                                                transfer_id,
-                                                                                filename: fname,
-                                                                                saved_to,
-                                                                                is_outgoing: false,
-                                                                                peer,
-                                                                            },
-                                                                        )
-                                                                        .await;
-                                                                }
-                                                                Err(e) => {
-                                                                    let _ = event_tx
-                                                                        .send(NetworkEvent::FileError {
-                                                                            transfer_id,
-                                                                            reason: format!(
-                                                                                "Не удалось сохранить «{}»: {}",
-                                                                                fname, e
-                                                                            ),
-                                                                        })
-                                                                        .await;
-                                                                }
-                                                            }
-                                                        }
-                                                    }
-                                                    incoming_transfers.remove(&transfer_id);
-                                                }
-                                            }
+                                            // Устаревший путь (plain): совместимость со старыми пирами.
+                                            apply_incoming_file_chunk(
+                                                transfer_id,
+                                                chunk_index,
+                                                data,
+                                                peer,
+                                                &now,
+                                                &mut incoming_transfers,
+                                                &event_tx,
+                                            )
+                                            .await;
                                         }
                                         FilePacket::Cancel { transfer_id } => {
                                             incoming_transfers.remove(&transfer_id);

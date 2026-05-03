@@ -1,8 +1,11 @@
-//! Передача файлов по отдельному sub-протоколу `/void/file/1.0.0`.
+//! Передача файлов по sub-протоколу `/void/file/1.0.0` (офферы, принятие).
 //!
 //! Особенности:
+//! * **Содержимое чанков** шифруется тем же Double Ratchet (`SecureSession`),
+//!   что и чат (`/void/chat/1.0.0`): шум транспортного уровня не раскрывает файлы оператору relay.
+//! * Метаданные оффера (имя, размер, хэш для целостности) всё ещё идут по `/void/file/1.0.0`.
 //! * Чанковая передача: файл разбивается на куски `FILE_CHUNK_SIZE` байт.
-//! * Integrity: SHA-256 (через blake2) всего файла проверяется на приёмнике.
+//! * Integrity: BLAKE2b-512 (первые 32 байта) всего файла проверяется на приёмнике.
 //! * Rate-limit на relay: если соединение идёт через p2p-circuit relay,
 //!   скорость отправки ограничивается `RELAY_RATE_LIMIT_BPS` байт/сек.
 //! * Файлы сохраняются в папку `void_downloads/` рядом с исполняемым файлом.
@@ -91,6 +94,35 @@ pub const DIRECT_CHUNK_DELAY: Duration = Duration::from_millis(5);
 /// Папка для сохранения принятых файлов.
 pub const DOWNLOADS_DIR: &str = "void_downloads";
 
+/// Префикс открытого текста перед Double Ratchet: не начинается с `{`, чтобы отличаться от JSON чата.
+pub const FILE_CHUNK_E2EE_MAGIC: &[u8; 4] = b"VfC1";
+
+/// Кодирует один чанк для `SecureSession::encrypt_payload` / `decrypt_payload`.
+pub fn encode_e2ee_file_chunk_frame(
+    transfer_id: &[u8; 16],
+    chunk_index: u32,
+    data: &[u8],
+) -> Vec<u8> {
+    let mut v = Vec::with_capacity(FILE_CHUNK_E2EE_MAGIC.len() + 16 + 4 + data.len());
+    v.extend_from_slice(FILE_CHUNK_E2EE_MAGIC);
+    v.extend_from_slice(transfer_id);
+    v.extend_from_slice(&chunk_index.to_le_bytes());
+    v.extend_from_slice(data);
+    v
+}
+
+/// Разбор результата `decrypt_payload`, если это чанк файла.
+pub fn try_decode_e2ee_file_chunk_frame(buf: &[u8]) -> Option<([u8; 16], u32, Vec<u8>)> {
+    const HEADER: usize = FILE_CHUNK_E2EE_MAGIC.len() + 16 + 4;
+    if buf.len() < HEADER || &buf[..4] != FILE_CHUNK_E2EE_MAGIC {
+        return None;
+    }
+    let mut tid = [0u8; 16];
+    tid.copy_from_slice(&buf[4..20]);
+    let idx = u32::from_le_bytes(buf[20..HEADER].try_into().ok()?);
+    Some((tid, idx, buf[HEADER..].to_vec()))
+}
+
 /// Вычисляет задержку между чанками для relay-соединения.
 pub fn relay_chunk_delay() -> Duration {
     let ms = (FILE_CHUNK_SIZE as u64 * 1000) / RELAY_RATE_LIMIT_BPS;
@@ -121,7 +153,8 @@ pub enum FilePacket {
         transfer_id: [u8; 16],
         reason: String,
     },
-    /// Отправитель → получатель: один чанк данных.
+    /// Отправитель → получатель: один чанк данных (**устарело**: новые узлы шлют чанки по E2EE чата).
+    /// Оставлено для совместимости со старыми пирами.
     Chunk {
         transfer_id: [u8; 16],
         chunk_index: u32,
