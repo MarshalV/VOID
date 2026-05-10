@@ -2425,14 +2425,21 @@ async fn run_chat_network(
                                                     sessions.remove(&peer);
                                                 }
                                                 let session_exists = sessions.contains_key(&peer);
-                                                if is_initiator && !session_exists {
-                                                    // Алиса получила Hello от Боба (как ответ)
+                                                // Завершение стороны, которая первая послала Hello (есть наш ephem в pending).
+                                                // Раньше требовался is_initiator (меньший PeerId) — тогда пир с большим ID,
+                                                // написавший первым, никогда не создавал сессию по Hello в ответе.
+                                                if !session_exists {
                                                     let remote_static_pub = crypto::PublicKey::from(public_key);
                                                     let remote_ephem_pub = crypto::PublicKey::from(ephemeral_key);
                                                     if let Some(local_ephem_secret) = pending_handshakes.remove(&peer) {
                                                         let session = crypto::SecureSession::new_initiator(&local_static, &remote_static_pub, local_ephem_secret, &remote_ephem_pub);
                                                         sessions.insert(peer, session);
-                                                        println!("[{}] 🤝 E2EE: Сессия (Alice/Res) создана с {}", now, &peer.to_string()[..8]);
+                                                        println!(
+                                                            "[{}] 🤝 E2EE: Сессия (ответ Hello) создана с {}{}",
+                                                            now,
+                                                            &peer.to_string()[..8],
+                                                            if is_initiator { " [initiator по ID]" } else { "" }
+                                                        );
                                                         if let Some(buffered) = pending_messages.remove(&peer) {
                                                             if let Some(sess) = sessions.get_mut(&peer) {
                                                                 for data in buffered {
