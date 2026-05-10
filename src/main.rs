@@ -2253,40 +2253,51 @@ async fn run_chat_network(
                                             if peer != local_peer_id {
                                                 let is_initiator = local_peer_id < peer;
                                                 let _role_str = if is_initiator { "Initiator" } else { "Responder" };
-                                                let session_exists = sessions.contains_key(&peer);
 
-                                                if !session_exists {
-                                                    let remote_static_pub = crypto::PublicKey::from(public_key);
-                                                    let remote_ephem_pub = crypto::PublicKey::from(ephemeral_key);
+                                                // Новый Hello всегда перезапускает согласование: иначе после рестарта
+                                                // пира мы бы оставили старый ratchet и только вернули Ack.
+                                                if sessions.contains_key(&peer) {
+                                                    println!(
+                                                        "[{}] 🔄 E2EE: сброс сессии с {} (новый Hello)",
+                                                        now,
+                                                        &peer.to_string()[..8]
+                                                    );
+                                                    sessions.remove(&peer);
+                                                }
+                                                // Наш незавершённый Hello (если был) — одно значение; либо дополняем им
+                                                // рукопожатие, либо уступаем ответом как responder.
+                                                let took_outgoing = pending_handshakes.remove(&peer);
 
-                                                    if is_initiator {
-                                                        // Alice получила Hello от Боба (как запрос)
-                                                        if let Some(local_ephem_secret) = pending_handshakes.remove(&peer) {
-                                                            let session = crypto::SecureSession::new_initiator(&local_static, &remote_static_pub, local_ephem_secret, &remote_ephem_pub);
-                                                            sessions.insert(peer, session);
-                                                            println!("[{}] 🤝 E2EE: Сессия (Alice/Req) создана с {}", now, &peer.to_string()[..8]);
-                                                            if let Some(buffered) = pending_messages.remove(&peer) {
-                                                                if let Some(sess) = sessions.get_mut(&peer) {
-                                                                    for data in buffered {
-                                                                        if let Ok((header, ciphertext)) = sess.encrypt_payload(&data) {
-                                                                            let pkt = V1Packet::Encrypted { header, ciphertext };
-                                                                            let req_id = swarm.behaviour_mut().request_response.send_request(&peer, pkt);
-                                                                            outbound_msg_requests.insert(req_id, peer);
-                                                                            println!("[{}] 📨 E2EE: Буферизованное сообщение отправлено {}", now, &peer.to_string()[..8]);
-                                                                        }
+                                                let remote_static_pub = crypto::PublicKey::from(public_key);
+                                                let remote_ephem_pub = crypto::PublicKey::from(ephemeral_key);
+
+                                                if is_initiator {
+                                                    // По PeerId мы «инициатор»; если уже посылали Hello — закрываем пару.
+                                                    if let Some(local_ephem_secret) = took_outgoing {
+                                                        let session = crypto::SecureSession::new_initiator(&local_static, &remote_static_pub, local_ephem_secret, &remote_ephem_pub);
+                                                        sessions.insert(peer, session);
+                                                        println!("[{}] 🤝 E2EE: Сессия (Alice/Req) создана с {}", now, &peer.to_string()[..8]);
+                                                        if let Some(buffered) = pending_messages.remove(&peer) {
+                                                            if let Some(sess) = sessions.get_mut(&peer) {
+                                                                for data in buffered {
+                                                                    if let Ok((header, ciphertext)) = sess.encrypt_payload(&data) {
+                                                                        let pkt = V1Packet::Encrypted { header, ciphertext };
+                                                                        let req_id = swarm.behaviour_mut().request_response.send_request(&peer, pkt);
+                                                                        outbound_msg_requests.insert(req_id, peer);
+                                                                        println!("[{}] 📨 E2EE: Буферизованное сообщение отправлено {}", now, &peer.to_string()[..8]);
                                                                     }
                                                                 }
                                                             }
                                                         }
                                                         let _ = swarm.behaviour_mut().request_response.send_response(channel, V1Packet::Ack);
                                                     } else {
-                                                        // Боб получил Hello от Алисы
+                                                        // Инициатор по ID, но свой Hello мы ещё не слали — завершаем как responder.
                                                         let local_ephem_secret = crypto::StaticSecret::random_from_rng(&mut rand::rngs::OsRng);
                                                         let local_ephem_pub = crypto::PublicKey::from(&local_ephem_secret);
 
                                                         let session = crypto::SecureSession::new_responder(&local_static, &remote_static_pub, &remote_ephem_pub, local_ephem_secret);
                                                         sessions.insert(peer, session);
-                                                        println!("[{}] 🤝 E2EE: Сессия (Bob/Res) создана с {}", now, &peer.to_string()[..8]);
+                                                        println!("[{}] 🤝 E2EE: Сессия (fallback Res после Hello пира) с {}", now, &peer.to_string()[..8]);
                                                         if let Some(buffered) = pending_messages.remove(&peer) {
                                                             if let Some(sess) = sessions.get_mut(&peer) {
                                                                 for data in buffered {
@@ -2300,7 +2311,6 @@ async fn run_chat_network(
                                                             }
                                                         }
 
-                                                        // Боб отвечает своим Hello
                                                         let my_hello = V1Packet::Hello {
                                                             public_key: my_public_key.to_bytes(),
                                                             ephemeral_key: local_ephem_pub.to_bytes(),
@@ -2308,7 +2318,31 @@ async fn run_chat_network(
                                                         let _ = swarm.behaviour_mut().request_response.send_response(channel, my_hello);
                                                     }
                                                 } else {
-                                                    let _ = swarm.behaviour_mut().request_response.send_response(channel, V1Packet::Ack);
+                                                    // Боб получил Hello от Алисы
+                                                    let local_ephem_secret = crypto::StaticSecret::random_from_rng(&mut rand::rngs::OsRng);
+                                                    let local_ephem_pub = crypto::PublicKey::from(&local_ephem_secret);
+
+                                                    let session = crypto::SecureSession::new_responder(&local_static, &remote_static_pub, &remote_ephem_pub, local_ephem_secret);
+                                                    sessions.insert(peer, session);
+                                                    println!("[{}] 🤝 E2EE: Сессия (Bob/Res) создана с {}", now, &peer.to_string()[..8]);
+                                                    if let Some(buffered) = pending_messages.remove(&peer) {
+                                                        if let Some(sess) = sessions.get_mut(&peer) {
+                                                            for data in buffered {
+                                                                if let Ok((header, ciphertext)) = sess.encrypt_payload(&data) {
+                                                                    let pkt = V1Packet::Encrypted { header, ciphertext };
+                                                                    let req_id = swarm.behaviour_mut().request_response.send_request(&peer, pkt);
+                                                                    outbound_msg_requests.insert(req_id, peer);
+                                                                    println!("[{}] 📨 E2EE: Буферизованное сообщение отправлено {}", now, &peer.to_string()[..8]);
+                                                                }
+                                                            }
+                                                        }
+                                                    }
+
+                                                    let my_hello = V1Packet::Hello {
+                                                        public_key: my_public_key.to_bytes(),
+                                                        ephemeral_key: local_ephem_pub.to_bytes(),
+                                                    };
+                                                    let _ = swarm.behaviour_mut().request_response.send_response(channel, my_hello);
                                                 }
                                             }
                                         }
@@ -2382,6 +2416,14 @@ async fn run_chat_network(
                                         V1Packet::Hello { public_key, ephemeral_key } => {
                                             if peer != local_peer_id {
                                                 let is_initiator = local_peer_id < peer;
+                                                if sessions.contains_key(&peer) {
+                                                    println!(
+                                                        "[{}] 🔄 E2EE: сброс сессии с {} (Hello в ответе)",
+                                                        now,
+                                                        &peer.to_string()[..8]
+                                                    );
+                                                    sessions.remove(&peer);
+                                                }
                                                 let session_exists = sessions.contains_key(&peer);
                                                 if is_initiator && !session_exists {
                                                     // Алиса получила Hello от Боба (как ответ)
@@ -2576,6 +2618,13 @@ async fn run_chat_network(
                             let connected_count = swarm.connected_peers().count();
                             println!("❌ СОЕДИНЕНИЕ ЗАКРЫТО: {}. Причина: {:?}. Осталось: {}", peer_id, cause, connected_count);
                             relay_peers.remove(&peer_id);
+
+                            // E2EE: при обрыве TCP/QUIC сбрасываем криптосостояние с пиром.
+                            // Иначе после рестарта одного клиента второй держит «старый» ratchet
+                            // и новые Hello игнорируются (отправлялся только Ack → чат мёртв).
+                            sessions.remove(&peer_id);
+                            pending_handshakes.remove(&peer_id);
+                            pending_messages.remove(&peer_id);
 
                             // Планируем переподключение для контактов из vault.
                             // Backoff: 5 с → 20 с → 60 с → 5 мин (и далее 5 мин).
