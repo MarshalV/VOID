@@ -5,6 +5,7 @@ use aes_gcm::{
     aead::{Aead, KeyInit},
     Aes256Gcm, Key, Nonce,
 };
+use argon2::{Algorithm, Argon2, Params, Version};
 use chrono;
 use eframe::egui;
 use futures::StreamExt;
@@ -15,6 +16,7 @@ use libp2p::{
 };
 use rand::RngCore;
 use serde::{Deserialize, Serialize};
+use zeroize::{Zeroize, Zeroizing};
 use std::collections::{HashMap, HashSet};
 use std::error::Error;
 use std::path::Path;
@@ -308,28 +310,94 @@ impl Storage {
     const FILE_TMP: &'static str = "vault.bin.tmp";
     const FILE_BAK: &'static str = "vault.bin.bak";
     const KEY_FILE: &'static str = "void.key";
+    /// Магия и размер обёртки `void.key` v2: Argon2id KDF + AES-256-GCM над сыром мастер-ключом vault.
+    const KEY_WRAP_MAGIC: &'static [u8; 8] = b"VOIDKEY2";
+    const WRAP_SALT_LEN: usize = 32;
+    const WRAP_NONCE_LEN: usize = 12;
 
-    fn get_master_key() -> [u8; 32] {
-        if let Ok(k) = std::fs::read(Self::KEY_FILE) {
-            if k.len() == 32 {
-                let mut key = [0u8; 32];
-                key.copy_from_slice(&k);
-                return key;
-            }
-        }
+    fn derive_wrap_key(password: &[u8], salt: &[u8]) -> Result<[u8; 32], Box<dyn Error>> {
+        let params = Params::new(32768, 3, 4, Some(32)).map_err(|e| e.to_string())?;
+        let argon = Argon2::new(Algorithm::Argon2id, Version::V0x13, params);
         let mut key = [0u8; 32];
-        rand::thread_rng().fill_bytes(&mut key);
-        let _ = std::fs::write(Self::KEY_FILE, &key);
-        key
+        argon
+            .hash_password_into(password, salt, &mut key)
+            .map_err(|e| format!("argon2: {}", e))?;
+        Ok(key)
+    }
+
+    /// Пишет `void.key`: мастер-ключ vault (32 байта) зашифрован паролем (KDF Argon2id + AES-GCM).
+    pub(crate) fn write_wrapped_master_key_file(
+        master_plain: &[u8; 32],
+        password: &str,
+    ) -> Result<(), Box<dyn Error>> {
+        let mut salt = vec![0u8; Self::WRAP_SALT_LEN];
+        rand::thread_rng().fill_bytes(&mut salt);
+        let wrap_key = Self::derive_wrap_key(password.as_bytes(), &salt)?;
+        let cipher = Aes256Gcm::new(Key::<Aes256Gcm>::from_slice(&wrap_key));
+        let mut nonce = [0u8; Self::WRAP_NONCE_LEN];
+        rand::thread_rng().fill_bytes(&mut nonce);
+        let ct = cipher
+            .encrypt(Nonce::from_slice(&nonce), master_plain.as_ref())
+            .map_err(|e| format!("wrap key encrypt: {}", e))?;
+        let mut blob = Vec::with_capacity(8 + salt.len() + nonce.len() + ct.len());
+        blob.extend_from_slice(Self::KEY_WRAP_MAGIC);
+        blob.extend_from_slice(&salt);
+        blob.extend_from_slice(&nonce);
+        blob.extend_from_slice(&ct);
+        std::fs::write(Self::KEY_FILE, &blob)?;
+        Ok(())
+    }
+
+    /// Считывает мастер-ключ из `void.key` v2 (Argon2id + AES-GCM).
+    pub(crate) fn unwrap_master_key_file(password: &str) -> Result<[u8; 32], Box<dyn Error>> {
+        let blob = std::fs::read(Self::KEY_FILE)?;
+        Self::unwrap_master_key_bytes(&blob, password)
+    }
+
+    fn unwrap_master_key_bytes(blob: &[u8], password: &str) -> Result<[u8; 32], Box<dyn Error>> {
+        let min =
+            Self::KEY_WRAP_MAGIC.len() + Self::WRAP_SALT_LEN + Self::WRAP_NONCE_LEN + 16;
+        if blob.len() < min {
+            return Err("void.key слишком короткий или повреждён".into());
+        }
+        let (magic, rest) = blob.split_at(Self::KEY_WRAP_MAGIC.len());
+        if magic != Self::KEY_WRAP_MAGIC.as_slice() {
+            return Err(
+                "void.key без магии VOIDKEY2 (ожидается формат с паролём)".into(),
+            );
+        }
+        let (salt, rest) = rest.split_at(Self::WRAP_SALT_LEN);
+        let (nonce, ct) = rest.split_at(Self::WRAP_NONCE_LEN);
+        let wrap_key = Self::derive_wrap_key(password.as_bytes(), salt)?;
+        let cipher = Aes256Gcm::new(Key::<Aes256Gcm>::from_slice(&wrap_key));
+        let plain = cipher
+            .decrypt(Nonce::from_slice(nonce), ct.as_ref())
+            .map_err(|_| "Неверный пароль или повреждённый void.key".to_string())?;
+        if plain.len() != 32 {
+            return Err("void.key: некорректная длина мастер-ключа".into());
+        }
+        let mut out = [0u8; 32];
+        out.copy_from_slice(&plain);
+        Ok(out)
+    }
+
+    pub(crate) fn read_key_blob() -> Result<Vec<u8>, std::io::Error> {
+        std::fs::read(Self::KEY_FILE)
+    }
+
+    pub(crate) fn is_wrapped_keyfile(raw: &[u8]) -> bool {
+        raw.len() >= Self::KEY_WRAP_MAGIC.len()
+            && &raw[..Self::KEY_WRAP_MAGIC.len()] == Self::KEY_WRAP_MAGIC.as_slice()
     }
 
     fn save(
+        master_key: &[u8; 32],
         nickname: &str,
         keypair: Option<&libp2p::identity::Keypair>,
         static_secret: Option<&crypto::StaticSecret>,
         address_book: Option<&[AddressBookEntry]>,
     ) -> Result<(), Box<dyn Error>> {
-        let current_load = Self::load();
+        let current_load = Self::load(master_key);
 
         let keypair_bytes = if let Some(kp) = keypair {
             kp.to_protobuf_encoding()?
@@ -372,8 +440,7 @@ impl Storage {
         };
         let plaintext = serde_json::to_vec(&data)?;
 
-        let master_key = Self::get_master_key();
-        let cipher = Aes256Gcm::new(Key::<Aes256Gcm>::from_slice(&master_key));
+        let cipher = Aes256Gcm::new(Key::<Aes256Gcm>::from_slice(master_key.as_slice()));
 
         let mut nonce_bytes = [0u8; 12];
         rand::thread_rng().fill_bytes(&mut nonce_bytes);
@@ -399,7 +466,7 @@ impl Storage {
         Ok(())
     }
 
-    fn load() -> Result<StorageData, Box<dyn Error>> {
+    fn load(master_key: &[u8; 32]) -> Result<StorageData, Box<dyn Error>> {
         if !std::path::Path::new(Self::FILE).exists() {
             return Err("Vault file not found".into());
         }
@@ -409,8 +476,7 @@ impl Storage {
         }
 
         let (nonce_bytes, ciphertext) = data.split_at(12);
-        let master_key = Self::get_master_key();
-        let cipher = Aes256Gcm::new(Key::<Aes256Gcm>::from_slice(&master_key));
+        let cipher = Aes256Gcm::new(Key::<Aes256Gcm>::from_slice(master_key.as_slice()));
         let nonce = Nonce::from_slice(nonce_bytes);
 
         let plaintext = cipher
@@ -419,6 +485,58 @@ impl Storage {
 
         let storage: StorageData = serde_json::from_slice(&plaintext)?;
         Ok(storage)
+    }
+}
+
+/// Какой экран разблокировки vault показать при старте.
+#[derive(Clone)]
+pub(crate) enum VaultUnlockKind {
+    /// Нет `vault.bin`: создаём профиль, пароль задаётся дважды.
+    CreateProfile,
+    /// Обычный вход: `void.key` в формате Argon2id + AES-GCM.
+    OpenWrappedKey,
+    /// Старый `void.key` ровно 32 байта сырого мастер-ключа — перенос на защищённый формат.
+    MigratePlainMaster(Zeroizing<[u8; 32]>),
+}
+
+pub(crate) struct VaultUnlockState {
+    pub kind: VaultUnlockKind,
+    pub password: String,
+    pub password_confirm: String,
+    pub error: Option<String>,
+}
+
+pub(crate) struct DeferredNetworkSpawn {
+    pub event_tx: mpsc::Sender<NetworkEvent>,
+    pub command_rx: mpsc::Receiver<UICommand>,
+    pub command_tx_for_mdns: mpsc::Sender<UICommand>,
+    pub void_bootstraps: Vec<Multiaddr>,
+}
+
+/// Определяет сценарий разблокировки по наличию `vault.bin` и формату `void.key`.
+fn detect_vault_unlock_kind() -> Result<VaultUnlockKind, String> {
+    let vault_exists = Path::new(Storage::FILE).exists();
+    let raw_key = Storage::read_key_blob().unwrap_or_else(|_| Vec::new());
+    let key_empty = raw_key.is_empty();
+
+    match (vault_exists, key_empty, raw_key.len()) {
+        (false, true, _) => Ok(VaultUnlockKind::CreateProfile),
+        (false, false, _) => Err(
+            "Найден void.key без vault.bin — восстановите vault или удалите void.key.".into(),
+        ),
+        (true, true, _) => Err(format!(
+            "Нет {} при существующем vault — добавьте void.key или восстановите файл ключа.",
+            Storage::KEY_FILE
+        )),
+        (true, false, 32) if !Storage::is_wrapped_keyfile(&raw_key) => {
+            let mut m = [0u8; 32];
+            m.copy_from_slice(&raw_key);
+            Ok(VaultUnlockKind::MigratePlainMaster(Zeroizing::new(m)))
+        }
+        (true, false, _) if Storage::is_wrapped_keyfile(&raw_key) => Ok(VaultUnlockKind::OpenWrappedKey),
+        (true, false, _) => Err(
+            "void.key неизвестного формата (ни 32 байта, ни VOIDKEY2).".into(),
+        ),
     }
 }
 
@@ -744,11 +862,19 @@ struct App {
         [u8; 16],
         PeerId,
     )>,
+    /// Экран ввода пароля до расшифровки `void.key` / создания профиля.
+    pub(crate) pending_unlock: Option<VaultUnlockState>,
+    deferred_network_spawn: Option<DeferredNetworkSpawn>,
+    /// Мастер-ключ AES vault (после разблокировки). До входа отсутствует.
+    vault_master_key: Option<Zeroizing<[u8; 32]>>,
 }
 
 impl App {
     fn new(
         cc: &eframe::CreationContext<'_>,
+        pending_unlock: Option<VaultUnlockState>,
+        deferred_network_spawn: Option<DeferredNetworkSpawn>,
+        vault_master_key: Option<Zeroizing<[u8; 32]>>,
         local_peer_id: PeerId,
         local_nickname: String,
         local_static: crypto::StaticSecret,
@@ -794,11 +920,328 @@ impl App {
             active_file_transfers: HashMap::new(),
             show_attach_menu: false,
             pending_accept: None,
+            pending_unlock,
+            deferred_network_spawn,
+            vault_master_key,
         }
     }
 
-    /// Сохраняет ник и записную книгу в `vault.bin` (AES-GCM, ключ в `void.key`).
+    /// Экран разблокировки vault. Возвращает `true`, пока нужно блокировать основной UI.
+    pub(crate) fn vault_unlock_gate(&mut self, ctx: &egui::Context) -> bool {
+        let Some(_) = self.pending_unlock.as_ref() else {
+            return false;
+        };
+
+        #[derive(Clone, Copy)]
+        enum Act {
+            Unlock,
+        }
+        let mut act = None::<Act>;
+
+        egui::CentralPanel::default().show(ctx, |ui| {
+            ui.vertical_centered(|ui| {
+                ui.add_space(56.0);
+                ui.label(egui::RichText::new("VOID").size(36.0).strong());
+                ui.add_space(12.0);
+                let subtitle = match &self.pending_unlock.as_ref().unwrap().kind {
+                    VaultUnlockKind::CreateProfile => "Задайте пароль vault (AES-ключ будет защищён Argon2id).",
+                    VaultUnlockKind::OpenWrappedKey => "Введите пароль vault.",
+                    VaultUnlockKind::MigratePlainMaster(_) => {
+                        "Старый void.key без пароля: задаётесь пароль (Argon2id + AES), vault не меняется."
+                    }
+                };
+                ui.label(egui::RichText::new(subtitle).weak());
+                ui.add_space(24.0);
+                ui.set_max_width(420.0);
+                let need_confirm =
+                    matches!(
+                        self.pending_unlock.as_ref().unwrap().kind,
+                        VaultUnlockKind::CreateProfile | VaultUnlockKind::MigratePlainMaster(_),
+                    );
+
+                if let Some(p) = self.pending_unlock.as_mut() {
+                    ui.label("Пароль:");
+                    ui.add(
+                        egui::TextEdit::singleline(&mut p.password)
+                            .desired_width(320.0)
+                            .password(true)
+                            .hint_text("Не короче 8 символов"),
+                    );
+
+                    if need_confirm {
+                        ui.add_space(8.0);
+                        ui.label("Пароль ещё раз:");
+                        ui.add(
+                            egui::TextEdit::singleline(&mut p.password_confirm)
+                                .desired_width(320.0)
+                                .password(true),
+                        );
+                    }
+
+                    if let Some(err) = &p.error {
+                        ui.add_space(8.0);
+                        ui.colored_label(egui::Color32::from_rgb(220, 100, 100), err);
+                    }
+
+                    ui.add_space(24.0);
+                    if ui
+                        .add_sized([180.0, 36.0], egui::Button::new("Продолжить"))
+                        .clicked()
+                    {
+                        act = Some(Act::Unlock);
+                    }
+                }
+                ui.add_space(12.0);
+                ui.small(
+                    "Мастер-ключ vault зашифрован в void.key паролем (Argon2id + AES-GCM).",
+                );
+            });
+        });
+
+        if matches!(act, Some(Act::Unlock)) {
+            self.submit_vault_unlock(ctx);
+        }
+        ctx.request_repaint_after(Duration::from_millis(200));
+        true
+    }
+
+    fn submit_vault_unlock(&mut self, ctx: &egui::Context) {
+        let Some(mut pending) = self.pending_unlock.take() else {
+            return;
+        };
+        pending.error = None;
+        let pwd = pending.password.trim();
+        let pwd2 = pending.password_confirm.trim();
+        let require_confirm = matches!(
+            pending.kind,
+            VaultUnlockKind::CreateProfile | VaultUnlockKind::MigratePlainMaster(_),
+        );
+
+        if pwd.len() < 8 {
+            pending.error = Some("Укажите пароль не короче 8 символов.".into());
+            self.pending_unlock = Some(pending);
+            return;
+        }
+        if require_confirm && pwd != pwd2 {
+            pending.error = Some("Пароли не совпадают.".into());
+            self.pending_unlock = Some(pending);
+            return;
+        }
+
+        let kind_followup = match &pending.kind {
+            VaultUnlockKind::CreateProfile => VaultUnlockKind::CreateProfile,
+            VaultUnlockKind::OpenWrappedKey => VaultUnlockKind::OpenWrappedKey,
+            VaultUnlockKind::MigratePlainMaster(z) => {
+                VaultUnlockKind::MigratePlainMaster(z.clone())
+            }
+        };
+
+        let master_arr: Zeroizing<[u8; 32]> = match &pending.kind {
+            VaultUnlockKind::OpenWrappedKey => match Storage::unwrap_master_key_file(pwd) {
+                Ok(m) => Zeroizing::new(m),
+                Err(e) => {
+                    pending.password.zeroize();
+                    pending.password_confirm.zeroize();
+                    pending.error = Some(format!("{}", e));
+                    self.pending_unlock = Some(pending);
+                    return;
+                }
+            },
+            VaultUnlockKind::MigratePlainMaster(leg) => {
+                let plain = **leg;
+                if let Err(e) = Storage::write_wrapped_master_key_file(&plain, pwd) {
+                    pending.error = Some(format!("{}", e));
+                    self.pending_unlock = Some(pending);
+                    return;
+                }
+                Zeroizing::new(plain)
+            }
+            VaultUnlockKind::CreateProfile => {
+                let mut plain = [0u8; 32];
+                rand::thread_rng().fill_bytes(&mut plain);
+                if let Err(e) = Storage::write_wrapped_master_key_file(&plain, pwd) {
+                    pending.error = Some(format!("{}", e));
+                    self.pending_unlock = Some(pending);
+                    return;
+                }
+                Zeroizing::new(plain)
+            }
+        };
+
+        pending.password.zeroize();
+        pending.password_confirm.zeroize();
+        drop(pending);
+
+        let Some(dn_sp) = self.deferred_network_spawn.take() else {
+            self.pending_unlock = Some(VaultUnlockState {
+                kind: kind_followup,
+                password: String::new(),
+                password_confirm: String::new(),
+                error: Some("Внутренняя ошибка: параметры сети недоступны.".into()),
+            });
+            return;
+        };
+
+        match kind_followup {
+            VaultUnlockKind::OpenWrappedKey | VaultUnlockKind::MigratePlainMaster(_) => {
+                let storage = match Storage::load(&master_arr) {
+                    Ok(s) => s,
+                    Err(e) => {
+                        self.pending_unlock = Some(VaultUnlockState {
+                            kind: VaultUnlockKind::OpenWrappedKey,
+                            password: String::new(),
+                            password_confirm: String::new(),
+                            error: Some(format!("Не удалось прочитать vault.bin: {}", e)),
+                        });
+                        self.deferred_network_spawn = Some(dn_sp);
+                        return;
+                    }
+                };
+                let local_key = match libp2p::identity::Keypair::from_protobuf_encoding(
+                    &storage.keypair_bytes,
+                ) {
+                    Ok(k) => k,
+                    Err(e) => {
+                        self.pending_unlock = Some(VaultUnlockState {
+                            kind: VaultUnlockKind::OpenWrappedKey,
+                            password: String::new(),
+                            password_confirm: String::new(),
+                            error: Some(format!("Не удалось восстановить ключи: {}", e)),
+                        });
+                        self.deferred_network_spawn = Some(dn_sp);
+                        return;
+                    }
+                };
+                let static_secret = crypto::StaticSecret::from(storage.static_secret_bytes);
+                let my_id = PeerId::from(local_key.public());
+                let mut book = HashMap::new();
+                let mut addrs_map: HashMap<PeerId, Vec<Multiaddr>> = HashMap::new();
+                for entry in storage.address_book {
+                    if let Ok(pid) = entry.peer_id.parse::<PeerId>() {
+                        if pid != my_id {
+                            book.insert(pid, entry.display_name);
+                            let mut parsed: Vec<Multiaddr> = entry
+                                .addrs
+                                .iter()
+                                .filter_map(|s| s.parse::<Multiaddr>().ok())
+                                .collect();
+                            if !parsed.is_empty() {
+                                addrs_map.entry(pid).or_default().append(&mut parsed);
+                            }
+                        }
+                    }
+                }
+                let contact_addrs_flat: Vec<(PeerId, Multiaddr)> = addrs_map
+                    .iter()
+                    .flat_map(|(pid, addrs)| addrs.iter().cloned().map(move |a| (*pid, a)))
+                    .collect();
+                tokio::spawn(run_chat_network(
+                    dn_sp.command_rx,
+                    dn_sp.event_tx,
+                    dn_sp.command_tx_for_mdns,
+                    local_key.clone(),
+                    static_secret.clone(),
+                    dn_sp.void_bootstraps,
+                    contact_addrs_flat,
+                ));
+                self.apply_unlock_success(
+                    ctx,
+                    local_key,
+                    storage.nickname,
+                    static_secret,
+                    book,
+                    addrs_map,
+                    master_arr,
+                );
+            }
+            VaultUnlockKind::CreateProfile => {
+                let local_key = libp2p::identity::Keypair::generate_ed25519();
+                let static_secret =
+                    crypto::StaticSecret::random_from_rng(&mut rand::rngs::OsRng);
+                let nickname = format!(
+                    "User_{}",
+                    &PeerId::from(local_key.public()).to_string()[..4]
+                );
+                if let Err(e) = Storage::save(
+                    &master_arr,
+                    &nickname,
+                    Some(&local_key),
+                    Some(&static_secret),
+                    None,
+                ) {
+                    let _ = std::fs::remove_file(Storage::KEY_FILE);
+                    self.pending_unlock = Some(VaultUnlockState {
+                        kind: VaultUnlockKind::CreateProfile,
+                        password: String::new(),
+                        password_confirm: String::new(),
+                        error: Some(format!("Не удалось создать vault: {}", e)),
+                    });
+                    self.deferred_network_spawn = Some(dn_sp);
+                    return;
+                }
+
+                tokio::spawn(run_chat_network(
+                    dn_sp.command_rx,
+                    dn_sp.event_tx,
+                    dn_sp.command_tx_for_mdns,
+                    local_key.clone(),
+                    static_secret.clone(),
+                    dn_sp.void_bootstraps,
+                    Vec::new(),
+                ));
+
+                self.apply_unlock_success(
+                    ctx,
+                    local_key,
+                    nickname,
+                    static_secret,
+                    HashMap::new(),
+                    HashMap::new(),
+                    master_arr,
+                );
+            }
+        }
+    }
+
+    fn apply_unlock_success(
+        &mut self,
+        ctx: &egui::Context,
+        local_key: libp2p::identity::Keypair,
+        nickname: String,
+        static_secret: crypto::StaticSecret,
+        book: HashMap<PeerId, String>,
+        addrs_map: HashMap<PeerId, Vec<Multiaddr>>,
+        master_arr: Zeroizing<[u8; 32]>,
+    ) {
+        self.local_peer_id = PeerId::from(local_key.public());
+        self.local_nickname = nickname;
+        self.known_peers = book;
+        self.contact_addrs = addrs_map;
+        self._local_static = static_secret;
+        self.pending_unlock = None;
+        self.vault_master_key = Some(master_arr);
+
+        println!("=== VOID P2P Chat ===");
+        println!("Ваш Peer ID: {}", self.local_peer_id);
+        println!("Ваш никнейм: {}", self.local_nickname);
+
+        let pid = self.local_peer_id.to_string();
+        let tit = pid
+            .as_str()
+            .get(..8)
+            .map(str::to_string)
+            .unwrap_or_else(|| pid.clone());
+        ctx.send_viewport_cmd(egui::ViewportCommand::Title(format!("VOID Chat [{}]", tit)));
+
+        self.add_status("Vault разблокирован, сеть запущена.".into());
+    }
+
+    /// Сохраняет ник и записную книгу в `vault.bin` (AES-GCM под мастер-ключом).
     fn persist_vault(&self) {
+        let Some(ref vault_master_key) = self.vault_master_key else {
+            return;
+        };
+
         let mut entries: Vec<AddressBookEntry> = self
             .known_peers
             .iter()
@@ -821,6 +1264,7 @@ impl App {
                 .cmp(&b.display_name.to_lowercase())
         });
         if let Err(e) = Storage::save(
+            vault_master_key,
             &self.local_nickname,
             None,
             None,
@@ -949,198 +1393,20 @@ impl App {
 
 }
 
-#[tokio::main]
-async fn main() -> Result<(), Box<dyn Error>> {
-    // Включаем логи для отладки
-    let _ = tracing_subscriber::fmt().with_env_filter("info").try_init();
-
-    // === Автоматически добавляем правило файрвола ===
-    #[allow(unused_variables)]
-    let exe_path = std::env::current_exe().unwrap_or_default();
-    #[allow(unused_variables)]
-    let exe = exe_path.display().to_string();
-
-    #[cfg(target_os = "windows")]
-    {
-        // Проверяем, запущены ли мы уже от Администратора
-        let is_admin = std::process::Command::new("net")
-            .args(["session"])
-            .output()
-            .map(|o| o.status.success())
-            .unwrap_or(false);
-
-        if is_admin {
-            println!("Настраиваю файрвол Windows (Admin Mode)...");
-            let _ = std::process::Command::new("netsh")
-                .args(["advfirewall", "firewall", "delete", "rule", "name=VOID P2P"])
-                .output();
-            let tcp_r = std::process::Command::new("netsh")
-                .args([
-                    "advfirewall",
-                    "firewall",
-                    "add",
-                    "rule",
-                    "name=VOID P2P",
-                    "dir=in",
-                    "action=allow",
-                    "protocol=TCP",
-                    "localport=50001",
-                    "profile=any",
-                    "enable=yes",
-                ])
-                .output();
-            let udp_r = std::process::Command::new("netsh")
-                .args([
-                    "advfirewall",
-                    "firewall",
-                    "add",
-                    "rule",
-                    "name=VOID P2P",
-                    "dir=in",
-                    "action=allow",
-                    "protocol=UDP",
-                    "localport=50001",
-                    "profile=any",
-                    "edge=yes",
-                    "enable=yes",
-                ])
-                .output();
-            match (tcp_r, udp_r) {
-                (Ok(t), Ok(u)) if t.status.success() && u.status.success() => {
-                    println!("✅ Файрвол настроен (TCP + UDP разрешены)")
-                }
-                _ => println!("⚠ Не удалось настроить файрвол"),
-            }
-        } else {
-            // Пишем команды в временный .bat файл, запускаем от админа через UAC
-            let bat = format!(
-                "@echo off\r\n\
-                 netsh advfirewall firewall delete rule name=\"VOID P2P\"\r\n\
-                 netsh advfirewall firewall add rule name=\"VOID P2P\" dir=in action=allow protocol=TCP localport=50001 profile=any enable=yes\r\n\
-                 netsh advfirewall firewall add rule name=\"VOID P2P\" dir=in action=allow protocol=UDP localport=50001 profile=any edge=yes enable=yes\r\n"
-            );
-            let bat_path = std::env::temp_dir().join("void_p2p_firewall.bat");
-            if std::fs::write(&bat_path, bat).is_ok() {
-                println!("Настраиваю файрвол (запрос UAC)...");
-                // ShellExecute runas — самый надёжный способ UAC-элевации
-                let result = std::process::Command::new("powershell")
-                    .args([
-                        "-NoProfile",
-                        "-Command",
-                        &format!(
-                            "Start-Process -FilePath '{}' -Verb RunAs -Wait",
-                            bat_path.display()
-                        ),
-                    ])
-                    .status();
-                match result {
-                    Ok(s) if s.success() => println!("✅ Файрвол настроен"),
-                    _ => {
-                        println!("⚠ UAC отклонён. Запустите вручную от Админастратора:");
-                        println!("  {}", bat_path.display());
-                    }
-                }
-            }
-        }
-    }
-
-    #[cfg(target_os = "macos")]
-    {
-        println!("Настраиваю файрвол macOS...");
-        let _ = std::process::Command::new("sudo")
-            .args([
-                "/usr/libexec/ApplicationFirewall/socketfilterfw",
-                "--add",
-                &exe,
-            ])
-            .output();
-        let _ = std::process::Command::new("sudo")
-            .args([
-                "/usr/libexec/ApplicationFirewall/socketfilterfw",
-                "--unblockapp",
-                &exe,
-            ])
-            .output();
-        println!("✅ Файрвол macOS настроен");
-    }
-
-    let (local_key, local_nickname, static_secret, initial_address_book, initial_contact_addrs) =
-        if let Ok(storage) = Storage::load() {
-            let key = libp2p::identity::Keypair::from_protobuf_encoding(&storage.keypair_bytes)
-                .expect("Failed to decode saved keypair");
-            let static_secret = crypto::StaticSecret::from(storage.static_secret_bytes);
-            let my_id = PeerId::from(key.public());
-            let mut book = HashMap::new();
-            let mut addrs_map: HashMap<PeerId, Vec<Multiaddr>> = HashMap::new();
-            for entry in storage.address_book {
-                if let Ok(pid) = entry.peer_id.parse::<PeerId>() {
-                    if pid != my_id {
-                        book.insert(pid, entry.display_name);
-                        let mut parsed: Vec<Multiaddr> = entry
-                            .addrs
-                            .iter()
-                            .filter_map(|s| s.parse::<Multiaddr>().ok())
-                            .collect();
-                        if !parsed.is_empty() {
-                            addrs_map.entry(pid).or_default().append(&mut parsed);
-                        }
-                    }
-                }
-            }
-            (key, storage.nickname, static_secret, book, addrs_map)
-        } else {
-            let key = libp2p::identity::Keypair::generate_ed25519();
-            let static_secret = crypto::StaticSecret::random_from_rng(&mut rand::rngs::OsRng);
-            let nickname = format!("User_{}", &PeerId::from(key.public()).to_string()[..4]);
-            let _ = Storage::save(&nickname, Some(&key), Some(&static_secret), None);
-            (
-                key,
-                nickname,
-                static_secret,
-                HashMap::new(),
-                HashMap::new(),
-            )
-        };
-    let local_peer_id = PeerId::from(local_key.public());
-
-    println!("=== VOID P2P Chat ===");
-    println!("Ваш Peer ID: {}", local_peer_id);
-    println!("Ваш никнейм: {}", local_nickname);
-
-    let void_bootstraps = void_bootstrap_multiaddrs();
-    if void_bootstraps.is_empty() {
-        println!(
-            "🌐 Глобально: нет seed для DHT — задайте BUILTIN_VOID_BOOTSTRAP / VOID_BOOTSTRAP_PUBLIC_LIST_URL в коде, VOID_BOOTSTRAP_URL, VOID_BOOTSTRAP, void-bootstrap.txt, либо полный multiaddr собеседника. mDNS — только LAN."
-        );
-    } else {
-        println!(
-            "🌐 VOID bootstrap: {} multiaddr → заполнение DHT /void/kad/1.0.0 (без IPFS).",
-            void_bootstraps.len()
-        );
-    }
-
-    let (event_tx, event_rx) = mpsc::channel(256);
-    let (command_tx, mut command_rx) = mpsc::channel(256);
-
-    let event_tx_clone = event_tx.clone();
-    let command_tx_for_mdns = command_tx.clone(); // для delayed dial из mDNS
-
-    let static_secret_net = static_secret.clone();
-    let void_bootstraps_for_net = void_bootstraps.clone();
-    let contact_addrs_for_net: Vec<(PeerId, Multiaddr)> = initial_contact_addrs
-        .iter()
-        .flat_map(|(pid, addrs)| addrs.iter().cloned().map(move |a| (*pid, a)))
-        .collect();
-    tokio::spawn(async move {
-        let event_tx = event_tx_clone;
-        let command_tx_for_mdns = command_tx_for_mdns;
-        let local_static = static_secret_net;
-        let void_bootstraps = void_bootstraps_for_net;
-        let contact_seed_addrs = contact_addrs_for_net;
+async fn run_chat_network(
+    mut command_rx: mpsc::Receiver<UICommand>,
+    event_tx: mpsc::Sender<NetworkEvent>,
+    command_tx_for_mdns: mpsc::Sender<UICommand>,
+    local_key: libp2p::identity::Keypair,
+    local_static: crypto::StaticSecret,
+    void_bootstraps: Vec<Multiaddr>,
+    contact_seed_addrs: Vec<(PeerId, Multiaddr)>,
+) {
         let mut sessions: HashMap<PeerId, crypto::SecureSession> = HashMap::new();
         let mut pending_handshakes: HashMap<PeerId, crypto::StaticSecret> = HashMap::new();
         let mut pending_messages: HashMap<PeerId, Vec<Vec<u8>>> = HashMap::new();
         let my_public_key = crypto::PublicKey::from(&local_static);
+        let local_peer_id = local_key.public().to_peer_id();
 
         // Swarm: TCP + noise + yamux + Relay Client
         let mut swarm = libp2p::SwarmBuilder::with_existing_identity(local_key.clone())
@@ -2723,15 +2989,168 @@ async fn main() -> Result<(), Box<dyn Error>> {
                 }
             }
         }
-    });
+}
+
+#[tokio::main]
+async fn main() -> Result<(), Box<dyn Error>> {
+    // Включаем логи для отладки
+    let _ = tracing_subscriber::fmt().with_env_filter("info").try_init();
+
+    // === Автоматически добавляем правило файрвола ===
+    #[allow(unused_variables)]
+    let exe_path = std::env::current_exe().unwrap_or_default();
+    #[allow(unused_variables)]
+    let exe = exe_path.display().to_string();
+
+    #[cfg(target_os = "windows")]
+    {
+        // Проверяем, запущены ли мы уже от Администратора
+        let is_admin = std::process::Command::new("net")
+            .args(["session"])
+            .output()
+            .map(|o| o.status.success())
+            .unwrap_or(false);
+
+        if is_admin {
+            println!("Настраиваю файрвол Windows (Admin Mode)...");
+            let _ = std::process::Command::new("netsh")
+                .args(["advfirewall", "firewall", "delete", "rule", "name=VOID P2P"])
+                .output();
+            let tcp_r = std::process::Command::new("netsh")
+                .args([
+                    "advfirewall",
+                    "firewall",
+                    "add",
+                    "rule",
+                    "name=VOID P2P",
+                    "dir=in",
+                    "action=allow",
+                    "protocol=TCP",
+                    "localport=50001",
+                    "profile=any",
+                    "enable=yes",
+                ])
+                .output();
+            let udp_r = std::process::Command::new("netsh")
+                .args([
+                    "advfirewall",
+                    "firewall",
+                    "add",
+                    "rule",
+                    "name=VOID P2P",
+                    "dir=in",
+                    "action=allow",
+                    "protocol=UDP",
+                    "localport=50001",
+                    "profile=any",
+                    "edge=yes",
+                    "enable=yes",
+                ])
+                .output();
+            match (tcp_r, udp_r) {
+                (Ok(t), Ok(u)) if t.status.success() && u.status.success() => {
+                    println!("✅ Файрвол настроен (TCP + UDP разрешены)")
+                }
+                _ => println!("⚠ Не удалось настроить файрвол"),
+            }
+        } else {
+            // Пишем команды в временный .bat файл, запускаем от админа через UAC
+            let bat = format!(
+                "@echo off\r\n\
+                 netsh advfirewall firewall delete rule name=\"VOID P2P\"\r\n\
+                 netsh advfirewall firewall add rule name=\"VOID P2P\" dir=in action=allow protocol=TCP localport=50001 profile=any enable=yes\r\n\
+                 netsh advfirewall firewall add rule name=\"VOID P2P\" dir=in action=allow protocol=UDP localport=50001 profile=any edge=yes enable=yes\r\n"
+            );
+            let bat_path = std::env::temp_dir().join("void_p2p_firewall.bat");
+            if std::fs::write(&bat_path, bat).is_ok() {
+                println!("Настраиваю файрвол (запрос UAC)...");
+                // ShellExecute runas — самый надёжный способ UAC-элевации
+                let result = std::process::Command::new("powershell")
+                    .args([
+                        "-NoProfile",
+                        "-Command",
+                        &format!(
+                            "Start-Process -FilePath '{}' -Verb RunAs -Wait",
+                            bat_path.display()
+                        ),
+                    ])
+                    .status();
+                match result {
+                    Ok(s) if s.success() => println!("✅ Файрвол настроен"),
+                    _ => {
+                        println!("⚠ UAC отклонён. Запустите вручную от Админастратора:");
+                        println!("  {}", bat_path.display());
+                    }
+                }
+            }
+        }
+    }
+
+    #[cfg(target_os = "macos")]
+    {
+        println!("Настраиваю файрвол macOS...");
+        let _ = std::process::Command::new("sudo")
+            .args([
+                "/usr/libexec/ApplicationFirewall/socketfilterfw",
+                "--add",
+                &exe,
+            ])
+            .output();
+        let _ = std::process::Command::new("sudo")
+            .args([
+                "/usr/libexec/ApplicationFirewall/socketfilterfw",
+                "--unblockapp",
+                &exe,
+            ])
+            .output();
+        println!("✅ Файрвол macOS настроен");
+    }
+
+    let vault_unlock_kind =
+        detect_vault_unlock_kind().map_err(|m| Box::<dyn Error>::from(m))?;
+
+    let void_bootstraps = void_bootstrap_multiaddrs();
+    if void_bootstraps.is_empty() {
+        println!(
+            "🌐 Глобально: нет seed для DHT — задайте BUILTIN_VOID_BOOTSTRAP / VOID_BOOTSTRAP_PUBLIC_LIST_URL в коде, VOID_BOOTSTRAP_URL, VOID_BOOTSTRAP, void-bootstrap.txt, либо полный multiaddr собеседника. mDNS — только LAN."
+        );
+    } else {
+        println!(
+            "🌐 VOID bootstrap: {} multiaddr → заполнение DHT /void/kad/1.0.0 (без IPFS).",
+            void_bootstraps.len()
+        );
+    }
+
+    let (event_tx, event_rx) = mpsc::channel(256);
+    let (command_tx, command_rx) = mpsc::channel(256);
+    let command_tx_for_mdns = command_tx.clone();
+
+    let deferred_network_spawn = DeferredNetworkSpawn {
+        event_tx: event_tx.clone(),
+        command_rx,
+        command_tx_for_mdns,
+        void_bootstraps,
+    };
+
+    let pending_unlock_state = VaultUnlockState {
+        kind: vault_unlock_kind,
+        password: String::new(),
+        password_confirm: String::new(),
+        error: None,
+    };
+
+    let placeholder_kp = libp2p::identity::Keypair::generate_ed25519();
+    let placeholder_peer_id = PeerId::from(placeholder_kp.public());
+    let placeholder_static_secret =
+        crypto::StaticSecret::random_from_rng(&mut rand::rngs::OsRng);
 
     let viewport = egui::ViewportBuilder::default()
         .with_inner_size([1280.0, 820.0])
         .with_min_inner_size([820.0, 540.0])
-        .with_title(format!("VOID Chat [{}]", &local_peer_id.to_string()[..8]));
+        .with_title("VOID — пароль vault");
 
     eframe::run_native(
-        &format!("VOID Chat [{}]", local_peer_id.to_string()[..8].to_string()),
+        "VOID P2P",
         eframe::NativeOptions {
             viewport,
             ..Default::default()
@@ -2739,11 +3158,14 @@ async fn main() -> Result<(), Box<dyn Error>> {
         Box::new(move |cc| {
             Ok(Box::new(App::new(
                 cc,
-                local_peer_id,
-                local_nickname,
-                static_secret,
-                initial_address_book,
-                initial_contact_addrs,
+                Some(pending_unlock_state),
+                Some(deferred_network_spawn),
+                None,
+                placeholder_peer_id,
+                "Разблокировка…".into(),
+                placeholder_static_secret,
+                HashMap::new(),
+                HashMap::new(),
                 command_tx,
                 event_rx,
             )))

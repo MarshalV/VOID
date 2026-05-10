@@ -1037,6 +1037,10 @@ pub(crate) fn setup_custom_style(ctx: &egui::Context) {
 
 impl eframe::App for App {
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
+        if self.vault_unlock_gate(ctx) {
+            return;
+        }
+
         self.known_peers.remove(&self.local_peer_id);
 
         // ── Поллинг результата выбора папки сохранения ────────────────────
