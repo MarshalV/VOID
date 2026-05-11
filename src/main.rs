@@ -19,6 +19,7 @@ use serde::{Deserialize, Serialize};
 use zeroize::{Zeroize, Zeroizing};
 use std::collections::{HashMap, HashSet};
 use std::error::Error;
+use std::io::Read;
 use std::path::Path;
 use std::time::{Duration, Instant};
 use tokio::sync::mpsc;
@@ -117,6 +118,7 @@ const VOID_BOOTSTRAP_PUBLIC_LIST_URL: &str = "";
 /// Источники (все опциональны, объединяются и дедуплицируются):
 /// - `BUILTIN_VOID_BOOTSTRAP` и сборка с `VOID_BUILTIN_BOOTSTRAP=/ip4/.../p2p/...,...` (вшито в exe);
 /// - HTTP(S): `VOID_BOOTSTRAP_URL` и/или `VOID_BOOTSTRAP_PUBLIC_LIST_URL` (если не пустой и не задан `VOID_SKIP_PUBLIC_BOOTSTRAP_LIST`);
+///   Тело ответа ограничено (~256 KiB). Опционально: `VOID_BOOTSTRAP_TRUSTED_HOSTS=host1,host2` — только эти хосты для URL-загрузки;
 /// - переменная `VOID_BOOTSTRAP`: multiaddr через запятую;
 /// - файл `void-bootstrap.txt`: одна multiaddr на строку.
 ///
@@ -147,25 +149,69 @@ fn append_bootstraps_from_comma_separated(out: &mut Vec<Multiaddr>, s: &str, sou
     }
 }
 
+/// Макс. размер тела ответа bootstrap-списка (защита от DoS по памяти).
+const VOID_BOOTSTRAP_HTTP_MAX_BODY: u64 = 256 * 1024;
+
+/// Опционально: через запятую имена хостов, с которых разрешена загрузка seed по HTTPS/HTTP
+/// (`VOID_BOOTSTRAP_URL`, публичный URL из кода). Пусто — как раньше, любой хост.
+fn void_bootstrap_url_host_allowed(host: Option<&str>) -> bool {
+    let Some(host) = host else {
+        return false;
+    };
+    let Ok(list) = std::env::var("VOID_BOOTSTRAP_TRUSTED_HOSTS") else {
+        return true;
+    };
+    let t = list.trim();
+    if t.is_empty() {
+        return true;
+    }
+    t.split(',').any(|h| h.trim().eq_ignore_ascii_case(host))
+}
+
 fn fetch_void_bootstrap_list(url: &str) -> Option<String> {
+    let parsed = reqwest::Url::parse(url).ok()?;
+    if !void_bootstrap_url_host_allowed(parsed.host_str()) {
+        eprintln!(
+            "VOID bootstrap URL {}: хост не в списке VOID_BOOTSTRAP_TRUSTED_HOSTS — отказ.",
+            url
+        );
+        return None;
+    }
+
     let client = reqwest::blocking::Client::builder()
         .timeout(Duration::from_secs(12))
         .build()
         .ok()?;
-    match client.get(url).send() {
-        Ok(resp) => {
-            if !resp.status().is_success() {
-                eprintln!(
-                    "VOID bootstrap URL {}: HTTP {}",
-                    url,
-                    resp.status()
-                );
-                return None;
-            }
-            resp.text().ok()
-        }
+    let resp = match client.get(url).send() {
+        Ok(r) => r,
         Err(e) => {
             eprintln!("VOID bootstrap URL {}: {}", url, e);
+            return None;
+        }
+    };
+    if !resp.status().is_success() {
+        eprintln!(
+            "VOID bootstrap URL {}: HTTP {}",
+            url,
+            resp.status()
+        );
+        return None;
+    }
+    let mut buf = Vec::new();
+    match resp
+        .take(VOID_BOOTSTRAP_HTTP_MAX_BODY.saturating_add(1))
+        .read_to_end(&mut buf)
+    {
+        Ok(n) if n as u64 <= VOID_BOOTSTRAP_HTTP_MAX_BODY => String::from_utf8(buf).ok(),
+        Ok(_) => {
+            eprintln!(
+                "VOID bootstrap URL {}: тело ответа больше {} байт — отказ.",
+                url, VOID_BOOTSTRAP_HTTP_MAX_BODY
+            );
+            None
+        }
+        Err(e) => {
+            eprintln!("VOID bootstrap URL {}: чтение тела: {}", url, e);
             None
         }
     }
@@ -549,18 +595,135 @@ struct ChatMessage {
     timestamp: String,
 }
 
+/// Лимиты JSON чата после `decrypt_payload` (защита от DoS по памяти).
+const MAX_CHAT_JSON_BYTES: usize = 64 * 1024;
+const MAX_CHAT_SENDER_ID_BYTES: usize = 512;
+const MAX_CHAT_SENDER_NAME_BYTES: usize = 256;
+const MAX_CHAT_TEXT_BYTES: usize = 16 * 1024;
+const MAX_CHAT_TIMESTAMP_BYTES: usize = 64;
+
+const VOID_HELLO_BIND_PREFIX: &[u8] = b"VOID_E2EE_HELLO_BIND_V1\0";
+
+/// Inline multihash PeerId (Ed25519): извлечь транспортный `PublicKey` для проверки подписи Hello.
+fn void_peer_transport_public_key(peer: PeerId) -> Option<libp2p::identity::PublicKey> {
+    const CODE_IDENTITY: u64 = 0;
+    let mh = peer.as_ref();
+    if mh.code() != CODE_IDENTITY {
+        return None;
+    }
+    libp2p::identity::PublicKey::try_decode_protobuf(mh.digest()).ok()
+}
+
+fn hello_bind_message(
+    signer_peer: PeerId,
+    recipient_peer: PeerId,
+    x25519_static: &[u8; 32],
+    x25519_ephemeral: &[u8; 32],
+) -> Vec<u8> {
+    let mut v = Vec::with_capacity(96 + VOID_HELLO_BIND_PREFIX.len());
+    v.extend_from_slice(VOID_HELLO_BIND_PREFIX);
+    v.extend_from_slice(&signer_peer.to_bytes());
+    v.extend_from_slice(&recipient_peer.to_bytes());
+    v.extend_from_slice(x25519_static.as_slice());
+    v.extend_from_slice(x25519_ephemeral.as_slice());
+    v
+}
+
+fn verify_hello_transport_binding(
+    signer_peer_id: PeerId,
+    recipient_peer_id: PeerId,
+    x25519_static: &[u8; 32],
+    x25519_ephemeral: &[u8; 32],
+    transport_sig: &[u8],
+) -> bool {
+    const MAX_SIG: usize = 256;
+    if transport_sig.is_empty() || transport_sig.len() > MAX_SIG {
+        return false;
+    }
+    let Some(pubkey) = void_peer_transport_public_key(signer_peer_id) else {
+        return false;
+    };
+    let msg = hello_bind_message(
+        signer_peer_id,
+        recipient_peer_id,
+        x25519_static,
+        x25519_ephemeral,
+    );
+    pubkey.verify(&msg, transport_sig)
+}
+
+fn sign_hello_transport_binding(
+    transport: &libp2p::identity::Keypair,
+    signer_peer: PeerId,
+    recipient_peer: PeerId,
+    x25519_static: &[u8; 32],
+    x25519_ephemeral: &[u8; 32],
+) -> Option<Vec<u8>> {
+    let msg = hello_bind_message(signer_peer, recipient_peer, x25519_static, x25519_ephemeral);
+    transport.sign(&msg).ok()
+}
+
+/// Разбор JSON чата после DR: верхняя граница буфера и длины полей.
+fn parse_decrypted_chat_json(plaintext: &[u8]) -> Option<ChatMessage> {
+    if plaintext.len() > MAX_CHAT_JSON_BYTES {
+        return None;
+    }
+    if plaintext.first() != Some(&b'{') {
+        return None;
+    }
+    let msg: ChatMessage = serde_json::from_slice(plaintext).ok()?;
+    if msg.sender_id.len() > MAX_CHAT_SENDER_ID_BYTES
+        || msg.sender_name.len() > MAX_CHAT_SENDER_NAME_BYTES
+        || msg.text.len() > MAX_CHAT_TEXT_BYTES
+        || msg.timestamp.len() > MAX_CHAT_TIMESTAMP_BYTES
+    {
+        return None;
+    }
+    if let Some(ref r) = msg.recipient_id {
+        if r.len() > MAX_CHAT_SENDER_ID_BYTES {
+            return None;
+        }
+    }
+    Some(msg)
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 enum V1Packet {
     Hello {
         public_key: [u8; 32],
         ephemeral_key: [u8; 32],
+        /// Подпись Ed25519 (libp2p identity) над `VOID_E2EE_HELLO_BIND_V1` + peerId||peerId||x25519||ephem.
+        #[serde(default)]
+        transport_sig: Vec<u8>,
     },
     Encrypted {
         header: crypto::MessageHeader,
         ciphertext: Vec<u8>,
     },
-    Plain(ChatMessage),
     Ack,
+}
+
+fn build_v1_hello(
+    transport: &libp2p::identity::Keypair,
+    signer_peer: PeerId,
+    recipient_peer: PeerId,
+    x25519_static_pubkey: crypto::PublicKey,
+    x25519_ephem_pubkey: crypto::PublicKey,
+) -> Option<V1Packet> {
+    let static_b = x25519_static_pubkey.to_bytes();
+    let ephem_b = x25519_ephem_pubkey.to_bytes();
+    let transport_sig = sign_hello_transport_binding(
+        transport,
+        signer_peer,
+        recipient_peer,
+        &static_b,
+        &ephem_b,
+    )?;
+    Some(V1Packet::Hello {
+        public_key: static_b,
+        ephemeral_key: ephem_b,
+        transport_sig,
+    })
 }
 
 /// Прогресс активной передачи файла (для UI).
@@ -1622,7 +1785,7 @@ async fn run_chat_network(
             HashMap::new();
         // Ticker для отправки чанков (с учётом rate-limit на relay).
         let mut chunk_tick = tokio::time::interval(Duration::from_millis(20));
-        // RequestId → PeerId для сообщений (Plain/Encrypted), чтобы по ответу
+        // RequestId → PeerId для зашифрованных сообщений, чтобы по ответу
         // (Ack/прочее) однозначно подтвердить доставку конкретному пиру и снять
         // pending-ретраи в UI. Hello-handshake'ы сюда НЕ попадают.
         let mut outbound_msg_requests: HashMap<libp2p::request_response::OutboundRequestId, PeerId> = HashMap::new();
@@ -2020,14 +2183,30 @@ async fn run_chat_network(
                                         if !pending_handshakes.contains_key(&peer_id) {
                                             let ephem_secret = crypto::StaticSecret::random_from_rng(&mut rand::rngs::OsRng);
                                             let ephem_pub = crypto::PublicKey::from(&ephem_secret);
-                                            pending_handshakes.insert(peer_id, ephem_secret);
-
-                                            let hello = V1Packet::Hello {
-                                                public_key: my_public_key.to_bytes(),
-                                                ephemeral_key: ephem_pub.to_bytes(),
-                                            };
-                                            let _ = swarm.behaviour_mut().request_response.send_request(&peer_id, hello);
-                                            println!("[{}] 🤝 E2EE: Сессии нет, направлен Hello (+Ephem) пиру {}", now, &peer_id.to_string()[..8]);
+                                            if let Some(hello) = build_v1_hello(
+                                                &local_key,
+                                                local_peer_id,
+                                                peer_id,
+                                                my_public_key,
+                                                ephem_pub,
+                                            ) {
+                                                pending_handshakes.insert(peer_id, ephem_secret);
+                                                let _ = swarm
+                                                    .behaviour_mut()
+                                                    .request_response
+                                                    .send_request(&peer_id, hello);
+                                                println!(
+                                                    "[{}] 🤝 E2EE: Сессии нет, направлен Hello (+Ephem) пиру {}",
+                                                    now,
+                                                    &peer_id.to_string()[..8]
+                                                );
+                                            } else {
+                                                println!(
+                                                    "[{}] ❌ E2EE: не удалось подписать Hello для {}",
+                                                    now,
+                                                    &peer_id.to_string()[..8]
+                                                );
+                                            }
                                         }
                                         pending_messages.entry(peer_id).or_default().push(json_data);
                                         println!("[{}] ⏳ E2EE: Сообщение буферизовано до хендшейка с {}", now, &peer_id.to_string()[..8]);
@@ -2249,8 +2428,25 @@ async fn run_chat_network(
                             match message {
                                 libp2p::request_response::Message::Request { request, channel, .. } => {
                                     match request {
-                                        V1Packet::Hello { public_key, ephemeral_key } => {
+                                        V1Packet::Hello { public_key, ephemeral_key, transport_sig } => {
                                             if peer != local_peer_id {
+                                                if !verify_hello_transport_binding(
+                                                    peer,
+                                                    local_peer_id,
+                                                    &public_key,
+                                                    &ephemeral_key,
+                                                    transport_sig.as_slice(),
+                                                ) {
+                                                    println!(
+                                                        "[{}] ❌ E2EE: Hello от {} без привязки к libp2p identity — игнор.",
+                                                        now,
+                                                        &peer.to_string()[..8]
+                                                    );
+                                                    let _ = swarm
+                                                        .behaviour_mut()
+                                                        .request_response
+                                                        .send_response(channel, V1Packet::Ack);
+                                                } else {
                                                 let is_initiator = local_peer_id < peer;
                                                 let _role_str = if is_initiator { "Initiator" } else { "Responder" };
 
@@ -2311,11 +2507,15 @@ async fn run_chat_network(
                                                             }
                                                         }
 
-                                                        let my_hello = V1Packet::Hello {
-                                                            public_key: my_public_key.to_bytes(),
-                                                            ephemeral_key: local_ephem_pub.to_bytes(),
-                                                        };
+                                                    if let Some(my_hello) = build_v1_hello(
+                                                        &local_key,
+                                                        local_peer_id,
+                                                        peer,
+                                                        my_public_key,
+                                                        local_ephem_pub,
+                                                    ) {
                                                         let _ = swarm.behaviour_mut().request_response.send_response(channel, my_hello);
+                                                    }
                                                     }
                                                 } else {
                                                     // Боб получил Hello от Алисы
@@ -2338,11 +2538,16 @@ async fn run_chat_network(
                                                         }
                                                     }
 
-                                                    let my_hello = V1Packet::Hello {
-                                                        public_key: my_public_key.to_bytes(),
-                                                        ephemeral_key: local_ephem_pub.to_bytes(),
-                                                    };
-                                                    let _ = swarm.behaviour_mut().request_response.send_response(channel, my_hello);
+                                                    if let Some(my_hello) = build_v1_hello(
+                                                        &local_key,
+                                                        local_peer_id,
+                                                        peer,
+                                                        my_public_key,
+                                                        local_ephem_pub,
+                                                    ) {
+                                                        let _ = swarm.behaviour_mut().request_response.send_response(channel, my_hello);
+                                                    }
+                                                }
                                                 }
                                             }
                                         }
@@ -2365,10 +2570,8 @@ async fn run_chat_network(
                                                                 &event_tx,
                                                             )
                                                             .await;
-                                                        } else if let Ok(msg) =
-                                                            serde_json::from_slice::<ChatMessage>(
-                                                                &plaintext,
-                                                            )
+                                                        } else if let Some(msg) =
+                                                            parse_decrypted_chat_json(&plaintext)
                                                         {
                                                             println!(
                                                                 "[{}] 🔒 E2EE: Сообщение ДЕШИФРОВАНО от {}",
@@ -2392,20 +2595,13 @@ async fn run_chat_network(
                                             }
                                             let _ = swarm.behaviour_mut().request_response.send_response(channel, V1Packet::Ack);
                                         }
-                                        V1Packet::Plain(msg) => {
-                                            if peer != local_peer_id {
-                                                println!("[{}] 📖 Текст открытый: {}", now, msg.text);
-                                                let _ = event_tx.send(NetworkEvent::ChatMessage(msg)).await;
-                                            }
-                                            let _ = swarm.behaviour_mut().request_response.send_response(channel, V1Packet::Ack);
-                                        }
                                         V1Packet::Ack => {
                                             let _ = swarm.behaviour_mut().request_response.send_response(channel, V1Packet::Ack);
                                         }
                                     }
                                 }
                                 libp2p::request_response::Message::Response { request_id, response } => {
-                                    // Если это ответ на наше отправленное сообщение (Plain/Encrypted),
+                                    // Если это ответ на наше отправленное сообщение (Encrypted),
                                     // считаем доставку подтверждённой и сообщаем UI, чтобы он снял
                                     // соответствующий pending-ретрай и не показывал ошибку.
                                     if let Some(delivered_peer) = outbound_msg_requests.remove(&request_id) {
@@ -2413,8 +2609,21 @@ async fn run_chat_network(
                                         let _ = event_tx.send(NetworkEvent::MessageDelivered(delivered_peer)).await;
                                     }
                                     match response {
-                                        V1Packet::Hello { public_key, ephemeral_key } => {
+                                        V1Packet::Hello { public_key, ephemeral_key, transport_sig } => {
                                             if peer != local_peer_id {
+                                                if !verify_hello_transport_binding(
+                                                    peer,
+                                                    local_peer_id,
+                                                    &public_key,
+                                                    &ephemeral_key,
+                                                    transport_sig.as_slice(),
+                                                ) {
+                                                    println!(
+                                                        "[{}] ❌ E2EE: Hello (ответ) от {} без привязки к libp2p identity — игнор.",
+                                                        now,
+                                                        &peer.to_string()[..8]
+                                                    );
+                                                } else {
                                                 let is_initiator = local_peer_id < peer;
                                                 if sessions.contains_key(&peer) {
                                                     println!(
@@ -2454,6 +2663,7 @@ async fn run_chat_network(
                                                         }
                                                     }
                                                 }
+                                                }
                                             }
                                         }
                                         V1Packet::Encrypted { header, ciphertext } => {
@@ -2475,10 +2685,8 @@ async fn run_chat_network(
                                                             &event_tx,
                                                         )
                                                         .await;
-                                                    } else if let Ok(msg) =
-                                                        serde_json::from_slice::<ChatMessage>(
-                                                            &plaintext,
-                                                        )
+                                                    } else if let Some(msg) =
+                                                        parse_decrypted_chat_json(&plaintext)
                                                     {
                                                         let _ = event_tx
                                                             .send(NetworkEvent::ChatMessage(msg))
