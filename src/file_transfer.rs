@@ -85,6 +85,15 @@ pub const FILE_CHUNK_SIZE: usize = 32 * 1024;
 /// Максимально допустимый размер файла: 512 МБ.
 pub const MAX_FILE_SIZE: u64 = 512 * 1024 * 1024;
 
+/// Максимальная длина имени файла в оффере (защита от DoS по памяти в JSON RR).
+pub const MAX_OFFER_FILENAME_BYTES: usize = 512;
+
+/// Максимальная длина поля `Reject.reason` (байты UTF-8).
+pub const MAX_REJECT_REASON_BYTES: usize = 512;
+
+/// Устаревший plain-чанк по `/void/file`: не больше одного логического чанка файла.
+pub const MAX_LEGACY_CHUNK_DATA_BYTES: usize = FILE_CHUNK_SIZE;
+
 /// Скорость отправки через relay: 64 КБ/с.
 pub const RELAY_RATE_LIMIT_BPS: u64 = 64 * 1024;
 
@@ -127,6 +136,63 @@ pub fn try_decode_e2ee_file_chunk_frame(buf: &[u8]) -> Option<([u8; 16], u32, Ve
 pub fn relay_chunk_delay() -> Duration {
     let ms = (FILE_CHUNK_SIZE as u64 * 1000) / RELAY_RATE_LIMIT_BPS;
     Duration::from_millis(ms)
+}
+
+/// Проверка входящего `Offer` до выделения буферов чанков.
+pub fn validate_file_offer(
+    filename: &str,
+    total_size: u64,
+    total_chunks: u32,
+) -> Result<(), &'static str> {
+    if filename.len() > MAX_OFFER_FILENAME_BYTES {
+        return Err("слишком длинное имя файла в оффере");
+    }
+    if total_size == 0 || total_size > MAX_FILE_SIZE {
+        return Err("некорректный размер файла в оффере");
+    }
+    let chunk_sz = FILE_CHUNK_SIZE as u64;
+    let expected = ((total_size + chunk_sz - 1) / chunk_sz) as u32;
+    if total_chunks == 0 || total_chunks != expected {
+        return Err("несогласованы размер файла и число чанков");
+    }
+    Ok(())
+}
+
+/// Обрезает строку по границе UTF-8, не превышая `max_bytes` байт.
+pub fn clamp_utf8_by_bytes(s: &str, max_bytes: usize) -> String {
+    if s.len() <= max_bytes {
+        return s.to_string();
+    }
+    let mut end = max_bytes;
+    while end > 0 && !s.is_char_boundary(end) {
+        end -= 1;
+    }
+    s[..end].to_string()
+}
+
+/// Проверка входящего `FilePacket` после JSON-десериализации (DoS по полям).
+pub fn validate_inbound_file_packet(p: &FilePacket) -> Result<(), &'static str> {
+    match p {
+        FilePacket::Offer {
+            filename,
+            total_size,
+            total_chunks,
+            ..
+        } => validate_file_offer(filename, *total_size, *total_chunks),
+        FilePacket::Reject { reason, .. } => {
+            if reason.len() > MAX_REJECT_REASON_BYTES {
+                return Err("слишком длинная причина отклонения файла");
+            }
+            Ok(())
+        }
+        FilePacket::Chunk { data, .. } => {
+            if data.len() > MAX_LEGACY_CHUNK_DATA_BYTES {
+                return Err("слишком большой устаревший чанк файла");
+            }
+            Ok(())
+        }
+        FilePacket::Accept { .. } | FilePacket::Cancel { .. } | FilePacket::Ack => Ok(()),
+    }
 }
 
 // ─── Пакеты протокола ─────────────────────────────────────────────────────────
@@ -360,5 +426,51 @@ pub fn fmt_size(bytes: u64) -> String {
         format!("{:.1} КБ", bytes as f64 / KB as f64)
     } else {
         format!("{} Б", bytes)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn validate_offer_ok_one_chunk() {
+        assert!(validate_file_offer("a.txt", 100, 1).is_ok());
+    }
+
+    #[test]
+    fn validate_offer_rejects_chunk_mismatch() {
+        assert!(validate_file_offer("a.txt", 100, 2).is_err());
+    }
+
+    #[test]
+    fn validate_offer_rejects_zero_size() {
+        assert!(validate_file_offer("a.txt", 0, 0).is_err());
+    }
+
+    #[test]
+    fn inbound_reject_reason_too_long() {
+        let reason = "x".repeat(MAX_REJECT_REASON_BYTES + 1);
+        let p = FilePacket::Reject {
+            transfer_id: [0u8; 16],
+            reason,
+        };
+        assert!(validate_inbound_file_packet(&p).is_err());
+    }
+
+    #[test]
+    fn inbound_chunk_too_large() {
+        let p = FilePacket::Chunk {
+            transfer_id: [0u8; 16],
+            chunk_index: 0,
+            data: vec![0u8; MAX_LEGACY_CHUNK_DATA_BYTES + 1],
+        };
+        assert!(validate_inbound_file_packet(&p).is_err());
+    }
+
+    #[test]
+    fn clamp_utf8_respects_boundary() {
+        let s = "абв"; // 6 bytes in UTF-8
+        assert_eq!(clamp_utf8_by_bytes(s, 5).len(), 4);
     }
 }

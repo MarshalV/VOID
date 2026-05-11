@@ -9,6 +9,7 @@ use eframe::egui;
 use libp2p::PeerId;
 use std::collections::hash_map::Entry;
 use std::time::{Duration, Instant};
+use tracing::warn;
 
 use crate::{
     file_transfer, parse_seed_input, App, ChatMessage, FileTransferProgress, NetworkEvent,
@@ -55,7 +56,7 @@ impl App {
                     self.chat_bg_texture = Some(handle);
                 }
                 Err(e) => {
-                    eprintln!("VOID: не удалось декодировать static/icon.png: {}", e);
+                    warn!(target: "void_net", "static/icon.png decode: {}", e);
                 }
             }
         }

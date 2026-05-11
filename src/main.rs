@@ -1,6 +1,15 @@
 mod crypto;
 mod file_transfer;
 mod ui;
+
+use std::sync::Arc;
+use rustls::client::WebPkiServerVerifier;
+use rustls::client::danger::{
+    HandshakeSignatureValid, ServerCertVerified, ServerCertVerifier,
+};
+use rustls::pki_types::{CertificateDer, ServerName, UnixTime};
+use rustls::{DigitallySignedStruct, Error as RustlsError, RootCertStore, SignatureScheme};
+use sha2::{Digest, Sha256};
 use aes_gcm::{
     aead::{Aead, KeyInit},
     Aes256Gcm, Key, Nonce,
@@ -8,12 +17,18 @@ use aes_gcm::{
 use argon2::{Algorithm, Argon2, Params, Version};
 use chrono;
 use eframe::egui;
+use tracing::{debug, info, warn};
 use futures::StreamExt;
 use libp2p::{
     autonat, dcutr, identify, kad, mdns, noise, ping, relay,
-    swarm::{dial_opts::DialOpts, NetworkBehaviour, SwarmEvent},
+    swarm::{
+        behaviour::toggle::Toggle,
+        dial_opts::DialOpts,
+        NetworkBehaviour, SwarmEvent,
+    },
     tcp, upnp, yamux, Multiaddr, PeerId, StreamProtocol,
 };
+use libp2p::identity::ed25519;
 use rand::RngCore;
 use serde::{Deserialize, Serialize};
 use zeroize::{Zeroize, Zeroizing};
@@ -119,8 +134,13 @@ const VOID_BOOTSTRAP_PUBLIC_LIST_URL: &str = "";
 /// - `BUILTIN_VOID_BOOTSTRAP` и сборка с `VOID_BUILTIN_BOOTSTRAP=/ip4/.../p2p/...,...` (вшито в exe);
 /// - HTTP(S): `VOID_BOOTSTRAP_URL` и/или `VOID_BOOTSTRAP_PUBLIC_LIST_URL` (если не пустой и не задан `VOID_SKIP_PUBLIC_BOOTSTRAP_LIST`);
 ///   Тело ответа ограничено (~256 KiB). Опционально: `VOID_BOOTSTRAP_TRUSTED_HOSTS=host1,host2` — только эти хосты для URL-загрузки;
+///   Для HTTPS: `VOID_BOOTSTRAP_TLS_LEAF_SHA256` — через запятую SHA-256 DER листового сертификата (64 hex), дополнительно к проверке CA;
 /// - переменная `VOID_BOOTSTRAP`: multiaddr через запятую;
-/// - файл `void-bootstrap.txt`: одна multiaddr на строку.
+/// - файл `void-bootstrap.txt`: одна multiaddr на строку;
+/// - опционально Ed25519: `VOID_BOOTSTRAP_SIGNING_PUB_HEX` + `void-bootstrap.sig` (64 B) для файла;
+///   для HTTP — ещё `VOID_BOOTSTRAP_URL_SIG_HEX` (128 hex);
+/// - `VOID_DISABLE_MDNS` — отключить mDNS в LAN;
+/// - `VOID_APPLY_FIREWALL_RULE=1` — разрешить автоматическую настройку файрвола (Windows/macOS).
 ///
 /// Любой может поднять публичный узел VOID — это не «центральный сервер чата», а точка входа в DHT (как у torrent).
 fn append_bootstraps_from_lines(out: &mut Vec<Multiaddr>, text: &str, source: &str) {
@@ -131,7 +151,7 @@ fn append_bootstraps_from_lines(out: &mut Vec<Multiaddr>, text: &str, source: &s
         }
         match t.parse::<Multiaddr>() {
             Ok(ma) => out.push(ma),
-            Err(_) => eprintln!("{}: пропуск строки: {}", source, t),
+            Err(_) => warn!("{}: пропуск строки: {}", source, t),
         }
     }
 }
@@ -144,7 +164,7 @@ fn append_bootstraps_from_comma_separated(out: &mut Vec<Multiaddr>, s: &str, sou
         }
         match t.parse::<Multiaddr>() {
             Ok(ma) => out.push(ma),
-            Err(_) => eprintln!("{}: пропуск неверной multiaddr: {}", source, t),
+            Err(_) => warn!("{}: пропуск неверной multiaddr: {}", source, t),
         }
     }
 }
@@ -171,26 +191,23 @@ fn void_bootstrap_url_host_allowed(host: Option<&str>) -> bool {
 fn fetch_void_bootstrap_list(url: &str) -> Option<String> {
     let parsed = reqwest::Url::parse(url).ok()?;
     if !void_bootstrap_url_host_allowed(parsed.host_str()) {
-        eprintln!(
+        warn!(
             "VOID bootstrap URL {}: хост не в списке VOID_BOOTSTRAP_TRUSTED_HOSTS — отказ.",
             url
         );
         return None;
     }
 
-    let client = reqwest::blocking::Client::builder()
-        .timeout(Duration::from_secs(12))
-        .build()
-        .ok()?;
+    let client = void_bootstrap_blocking_client(&parsed)?;
     let resp = match client.get(url).send() {
         Ok(r) => r,
         Err(e) => {
-            eprintln!("VOID bootstrap URL {}: {}", url, e);
+            warn!("VOID bootstrap URL {}: {}", url, e);
             return None;
         }
     };
     if !resp.status().is_success() {
-        eprintln!(
+        warn!(
             "VOID bootstrap URL {}: HTTP {}",
             url,
             resp.status()
@@ -204,14 +221,14 @@ fn fetch_void_bootstrap_list(url: &str) -> Option<String> {
     {
         Ok(n) if n as u64 <= VOID_BOOTSTRAP_HTTP_MAX_BODY => String::from_utf8(buf).ok(),
         Ok(_) => {
-            eprintln!(
+            warn!(
                 "VOID bootstrap URL {}: тело ответа больше {} байт — отказ.",
                 url, VOID_BOOTSTRAP_HTTP_MAX_BODY
             );
             None
         }
         Err(e) => {
-            eprintln!("VOID bootstrap URL {}: чтение тела: {}", url, e);
+            warn!("VOID bootstrap URL {}: чтение тела: {}", url, e);
             None
         }
     }
@@ -243,6 +260,215 @@ fn parse_seed_input(raw: &str) -> Option<(Multiaddr, Option<PeerId>)> {
     Some((ma, None))
 }
 
+pub(crate) fn hex_decode_32(s: &str) -> Option<[u8; 32]> {
+    let t = s.trim().strip_prefix("0x").unwrap_or(s.trim());
+    if t.len() != 64 {
+        return None;
+    }
+    let mut out = [0u8; 32];
+    for i in 0..32 {
+        out[i] = u8::from_str_radix(&t[i * 2..i * 2 + 2], 16).ok()?;
+    }
+    Some(out)
+}
+
+fn hex_decode_64(s: &str) -> Option<[u8; 64]> {
+    let t = s.trim().strip_prefix("0x").unwrap_or(s.trim());
+    if t.len() != 128 {
+        return None;
+    }
+    let mut out = [0u8; 64];
+    for i in 0..64 {
+        out[i] = u8::from_str_radix(&t[i * 2..i * 2 + 2], 16).ok()?;
+    }
+    Some(out)
+}
+
+/// `VOID_BOOTSTRAP_TLS_LEAF_SHA256` — SHA-256 DER листового сертификата (64 hex), через запятую.
+fn parse_void_bootstrap_tls_leaf_pins() -> Option<HashSet<[u8; 32]>> {
+    let raw = std::env::var("VOID_BOOTSTRAP_TLS_LEAF_SHA256").ok()?;
+    if raw.trim().is_empty() {
+        return None;
+    }
+    let mut set = HashSet::new();
+    for part in raw.split(',') {
+        let t = part.trim();
+        if t.is_empty() {
+            continue;
+        }
+        let h = hex_decode_32(t)?;
+        set.insert(h);
+    }
+    if set.is_empty() {
+        None
+    } else {
+        Some(set)
+    }
+}
+
+#[derive(Debug)]
+struct VoidBootstrapLeafPinVerifier {
+    inner: Arc<WebPkiServerVerifier>,
+    pins: HashSet<[u8; 32]>,
+}
+
+impl ServerCertVerifier for VoidBootstrapLeafPinVerifier {
+    fn verify_server_cert(
+        &self,
+        end_entity: &CertificateDer<'_>,
+        intermediates: &[CertificateDer<'_>],
+        server_name: &ServerName<'_>,
+        ocsp_response: &[u8],
+        now: UnixTime,
+    ) -> Result<ServerCertVerified, RustlsError> {
+        self.inner.verify_server_cert(
+            end_entity,
+            intermediates,
+            server_name,
+            ocsp_response,
+            now,
+        )?;
+        let digest: [u8; 32] = Sha256::digest(end_entity.as_ref()).into();
+        if !self.pins.contains(&digest) {
+            return Err(RustlsError::InvalidCertificate(
+                rustls::CertificateError::ApplicationVerificationFailure,
+            ));
+        }
+        Ok(ServerCertVerified::assertion())
+    }
+
+    fn verify_tls12_signature(
+        &self,
+        message: &[u8],
+        cert: &CertificateDer<'_>,
+        dss: &DigitallySignedStruct,
+    ) -> Result<HandshakeSignatureValid, RustlsError> {
+        self.inner.verify_tls12_signature(message, cert, dss)
+    }
+
+    fn verify_tls13_signature(
+        &self,
+        message: &[u8],
+        cert: &CertificateDer<'_>,
+        dss: &DigitallySignedStruct,
+    ) -> Result<HandshakeSignatureValid, RustlsError> {
+        self.inner.verify_tls13_signature(message, cert, dss)
+    }
+
+    fn supported_verify_schemes(&self) -> Vec<SignatureScheme> {
+        self.inner.supported_verify_schemes()
+    }
+}
+
+fn void_bootstrap_rustls_config_with_pins(
+    pins: HashSet<[u8; 32]>,
+) -> Result<rustls::ClientConfig, String> {
+    let crypto = Arc::new(rustls::crypto::ring::default_provider());
+    let mut root_store = RootCertStore::empty();
+    let _ = root_store.extend(webpki_roots::TLS_SERVER_ROOTS.iter().cloned());
+    let roots = Arc::new(root_store);
+    let inner = WebPkiServerVerifier::builder_with_provider(roots, crypto.clone())
+        .build()
+        .map_err(|e| format!("tls webpki verifier: {:?}", e))?;
+    let verifier = Arc::new(VoidBootstrapLeafPinVerifier { inner, pins });
+    Ok(
+        rustls::ClientConfig::builder_with_provider(crypto)
+            .with_safe_default_protocol_versions()
+            .map_err(|e| format!("tls versions: {:?}", e))?
+            .dangerous()
+            .with_custom_certificate_verifier(verifier)
+            .with_no_client_auth(),
+    )
+}
+
+fn void_bootstrap_blocking_client(url: &reqwest::Url) -> Option<reqwest::blocking::Client> {
+    let is_https = url.scheme() == "https";
+    let pins = parse_void_bootstrap_tls_leaf_pins();
+    let use_pins = is_https && pins.as_ref().is_some_and(|p| !p.is_empty());
+    let timeout = Duration::from_secs(12);
+    if use_pins {
+        let p = pins?;
+        let tls = match void_bootstrap_rustls_config_with_pins(p) {
+            Ok(c) => c,
+            Err(e) => {
+                warn!(target: "void_net", "VOID bootstrap TLS: {}", e);
+                return None;
+            }
+        };
+        return reqwest::blocking::Client::builder()
+            .timeout(timeout)
+            .use_preconfigured_tls(Arc::new(tls))
+            .build()
+            .ok();
+    }
+    reqwest::blocking::Client::builder()
+        .timeout(timeout)
+        .build()
+        .ok()
+}
+
+fn void_bootstrap_signing_pubkey_from_env() -> Option<ed25519::PublicKey> {
+    let hex = std::env::var("VOID_BOOTSTRAP_SIGNING_PUB_HEX").ok()?;
+    let bytes = hex_decode_32(&hex)?;
+    ed25519::PublicKey::try_from_bytes(&bytes).ok()
+}
+
+/// Если задан `VOID_BOOTSTRAP_SIGNING_PUB_HEX`, проверяет detached-подпись файла `path` + `<stem>.sig`.
+fn verify_void_bootstrap_file(path: &Path, text: &str) -> Result<(), String> {
+    let Some(pk) = void_bootstrap_signing_pubkey_from_env() else {
+        return Ok(());
+    };
+    let stem = path
+        .file_stem()
+        .and_then(|s| s.to_str())
+        .unwrap_or("void-bootstrap");
+    let sig_path = path.with_file_name(format!("{stem}.sig"));
+    let sig = std::fs::read(&sig_path).map_err(|e| {
+        format!(
+            "VOID bootstrap: нет подписи {} ({})",
+            sig_path.display(),
+            e
+        )
+    })?;
+    if sig.len() != 64 {
+        return Err(format!(
+            "VOID bootstrap: {} — ожидается 64 байта Ed25519, получено {}",
+            sig_path.display(),
+            sig.len()
+        ));
+    }
+    if !pk.verify(text.as_bytes(), &sig) {
+        return Err(
+            "VOID bootstrap: подпись void-bootstrap не совпала с VOID_BOOTSTRAP_SIGNING_PUB_HEX"
+                .into(),
+        );
+    }
+    Ok(())
+}
+
+/// `true` — можно добавлять строки; `false` — источник пропущен (например, нет URL-подписи).
+fn verify_void_bootstrap_http_body(body: &str, source: &str) -> Result<bool, String> {
+    let Some(pk) = void_bootstrap_signing_pubkey_from_env() else {
+        return Ok(true);
+    };
+    let Ok(hex) = std::env::var("VOID_BOOTSTRAP_URL_SIG_HEX") else {
+        warn!(
+            "VOID bootstrap: пропуск {}: задан VOID_BOOTSTRAP_SIGNING_PUB_HEX, но нет VOID_BOOTSTRAP_URL_SIG_HEX (128 hex)",
+            source
+        );
+        return Ok(false);
+    };
+    let sig_bytes = hex_decode_64(&hex).ok_or_else(|| {
+        "VOID bootstrap: VOID_BOOTSTRAP_URL_SIG_HEX должен быть 128 hex-символов (64 байта)".to_string()
+    })?;
+    if !pk.verify(body.as_bytes(), &sig_bytes) {
+        return Err(format!(
+            "VOID bootstrap: подпись тела для {source} не совпала с VOID_BOOTSTRAP_SIGNING_PUB_HEX"
+        ));
+    }
+    Ok(true)
+}
+
 fn void_bootstrap_multiaddrs() -> Vec<Multiaddr> {
     let mut out = Vec::new();
 
@@ -253,7 +479,7 @@ fn void_bootstrap_multiaddrs() -> Vec<Multiaddr> {
         }
         match t.parse::<Multiaddr>() {
             Ok(ma) => out.push(ma),
-            Err(_) => eprintln!("BUILTIN_VOID_BOOTSTRAP: пропуск: {}", t),
+            Err(_) => warn!("BUILTIN_VOID_BOOTSTRAP: пропуск: {}", t),
         }
     }
 
@@ -278,14 +504,22 @@ fn void_bootstrap_multiaddrs() -> Vec<Multiaddr> {
     urls.dedup();
     for url in urls {
         if let Some(body) = fetch_void_bootstrap_list(&url) {
-            append_bootstraps_from_lines(&mut out, &body, &format!("GET {}", url));
+            let src = format!("GET {}", url);
+            match verify_void_bootstrap_http_body(&body, &src) {
+                Ok(true) => append_bootstraps_from_lines(&mut out, &body, &src),
+                Ok(false) => {}
+                Err(e) => warn!("{}", e),
+            }
         }
     }
 
     let path = Path::new("void-bootstrap.txt");
     if path.exists() {
         if let Ok(txt) = std::fs::read_to_string(path) {
-            append_bootstraps_from_lines(&mut out, &txt, "void-bootstrap.txt");
+            match verify_void_bootstrap_file(path, &txt) {
+                Ok(()) => append_bootstraps_from_lines(&mut out, &txt, "void-bootstrap.txt"),
+                Err(e) => warn!("{}", e),
+            }
         }
     }
 
@@ -342,6 +576,9 @@ struct AddressBookEntry {
 
 #[derive(Serialize, Deserialize)]
 struct StorageData {
+    /// Версия формата plaintext JSON внутри AES-GCM (только `1` поддерживается).
+    #[serde(default = "storage_format_v1")]
+    format_version: u32,
     nickname: String,
     keypair_bytes: Vec<u8>,
     static_secret_bytes: [u8; 32],
@@ -350,8 +587,22 @@ struct StorageData {
     address_book: Vec<AddressBookEntry>,
 }
 
+fn storage_format_v1() -> u32 {
+    1
+}
+
 struct Storage;
 impl Storage {
+    /// Максимум байт JSON после расшифровки `vault.bin` (защита от чрезмерного `serde_json`).
+    const VAULT_PLAINTEXT_JSON_MAX: usize = 512 * 1024;
+    const VAULT_NICKNAME_MAX: usize = 256;
+    const VAULT_KEYPAIR_BYTES_MAX: usize = 16384;
+    const VAULT_ADDRESS_BOOK_MAX_ENTRIES: usize = 4096;
+    const VAULT_ENTRY_PEER_ID_MAX: usize = 256;
+    const VAULT_ENTRY_NAME_MAX: usize = 256;
+    const VAULT_ENTRY_ADDRS_MAX: usize = 128;
+    const VAULT_ENTRY_ONE_ADDR_MAX: usize = 1024;
+
     const FILE: &'static str = "vault.bin";
     const FILE_TMP: &'static str = "vault.bin.tmp";
     const FILE_BAK: &'static str = "vault.bin.bak";
@@ -479,6 +730,7 @@ impl Storage {
         };
 
         let data = StorageData {
+            format_version: 1,
             nickname: nickname.to_string(),
             keypair_bytes,
             static_secret_bytes,
@@ -512,6 +764,63 @@ impl Storage {
         Ok(())
     }
 
+    fn validate_plain_storage(s: &StorageData) -> Result<(), Box<dyn Error>> {
+        if s.nickname.len() > Self::VAULT_NICKNAME_MAX {
+            return Err(format!(
+                "vault: nickname длиннее {} байт",
+                Self::VAULT_NICKNAME_MAX
+            )
+            .into());
+        }
+        if s.keypair_bytes.len() > Self::VAULT_KEYPAIR_BYTES_MAX {
+            return Err(format!(
+                "vault: keypair_bytes больше {} байт",
+                Self::VAULT_KEYPAIR_BYTES_MAX
+            )
+            .into());
+        }
+        if s.address_book.len() > Self::VAULT_ADDRESS_BOOK_MAX_ENTRIES {
+            return Err(format!(
+                "vault: address_book больше {} записей",
+                Self::VAULT_ADDRESS_BOOK_MAX_ENTRIES
+            )
+            .into());
+        }
+        for (i, e) in s.address_book.iter().enumerate() {
+            if e.peer_id.len() > Self::VAULT_ENTRY_PEER_ID_MAX {
+                return Err(format!(
+                    "vault: address_book[{}].peer_id слишком длинный",
+                    i
+                )
+                .into());
+            }
+            if e.display_name.len() > Self::VAULT_ENTRY_NAME_MAX {
+                return Err(format!(
+                    "vault: address_book[{}].display_name слишком длинный",
+                    i
+                )
+                .into());
+            }
+            if e.addrs.len() > Self::VAULT_ENTRY_ADDRS_MAX {
+                return Err(format!(
+                    "vault: address_book[{}].addrs — слишком много адресов",
+                    i
+                )
+                .into());
+            }
+            for (j, a) in e.addrs.iter().enumerate() {
+                if a.len() > Self::VAULT_ENTRY_ONE_ADDR_MAX {
+                    return Err(format!(
+                        "vault: address_book[{}].addrs[{}] — строка multiaddr слишком длинная",
+                        i, j
+                    )
+                    .into());
+                }
+            }
+        }
+        Ok(())
+    }
+
     fn load(master_key: &[u8; 32]) -> Result<StorageData, Box<dyn Error>> {
         if !std::path::Path::new(Self::FILE).exists() {
             return Err("Vault file not found".into());
@@ -529,7 +838,24 @@ impl Storage {
             .decrypt(nonce, ciphertext)
             .map_err(|e| format!("Decryption error: {}", e))?;
 
+        if plaintext.len() > Self::VAULT_PLAINTEXT_JSON_MAX {
+            return Err(format!(
+                "vault: размер plaintext {} превышает лимит {} байт",
+                plaintext.len(),
+                Self::VAULT_PLAINTEXT_JSON_MAX
+            )
+            .into());
+        }
+
         let storage: StorageData = serde_json::from_slice(&plaintext)?;
+        Self::validate_plain_storage(&storage)?;
+        if storage.format_version != 1 {
+            return Err(format!(
+                "vault: неподдерживаемая format_version {}",
+                storage.format_version
+            )
+            .into());
+        }
         Ok(storage)
     }
 }
@@ -604,6 +930,8 @@ const MAX_CHAT_TIMESTAMP_BYTES: usize = 64;
 
 const VOID_HELLO_BIND_PREFIX: &[u8] = b"VOID_E2EE_HELLO_BIND_V1\0";
 
+const MAX_HELLO_TRANSPORT_PUBKEY_PB: usize = 4096;
+
 /// Inline multihash PeerId (Ed25519): извлечь транспортный `PublicKey` для проверки подписи Hello.
 fn void_peer_transport_public_key(peer: PeerId) -> Option<libp2p::identity::PublicKey> {
     const CODE_IDENTITY: u64 = 0;
@@ -612,6 +940,24 @@ fn void_peer_transport_public_key(peer: PeerId) -> Option<libp2p::identity::Publ
         return None;
     }
     libp2p::identity::PublicKey::try_decode_protobuf(mh.digest()).ok()
+}
+
+/// Ключ для проверки `transport_sig`: из identity-multihash или из protobuf в Hello (hashed PeerId).
+fn void_hello_signing_public_key(
+    signer_peer_id: PeerId,
+    transport_pubkey_pb: &[u8],
+) -> Option<libp2p::identity::PublicKey> {
+    if !transport_pubkey_pb.is_empty() {
+        if transport_pubkey_pb.len() > MAX_HELLO_TRANSPORT_PUBKEY_PB {
+            return None;
+        }
+        let pk = libp2p::identity::PublicKey::try_decode_protobuf(transport_pubkey_pb).ok()?;
+        if PeerId::from_public_key(&pk) != signer_peer_id {
+            return None;
+        }
+        return Some(pk);
+    }
+    void_peer_transport_public_key(signer_peer_id)
 }
 
 fn hello_bind_message(
@@ -635,12 +981,13 @@ fn verify_hello_transport_binding(
     x25519_static: &[u8; 32],
     x25519_ephemeral: &[u8; 32],
     transport_sig: &[u8],
+    transport_pubkey_pb: &[u8],
 ) -> bool {
     const MAX_SIG: usize = 256;
     if transport_sig.is_empty() || transport_sig.len() > MAX_SIG {
         return false;
     }
-    let Some(pubkey) = void_peer_transport_public_key(signer_peer_id) else {
+    let Some(pubkey) = void_hello_signing_public_key(signer_peer_id, transport_pubkey_pb) else {
         return false;
     };
     let msg = hello_bind_message(
@@ -695,6 +1042,9 @@ enum V1Packet {
         /// Подпись Ed25519 (libp2p identity) над `VOID_E2EE_HELLO_BIND_V1` + peerId||peerId||x25519||ephem.
         #[serde(default)]
         transport_sig: Vec<u8>,
+        /// Если PeerId не identity-multihash: protobuf `PublicKey` для проверки подписи.
+        #[serde(default)]
+        transport_pubkey_pb: Vec<u8>,
     },
     Encrypted {
         header: crypto::MessageHeader,
@@ -719,10 +1069,16 @@ fn build_v1_hello(
         &static_b,
         &ephem_b,
     )?;
+    let transport_pubkey_pb = if void_peer_transport_public_key(signer_peer).is_some() {
+        Vec::new()
+    } else {
+        transport.public().encode_protobuf()
+    };
     Some(V1Packet::Hello {
         public_key: static_b,
         ephemeral_key: ephem_b,
         transport_sig,
+        transport_pubkey_pb,
     })
 }
 
@@ -843,7 +1199,7 @@ async fn apply_incoming_file_chunk(
             if let Some(data) = maybe_data {
                 let sha_actual = file_transfer::hash_file(&data);
                 if sha_actual != sha_expected {
-                    println!(
+                    debug!(
                         "[{}] ❌ FILE: хэш не совпадает для «{}»!",
                         now, fname
                     );
@@ -865,7 +1221,7 @@ async fn apply_incoming_file_chunk(
                     let saved_to = save_path.display().to_string();
                     match std::fs::write(&save_path, &data) {
                         Ok(_) => {
-                            println!(
+                            debug!(
                                 "[{}] ✅ FILE: «{}» сохранён → {}",
                                 now, fname, saved_to
                             );
@@ -941,7 +1297,7 @@ struct ChatBehaviour {
         file_transfer::FilePacket,
         file_transfer::FilePacket,
     >,
-    mdns: mdns::tokio::Behaviour,
+    mdns: Toggle<mdns::tokio::Behaviour>,
     ping: ping::Behaviour,
     identify: identify::Behaviour,
     kad: kad::Behaviour<kad::store::MemoryStore>,
@@ -1091,8 +1447,9 @@ impl App {
 
     /// Экран разблокировки vault. Возвращает `true`, пока нужно блокировать основной UI.
     pub(crate) fn vault_unlock_gate(&mut self, ctx: &egui::Context) -> bool {
-        let Some(_) = self.pending_unlock.as_ref() else {
-            return false;
+        let kind = match self.pending_unlock.as_ref() {
+            Some(p) => p.kind.clone(),
+            None => return false,
         };
 
         #[derive(Clone, Copy)]
@@ -1101,26 +1458,26 @@ impl App {
         }
         let mut act = None::<Act>;
 
+        let subtitle = match &kind {
+            VaultUnlockKind::CreateProfile => "Задайте пароль vault (AES-ключ будет защищён Argon2id).",
+            VaultUnlockKind::OpenWrappedKey => "Введите пароль vault.",
+            VaultUnlockKind::MigratePlainMaster(_) => {
+                "Старый void.key без пароля: задаётесь пароль (Argon2id + AES), vault не меняется."
+            }
+        };
+        let need_confirm = matches!(
+            &kind,
+            VaultUnlockKind::CreateProfile | VaultUnlockKind::MigratePlainMaster(_),
+        );
+
         egui::CentralPanel::default().show(ctx, |ui| {
             ui.vertical_centered(|ui| {
                 ui.add_space(56.0);
                 ui.label(egui::RichText::new("VOID").size(36.0).strong());
                 ui.add_space(12.0);
-                let subtitle = match &self.pending_unlock.as_ref().unwrap().kind {
-                    VaultUnlockKind::CreateProfile => "Задайте пароль vault (AES-ключ будет защищён Argon2id).",
-                    VaultUnlockKind::OpenWrappedKey => "Введите пароль vault.",
-                    VaultUnlockKind::MigratePlainMaster(_) => {
-                        "Старый void.key без пароля: задаётесь пароль (Argon2id + AES), vault не меняется."
-                    }
-                };
                 ui.label(egui::RichText::new(subtitle).weak());
                 ui.add_space(24.0);
                 ui.set_max_width(420.0);
-                let need_confirm =
-                    matches!(
-                        self.pending_unlock.as_ref().unwrap().kind,
-                        VaultUnlockKind::CreateProfile | VaultUnlockKind::MigratePlainMaster(_),
-                    );
 
                 if let Some(p) = self.pending_unlock.as_mut() {
                     ui.label("Пароль:");
@@ -1213,6 +1570,8 @@ impl App {
             VaultUnlockKind::MigratePlainMaster(leg) => {
                 let plain = **leg;
                 if let Err(e) = Storage::write_wrapped_master_key_file(&plain, pwd) {
+                    pending.password.zeroize();
+                    pending.password_confirm.zeroize();
                     pending.error = Some(format!("{}", e));
                     self.pending_unlock = Some(pending);
                     return;
@@ -1223,6 +1582,8 @@ impl App {
                 let mut plain = [0u8; 32];
                 rand::thread_rng().fill_bytes(&mut plain);
                 if let Err(e) = Storage::write_wrapped_master_key_file(&plain, pwd) {
+                    pending.password.zeroize();
+                    pending.password_confirm.zeroize();
                     pending.error = Some(format!("{}", e));
                     self.pending_unlock = Some(pending);
                     return;
@@ -1384,9 +1745,9 @@ impl App {
         self.pending_unlock = None;
         self.vault_master_key = Some(master_arr);
 
-        println!("=== VOID P2P Chat ===");
-        println!("Ваш Peer ID: {}", self.local_peer_id);
-        println!("Ваш никнейм: {}", self.local_nickname);
+        info!("=== VOID P2P Chat ===");
+        info!("Ваш Peer ID: {}", self.local_peer_id);
+        info!("Ваш никнейм: {}", self.local_nickname);
 
         let pid = self.local_peer_id.to_string();
         let tit = pid
@@ -1433,7 +1794,7 @@ impl App {
             None,
             Some(&entries),
         ) {
-            eprintln!("VOID: не удалось сохранить vault (записная книга): {}", e);
+            warn!("VOID: не удалось сохранить vault (записная книга): {}", e);
         }
     }
 
@@ -1556,6 +1917,114 @@ impl App {
 
 }
 
+fn build_void_swarm(
+    local_key: libp2p::identity::Keypair,
+    void_bootstraps: &[Multiaddr],
+    contact_seed_addrs: &[(PeerId, Multiaddr)],
+) -> Result<libp2p::Swarm<ChatBehaviour>, String> {
+    Ok(libp2p::SwarmBuilder::with_existing_identity(local_key)
+        .with_tokio()
+        .with_tcp(
+            tcp::Config::default().nodelay(true),
+            noise::Config::new,
+            || {
+                let mut config = yamux::Config::default();
+                config.set_max_num_streams(512);
+                config
+            },
+        )
+        .map_err(|e| format!("with_tcp: {:?}", e))?
+        .with_quic()
+        .with_dns()
+        .map_err(|e| format!("with_dns: {:?}", e))?
+        .with_relay_client(noise::Config::new, || {
+            let mut config = yamux::Config::default();
+            config.set_max_num_streams(512);
+            config
+        })
+        .map_err(|e| format!("with_relay_client: {:?}", e))?
+        .with_behaviour(|key, relay_client| {
+            let local_peer_id = key.public().to_peer_id();
+
+            let kad_store = kad::store::MemoryStore::new(local_peer_id);
+            let mut kad_config = kad::Config::new(StreamProtocol::new("/void/kad/1.0.0"));
+            kad_config.set_periodic_bootstrap_interval(Some(Duration::from_secs(5 * 60)));
+            kad_config.set_query_timeout(Duration::from_secs(60));
+            let mut kad = kad::Behaviour::with_config(local_peer_id, kad_store, kad_config);
+            kad.set_mode(Some(libp2p::kad::Mode::Server));
+
+            for ma in void_bootstraps {
+                if let Some(pid) = peer_id_from_multiaddr(ma) {
+                    kad.add_address(&pid, ma.clone());
+                } else {
+                    warn!("VOID bootstrap: нет /p2p/ в конце адреса, пропуск: {}", ma);
+                }
+            }
+            for (pid, ma) in contact_seed_addrs {
+                kad.add_address(pid, ma.clone());
+            }
+            if !void_bootstraps.is_empty() {
+                let _ = kad.bootstrap();
+            }
+
+            let rr_config = libp2p::request_response::Config::default()
+                .with_request_timeout(Duration::from_secs(30));
+            let rr_protocol = libp2p::StreamProtocol::new("/void/chat/1.0.0");
+            let rr_behaviour = libp2p::request_response::json::Behaviour::<V1Packet, V1Packet>::new(
+                [(rr_protocol, libp2p::request_response::ProtocolSupport::Full)],
+                rr_config.clone(),
+            );
+
+            let file_rr_config = libp2p::request_response::Config::default()
+                .with_request_timeout(Duration::from_secs(300));
+            let file_rr_protocol = libp2p::StreamProtocol::new(file_transfer::FILE_PROTOCOL_ID);
+            let file_rr_behaviour = libp2p::request_response::json::Behaviour::<
+                file_transfer::FilePacket,
+                file_transfer::FilePacket,
+            >::new(
+                [(
+                    file_rr_protocol,
+                    libp2p::request_response::ProtocolSupport::Full,
+                )],
+                file_rr_config,
+            );
+
+            let mdns: Toggle<mdns::tokio::Behaviour> = if std::env::var("VOID_DISABLE_MDNS").is_ok() {
+                Toggle::from(None)
+            } else {
+                let b = mdns::tokio::Behaviour::new(mdns::Config::default(), local_peer_id)
+                    .map_err(|e| -> Box<dyn std::error::Error + Send + Sync> { Box::new(e) })?;
+                Toggle::from(Some(b))
+            };
+
+            Ok(ChatBehaviour {
+                request_response: rr_behaviour,
+                file_rr: file_rr_behaviour,
+                mdns,
+                ping: ping::Behaviour::new(
+                    ping::Config::new()
+                        .with_interval(Duration::from_secs(20))
+                        .with_timeout(Duration::from_secs(20)),
+                ),
+                identify: identify::Behaviour::new(
+                    identify::Config::new("/void/v1".into(), key.public())
+                        .with_push_listen_addr_updates(true),
+                ),
+                kad,
+                relay: relay_client,
+                dcutr: dcutr::Behaviour::new(local_peer_id),
+                autonat: autonat::Behaviour::new(local_peer_id, Default::default()),
+                upnp: upnp::tokio::Behaviour::default(),
+            })
+        })
+        .map_err(|e| format!("with_behaviour: {:?}", e))?
+        .with_swarm_config(|c| {
+            c.with_idle_connection_timeout(Duration::MAX)
+                .with_per_connection_event_buffer_size(256)
+        })
+        .build())
+}
+
 async fn run_chat_network(
     mut command_rx: mpsc::Receiver<UICommand>,
     event_tx: mpsc::Sender<NetworkEvent>,
@@ -1571,139 +2040,66 @@ async fn run_chat_network(
         let my_public_key = crypto::PublicKey::from(&local_static);
         let local_peer_id = local_key.public().to_peer_id();
 
-        // Swarm: TCP + noise + yamux + Relay Client
-        let mut swarm = libp2p::SwarmBuilder::with_existing_identity(local_key.clone())
-            .with_tokio()
-            .with_tcp(
-                tcp::Config::default().nodelay(true),
-                noise::Config::new,
-                || {
-                    let mut config = yamux::Config::default();
-                    // SYNC CHECK: This should appear in your editor if synced.
-                    config.set_max_num_streams(512);
-                    config
-                },
-            )
-            .unwrap()
-            .with_quic()
-            .with_dns()
-            .unwrap()
-            .with_relay_client(noise::Config::new, || {
-                let mut config = yamux::Config::default();
-                config.set_max_num_streams(512);
-                config
-            })
-            .unwrap()
-            .with_behaviour(|key, relay_client| {
-                let local_peer_id = key.public().to_peer_id();
-
-                // Kademlia: отдельный DHT VOID (/void/kad/1.0.0), не общий IPFS (/ipfs/kad/1.0.0).
-                // Иначе в таблицу попадают тысячи чужих узлов и «поиск пира» оборачивается звонками на IPFS.
-                let kad_store = kad::store::MemoryStore::new(local_peer_id);
-                let mut kad_config = kad::Config::new(StreamProtocol::new("/void/kad/1.0.0"));
-                // Переосвежаем routing table каждые 5 минут: без этого узел со временем
-                // «проваливается» из DHT и новые контакты перестают находиться.
-                kad_config.set_periodic_bootstrap_interval(Some(Duration::from_secs(5 * 60)));
-                kad_config.set_query_timeout(Duration::from_secs(60));
-                let mut kad = kad::Behaviour::with_config(local_peer_id, kad_store, kad_config);
-                kad.set_mode(Some(libp2p::kad::Mode::Server));
-
-                for ma in &void_bootstraps {
-                    if let Some(pid) = peer_id_from_multiaddr(ma) {
-                        kad.add_address(&pid, ma.clone());
-                    } else {
-                        eprintln!("VOID bootstrap: нет /p2p/ в конце адреса, пропуск: {}", ma);
-                    }
-                }
-                // Прогреваем kbuckets адресами контактов из vault — тогда
-                // `send_request` к ним работает без предварительного ручного dial.
-                for (pid, ma) in &contact_seed_addrs {
-                    kad.add_address(pid, ma.clone());
-                }
-                if !void_bootstraps.is_empty() {
-                    let _ = kad.bootstrap();
-                }
-
-                let rr_config = libp2p::request_response::Config::default()
-                    .with_request_timeout(Duration::from_secs(30)); // Увеличиваем тайм-аут до 30с
-                let rr_protocol = libp2p::StreamProtocol::new("/void/chat/1.0.0");
-                let rr_behaviour = libp2p::request_response::json::Behaviour::<V1Packet, V1Packet>::new(
-                    [(rr_protocol, libp2p::request_response::ProtocolSupport::Full)],
-                    rr_config.clone(),
-                );
-
-                // Отдельный request-response для файлового sub-протокола.
-                // Тайм-аут 5 мин: большие файлы через relay могут идти долго.
-                let file_rr_config = libp2p::request_response::Config::default()
-                    .with_request_timeout(Duration::from_secs(300));
-                let file_rr_protocol =
-                    libp2p::StreamProtocol::new(file_transfer::FILE_PROTOCOL_ID);
-                let file_rr_behaviour = libp2p::request_response::json::Behaviour::<
-                    file_transfer::FilePacket,
-                    file_transfer::FilePacket,
-                >::new(
-                    [(
-                        file_rr_protocol,
-                        libp2p::request_response::ProtocolSupport::Full,
-                    )],
-                    file_rr_config,
-                );
-
-                Ok(ChatBehaviour {
-                    request_response: rr_behaviour,
-                    file_rr: file_rr_behaviour,
-                    mdns: mdns::tokio::Behaviour::new(mdns::Config::default(), local_peer_id)
-                        .unwrap(),
-                    ping: ping::Behaviour::new(
-                        ping::Config::new()
-                            .with_interval(Duration::from_secs(20))
-                            .with_timeout(Duration::from_secs(20)),
-                    ),
-                    identify: identify::Behaviour::new(
-                        identify::Config::new(
-                            "/void/v1".into(), // Фиксируем версию для всех
-                            key.public(),
-                        )
-                        // Рассылаем пирам (в т.ч. bootstrap-ноде) обновлённые
-                        // listen-адреса при их изменении (UPnP, autonat, relay).
-                        // Без этого после смены внешнего IP bootstrap-нода хранит
-                        // устаревший адрес и другие пиры не могут нас найти в DHT.
-                        .with_push_listen_addr_updates(true),
-                    ),
-                    kad,
-                    relay: relay_client,
-                    dcutr: dcutr::Behaviour::new(local_peer_id),
-                    autonat: autonat::Behaviour::new(local_peer_id, Default::default()),
-                    upnp: upnp::tokio::Behaviour::default(),
-                })
-            })
-            .unwrap()
-            .with_swarm_config(|c| {
-                // Не закрываем idle-коннекты по таймеру: в мессенджере между
-                // сообщениями легко проходят часы, а ping / identify / kad в
-                // libp2p 0.56 не считаются «keep-alive» для свома. Старое
-                // значение 120s давало каскад KeepAliveTimeout → реконнект →
-                // `Os 48 AddrInUse` (TIME_WAIT на macOS). Закрытия мёртвых
-                // коннектов мы всё равно получаем через transport-ошибки
-                // стримов (ping/request-response) и TCP keepalive ОС.
-                c.with_idle_connection_timeout(Duration::MAX)
-                    .with_per_connection_event_buffer_size(256)
-            })
-            .build();
+        let mut swarm = match build_void_swarm(
+            local_key.clone(),
+            &void_bootstraps,
+            &contact_seed_addrs,
+        ) {
+            Ok(s) => s,
+            Err(msg) => {
+                warn!("❌ Swarm: {}", msg);
+                let _ = event_tx
+                    .send(NetworkEvent::Status(format!(
+                        "❌ Не удалось инициализировать сеть: {}",
+                        msg
+                    )))
+                    .await;
+                return;
+            }
+        };
 
         // Слушаем TCP. Сначала пробуем 50001 (согласно правилам файрвола).
-        let tcp_addr: Multiaddr = "/ip4/0.0.0.0/tcp/50001".parse().unwrap();
+        let tcp_addr: Multiaddr = match "/ip4/0.0.0.0/tcp/50001".parse() {
+            Ok(a) => a,
+            Err(_) => {
+                let _ = event_tx
+                    .send(NetworkEvent::Status(
+                        "❌ Внутренняя ошибка: некорректный TCP multiaddr.".into(),
+                    ))
+                    .await;
+                return;
+            }
+        };
 
         if let Err(e) = swarm.listen_on(tcp_addr.clone()) {
-            println!("⚠️ TCP порт 50001 занят ({:?}). Срочно ЗАКРОЙТЕ старые процессы или проверьте настройки.", e);
+            debug!("⚠️ TCP порт 50001 занят ({:?}). Срочно ЗАКРОЙТЕ старые процессы или проверьте настройки.", e);
             let _ = event_tx
                 .send(NetworkEvent::Status(
                     "⚠️ ПОРТ 50001 ЗАНЯТ! Закройте старые копии программы.".into(),
                 ))
                 .await;
-            swarm
-                .listen_on("/ip4/0.0.0.0/tcp/0".parse().unwrap())
-                .unwrap();
+            match "/ip4/0.0.0.0/tcp/0".parse::<Multiaddr>() {
+                Ok(fallback) => {
+                    if let Err(e2) = swarm.listen_on(fallback) {
+                        warn!("❌ TCP fallback 0: {:?}", e2);
+                        let _ = event_tx
+                            .send(NetworkEvent::Status(format!(
+                                "❌ Не удалось слушать TCP даже на свободном порту: {:?}",
+                                e2
+                            )))
+                            .await;
+                        return;
+                    }
+                }
+                Err(_) => {
+                    let _ = event_tx
+                        .send(NetworkEvent::Status(
+                            "❌ Внутренняя ошибка: некорректный fallback TCP multiaddr.".into(),
+                        ))
+                        .await;
+                    return;
+                }
+            }
         }
 
         // Слушаем QUIC (50001 часто занят другим процессом на Windows — пробуем 50002, затем ОС).
@@ -1714,28 +2110,52 @@ async fn run_chat_network(
         ];
         let mut quic_listening = false;
         for addr in quic_candidates {
-            match swarm.listen_on(addr.parse::<Multiaddr>().unwrap()) {
-                Ok(_) => {
-                    println!("🚀 QUIC: {}", addr);
-                    quic_listening = true;
-                    break;
-                }
-                Err(e) => println!("⚠️ QUIC {}: {:?} — следующий вариант...", addr, e),
+            match addr.parse::<Multiaddr>() {
+                Ok(ma) => match swarm.listen_on(ma) {
+                    Ok(_) => {
+                        debug!("🚀 QUIC: {}", addr);
+                        quic_listening = true;
+                        break;
+                    }
+                    Err(e) => debug!("⚠️ QUIC {}: {:?} — следующий вариант...", addr, e),
+                },
+                Err(e) => debug!("⚠️ QUIC parse {}: {:?}", addr, e),
             }
         }
         if !quic_listening {
-            println!("⚠️ QUIC не поднят ни на одном порту");
+            debug!("⚠️ QUIC не поднят ни на одном порту");
         }
 
         // Слушаем через Relay для работы за NAT
-        let _ = swarm.listen_on("/p2p-circuit".parse().unwrap());
+        match "/p2p-circuit".parse::<Multiaddr>() {
+            Ok(ma) => {
+                if let Err(e) = swarm.listen_on(ma) {
+                    warn!("⚠️ relay listen /p2p-circuit: {:?}", e);
+                }
+            }
+            Err(e) => warn!("⚠️ parse /p2p-circuit: {:?}", e),
+        }
 
         let startup_status = if void_bootstraps.is_empty() {
-            "🚀 Запущен. Интернет: полный multiaddr контакта или встроенный/URL seed (см. код), VOID_BOOTSTRAP, void-bootstrap.txt. LAN: mDNS.".to_string()
-        } else {
+            let lan = if std::env::var("VOID_DISABLE_MDNS").is_ok() {
+                "LAN: mDNS отключён (VOID_DISABLE_MDNS)."
+            } else {
+                "LAN: mDNS."
+            };
             format!(
-                "🚀 Запущен. VOID DHT: {} bootstrap-узл(ов) (без IPFS) + mDNS в LAN.",
-                void_bootstraps.len()
+                "🚀 Запущен. Интернет: полный multiaddr контакта или встроенный/URL seed (см. код), VOID_BOOTSTRAP, void-bootstrap.txt. {}",
+                lan
+            )
+        } else {
+            let lan = if std::env::var("VOID_DISABLE_MDNS").is_ok() {
+                "mDNS в LAN отключён"
+            } else {
+                "mDNS в LAN"
+            };
+            format!(
+                "🚀 Запущен. VOID DHT: {} bootstrap-узл(ов) (без IPFS) + {}.",
+                void_bootstraps.len(),
+                lan
             )
         };
         let _ = event_tx.send(NetworkEvent::Status(startup_status)).await;
@@ -1754,7 +2174,7 @@ async fn run_chat_network(
                 grouped.entry(*pid).or_default().push(ma.clone());
             }
             for (pid, addrs) in &grouped {
-                println!(
+                debug!(
                     "📇 Стартовый dial контакта {} ({} адр.)",
                     &pid.to_string()[..8],
                     addrs.len()
@@ -1766,7 +2186,7 @@ async fn run_chat_network(
                 if let Err(e) = swarm.dial(opts) {
                     let s = format!("{:?}", e);
                     if !s.contains("Condition") {
-                        eprintln!("contact dial {}: {:?}", pid, e);
+                        warn!("contact dial {}: {:?}", pid, e);
                     }
                 }
             }
@@ -1853,7 +2273,7 @@ async fn run_chat_network(
                             .get(&pid)
                             .map(|(_, a)| *a)
                             .unwrap_or(1);
-                        println!(
+                        debug!(
                             "🔄 Автореконнект: {} ({} адр., попытка {}).",
                             &pid.to_string()[..8],
                             clean.len(),
@@ -1878,7 +2298,7 @@ async fn run_chat_network(
                                     entry.0 = Instant::now() + next_delay;
                                     entry.1 += 1;
                                 }
-                                eprintln!("reconnect dial {}: {:?}", &pid.to_string()[..8], e);
+                                warn!("reconnect dial {}: {:?}", &pid.to_string()[..8], e);
                             }
                         }
                     }
@@ -1942,7 +2362,7 @@ async fn run_chat_network(
                                     })
                                     .await;
                                 if all_sent {
-                                    println!(
+                                    debug!(
                                         "📤 FILE[{}]: все {} чанк(ов) «{}» отправлены через E2EE{}.",
                                         fkind.label(),
                                         total,
@@ -1962,7 +2382,7 @@ async fn run_chat_network(
                                 }
                             }
                         } else {
-                            println!(
+                            debug!(
                                 "⚠️ FILE: не удалось зашифровать чанк {} для {} (нет E2EE-сессии).",
                                 chunk_idx,
                                 &peer.to_string()[..8]
@@ -2043,7 +2463,7 @@ async fn run_chat_network(
                                      .into_iter()
                                      .filter(|addr| !is_junk_addr(addr))
                                      .collect();
-                                 println!("🔌 UI_COMMAND: DialPeer {} ({} addresses)", short, addrs.len());
+                                 debug!("🔌 UI_COMMAND: DialPeer {} ({} addresses)", short, addrs.len());
 
                                  for addr in &addrs {
                                      swarm.behaviour_mut().kad.add_address(&peer_id, addr.clone());
@@ -2074,7 +2494,7 @@ async fn run_chat_network(
                                  if let Err(e) = swarm.dial(opts) {
                                       let err_str = format!("{:?}", e);
                                       if !err_str.contains("Condition") {
-                                          println!("❌ Dial ERROR для {}: {:?}", short, e);
+                                          debug!("❌ Dial ERROR для {}: {:?}", short, e);
                                       }
                                       pending_dials.remove(&peer_id);
                                  }
@@ -2088,6 +2508,14 @@ async fn run_chat_network(
                                             pending_seed_peers.insert(pid);
                                         } else {
                                             pending_seed_bare = true;
+                                            let _ = event_tx
+                                                .send(NetworkEvent::Status(
+                                                    "⚠ Вход без /p2p/<PeerId>: транспортный PeerId \
+                                                     будет известен только после соединения; \
+                                                     для bootstrap предпочтительно полный multiaddr."
+                                                        .into(),
+                                                ))
+                                                .await;
                                         }
                                         match swarm.dial(ma.clone()) {
                                             Ok(_) => {
@@ -2157,7 +2585,13 @@ async fn run_chat_network(
                             }
                             UICommand::SendMessage { sender_name, text, recipient, is_retry: _is_retry } => {
                                 let now = chrono::Local::now().format("%H:%M:%S").to_string();
-                                println!("[{}] 📤 UI_SEND: '{}' (To: {:?})", now, text, recipient);
+                                debug!(
+                                    target: "void_net",
+                                    time = %now,
+                                    text_len = text.len(),
+                                    has_recipient = recipient.is_some(),
+                                    "UI_SEND"
+                                );
                                 let msg = ChatMessage {
                                     sender_id: local_peer_id.to_string(),
                                     sender_name: sender_name.clone(),
@@ -2166,16 +2600,32 @@ async fn run_chat_network(
                                     timestamp: chrono::Local::now().format("%H:%M").to_string(),
                                 };
 
-                                let json_data = serde_json::to_vec(&msg).unwrap();
+                                let json_data = match serde_json::to_vec(&msg) {
+                                    Ok(v) => v,
+                                    Err(e) => {
+                                        debug!(
+                                            "[{}] ❌ UI_SEND: serde_json сообщения: {}",
+                                            now, e
+                                        );
+                                        let _ = event_tx
+                                            .send(NetworkEvent::Status(format!(
+                                                "❌ Не удалось сериализовать сообщение: {}",
+                                                e
+                                            )))
+                                            .await;
+                                        let _ = event_tx.send(NetworkEvent::ChatMessage(msg)).await;
+                                        continue;
+                                    }
+                                };
 
                                 if let Some(peer_id) = recipient {
                                     if let Some(session) = sessions.get_mut(&peer_id) {
                                         if let Ok((header, ciphertext)) = session.encrypt_payload(json_data.as_slice()) {
                                             let packet = V1Packet::Encrypted { header, ciphertext };
-                                            println!("[{}] 🔒 E2EE: Сообщение зашифровано для {}", now, &peer_id.to_string()[..8]);
+                                            debug!("[{}] 🔒 E2EE: Сообщение зашифровано для {}", now, &peer_id.to_string()[..8]);
                                             let req_id = swarm.behaviour_mut().request_response.send_request(&peer_id, packet);
                                             outbound_msg_requests.insert(req_id, peer_id);
-                                            println!("[{}] 📨 RequestResponse: Отправка пиру {}", now, &peer_id.to_string()[..8]);
+                                            debug!("[{}] 📨 RequestResponse: Отправка пиру {}", now, &peer_id.to_string()[..8]);
                                         }
                                     } else {
                                         // Нет сессии — инициируем хендшейк (если ещё не начат)
@@ -2195,13 +2645,13 @@ async fn run_chat_network(
                                                     .behaviour_mut()
                                                     .request_response
                                                     .send_request(&peer_id, hello);
-                                                println!(
+                                                debug!(
                                                     "[{}] 🤝 E2EE: Сессии нет, направлен Hello (+Ephem) пиру {}",
                                                     now,
                                                     &peer_id.to_string()[..8]
                                                 );
                                             } else {
-                                                println!(
+                                                debug!(
                                                     "[{}] ❌ E2EE: не удалось подписать Hello для {}",
                                                     now,
                                                     &peer_id.to_string()[..8]
@@ -2209,10 +2659,10 @@ async fn run_chat_network(
                                             }
                                         }
                                         pending_messages.entry(peer_id).or_default().push(json_data);
-                                        println!("[{}] ⏳ E2EE: Сообщение буферизовано до хендшейка с {}", now, &peer_id.to_string()[..8]);
+                                        debug!("[{}] ⏳ E2EE: Сообщение буферизовано до хендшейка с {}", now, &peer_id.to_string()[..8]);
                                     }
                                 } else {
-                                    println!("[{}] ⚠️ Попытка отправить сообщение без получателя (Global Chat отключен)", now);
+                                    debug!("[{}] ⚠️ Попытка отправить сообщение без получателя (Global Chat отключен)", now);
                                 }
                                 let _ = event_tx.send(NetworkEvent::ChatMessage(msg)).await;
                             }
@@ -2284,7 +2734,7 @@ async fn run_chat_network(
                                             };
                                             outgoing_transfers.insert(tid, transfer);
 
-                                            println!(
+                                            debug!(
                                                 "[{}] 📤 FILE[{}]: Offer «{}» → {} ({} чанков{})",
                                                 now,
                                                 file_kind.label(),
@@ -2316,7 +2766,7 @@ async fn run_chat_network(
                                 }
                                 let packet = file_transfer::FilePacket::Accept { transfer_id };
                                 swarm.behaviour_mut().file_rr.send_request(&from, packet);
-                                println!(
+                                debug!(
                                     "✅ FILE: Accept transfer {:x?} от {} → {}",
                                     &transfer_id[..4],
                                     &from.to_string()[..8],
@@ -2326,11 +2776,14 @@ async fn run_chat_network(
                             UICommand::RejectFile { transfer_id, from, reason } => {
                                 let packet = file_transfer::FilePacket::Reject {
                                     transfer_id,
-                                    reason: reason.clone(),
+                                    reason: file_transfer::clamp_utf8_by_bytes(
+                                        &reason,
+                                        file_transfer::MAX_REJECT_REASON_BYTES,
+                                    ),
                                 };
                                 swarm.behaviour_mut().file_rr.send_request(&from, packet);
                                 incoming_transfers.remove(&transfer_id);
-                                println!(
+                                debug!(
                                     "✖ FILE: Reject transfer {:x?} ({})",
                                     &transfer_id[..4],
                                     reason
@@ -2349,15 +2802,15 @@ async fn run_chat_network(
                             // которых никто извне не достучится, они только засоряют
                             // список и провоцируют бесполезные dial'ы у соседей.
                             if is_junk_addr(&address) && !s.contains("p2p-circuit") {
-                                println!("🚫 Пропуск виртуального интерфейса: {}", address);
+                                debug!("🚫 Пропуск виртуального интерфейса: {}", address);
                                 continue;
                             }
-                            println!("📡 СЛУШАЮ: {}", address);
+                            debug!("📡 СЛУШАЮ: {}", address);
 
                             let is_external = !s.contains("/ip6/") && !s.contains("/0.0.0.0") && !s.contains("/127.0.0.1") || s.contains("p2p-circuit");
 
                             if is_external {
-                                println!("  (Внешний/Relay): {}/p2p/{}", address, local_peer_id);
+                                debug!("  (Внешний/Relay): {}/p2p/{}", address, local_peer_id);
                                 let _ = event_tx.send(NetworkEvent::NewListenAddr(address.clone())).await;
                                 swarm.add_external_address(address.clone());
 
@@ -2386,7 +2839,7 @@ async fn run_chat_network(
                                 // Не трогаем анонсы из виртуальных интерфейсов — они не
                                 // ведут к рабочей LAN-связи, только тратят время Dial'а.
                                 if is_junk_addr(&addr) {
-                                    println!(
+                                    debug!(
                                         "🚫 mDNS: пропуск виртуального адреса {} (peer {})",
                                         addr,
                                         &peer_id.to_string()[..8]
@@ -2402,9 +2855,9 @@ async fn run_chat_network(
                                 // Используем DialOpts с NotDialing, чтобы mDNS не дублировал попытки
                                 // при нескольких событиях для одного пира.
                                 if addr.to_string().contains("quic-v1") {
-                                    println!("🔍 mDNS: найден пир {} (QUIC). Подключаюсь...", &peer_id.to_string()[..8]);
+                                    debug!("🔍 mDNS: найден пир {} (QUIC). Подключаюсь...", &peer_id.to_string()[..8]);
                                 } else {
-                                    println!("🔍 mDNS: найден пир {} (TCP). Подключаюсь...", &peer_id.to_string()[..8]);
+                                    debug!("🔍 mDNS: найден пир {} (TCP). Подключаюсь...", &peer_id.to_string()[..8]);
                                 }
                                 let mdns_opts = DialOpts::peer_id(peer_id)
                                     .condition(libp2p::swarm::dial_opts::PeerCondition::NotDialing)
@@ -2428,7 +2881,12 @@ async fn run_chat_network(
                             match message {
                                 libp2p::request_response::Message::Request { request, channel, .. } => {
                                     match request {
-                                        V1Packet::Hello { public_key, ephemeral_key, transport_sig } => {
+                                        V1Packet::Hello {
+                                            public_key,
+                                            ephemeral_key,
+                                            transport_sig,
+                                            transport_pubkey_pb,
+                                        } => {
                                             if peer != local_peer_id {
                                                 if !verify_hello_transport_binding(
                                                     peer,
@@ -2436,8 +2894,9 @@ async fn run_chat_network(
                                                     &public_key,
                                                     &ephemeral_key,
                                                     transport_sig.as_slice(),
+                                                    transport_pubkey_pb.as_slice(),
                                                 ) {
-                                                    println!(
+                                                    debug!(
                                                         "[{}] ❌ E2EE: Hello от {} без привязки к libp2p identity — игнор.",
                                                         now,
                                                         &peer.to_string()[..8]
@@ -2453,7 +2912,7 @@ async fn run_chat_network(
                                                 // Новый Hello всегда перезапускает согласование: иначе после рестарта
                                                 // пира мы бы оставили старый ratchet и только вернули Ack.
                                                 if sessions.contains_key(&peer) {
-                                                    println!(
+                                                    debug!(
                                                         "[{}] 🔄 E2EE: сброс сессии с {} (новый Hello)",
                                                         now,
                                                         &peer.to_string()[..8]
@@ -2472,7 +2931,7 @@ async fn run_chat_network(
                                                     if let Some(local_ephem_secret) = took_outgoing {
                                                         let session = crypto::SecureSession::new_initiator(&local_static, &remote_static_pub, local_ephem_secret, &remote_ephem_pub);
                                                         sessions.insert(peer, session);
-                                                        println!("[{}] 🤝 E2EE: Сессия (Alice/Req) создана с {}", now, &peer.to_string()[..8]);
+                                                        debug!("[{}] 🤝 E2EE: Сессия (Alice/Req) создана с {}", now, &peer.to_string()[..8]);
                                                         if let Some(buffered) = pending_messages.remove(&peer) {
                                                             if let Some(sess) = sessions.get_mut(&peer) {
                                                                 for data in buffered {
@@ -2480,7 +2939,7 @@ async fn run_chat_network(
                                                                         let pkt = V1Packet::Encrypted { header, ciphertext };
                                                                         let req_id = swarm.behaviour_mut().request_response.send_request(&peer, pkt);
                                                                         outbound_msg_requests.insert(req_id, peer);
-                                                                        println!("[{}] 📨 E2EE: Буферизованное сообщение отправлено {}", now, &peer.to_string()[..8]);
+                                                                        debug!("[{}] 📨 E2EE: Буферизованное сообщение отправлено {}", now, &peer.to_string()[..8]);
                                                                     }
                                                                 }
                                                             }
@@ -2493,7 +2952,7 @@ async fn run_chat_network(
 
                                                         let session = crypto::SecureSession::new_responder(&local_static, &remote_static_pub, &remote_ephem_pub, local_ephem_secret);
                                                         sessions.insert(peer, session);
-                                                        println!("[{}] 🤝 E2EE: Сессия (fallback Res после Hello пира) с {}", now, &peer.to_string()[..8]);
+                                                        debug!("[{}] 🤝 E2EE: Сессия (fallback Res после Hello пира) с {}", now, &peer.to_string()[..8]);
                                                         if let Some(buffered) = pending_messages.remove(&peer) {
                                                             if let Some(sess) = sessions.get_mut(&peer) {
                                                                 for data in buffered {
@@ -2501,7 +2960,7 @@ async fn run_chat_network(
                                                                         let pkt = V1Packet::Encrypted { header, ciphertext };
                                                                         let req_id = swarm.behaviour_mut().request_response.send_request(&peer, pkt);
                                                                         outbound_msg_requests.insert(req_id, peer);
-                                                                        println!("[{}] 📨 E2EE: Буферизованное сообщение отправлено {}", now, &peer.to_string()[..8]);
+                                                                        debug!("[{}] 📨 E2EE: Буферизованное сообщение отправлено {}", now, &peer.to_string()[..8]);
                                                                     }
                                                                 }
                                                             }
@@ -2524,7 +2983,7 @@ async fn run_chat_network(
 
                                                     let session = crypto::SecureSession::new_responder(&local_static, &remote_static_pub, &remote_ephem_pub, local_ephem_secret);
                                                     sessions.insert(peer, session);
-                                                    println!("[{}] 🤝 E2EE: Сессия (Bob/Res) создана с {}", now, &peer.to_string()[..8]);
+                                                    debug!("[{}] 🤝 E2EE: Сессия (Bob/Res) создана с {}", now, &peer.to_string()[..8]);
                                                     if let Some(buffered) = pending_messages.remove(&peer) {
                                                         if let Some(sess) = sessions.get_mut(&peer) {
                                                             for data in buffered {
@@ -2532,7 +2991,7 @@ async fn run_chat_network(
                                                                     let pkt = V1Packet::Encrypted { header, ciphertext };
                                                                     let req_id = swarm.behaviour_mut().request_response.send_request(&peer, pkt);
                                                                     outbound_msg_requests.insert(req_id, peer);
-                                                                    println!("[{}] 📨 E2EE: Буферизованное сообщение отправлено {}", now, &peer.to_string()[..8]);
+                                                                    debug!("[{}] 📨 E2EE: Буферизованное сообщение отправлено {}", now, &peer.to_string()[..8]);
                                                                 }
                                                             }
                                                         }
@@ -2573,7 +3032,7 @@ async fn run_chat_network(
                                                         } else if let Some(msg) =
                                                             parse_decrypted_chat_json(&plaintext)
                                                         {
-                                                            println!(
+                                                            debug!(
                                                                 "[{}] 🔒 E2EE: Сообщение ДЕШИФРОВАНО от {}",
                                                                 now,
                                                                 &peer.to_string()[..8]
@@ -2584,7 +3043,7 @@ async fn run_chat_network(
                                                         }
                                                     }
                                                     Err(_) => {
-                                                        println!(
+                                                        debug!(
                                                             "[{}] ❌ E2EE: Ошибка дешифровки от {}. Сбрасываю...",
                                                             now,
                                                             &peer.to_string()[..8]
@@ -2605,11 +3064,16 @@ async fn run_chat_network(
                                     // считаем доставку подтверждённой и сообщаем UI, чтобы он снял
                                     // соответствующий pending-ретрай и не показывал ошибку.
                                     if let Some(delivered_peer) = outbound_msg_requests.remove(&request_id) {
-                                        println!("[{}] ✅ RR: Доставка подтверждена пиром {}", now, &delivered_peer.to_string()[..8]);
+                                        debug!("[{}] ✅ RR: Доставка подтверждена пиром {}", now, &delivered_peer.to_string()[..8]);
                                         let _ = event_tx.send(NetworkEvent::MessageDelivered(delivered_peer)).await;
                                     }
                                     match response {
-                                        V1Packet::Hello { public_key, ephemeral_key, transport_sig } => {
+                                        V1Packet::Hello {
+                                            public_key,
+                                            ephemeral_key,
+                                            transport_sig,
+                                            transport_pubkey_pb,
+                                        } => {
                                             if peer != local_peer_id {
                                                 if !verify_hello_transport_binding(
                                                     peer,
@@ -2617,8 +3081,9 @@ async fn run_chat_network(
                                                     &public_key,
                                                     &ephemeral_key,
                                                     transport_sig.as_slice(),
+                                                    transport_pubkey_pb.as_slice(),
                                                 ) {
-                                                    println!(
+                                                    debug!(
                                                         "[{}] ❌ E2EE: Hello (ответ) от {} без привязки к libp2p identity — игнор.",
                                                         now,
                                                         &peer.to_string()[..8]
@@ -2626,7 +3091,7 @@ async fn run_chat_network(
                                                 } else {
                                                 let is_initiator = local_peer_id < peer;
                                                 if sessions.contains_key(&peer) {
-                                                    println!(
+                                                    debug!(
                                                         "[{}] 🔄 E2EE: сброс сессии с {} (Hello в ответе)",
                                                         now,
                                                         &peer.to_string()[..8]
@@ -2643,7 +3108,7 @@ async fn run_chat_network(
                                                     if let Some(local_ephem_secret) = pending_handshakes.remove(&peer) {
                                                         let session = crypto::SecureSession::new_initiator(&local_static, &remote_static_pub, local_ephem_secret, &remote_ephem_pub);
                                                         sessions.insert(peer, session);
-                                                        println!(
+                                                        debug!(
                                                             "[{}] 🤝 E2EE: Сессия (ответ Hello) создана с {}{}",
                                                             now,
                                                             &peer.to_string()[..8],
@@ -2656,7 +3121,7 @@ async fn run_chat_network(
                                                                         let pkt = V1Packet::Encrypted { header, ciphertext };
                                                                         let req_id = swarm.behaviour_mut().request_response.send_request(&peer, pkt);
                                                                         outbound_msg_requests.insert(req_id, peer);
-                                                                        println!("[{}] 📨 E2EE: Буферизованное сообщение отправлено {}", now, &peer.to_string()[..8]);
+                                                                        debug!("[{}] 📨 E2EE: Буферизованное сообщение отправлено {}", now, &peer.to_string()[..8]);
                                                                     }
                                                                 }
                                                             }
@@ -2712,7 +3177,7 @@ async fn run_chat_network(
                                 .unwrap_or(false);
                             last_rr_outfail.insert(peer, now_inst);
                             if !is_dup {
-                                println!("⚠️ [RR] OutFailure пиру {}: {:?}", peer, error);
+                                debug!("⚠️ [RR] OutFailure пиру {}: {:?}", peer, error);
                             }
                             match error {
                                 libp2p::request_response::OutboundFailure::DialFailure => {
@@ -2731,10 +3196,10 @@ async fn run_chat_network(
                             }
                         }
                         SwarmEvent::Behaviour(ChatBehaviourEvent::RequestResponse(libp2p::request_response::Event::InboundFailure { peer, error, .. })) => {
-                            println!("⚠️ [RR] InFailure от пира {}: {:?}", peer, error);
+                            debug!("⚠️ [RR] InFailure от пира {}: {:?}", peer, error);
                         }
                         SwarmEvent::ExternalAddrConfirmed { address } => {
-                            println!("🌍 ВНЕШНИЙ АДРЕС ПОДТВЕРЖДЕН: {}", address);
+                            debug!("🌍 ВНЕШНИЙ АДРЕС ПОДТВЕРЖДЕН: {}", address);
                             let _ = event_tx.send(NetworkEvent::Status(
                                 format!("🌍 ГЛОБАЛЬНЫЙ АДРЕС: Вы доступны из интернета!")
                             )).await;
@@ -2750,7 +3215,7 @@ async fn run_chat_network(
                         }
                         SwarmEvent::ConnectionEstablished { peer_id, ref endpoint, .. } => {
                             let connected_count = swarm.connected_peers().count();
-                            println!("✅ СОЕДИНЕНО: {}. Endpoint: {:?}. Всего пиров: {}", peer_id, endpoint, connected_count);
+                            debug!("✅ СОЕДИНЕНО: {}. Endpoint: {:?}. Всего пиров: {}", peer_id, endpoint, connected_count);
                             pending_dials.remove(&peer_id);
                             // Соединение установлено — снимаем задание на реконнект.
                             reconnect_queue.remove(&peer_id);
@@ -2766,7 +3231,7 @@ async fn run_chat_network(
                             };
                             if is_relay_conn {
                                 relay_peers.insert(peer_id);
-                                println!(
+                                debug!(
                                     "📡 FILE rate-limit: {} подключён через relay.",
                                     &peer_id.to_string()[..8]
                                 );
@@ -2831,7 +3296,7 @@ async fn run_chat_network(
                         },
                         SwarmEvent::ConnectionClosed { peer_id, cause, .. } => {
                             let connected_count = swarm.connected_peers().count();
-                            println!("❌ СОЕДИНЕНИЕ ЗАКРЫТО: {}. Причина: {:?}. Осталось: {}", peer_id, cause, connected_count);
+                            debug!("❌ СОЕДИНЕНИЕ ЗАКРЫТО: {}. Причина: {:?}. Осталось: {}", peer_id, cause, connected_count);
                             relay_peers.remove(&peer_id);
 
                             // E2EE: при обрыве TCP/QUIC сбрасываем криптосостояние с пиром.
@@ -2859,7 +3324,7 @@ async fn run_chat_network(
                                     peer_id,
                                     (Instant::now() + delay, attempt + 1),
                                 );
-                                println!(
+                                debug!(
                                     "🔄 Реконнект запланирован: {} через {}с (попытка {}).",
                                     &peer_id.to_string()[..8],
                                     delay.as_secs(),
@@ -2870,7 +3335,7 @@ async fn run_chat_network(
                             let _ = event_tx.send(NetworkEvent::Disconnected(peer_id)).await;
                         }
                         SwarmEvent::IncomingConnection { local_addr, send_back_addr, .. } => {
-                            println!("📥 Входящее соединение: from {:?} to {:?}", send_back_addr, local_addr);
+                            debug!("📥 Входящее соединение: from {:?} to {:?}", send_back_addr, local_addr);
                         },
 
                         SwarmEvent::OutgoingConnectionError { peer_id, error, .. } => {
@@ -2889,18 +3354,18 @@ async fn run_chat_network(
                                            err_str.contains("No Matching Records Found");
 
                              if !is_noise {
-                                 println!("❌ ОШИБКА ИСХОДЯЩЕГО СОЕДИНЕНИЯ (peer: {}): {:?}", peer_str, error);
+                                 debug!("❌ ОШИБКА ИСХОДЯЩЕГО СОЕДИНЕНИЯ (peer: {}): {:?}", peer_str, error);
                                  let _ = event_tx.send(NetworkEvent::Status(
                                      format!("❌ Ошибка подключения: {}", peer_str)
                                  )).await;
                              } else {
                                  // В консоли пишем кратко
                                  if err_str.contains("Timeout") || err_str.contains("Handshake") {
-                                     println!("ℹ️ [{}] Тайм-аут с {}. Проверьте ФАЙРВОЛ на обоих сторонах!", now, peer_str);
+                                     debug!("ℹ️ [{}] Тайм-аут с {}. Проверьте ФАЙРВОЛ на обоих сторонах!", now, peer_str);
                                  } else if err_str.contains("10048") {
-                                     println!("ℹ️ [{}] Ошибка 10048 (нормально для Windows): {}", now, peer_str);
+                                     debug!("ℹ️ [{}] Ошибка 10048 (нормально для Windows): {}", now, peer_str);
                                  } else {
-                                     println!("ℹ️ [{}] Техническая задержка/отказ (peer: {}): {}", now, peer_str, err_str);
+                                     debug!("ℹ️ [{}] Техническая задержка/отказ (peer: {}): {}", now, peer_str, err_str);
                                  }
                              }
 
@@ -2924,7 +3389,7 @@ async fn run_chat_network(
                                 .protocols
                                 .iter()
                                 .any(|p| p.as_ref() == "/void/chat/1.0.0");
-                            println!(
+                            debug!(
                                 "[{}] 🆔 Identify: {} — {} listen, {} протоколов{}",
                                 now,
                                 peer_id,
@@ -2983,26 +3448,26 @@ async fn run_chat_network(
                             }
                         }
                         SwarmEvent::Behaviour(ChatBehaviourEvent::Identify(identify::Event::Sent { peer_id, .. })) => {
-                            println!("🆔 Identify: Отправлена информация пиру {}", peer_id);
+                            debug!("🆔 Identify: Отправлена информация пиру {}", peer_id);
                         }
                         SwarmEvent::Behaviour(ChatBehaviourEvent::Identify(identify::Event::Error { peer_id, error, .. })) => {
                             let err_str = error.to_string();
                             let err_lower = err_str.to_lowercase();
                             if err_lower.contains("negotiat") || err_lower.contains("failed to negotiate") || err_lower.contains("support") {
-                                println!("❌ [КРИТИЧНО] Identify: Несовпадение версий с {}.", peer_id);
-                                println!("🔥 Срочно ОБНОВИТЕ другое приложение и ЗАКРОЙТЕ старые процессы!");
+                                debug!("❌ [КРИТИЧНО] Identify: Несовпадение версий с {}.", peer_id);
+                                debug!("🔥 Срочно ОБНОВИТЕ другое приложение и ЗАКРОЙТЕ старые процессы!");
                                 let _ = event_tx.send(NetworkEvent::Status(
                                     format!("❌ ОШИБКА: Пир {}... использует СТАРУЮ ВЕРСИЮ!", &peer_id.to_string()[..8])
                                 )).await;
                             } else {
-                                println!("🆔 Identify: Ошибка с пиром {}: {:?}", peer_id, error);
+                                debug!("🆔 Identify: Ошибка с пиром {}: {:?}", peer_id, error);
                             }
                         }
 
                         SwarmEvent::Behaviour(ChatBehaviourEvent::Kad(kad::Event::OutboundQueryProgressed { result, .. })) => {
                             match result {
                                  libp2p::kad::QueryResult::GetClosestPeers(Ok(ok)) => {
-                                    println!(
+                                    debug!(
                                         "🔍 Kademlia: get_closest_peers готов (кандидатов: {}).",
                                         ok.peers.len()
                                     );
@@ -3013,7 +3478,7 @@ async fn run_chat_network(
                                             .iter()
                                             .find(|p| p.peer_id == wanted && !p.addrs.is_empty())
                                         {
-                                            println!(
+                                            debug!(
                                                 "📍 В таблице есть целевой пир {} — набираю ({} адр.)",
                                                 &wanted.to_string()[..8],
                                                 hit.addrs.len()
@@ -3023,7 +3488,7 @@ async fn run_chat_network(
                                                 hit.addrs.clone(),
                                             ));
                                         } else if ok.peers.is_empty() {
-                                            println!(
+                                            debug!(
                                                 "⚠️ Kademlia: 0 кандидатов для {} — пустая таблица DHT (нет bootstrap).",
                                                 &wanted.to_string()[..12]
                                             );
@@ -3034,7 +3499,7 @@ async fn run_chat_network(
                                                 )))
                                                 .await;
                                         } else {
-                                            println!(
+                                            debug!(
                                                 "⚠️ Пир {} нет среди ответов DHT с адресами — нужен multiaddr, bootstrap или mDNS (LAN).",
                                                 &wanted.to_string()[..12]
                                             );
@@ -3048,7 +3513,7 @@ async fn run_chat_network(
                                     }
                                 }
                                 libp2p::kad::QueryResult::GetClosestPeers(Err(e)) => {
-                                    println!("⚠️ Kademlia get_closest_peers: {:?}", e);
+                                    debug!("⚠️ Kademlia get_closest_peers: {:?}", e);
                                     let key = e.key();
                                     if let Some(wanted) = PeerId::from_bytes(key).ok() {
                                         if let Some(addrs) = kad_local_addrs_for_peer(
@@ -3073,7 +3538,7 @@ async fn run_chat_network(
                         }
                         SwarmEvent::Behaviour(ChatBehaviourEvent::Kad(kad::Event::RoutingUpdated { peer, addresses, .. })) => {
                             // Полный список адресов быстро раздувает лог (IPFS-пиры часто обновляют DHT).
-                            println!(
+                            debug!(
                                 "📍 Kademlia: маршрут для {} — {} адр.",
                                 peer,
                                 addresses.len()
@@ -3092,6 +3557,21 @@ async fn run_chat_network(
                                     ..
                                 } => {
                                     use file_transfer::FilePacket;
+                                    if let Err(reason) =
+                                        file_transfer::validate_inbound_file_packet(&request)
+                                    {
+                                        warn!(
+                                            target: "void_net",
+                                            peer = %peer,
+                                            "FILE RR: invalid packet: {}",
+                                            reason
+                                        );
+                                        let _ = swarm
+                                            .behaviour_mut()
+                                            .file_rr
+                                            .send_response(channel, FilePacket::Ack);
+                                        continue;
+                                    }
                                     match request {
                                         FilePacket::Offer {
                                             transfer_id,
@@ -3101,7 +3581,24 @@ async fn run_chat_network(
                                             sha256,
                                             kind,
                                         } => {
-                                            println!(
+                                            if let Err(reason) = file_transfer::validate_file_offer(
+                                                &filename,
+                                                total_size,
+                                                total_chunks,
+                                            ) {
+                                                debug!(
+                                                    "[{}] 🚫 FILE: отклонён Offer от {}: {}",
+                                                    now,
+                                                    &peer.to_string()[..8],
+                                                    reason
+                                                );
+                                                let _ = swarm
+                                                    .behaviour_mut()
+                                                    .file_rr
+                                                    .send_response(channel, FilePacket::Ack);
+                                                continue;
+                                            }
+                                            debug!(
                                                 "[{}] 📥 FILE[{}]: Offer «{}» от {} ({} чанков, {} байт)",
                                                 now,
                                                 kind.label(),
@@ -3136,7 +3633,7 @@ async fn run_chat_network(
                                                 .await;
                                         }
                                         FilePacket::Accept { transfer_id } => {
-                                            println!(
+                                            debug!(
                                                 "[{}] ✅ FILE: Accept от {} для {:x?}",
                                                 now,
                                                 &peer.to_string()[..8],
@@ -3155,7 +3652,7 @@ async fn run_chat_network(
                                                 .send_response(channel, FilePacket::Ack);
                                         }
                                         FilePacket::Reject { transfer_id, reason } => {
-                                            println!(
+                                            debug!(
                                                 "[{}] ✖ FILE: Reject от {}: {}",
                                                 now,
                                                 &peer.to_string()[..8],
@@ -3232,7 +3729,7 @@ async fn run_chat_network(
                                 ..
                             },
                         )) => {
-                            println!(
+                            debug!(
                                 "⚠️ [FILE RR] OutFailure пиру {}: {:?}",
                                 &peer.to_string()[..8],
                                 error
@@ -3241,7 +3738,7 @@ async fn run_chat_network(
                         SwarmEvent::Behaviour(ChatBehaviourEvent::FileRr(
                             libp2p::request_response::Event::InboundFailure { peer, error, .. },
                         )) => {
-                            println!(
+                            debug!(
                                 "⚠️ [FILE RR] InFailure от {}: {:?}",
                                 &peer.to_string()[..8],
                                 error
@@ -3255,19 +3752,30 @@ async fn run_chat_network(
         }
 }
 
+fn env_flag_true(name: &str) -> bool {
+    std::env::var(name)
+        .map(|v| v == "1" || v.eq_ignore_ascii_case("true") || v.eq_ignore_ascii_case("yes"))
+        .unwrap_or(false)
+}
+
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn Error>> {
-    // Включаем логи для отладки
-    let _ = tracing_subscriber::fmt().with_env_filter("info").try_init();
+    let _ = tracing_subscriber::fmt()
+        .with_env_filter(
+            tracing_subscriber::EnvFilter::try_from_default_env().unwrap_or_else(|_| {
+                tracing_subscriber::EnvFilter::new("warn")
+            }),
+        )
+        .try_init();
 
-    // === Автоматически добавляем правило файрвола ===
+    // === Правила файрвола: только по явному согласию (VOID_APPLY_FIREWALL_RULE=1) ===
     #[allow(unused_variables)]
     let exe_path = std::env::current_exe().unwrap_or_default();
     #[allow(unused_variables)]
     let exe = exe_path.display().to_string();
 
     #[cfg(target_os = "windows")]
-    {
+    if env_flag_true("VOID_APPLY_FIREWALL_RULE") {
         // Проверяем, запущены ли мы уже от Администратора
         let is_admin = std::process::Command::new("net")
             .args(["session"])
@@ -3276,7 +3784,7 @@ async fn main() -> Result<(), Box<dyn Error>> {
             .unwrap_or(false);
 
         if is_admin {
-            println!("Настраиваю файрвол Windows (Admin Mode)...");
+            info!("Настраиваю файрвол Windows (Admin Mode)...");
             let _ = std::process::Command::new("netsh")
                 .args(["advfirewall", "firewall", "delete", "rule", "name=VOID P2P"])
                 .output();
@@ -3313,9 +3821,9 @@ async fn main() -> Result<(), Box<dyn Error>> {
                 .output();
             match (tcp_r, udp_r) {
                 (Ok(t), Ok(u)) if t.status.success() && u.status.success() => {
-                    println!("✅ Файрвол настроен (TCP + UDP разрешены)")
+                    info!("✅ Файрвол настроен (TCP + UDP разрешены)")
                 }
-                _ => println!("⚠ Не удалось настроить файрвол"),
+                _ => info!("⚠ Не удалось настроить файрвол"),
             }
         } else {
             // Пишем команды в временный .bat файл, запускаем от админа через UAC
@@ -3327,7 +3835,7 @@ async fn main() -> Result<(), Box<dyn Error>> {
             );
             let bat_path = std::env::temp_dir().join("void_p2p_firewall.bat");
             if std::fs::write(&bat_path, bat).is_ok() {
-                println!("Настраиваю файрвол (запрос UAC)...");
+                info!("Настраиваю файрвол (запрос UAC)...");
                 // ShellExecute runas — самый надёжный способ UAC-элевации
                 let result = std::process::Command::new("powershell")
                     .args([
@@ -3340,19 +3848,23 @@ async fn main() -> Result<(), Box<dyn Error>> {
                     ])
                     .status();
                 match result {
-                    Ok(s) if s.success() => println!("✅ Файрвол настроен"),
+                    Ok(s) if s.success() => info!("✅ Файрвол настроен"),
                     _ => {
-                        println!("⚠ UAC отклонён. Запустите вручную от Админастратора:");
-                        println!("  {}", bat_path.display());
+                        info!("⚠ UAC отклонён. Запустите вручную от Админастратора:");
+                        info!("  {}", bat_path.display());
                     }
                 }
             }
         }
+    } else {
+        info!(
+            "VOID: автонастройка файрвола отключена. Для входящих TCP/UDP 50001 задайте VOID_APPLY_FIREWALL_RULE=1 или откройте порты вручную."
+        );
     }
 
     #[cfg(target_os = "macos")]
-    {
-        println!("Настраиваю файрвол macOS...");
+    if env_flag_true("VOID_APPLY_FIREWALL_RULE") {
+        info!("Настраиваю файрвол macOS...");
         let _ = std::process::Command::new("sudo")
             .args([
                 "/usr/libexec/ApplicationFirewall/socketfilterfw",
@@ -3367,7 +3879,11 @@ async fn main() -> Result<(), Box<dyn Error>> {
                 &exe,
             ])
             .output();
-        println!("✅ Файрвол macOS настроен");
+        info!("✅ Файрвол macOS настроен");
+    } else {
+        info!(
+            "VOID: автонастройка файрвола macOS отключена (VOID_APPLY_FIREWALL_RULE=1 — включить)."
+        );
     }
 
     let vault_unlock_kind =
@@ -3375,11 +3891,11 @@ async fn main() -> Result<(), Box<dyn Error>> {
 
     let void_bootstraps = void_bootstrap_multiaddrs();
     if void_bootstraps.is_empty() {
-        println!(
-            "🌐 Глобально: нет seed для DHT — задайте BUILTIN_VOID_BOOTSTRAP / VOID_BOOTSTRAP_PUBLIC_LIST_URL в коде, VOID_BOOTSTRAP_URL, VOID_BOOTSTRAP, void-bootstrap.txt, либо полный multiaddr собеседника. mDNS — только LAN."
+        info!(
+            "🌐 Глобально: нет seed для DHT — задайте BUILTIN_VOID_BOOTSTRAP / VOID_BOOTSTRAP_PUBLIC_LIST_URL в коде, VOID_BOOTSTRAP_URL, VOID_BOOTSTRAP, void-bootstrap.txt, либо полный multiaddr собеседника. LAN: mDNS (отключить: VOID_DISABLE_MDNS)."
         );
     } else {
-        println!(
+        info!(
             "🌐 VOID bootstrap: {} multiaddr → заполнение DHT /void/kad/1.0.0 (без IPFS).",
             void_bootstraps.len()
         );

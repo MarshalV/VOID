@@ -294,9 +294,11 @@ impl SecureSession {
     }
 
     fn skip_message_keys(&mut self, until: u32) -> Result<()> {
+        // Верхняя граница буфера out-of-order ключей (память ~N×64 B); выше — сброс сессии у пира.
+        const MAX_SKIPPED_MESSAGE_KEYS: usize = 4096;
         if let Some(ck) = self.ck_recv.as_mut() {
             while ck.index < until {
-                if self.skipped_keys.len() >= 100 {
+                if self.skipped_keys.len() >= MAX_SKIPPED_MESSAGE_KEYS {
                     return Err(anyhow!("Too many skipped keys"));
                 }
                 let mk = ck.step();
