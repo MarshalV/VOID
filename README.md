@@ -33,7 +33,7 @@
 ## Ключевые возможности
 
 - **Полностью P2P** — сообщения доставляются напрямую по `/void/chat/1.0.0` (request-response).
-- **E2EE из коробки** — Noise IK handshake + Double Ratchet (Forward Secrecy + Post-Compromise Security).
+- **E2EE из коробки** — транспорт **Noise**, затем слой приложения: обмен X25519-ключами в `Hello`, **подпись Ed25519** (libp2p identity) привязки к `PeerId`, далее **Double Ratchet** (Forward Secrecy + Post-Compromise Security). В чат принимается только зашифрованный полезный груз (без «plain» JSON).
 - **Свой DHT** — отдельный Kademlia-рой `/void/kad/1.0.0`, не пересекающийся с публичным IPFS.
 - **NAT Traversal** — Relay v2, DCUtR (hole-punching), AutoNAT, UPnP.
 - **Транспорты** — TCP и QUIC, мультиплексирование Yamux, шифрование канала Noise.
@@ -70,9 +70,9 @@
 Источники bootstrap-адресов (все опциональны, склеиваются и дедуплицируются):
 
 1. **Вшитые в бинарь** (`BUILTIN_VOID_BOOTSTRAP` в `src/main.rs`, или флагом сборки `VOID_BUILTIN_BOOTSTRAP`).
-2. **HTTP(S) список** (`VOID_BOOTSTRAP_URL` или `VOID_BOOTSTRAP_PUBLIC_LIST_URL`) — текстовый файл с одной multiaddr на строку.
+2. **HTTP(S) список** (`VOID_BOOTSTRAP_URL` или `VOID_BOOTSTRAP_PUBLIC_LIST_URL`) — текстовый файл с одной multiaddr на строку; размер тела ответа ограничен (~256 KiB). Опционально: **`VOID_BOOTSTRAP_TRUSTED_HOSTS`** — через запятую имена хостов, с которых разрешена загрузка по URL. Для **HTTPS** можно задать **`VOID_BOOTSTRAP_TLS_LEAF_SHA256`**: через запятую **64 hex** (SHA-256 DER **листового** сертификата) — после проверки цепочки CA выполняется дополнительная проверка отпечатка.
 3. **Переменная окружения** `VOID_BOOTSTRAP` — адреса через запятую.
-4. **Файл `void-bootstrap.txt`** рядом с бинарём — одна multiaddr на строку, `#` — комментарий.
+4. **Файл `void-bootstrap.txt`** рядом с бинарём — одна multiaddr на строку, `#` — комментарий. Опционально: **`VOID_BOOTSTRAP_SIGNING_PUB_HEX`** + файл `<имя>.sig` (64 байта Ed25519) для проверки содержимого; для HTTP при том же ключе — **`VOID_BOOTSTRAP_URL_SIG_HEX`** (128 hex).
 5. **UI** — боковая панель **«VOID BOOTSTRAP (DHT)»** → правка текста → **«Сохранить и применить»** (без перезапуска).
 
 ```powershell
@@ -87,13 +87,15 @@ cargo run
 
 | Этап | Алгоритм |
 |------|---------|
-| Handshake | **Noise IK** — статическая аутентификация обеих сторон |
+| Транспорт | **Noise** — шифрование и аутентификация libp2p-канала |
+| Приложение | Обмен статическим и эфемерным **X25519** в `Hello` + **Ed25519**-подпись привязки к `PeerId` (для не-inline `PeerId` в `Hello` передаётся protobuf ключа — см. код) |
 | Ratchet | **Double Ratchet** (symmetric + DH ratchet) |
-| KDF | **BLAKE2b-512** |
+| KDF в ratchet | **HKDF-SHA256** |
 | AEAD | **ChaCha20-Poly1305** |
 | DH | **X25519** (`x25519-dalek`) |
+| Целостность файлов (BLAKE2) | **BLAKE2b-512** (первые 32 байта на весь файл) |
 | Защита памяти | `zeroize` (затирание ключей в ОЗУ при Drop) |
-| Skipped keys | до **100** out-of-order сообщений (важно для P2P с задержками) |
+| Skipped keys | до **4096** out-of-order сообщений (P2P и relay дают переупорядочивание) |
 
 Каждое сообщение зашифровано своим одноразовым `message_key`. Компрометация одного ключа **не раскрывает** ни прошлые, ни будущие сообщения.
 
@@ -115,10 +117,15 @@ cargo run
 |----------|---------|
 | Размер чанка | **32 КБ** |
 | Максимальный размер файла | **512 МБ** |
+| Макс. длина имени в оффере | **512** байт UTF-8 |
+| Макс. длина `Reject.reason` | **512** байт UTF-8 |
+| Устаревший plain-`Chunk` | данные чанка не больше **32 КБ** (совместимость со старыми пирами) |
 | Хэш целостности | **BLAKE2b-512** (первые 32 байта) |
 | Папка загрузок | `void_downloads/` рядом с исполняемым файлом |
 
 #### Сценарий передачи (пакеты протокола)
+
+Современный клиент после `Accept` шлёт **полезную нагрузку чанков по E2EE чату** (`/void/chat`), а не сырым `Chunk` по `/void/file`. По `/void/file` по-прежнему идут **метаданные оффера** (`Offer` / `Accept` / `Reject` / `Cancel`) и подтверждения `Ack`.
 
 ```
 Отправитель                              Получатель
@@ -129,7 +136,8 @@ cargo run
     |  Accept {id}  /  Reject {id, reason}  |
     | <------------------------------------- |
     |                                        |
-    |  Chunk {id, index, data}  × N          |
+    |  данные чанков по E2EE /void/chat …    |
+    |  (или устар.: Chunk по /void/file)     |
     | -------------------------------------> |
     |       (BLAKE2b проверяется по итогу)   |
     |                                        |
@@ -166,9 +174,9 @@ cargo run
 | Файл | Что внутри | Защита |
 |------|-----------|--------|
 | `void.key` | Обёрнутый мастер-ключ vault (магия `VOIDKEY2` + salt + AES-GCM) | Пароль + Argon2id; офлайн без пароля содержимое не расшифровать |
-| `vault.bin` | nickname, `StaticSecret`, адресная книга | AES-256-GCM (мастер из `void.key`) |
+| `vault.bin` | `format_version`, nickname, ключи, адресная книга | AES-256-GCM (мастер из `void.key`) |
 
-Запись — через `vault.bin.tmp` + атомарный `rename`, чтобы сбой посередине не оставил усечённый vault. Есть резервная копия `vault.bin.bak`.
+После расшифровки plaintext JSON ограничен по размеру; дополнительно проверяются длины полей и число записей в `address_book` (см. `Storage` в `src/main.rs`). Запись — через `vault.bin.tmp` + атомарный `rename`, чтобы сбой посередине не оставил усечённый vault. Есть резервная копия `vault.bin.bak`.
 
 > ⚠️ **Никогда не передавайте пароль vault, `void.key` и `vault.bin` третьим лицам** — вместе это даёт полный доступ к идентичности и ключам.
 
@@ -184,7 +192,7 @@ cargo run
 - **UI:** [`eframe`/`egui`](https://github.com/emilk/egui) 0.29 — тёмная тема, glassmorphism, собственные идентиконы-аватары
 - **Криптография:** `x25519-dalek`, `chacha20poly1305`, `blake2`, `aes-gcm`, `zeroize`
 - **Сериализация:** `serde`, `serde_json`, `bincode`
-- **HTTP (bootstrap list):** `reqwest` (rustls)
+- **HTTP (bootstrap list):** `reqwest` (rustls); опционально кастомный `ClientConfig` с pin листового сертификата (`VOID_BOOTSTRAP_TLS_LEAF_SHA256`)
 
 ---
 
@@ -217,13 +225,25 @@ cargo run --release
 
 ## Конфигурация
 
-| Переменная окружения | Назначение |
-|----------------------|-----------|
+### Переменные окружения (клиент VOID)
+
+| Переменная | Назначение |
+|------------|-----------|
 | `VOID_BOOTSTRAP` | Список multiaddr через запятую |
-| `VOID_BOOTSTRAP_URL` | URL к текстовому файлу со списком seed |
-| `VOID_SKIP_PUBLIC_BOOTSTRAP_LIST` | Отключить вшитый `VOID_BOOTSTRAP_PUBLIC_LIST_URL` |
-| `VOID_BUILTIN_BOOTSTRAP` | (compile-time) вшить seed прямо в бинарь |
-| `RUST_LOG` | Уровень логов (`info`, `debug`, `trace`) |
+| `VOID_BOOTSTRAP_URL` | URL текстового файла со списком seed (HTTP/HTTPS) |
+| `VOID_BOOTSTRAP_PUBLIC_LIST_URL` | Публичный URL из кода (если задан в сборке); отключается вместе с `VOID_SKIP_PUBLIC_BOOTSTRAP_LIST` |
+| `VOID_SKIP_PUBLIC_BOOTSTRAP_LIST` | Не использовать вшитый публичный URL списка |
+| `VOID_BOOTSTRAP_TRUSTED_HOSTS` | Через запятую: разрешённые **имена хостов** для загрузки bootstrap по URL |
+| `VOID_BOOTSTRAP_TLS_LEAF_SHA256` | Для **HTTPS**: через запятую 64 hex = SHA-256 DER листового сертификата (после проверки CA) |
+| `VOID_BOOTSTRAP_SIGNING_PUB_HEX` | Опционально: Ed25519 публичный ключ (32 байта в hex) для проверки подписи `void-bootstrap.txt` / тела URL |
+| `VOID_BOOTSTRAP_URL_SIG_HEX` | 128 hex (64 байта подписи), если задан pubkey и грузите список по HTTPS |
+| `VOID_DISABLE_MDNS` | Задать (любое значение) — отключить mDNS в LAN |
+| `VOID_APPLY_FIREWALL_RULE` | `1` / `true` / `yes` — разрешить автоматическую настройку входящих правил файрвола (Windows/macOS) |
+| `VOID_SKIP_SUBNETS` | Доп. CIDR через запятую для фильтра «мусорных» listen-адресов (см. код) |
+| `VOID_BUILTIN_BOOTSTRAP` | При сборке: вшить seed в бинарь |
+| `RUST_LOG` | Фильтр `tracing` (например `void_net=debug`, `info`). Если не задан, подписчик по умолчанию — уровень **warn** |
+
+Подробная инвентаризация рисков и контролей — в [`SECURITY_REVISION.md`](./SECURITY_REVISION.md).
 
 ---
 
@@ -395,7 +415,7 @@ Multiaddr собирается налету: `/ip4/<host>/tcp/<libp2p_port>/p2p/
 
 ### Что уже есть
 - [x] Прямой P2P обмен через `libp2p`
-- [x] Double Ratchet + Noise IK
+- [x] Double Ratchet + Noise + привязка `Hello` к libp2p identity
 - [x] Kademlia DHT `/void/kad/1.0.0`
 - [x] NAT Traversal (Relay v2, DCUtR, UPnP, AutoNAT)
 - [x] Зашифрованный vault, адресная книга
@@ -417,6 +437,8 @@ Multiaddr собирается налету: `/ip4/<host>/tcp/<libp2p_port>/p2p/
 Если вы нашли уязвимость — **не открывайте публичный issue**. Свяжитесь приватно (контакт в профиле автора) и дайте немного времени на фикс. Критические баги с доказательством эксплуатации — в приоритете.
 
 ⚠️ Проект в alpha и **не прошёл внешний аудит криптографии**. Не используйте VOID для защиты жизни или свободы людей.
+
+**Практика в коде (кратко):** только зашифрованные сообщения в чате; привязка `Hello` к libp2p-идентичности; лимиты JSON после E2EE; лимиты на bootstrap HTTP, опционально pin TLS и Ed25519-подпись списков; лимиты vault и файлового RR; логи через `tracing` (подробности — `RUST_LOG=void_net=debug`). Детали и остаточные риски — в [`SECURITY_REVISION.md`](./SECURITY_REVISION.md).
 
 ---
 
