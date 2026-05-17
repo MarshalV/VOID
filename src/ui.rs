@@ -3,7 +3,7 @@
 //! Сюда вынесены: космическая палитра, helper'ы отрисовки (аватары,
 //! starfield, chat-bg), toast-уведомления, подстройка стиля egui и полный
 //! `impl eframe::App` (sidebar, шапка чата, лента сообщений, поле ввода).
-//! Бизнес-логика (сеть, хранилище, retry) остаётся в `main.rs`.
+//! Бизнес-логика (сеть, хранилище, retry) — в `app`, `network`, `vault`, `protocol`, `bootstrap`.
 
 use eframe::egui;
 use libp2p::PeerId;
