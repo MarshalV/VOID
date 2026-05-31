@@ -125,7 +125,7 @@ pub(crate) enum NetworkEvent {
     ChatDeleteApply {
         from: PeerId,
         message_ids: Vec<String>,
-        reply: tokio::sync::oneshot::Sender<(Vec<String>, Vec<String>)>,
+        reply: std::sync::mpsc::Sender<(Vec<String>, Vec<String>)>,
     },
     /// Результат удаления у собеседника (`kind: delete_ack`).
     DeleteAckResult {
@@ -545,7 +545,8 @@ async fn apply_incoming_delete_via_ui(
     from: PeerId,
     message_ids: Vec<String>,
 ) -> (Vec<String>, Vec<String>) {
-    let (reply_tx, reply_rx) = tokio::sync::oneshot::channel();
+    let fallback_missing = message_ids.clone();
+    let (reply_tx, reply_rx) = std::sync::mpsc::channel();
     if event_tx
         .send(NetworkEvent::ChatDeleteApply {
             from,
@@ -555,11 +556,24 @@ async fn apply_incoming_delete_via_ui(
         .await
         .is_err()
     {
-        return (Vec::new(), Vec::new());
+        return (Vec::new(), fallback_missing);
     }
-    match tokio::time::timeout(Duration::from_secs(2), reply_rx).await {
-        Ok(Ok(result)) => result,
-        _ => (Vec::new(), Vec::new()),
+
+    let deadline = Instant::now() + Duration::from_secs(5);
+    loop {
+        match reply_rx.try_recv() {
+            Ok(result) => return result,
+            Err(std::sync::mpsc::TryRecvError::Empty) => {
+                if Instant::now() >= deadline {
+                    return (Vec::new(), fallback_missing);
+                }
+                tokio::task::yield_now().await;
+                tokio::time::sleep(Duration::from_millis(16)).await;
+            }
+            Err(std::sync::mpsc::TryRecvError::Disconnected) => {
+                return (Vec::new(), fallback_missing);
+            }
+        }
     }
 }
 
@@ -1739,7 +1753,7 @@ pub async fn run_chat_network(
                                     } else if let Some((ack_peer, requested_ids)) =
                                         outbound_delete_requests.remove(&request_id)
                                     {
-                                        match &response {
+                                        let (deleted, missing) = match &response {
                                             V1Packet::Encrypted { header, ciphertext } => {
                                                 if let Some(session) = sessions.get_mut(&peer) {
                                                     if let Ok(plaintext) =
@@ -1752,44 +1766,27 @@ pub async fn run_chat_network(
                                                             },
                                                         ) = parse_decrypted_chat_frame(&plaintext)
                                                         {
-                                                            let _ = event_tx
-                                                                .send(NetworkEvent::DeleteAckResult {
-                                                                    peer: ack_peer,
-                                                                    deleted,
-                                                                    missing,
-                                                                })
-                                                                .await;
+                                                            (deleted, missing)
                                                         } else {
-                                                            let _ = event_tx
-                                                                .send(NetworkEvent::DeleteAckResult {
-                                                                    peer: ack_peer,
-                                                                    deleted: requested_ids,
-                                                                    missing: Vec::new(),
-                                                                })
-                                                                .await;
+                                                            (Vec::new(), requested_ids.clone())
                                                         }
+                                                    } else {
+                                                        (Vec::new(), requested_ids.clone())
                                                     }
+                                                } else {
+                                                    (Vec::new(), requested_ids.clone())
                                                 }
                                             }
-                                            V1Packet::Ack => {
-                                                let _ = event_tx
-                                                    .send(NetworkEvent::DeleteAckResult {
-                                                        peer: ack_peer,
-                                                        deleted: requested_ids,
-                                                        missing: Vec::new(),
-                                                    })
-                                                    .await;
-                                            }
-                                            _ => {
-                                                let _ = event_tx
-                                                    .send(NetworkEvent::DeleteAckResult {
-                                                        peer: ack_peer,
-                                                        deleted: Vec::new(),
-                                                        missing: requested_ids,
-                                                    })
-                                                    .await;
-                                            }
-                                        }
+                                            V1Packet::Ack => (requested_ids.clone(), Vec::new()),
+                                            _ => (Vec::new(), requested_ids.clone()),
+                                        };
+                                        let _ = event_tx
+                                            .send(NetworkEvent::DeleteAckResult {
+                                                peer: ack_peer,
+                                                deleted,
+                                                missing,
+                                            })
+                                            .await;
                                     }
                                     match response {
                                         V1Packet::Hello {

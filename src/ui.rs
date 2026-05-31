@@ -77,7 +77,9 @@ impl App {
         if self.toasts.is_empty() {
             return;
         }
-        let screen = ctx.screen_rect();
+        let screen = ctx
+            .input(|i| i.viewport().inner_rect)
+            .unwrap_or_else(|| ctx.screen_rect());
         let anchor = egui::pos2(screen.right() - 16.0, screen.top() + 72.0);
         let now = Instant::now();
 
@@ -102,7 +104,7 @@ impl App {
             let bg = egui::Color32::from_rgba_unmultiplied(bg.r(), bg.g(), bg.b(), alpha);
 
             egui::Area::new(egui::Id::new(("toast_area", i)))
-                .order(egui::Order::Tooltip)
+                .order(egui::Order::Foreground)
                 .anchor(
                     egui::Align2::RIGHT_TOP,
                     egui::vec2(
@@ -161,6 +163,27 @@ impl App {
             expires_at: Instant::now() + ttl,
             kind,
         });
+    }
+
+    fn notify_peer_delete_missing(&mut self, peer: PeerId, missing: &[String]) {
+        if missing.is_empty() {
+            return;
+        }
+        let peer_label = self
+            .known_peers
+            .get(&peer)
+            .cloned()
+            .unwrap_or_else(|| format!("{}…", &peer.to_string()[..8]));
+        let text = if missing.len() == 1 {
+            format!("У {peer_label} это сообщение уже удалено")
+        } else {
+            format!(
+                "У {peer_label} {n} сообщ. уже удалено у собеседника",
+                n = missing.len()
+            )
+        };
+        self.add_status(text.clone());
+        self.push_toast(text, ToastKind::Info, TOAST_TTL_SHORT);
     }
 
     // =====================================================================
@@ -1182,22 +1205,7 @@ impl eframe::App for App {
                     let _ = reply.send(result);
                 }
                 NetworkEvent::DeleteAckResult { peer, deleted: _, missing } => {
-                    if !missing.is_empty() {
-                        let peer_label = self
-                            .known_peers
-                            .get(&peer)
-                            .cloned()
-                            .unwrap_or_else(|| format!("{}…", &peer.to_string()[..8]));
-                        let text = if missing.len() == 1 {
-                            format!("ℹ️ У {peer_label} это сообщение уже удалено")
-                        } else {
-                            format!(
-                                "ℹ️ У {peer_label} {n} сообщ. уже удалено у собеседника",
-                                n = missing.len()
-                            )
-                        };
-                        self.push_toast(text, ToastKind::Info, TOAST_TTL_SHORT);
-                    }
+                    self.notify_peer_delete_missing(peer, &missing);
                 }
                 NetworkEvent::Status(msg) => {
                     self.add_status(msg);
