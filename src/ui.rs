@@ -1615,7 +1615,7 @@ impl eframe::App for App {
                             });
                         draw_avatar(ui, &self.selected_chat, &display_name, 40.0, None);
                         ui.add_space(12.0);
-                        ui.vertical(|ui| {
+                        let contact_header = ui.vertical(|ui| {
                             ui.label(
                                 egui::RichText::new(&display_name)
                                     .strong()
@@ -1633,6 +1633,32 @@ impl eframe::App for App {
                                     .color(palette::TEXT_MUTED),
                             );
                         });
+                        contact_header.response.context_menu(|ui| {
+                            ui.label(
+                                egui::RichText::new("Переписка")
+                                    .color(palette::TEXT_MUTED)
+                                    .size(11.0),
+                            );
+                            ui.separator();
+                            if ui.button("Очистить у себя").clicked() {
+                                chat_clear_action = Some(ConversationClearAction::AllLocal);
+                                ui.close_menu();
+                            }
+                            ui.separator();
+                            ui.label(
+                                egui::RichText::new("Мои сообщения")
+                                    .color(palette::TEXT_MUTED)
+                                    .size(11.0),
+                            );
+                            if ui.button("Только у собеседника").clicked() {
+                                chat_clear_action = Some(ConversationClearAction::OwnRemoteOnly);
+                                ui.close_menu();
+                            }
+                            if ui.button("У обоих").clicked() {
+                                chat_clear_action = Some(ConversationClearAction::OwnBoth);
+                                ui.close_menu();
+                            }
+                        });
                     } else {
                         ui.label(
                             egui::RichText::new("✦ VOID")
@@ -1647,55 +1673,21 @@ impl eframe::App for App {
                         );
                     }
                     ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                        let header_menu = ui
+                        if ui
                             .add(
                                 egui::Button::new(
-                                    egui::RichText::new("⋮")
-                                        .size(20.0)
+                                    egui::RichText::new("⋯")
+                                        .size(22.0)
                                         .color(palette::TEXT),
                                 )
                                 .fill(egui::Color32::TRANSPARENT)
                                 .stroke(egui::Stroke::NONE),
                             )
-                            .on_hover_text("Меню");
-                        header_menu.context_menu(|ui| {
-                            if !self.selected_chat.is_empty() {
-                                ui.label(
-                                    egui::RichText::new("Переписка")
-                                        .color(palette::TEXT_MUTED)
-                                        .size(11.0),
-                                );
-                                ui.separator();
-                                if ui.button("Очистить у себя").clicked() {
-                                    chat_clear_action = Some(ConversationClearAction::AllLocal);
-                                    ui.close_menu();
-                                }
-                                ui.separator();
-                                ui.label(
-                                    egui::RichText::new("Мои сообщения")
-                                        .color(palette::TEXT_MUTED)
-                                        .size(11.0),
-                                );
-                                if ui.button("Только у собеседника").clicked() {
-                                    chat_clear_action = Some(ConversationClearAction::OwnRemoteOnly);
-                                    ui.close_menu();
-                                }
-                                if ui.button("У обоих").clicked() {
-                                    chat_clear_action = Some(ConversationClearAction::OwnBoth);
-                                    ui.close_menu();
-                                }
-                                ui.separator();
-                            }
-                            let console_label = if self.show_logs {
-                                "✓ Системная консоль"
-                            } else {
-                                "Системная консоль"
-                            };
-                            if ui.button(console_label).clicked() {
-                                self.show_logs = !self.show_logs;
-                                ui.close_menu();
-                            }
-                        });
+                            .on_hover_text("Системная консоль")
+                            .clicked()
+                        {
+                            self.show_logs = !self.show_logs;
+                        }
                         ui.add_space(6.0);
                         ui.label(
                             egui::RichText::new(format!(
