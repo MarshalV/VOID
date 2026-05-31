@@ -17,6 +17,7 @@ use tokio::sync::mpsc;
 use tracing::{debug, warn};
 
 use crate::bootstrap::{parse_seed_input, peer_id_from_multiaddr, void_bootstrap_multiaddrs};
+use crate::app::SharedChatMessages;
 use crate::crypto;
 use crate::file_transfer;
 use crate::protocol::{
@@ -121,12 +122,6 @@ pub(crate) enum NetworkEvent {
     Connected(PeerId),
     Disconnected(PeerId),
     ChatMessage(ChatMessage),
-    /// Удаление копий своих сообщений у собеседника (`kind: delete`).
-    ChatDeleteApply {
-        from: PeerId,
-        message_ids: Vec<String>,
-        reply: std::sync::mpsc::Sender<(Vec<String>, Vec<String>)>,
-    },
     /// Результат удаления у собеседника (`kind: delete_ack`).
     DeleteAckResult {
         peer: PeerId,
@@ -540,43 +535,6 @@ async fn flush_pending_encrypted_messages(
     }
 }
 
-async fn apply_incoming_delete_via_ui(
-    event_tx: &mpsc::Sender<NetworkEvent>,
-    from: PeerId,
-    message_ids: Vec<String>,
-) -> (Vec<String>, Vec<String>) {
-    let fallback_missing = message_ids.clone();
-    let (reply_tx, reply_rx) = std::sync::mpsc::channel();
-    if event_tx
-        .send(NetworkEvent::ChatDeleteApply {
-            from,
-            message_ids,
-            reply: reply_tx,
-        })
-        .await
-        .is_err()
-    {
-        return (Vec::new(), fallback_missing);
-    }
-
-    let deadline = Instant::now() + Duration::from_secs(5);
-    loop {
-        match reply_rx.try_recv() {
-            Ok(result) => return result,
-            Err(std::sync::mpsc::TryRecvError::Empty) => {
-                if Instant::now() >= deadline {
-                    return (Vec::new(), fallback_missing);
-                }
-                tokio::task::yield_now().await;
-                tokio::time::sleep(Duration::from_millis(16)).await;
-            }
-            Err(std::sync::mpsc::TryRecvError::Disconnected) => {
-                return (Vec::new(), fallback_missing);
-            }
-        }
-    }
-}
-
 fn send_delete_ack_response(
     session: &mut crypto::SecureSession,
     channel: libp2p::request_response::ResponseChannel<V1Packet>,
@@ -605,6 +563,7 @@ pub async fn run_chat_network(
     local_static: crypto::StaticSecret,
     void_bootstraps: Vec<Multiaddr>,
     contact_seed_addrs: Vec<(PeerId, Multiaddr)>,
+    chat_messages: SharedChatMessages,
 ) {
         let mut sessions: HashMap<PeerId, crypto::SecureSession> = HashMap::new();
         let mut pending_handshakes: HashMap<PeerId, crypto::StaticSecret> = HashMap::new();
@@ -1698,12 +1657,10 @@ pub async fn run_chat_network(
                                                                     message_ids,
                                                                 } => {
                                                                     let (deleted, missing) =
-                                                                        apply_incoming_delete_via_ui(
-                                                                            &event_tx,
+                                                                        chat_messages.apply_incoming_delete(
                                                                             peer,
-                                                                            message_ids,
-                                                                        )
-                                                                        .await;
+                                                                            &message_ids,
+                                                                        );
                                                                     if let Some(ch) = response_channel.take() {
                                                                         response_channel =
                                                                             send_delete_ack_response(

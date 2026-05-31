@@ -12,7 +12,7 @@ use std::time::{Duration, Instant};
 use tracing::warn;
 
 use crate::{
-    file_transfer, parse_seed_input, new_message_id, App, ChatMessage, DeleteScope,
+    file_transfer, parse_seed_input, new_message_id, App, DeleteScope,
     FileTransferProgress, NetworkEvent, PendingSend, UICommand, RESEND_GRACE,
 };
 
@@ -77,9 +77,7 @@ impl App {
         if self.toasts.is_empty() {
             return;
         }
-        let screen = ctx
-            .input(|i| i.viewport().inner_rect)
-            .unwrap_or_else(|| ctx.screen_rect());
+        let screen = ctx.screen_rect();
         let anchor = egui::pos2(screen.right() - 16.0, screen.top() + 72.0);
         let now = Instant::now();
 
@@ -104,7 +102,7 @@ impl App {
             let bg = egui::Color32::from_rgba_unmultiplied(bg.r(), bg.g(), bg.b(), alpha);
 
             egui::Area::new(egui::Id::new(("toast_area", i)))
-                .order(egui::Order::Foreground)
+                .order(egui::Order::Tooltip)
                 .anchor(
                     egui::Align2::RIGHT_TOP,
                     egui::vec2(
@@ -165,9 +163,10 @@ impl App {
         });
     }
 
-    fn notify_peer_delete_missing(&mut self, peer: PeerId, missing: &[String]) {
+    /// Уведомление: у собеседника запрошенные сообщения уже удалены.
+    fn notify_peer_delete_missing(&mut self, peer: PeerId, missing: &[String]) -> bool {
         if missing.is_empty() {
-            return;
+            return false;
         }
         let peer_label = self
             .known_peers
@@ -183,7 +182,8 @@ impl App {
             )
         };
         self.add_status(text.clone());
-        self.push_toast(text, ToastKind::Info, TOAST_TTL_SHORT);
+        self.push_toast(text, ToastKind::Warn, TOAST_TTL_LONG);
+        true
     }
 
     // =====================================================================
@@ -342,16 +342,19 @@ impl App {
                     let peer_str = peer_id.to_string();
                     let is_selected = self.selected_chat == peer_str;
 
-                    let last_msg: Option<&ChatMessage> =
-                        self.messages.get(&peer_str).and_then(|v| v.last());
-                    let preview = match last_msg {
-                        Some(m) if m.sender_id == me_str => format!("Вы: {}", m.text),
-                        Some(m) => m.text.clone(),
-                        None => "Нажмите, чтобы написать…".to_string(),
+                    let (preview, time_str) = {
+                        let msgs = self.messages.lock();
+                        let last_msg = msgs.get(&peer_str).and_then(|v| v.last());
+                        let preview = match last_msg {
+                            Some(m) if m.sender_id == me_str => format!("Вы: {}", m.text),
+                            Some(m) => m.text.clone(),
+                            None => "Нажмите, чтобы написать…".to_string(),
+                        };
+                        let time_str = last_msg
+                            .map(|m| short_time(&m.timestamp))
+                            .unwrap_or_default();
+                        (preview, time_str)
                     };
-                    let time_str = last_msg
-                        .map(|m| short_time(&m.timestamp))
-                        .unwrap_or_default();
 
                     let bg = if is_selected {
                         palette::BG_SELECTED
@@ -429,7 +432,7 @@ impl App {
                     let click = inner.interact(egui::Sense::click());
                     if click.clicked() {
                         self.selected_chat = peer_str.clone();
-                        self.messages.entry(peer_str.clone()).or_insert_with(Vec::new);
+                        self.messages.lock().entry(peer_str.clone()).or_default();
                     }
                     click.context_menu(|ui| {
                         ui.label(
@@ -491,7 +494,7 @@ impl App {
                         let p = pid.to_string();
                         self.known_peers.remove(&pid);
                         self.peer_name_edits.remove(&pid);
-                        self.messages.remove(&p);
+                        self.messages.lock().remove(&p);
                         if self.selected_chat == p {
                             self.selected_chat.clear();
                         }
@@ -1110,6 +1113,8 @@ impl eframe::App for App {
             ctx.request_repaint_after(Duration::from_millis(50));
         }
 
+        let mut repaint_for_notify = false;
+
         while let Ok(event) = self.event_rx.try_recv() {
             match event {
                 NetworkEvent::PublicIpConfirmed(ip) => {
@@ -1196,16 +1201,10 @@ impl eframe::App for App {
 
                     self.ingest_chat_message(msg);
                 }
-                NetworkEvent::ChatDeleteApply {
-                    from,
-                    message_ids,
-                    reply,
-                } => {
-                    let result = self.apply_incoming_delete(from, &message_ids);
-                    let _ = reply.send(result);
-                }
                 NetworkEvent::DeleteAckResult { peer, deleted: _, missing } => {
-                    self.notify_peer_delete_missing(peer, &missing);
+                    if self.notify_peer_delete_missing(peer, &missing) {
+                        repaint_for_notify = true;
+                    }
                 }
                 NetworkEvent::Status(msg) => {
                     self.add_status(msg);
@@ -1282,7 +1281,7 @@ impl eframe::App for App {
                     self.pending_sends.retain(|p| p.peer != peer);
                     let removed_name = self.known_peers.remove(&peer);
                     self.contact_addrs.remove(&peer);
-                    self.messages.remove(&peer.to_string());
+                    self.messages.lock().remove(&peer.to_string());
                     if self.selected_chat == peer.to_string() {
                         self.selected_chat.clear();
                     }
@@ -1305,7 +1304,7 @@ impl eframe::App for App {
                     // отправки. Чаще всего это bootstrap из void-bootstrap.txt.
                     if self.known_peers.remove(&peer).is_some() {
                         self.contact_addrs.remove(&peer);
-                        self.messages.remove(&peer.to_string());
+                        self.messages.lock().remove(&peer.to_string());
                         if self.selected_chat == peer.to_string() {
                             self.selected_chat.clear();
                         }
@@ -1441,6 +1440,10 @@ impl eframe::App for App {
                     }
                 }
             }
+        }
+
+        if repaint_for_notify {
+            ctx.request_repaint();
         }
 
         // ===== Tick: повторные отправки + истечение toast'ов =====
@@ -2244,6 +2247,7 @@ impl eframe::App for App {
 
                 let messages = self
                     .messages
+                    .lock()
                     .get(&self.selected_chat)
                     .cloned()
                     .unwrap_or_default();

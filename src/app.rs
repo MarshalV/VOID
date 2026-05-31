@@ -2,6 +2,8 @@
 
 use std::collections::HashMap;
 use std::path::Path;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use eframe::egui;
@@ -20,12 +22,78 @@ use crate::protocol::{new_message_id, ChatMessage, FileTransferProgress};
 use crate::ui::{setup_custom_style, truncate_text, Toast, ToastKind, TOAST_TTL_LONG, TOAST_TTL_SHORT};
 use crate::vault::{AddressBookEntry, Storage, VaultUnlockKind, VaultUnlockState};
 
+/// Переписки, доступные и UI, и сетевому таску (входящее удаление без roundtrip через egui).
+#[derive(Clone)]
+pub(crate) struct SharedChatMessages {
+    inner: Arc<Mutex<HashMap<String, Vec<ChatMessage>>>>,
+    journal_dirty: Arc<AtomicBool>,
+}
+
+impl SharedChatMessages {
+    pub(crate) fn new() -> Self {
+        Self {
+            inner: Arc::new(Mutex::new(HashMap::new())),
+            journal_dirty: Arc::new(AtomicBool::new(false)),
+        }
+    }
+
+    pub(crate) fn lock(&self) -> std::sync::MutexGuard<'_, HashMap<String, Vec<ChatMessage>>> {
+        self.inner
+            .lock()
+            .unwrap_or_else(| poisoned| poisoned.into_inner())
+    }
+
+    pub(crate) fn mark_dirty(&self) {
+        self.journal_dirty.store(true, Ordering::Release);
+    }
+
+    pub(crate) fn take_dirty(&self) -> bool {
+        self.journal_dirty.swap(false, Ordering::AcqRel)
+    }
+
+    /// Применяет входящую delete-команду от собеседника (только его сообщения).
+    pub(crate) fn apply_incoming_delete(
+        &self,
+        from: PeerId,
+        message_ids: &[String],
+    ) -> (Vec<String>, Vec<String>) {
+        let peer_str = from.to_string();
+        let from_str = from.to_string();
+        let mut deleted = Vec::new();
+        let mut missing = Vec::new();
+
+        let mut messages = self.lock();
+        if let Some(msgs) = messages.get_mut(&peer_str) {
+            for id in message_ids {
+                if msgs
+                    .iter()
+                    .any(|m| m.id == *id && m.sender_id == from_str)
+                {
+                    deleted.push(id.clone());
+                } else {
+                    missing.push(id.clone());
+                }
+            }
+            if !deleted.is_empty() {
+                msgs.retain(|m| !(deleted.contains(&m.id) && m.sender_id == from_str));
+                drop(messages);
+                self.mark_dirty();
+            }
+        } else {
+            missing.extend(message_ids.iter().cloned());
+        }
+
+        (deleted, missing)
+    }
+}
+
 /// Параметры отложенного запуска сетевого таска после разблокировки vault.
 pub(crate) struct DeferredNetworkSpawn {
     pub event_tx: mpsc::Sender<NetworkEvent>,
     pub command_rx: mpsc::Receiver<UICommand>,
     pub command_tx_for_mdns: mpsc::Sender<UICommand>,
     pub void_bootstraps: Vec<Multiaddr>,
+    pub chat_messages: SharedChatMessages,
 }
 
 /// Сообщение в очереди ожидания доставки. Если в течение `RESEND_GRACE` после
@@ -63,7 +131,7 @@ pub(crate) struct App {
     pub(crate) connected_peers: usize,
     pub(crate) dial_address: String,
     pub(crate) chat_input: String,
-    pub(crate) messages: HashMap<String, Vec<ChatMessage>>,
+    pub(crate) messages: SharedChatMessages,
     pub(crate) known_peers: HashMap<PeerId, String>,
     /// Известные multiaddr контактов из зашифрованного vault. При старте
     /// подаются в Kademlia; при добавлении контакта — сразу Dial + Kad.
@@ -105,7 +173,6 @@ pub(crate) struct App {
     pub(crate) pending_unlock: Option<VaultUnlockState>,
     pub(crate) deferred_network_spawn: Option<DeferredNetworkSpawn>,
     pub(crate) vault_master_key: Option<Zeroizing<[u8; 32]>>,
-    pub(crate) chat_journal_dirty: bool,
 }
 
 impl App {
@@ -121,9 +188,9 @@ impl App {
         initial_contact_addrs: HashMap<PeerId, Vec<Multiaddr>>,
         command_tx: mpsc::Sender<UICommand>,
         event_rx: mpsc::Receiver<NetworkEvent>,
+        chat_messages: SharedChatMessages,
     ) -> Self {
         setup_custom_style(&cc.egui_ctx);
-        let messages = HashMap::new();
 
         Self {
             local_peer_id,
@@ -132,7 +199,7 @@ impl App {
             connected_peers: 0,
             dial_address: String::new(),
             chat_input: String::new(),
-            messages,
+            messages: chat_messages,
             known_peers: initial_address_book,
             contact_addrs: initial_contact_addrs,
             selected_chat: String::new(),
@@ -162,7 +229,6 @@ impl App {
             pending_unlock,
             deferred_network_spawn,
             vault_master_key,
-            chat_journal_dirty: false,
         }
     }
 
@@ -388,6 +454,7 @@ impl App {
                     static_secret.clone(),
                     dn_sp.void_bootstraps,
                     contact_addrs_flat,
+                    dn_sp.chat_messages.clone(),
                 ));
                 self.apply_unlock_success(
                     ctx,
@@ -433,6 +500,7 @@ impl App {
                     static_secret.clone(),
                     dn_sp.void_bootstraps,
                     Vec::new(),
+                    dn_sp.chat_messages.clone(),
                 ));
 
                 self.apply_unlock_success(
@@ -468,11 +536,11 @@ impl App {
 
         match ChatJournal::load(&master_arr) {
             Ok(loaded) => {
-                self.messages = loaded;
+                *self.messages.lock() = loaded;
                 self.ensure_message_ids();
                 info!(
                     "Загружено {} переписок из chat_journal.bin",
-                    self.messages.len()
+                    self.messages.lock().len()
                 );
             }
             Err(e) => {
@@ -495,8 +563,9 @@ impl App {
         self.add_status("Vault разблокирован, сеть запущена.".into());
     }
 
-    fn ensure_message_ids(&mut self) {
-        for msgs in self.messages.values_mut() {
+    fn ensure_message_ids(&self) {
+        let mut messages = self.messages.lock();
+        for msgs in messages.values_mut() {
             for msg in msgs.iter_mut() {
                 if msg.id.is_empty() {
                     msg.id = new_message_id();
@@ -510,19 +579,18 @@ impl App {
         let Some(ref vault_master_key) = self.vault_master_key else {
             return;
         };
-        if let Err(e) = ChatJournal::save(vault_master_key, &self.messages) {
+        if let Err(e) = ChatJournal::save(vault_master_key, &*self.messages.lock()) {
             warn!("VOID: не удалось сохранить chat_journal.bin: {}", e);
         }
     }
 
-    pub(crate) fn mark_chat_journal_dirty(&mut self) {
-        self.chat_journal_dirty = true;
+    pub(crate) fn mark_chat_journal_dirty(&self) {
+        self.messages.mark_dirty();
     }
 
-    pub(crate) fn flush_chat_journal_if_dirty(&mut self) {
-        if self.chat_journal_dirty {
+    pub(crate) fn flush_chat_journal_if_dirty(&self) {
+        if self.messages.take_dirty() {
             self.persist_chat_journal();
-            self.chat_journal_dirty = false;
         }
     }
 
@@ -544,7 +612,7 @@ impl App {
         };
 
         if let Some(b) = bucket {
-            self.messages.entry(b).or_default().push(msg);
+            self.messages.lock().entry(b).or_default().push(msg);
             self.mark_chat_journal_dirty();
         }
     }
@@ -563,6 +631,7 @@ impl App {
 
         let remote_ids: Vec<String> = self
             .messages
+            .lock()
             .get(&peer_str)
             .map(|msgs| {
                 msgs.iter()
@@ -573,7 +642,7 @@ impl App {
             .unwrap_or_default();
 
         if matches!(scope, DeleteScope::LocalOnly | DeleteScope::Both) {
-            if let Some(msgs) = self.messages.get_mut(&peer_str) {
+            if let Some(msgs) = self.messages.lock().get_mut(&peer_str) {
                 msgs.retain(|m| !message_ids.contains(&m.id));
             }
             self.mark_chat_journal_dirty();
@@ -589,7 +658,7 @@ impl App {
 
     pub(crate) fn delete_conversation_local(&mut self, peer: PeerId) {
         let peer_str = peer.to_string();
-        self.messages.remove(&peer_str);
+        self.messages.lock().remove(&peer_str);
         self.mark_chat_journal_dirty();
     }
 
@@ -598,6 +667,7 @@ impl App {
         let me = self.local_peer_id.to_string();
         let ids: Vec<String> = self
             .messages
+            .lock()
             .get(&peer_str)
             .map(|v| {
                 v.iter()
@@ -607,39 +677,6 @@ impl App {
             })
             .unwrap_or_default();
         self.delete_messages(peer, &ids, scope);
-    }
-
-    /// Применяет входящую delete-команду от собеседника (только его сообщения).
-    pub(crate) fn apply_incoming_delete(
-        &mut self,
-        from: PeerId,
-        message_ids: &[String],
-    ) -> (Vec<String>, Vec<String>) {
-        let peer_str = from.to_string();
-        let from_str = from.to_string();
-        let mut deleted = Vec::new();
-        let mut missing = Vec::new();
-
-        if let Some(msgs) = self.messages.get_mut(&peer_str) {
-            for id in message_ids {
-                if msgs
-                    .iter()
-                    .any(|m| m.id == *id && m.sender_id == from_str)
-                {
-                    deleted.push(id.clone());
-                } else {
-                    missing.push(id.clone());
-                }
-            }
-            if !deleted.is_empty() {
-                msgs.retain(|m| !(deleted.contains(&m.id) && m.sender_id == from_str));
-                self.mark_chat_journal_dirty();
-            }
-        } else {
-            missing.extend(message_ids.iter().cloned());
-        }
-
-        (deleted, missing)
     }
 
     /// Сохраняет ник и записную книгу в `vault.bin` (AES-GCM под мастер-ключом).
@@ -794,7 +831,7 @@ impl App {
         }
         let s = peer_id.to_string();
         self.selected_chat = s.clone();
-        self.messages.entry(s).or_insert_with(Vec::new);
+        self.messages.lock().entry(s).or_default();
         self.add_status(format!(
             "Открыт чат с {} — можно отправлять сообщения.",
             &peer_id.to_string()[..8]

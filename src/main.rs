@@ -9,7 +9,7 @@ mod network;
 mod protocol;
 mod vault;
 
-pub(crate) use app::{App, DeleteScope, PendingSend, RESEND_GRACE};
+pub(crate) use app::{App, DeleteScope, PendingSend, RESEND_GRACE, SharedChatMessages};
 pub(crate) use bootstrap::parse_seed_input;
 pub(crate) use protocol::{ChatMessage, new_message_id};
 pub(crate) use network::{NetworkEvent, UICommand};
@@ -175,11 +175,14 @@ async fn main() -> Result<(), Box<dyn Error>> {
     let (command_tx, command_rx) = mpsc::channel(256);
     let command_tx_for_mdns = command_tx.clone();
 
+    let chat_messages = SharedChatMessages::new();
+
     let deferred_network_spawn = DeferredNetworkSpawn {
         event_tx: event_tx.clone(),
         command_rx,
         command_tx_for_mdns,
         void_bootstraps,
+        chat_messages: chat_messages.clone(),
     };
 
     let pending_unlock_state = VaultUnlockState {
@@ -218,6 +221,7 @@ async fn main() -> Result<(), Box<dyn Error>> {
                 HashMap::new(),
                 command_tx,
                 event_rx,
+                chat_messages,
             )))
         }),
     )
