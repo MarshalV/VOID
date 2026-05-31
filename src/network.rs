@@ -17,7 +17,7 @@ use tokio::sync::mpsc;
 use tracing::{debug, warn};
 
 use crate::bootstrap::{parse_seed_input, peer_id_from_multiaddr, void_bootstrap_multiaddrs};
-use crate::app::{DeleteNotify, SharedChatMessages};
+use crate::app::SharedChatMessages;
 use crate::crypto;
 use crate::file_transfer;
 use crate::protocol::{
@@ -122,13 +122,6 @@ pub(crate) enum NetworkEvent {
     Connected(PeerId),
     Disconnected(PeerId),
     ChatMessage(ChatMessage),
-    /// Результат удаления у собеседника (`kind: delete_ack`).
-    DeleteAckResult {
-        peer: PeerId,
-        #[allow(dead_code)]
-        deleted: Vec<String>,
-        missing: Vec<String>,
-    },
     Status(String),
     PublicIpConfirmed(String),
     /// Снимок PeerId в локальной таблице Kademlia (для UI «узлы сети»).
@@ -555,26 +548,6 @@ fn send_delete_ack_response(
     None
 }
 
-fn emit_delete_ack_to_ui(
-    event_tx: &mpsc::Sender<NetworkEvent>,
-    delete_notify_tx: &std::sync::mpsc::Sender<DeleteNotify>,
-    peer: PeerId,
-    deleted: Vec<String>,
-    missing: Vec<String>,
-) {
-    if !missing.is_empty() {
-        let _ = delete_notify_tx.send(DeleteNotify {
-            peer,
-            missing: missing.clone(),
-        });
-    }
-    let _ = event_tx.try_send(NetworkEvent::DeleteAckResult {
-        peer,
-        deleted,
-        missing,
-    });
-}
-
 pub async fn run_chat_network(
     mut command_rx: mpsc::Receiver<UICommand>,
     event_tx: mpsc::Sender<NetworkEvent>,
@@ -584,7 +557,6 @@ pub async fn run_chat_network(
     void_bootstraps: Vec<Multiaddr>,
     contact_seed_addrs: Vec<(PeerId, Multiaddr)>,
     chat_messages: SharedChatMessages,
-    delete_notify_tx: std::sync::mpsc::Sender<DeleteNotify>,
 ) {
         let mut sessions: HashMap<PeerId, crypto::SecureSession> = HashMap::new();
         let mut pending_handshakes: HashMap<PeerId, crypto::StaticSecret> = HashMap::new();
@@ -1728,42 +1700,11 @@ pub async fn run_chat_network(
                                     if let Some(delivered_peer) = outbound_msg_requests.remove(&request_id) {
                                         debug!("[{}] ✅ RR: Доставка подтверждена пиром {}", now, &delivered_peer.to_string()[..8]);
                                         let _ = event_tx.send(NetworkEvent::MessageDelivered(delivered_peer)).await;
-                                    } else if let Some((ack_peer, requested_ids)) =
-                                        outbound_delete_requests.remove(&request_id)
-                                    {
-                                        let (deleted, missing) = match &response {
-                                            V1Packet::Encrypted { header, ciphertext } => {
-                                                if let Some(session) = sessions.get_mut(&peer) {
-                                                    if let Ok(plaintext) =
-                                                        session.decrypt_payload(header, ciphertext)
-                                                    {
-                                                        if let Some(
-                                                            DecryptedChatFrame::DeleteAck {
-                                                                deleted,
-                                                                missing,
-                                                            },
-                                                        ) = parse_decrypted_chat_frame(&plaintext)
-                                                        {
-                                                            (deleted, missing)
-                                                        } else {
-                                                            (Vec::new(), requested_ids.clone())
-                                                        }
-                                                    } else {
-                                                        (Vec::new(), requested_ids.clone())
-                                                    }
-                                                } else {
-                                                    (Vec::new(), requested_ids.clone())
-                                                }
-                                            }
-                                            V1Packet::Ack => (Vec::new(), requested_ids.clone()),
-                                            _ => (Vec::new(), requested_ids.clone()),
-                                        };
-                                        emit_delete_ack_to_ui(
-                                            &event_tx,
-                                            &delete_notify_tx,
-                                            ack_peer,
-                                            deleted,
-                                            missing,
+                                    } else if outbound_delete_requests.remove(&request_id).is_some() {
+                                        debug!(
+                                            "[{}] ✅ RR: delete подтверждён пиром {}",
+                                            now,
+                                            &peer.to_string()[..8]
                                         );
                                     }
                                     match response {

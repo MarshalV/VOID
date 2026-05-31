@@ -176,7 +176,6 @@ async fn main() -> Result<(), Box<dyn Error>> {
     let command_tx_for_mdns = command_tx.clone();
 
     let chat_messages = SharedChatMessages::new();
-    let (delete_notify_tx, delete_notify_rx) = std::sync::mpsc::channel();
 
     let deferred_network_spawn = DeferredNetworkSpawn {
         event_tx: event_tx.clone(),
@@ -184,7 +183,6 @@ async fn main() -> Result<(), Box<dyn Error>> {
         command_tx_for_mdns,
         void_bootstraps,
         chat_messages: chat_messages.clone(),
-        delete_notify_tx,
     };
 
     let pending_unlock_state = VaultUnlockState {
@@ -223,7 +221,6 @@ async fn main() -> Result<(), Box<dyn Error>> {
                 HashMap::new(),
                 command_tx,
                 event_rx,
-                delete_notify_rx,
                 chat_messages,
             )))
         }),
