@@ -1647,19 +1647,19 @@ impl eframe::App for App {
                         );
                     }
                     ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                        if !self.selected_chat.is_empty() {
-                            let chat_menu = ui
-                                .add(
-                                    egui::Button::new(
-                                        egui::RichText::new("⋮")
-                                            .size(20.0)
-                                            .color(palette::TEXT),
-                                    )
-                                    .fill(egui::Color32::TRANSPARENT)
-                                    .stroke(egui::Stroke::NONE),
+                        let header_menu = ui
+                            .add(
+                                egui::Button::new(
+                                    egui::RichText::new("⋮")
+                                        .size(20.0)
+                                        .color(palette::TEXT),
                                 )
-                                .on_hover_text("Переписка");
-                            chat_menu.context_menu(|ui| {
+                                .fill(egui::Color32::TRANSPARENT)
+                                .stroke(egui::Stroke::NONE),
+                            )
+                            .on_hover_text("Меню");
+                        header_menu.context_menu(|ui| {
+                            if !self.selected_chat.is_empty() {
                                 ui.label(
                                     egui::RichText::new("Переписка")
                                         .color(palette::TEXT_MUTED)
@@ -1684,24 +1684,19 @@ impl eframe::App for App {
                                     chat_clear_action = Some(ConversationClearAction::OwnBoth);
                                     ui.close_menu();
                                 }
-                            });
-                            ui.add_space(6.0);
-                        }
-                        if ui
-                            .add(
-                                egui::Button::new(
-                                    egui::RichText::new("⋯")
-                                        .size(22.0)
-                                        .color(palette::TEXT),
-                                )
-                                .fill(egui::Color32::TRANSPARENT)
-                                .stroke(egui::Stroke::NONE),
-                            )
-                            .on_hover_text("Системная консоль")
-                            .clicked()
-                        {
-                            self.show_logs = !self.show_logs;
-                        }
+                                ui.separator();
+                            }
+                            let console_label = if self.show_logs {
+                                "✓ Системная консоль"
+                            } else {
+                                "Системная консоль"
+                            };
+                            if ui.button(console_label).clicked() {
+                                self.show_logs = !self.show_logs;
+                                ui.close_menu();
+                            }
+                        });
+                        ui.add_space(6.0);
                         ui.label(
                             egui::RichText::new(format!(
                                 "● {} в сети",
