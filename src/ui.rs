@@ -12,8 +12,8 @@ use std::time::{Duration, Instant};
 use tracing::warn;
 
 use crate::{
-    file_transfer, parse_seed_input, App, ChatMessage, DeleteScope, FileTransferProgress,
-    NetworkEvent, PendingSend, UICommand, RESEND_GRACE,
+    file_transfer, parse_seed_input, new_message_id, App, ChatMessage, DeleteScope,
+    FileTransferProgress, NetworkEvent, PendingSend, UICommand, RESEND_GRACE,
 };
 
 /// TTL для коротких системных toast'ов.
@@ -467,7 +467,7 @@ impl App {
                         }
                     }
                     self.persist_vault();
-                    self.persist_chat_journal();
+                    self.mark_chat_journal_dirty();
                 }
 
                 ui.add_space(14.0);
@@ -1119,27 +1119,29 @@ impl eframe::App for App {
                     // сообщения этому пиру, не дожидаясь `RESEND_GRACE`/
                     // `RESEND_DELAY`. Без этого пользователь видит, что пир
                     // уже в сети, но сообщение уходит только через 8+ сек.
-                    let mut to_resend: Vec<(usize, PeerId, String)> = Vec::new();
+                    let mut to_resend: Vec<(usize, PeerId, String, String)> = Vec::new();
                     for (idx, p) in self.pending_sends.iter().enumerate() {
                         if p.peer == peer {
-                            to_resend.push((idx, p.peer, p.text.clone()));
+                            to_resend.push((idx, p.peer, p.text.clone(), p.message_id.clone()));
                         }
                     }
                     if !to_resend.is_empty() {
                         let now = Instant::now();
-                        for (idx, _, _) in &to_resend {
+                        for (idx, _, _, _) in &to_resend {
                             if let Some(p) = self.pending_sends.get_mut(*idx) {
+                                p.awaiting_session = false;
                                 p.attempts = p.attempts.saturating_add(1);
                                 p.last_send_at = now;
                                 p.dht_kicked = false;
                                 p.dht_kicked_at = None;
                             }
                         }
-                        for (_, peer, text) in to_resend {
+                        for (_, peer, text, message_id) in to_resend {
                             let _ = self.command_tx.try_send(UICommand::SendMessage {
                                 sender_name: self.local_nickname.clone(),
                                 text,
                                 recipient: Some(peer),
+                                message_id: Some(message_id),
                                 is_retry: true,
                             });
                         }
@@ -1169,7 +1171,7 @@ impl eframe::App for App {
                     if let Some(msgs) = self.messages.get_mut(&peer_str) {
                         msgs.retain(|m| !message_ids.contains(&m.id));
                     }
-                    self.persist_chat_journal();
+                    self.mark_chat_journal_dirty();
                 }
                 NetworkEvent::Status(msg) => {
                     self.add_status(msg);
@@ -1188,6 +1190,28 @@ impl eframe::App for App {
                         .position(|p| p.peer == peer)
                     {
                         self.pending_sends.remove(idx);
+                    }
+                }
+                NetworkEvent::MessageAwaitingSession(peer) => {
+                    if let Some(p) = self
+                        .pending_sends
+                        .iter_mut()
+                        .find(|p| p.peer == peer)
+                    {
+                        p.awaiting_session = true;
+                        p.last_send_at = Instant::now();
+                        p.dht_kicked = false;
+                        p.dht_kicked_at = None;
+                    }
+                }
+                NetworkEvent::MessageOnWire(peer) => {
+                    if let Some(p) = self
+                        .pending_sends
+                        .iter_mut()
+                        .find(|p| p.peer == peer)
+                    {
+                        p.awaiting_session = false;
+                        p.last_send_at = Instant::now();
                     }
                 }
                 NetworkEvent::SendFailedDial(peer) => {
@@ -1229,7 +1253,7 @@ impl eframe::App for App {
                         self.selected_chat.clear();
                     }
                     self.persist_vault();
-                    self.persist_chat_journal();
+                    self.mark_chat_journal_dirty();
                     let label = removed_name
                         .unwrap_or_else(|| format!("{}…", &peer.to_string()[..10]));
                     self.push_toast(
@@ -1252,7 +1276,7 @@ impl eframe::App for App {
                             self.selected_chat.clear();
                         }
                         self.persist_vault();
-                        self.persist_chat_journal();
+                        self.mark_chat_journal_dirty();
                         self.push_toast(
                             format!(
                                 "ℹ️ {}… — DHT/bootstrap-узел, не собеседник. Убран из контактов.",
@@ -2090,24 +2114,25 @@ impl eframe::App for App {
                                 };
                                 if let Some(peer_id) = recipient {
                                     let text_to_send = self.chat_input.clone();
+                                    let message_id = new_message_id();
                                     match self.command_tx.try_send(UICommand::SendMessage {
                                         sender_name: self.local_nickname.clone(),
                                         text: text_to_send.clone(),
                                         recipient: Some(peer_id),
+                                        message_id: Some(message_id.clone()),
                                         is_retry: false,
                                     }) {
                                         Ok(()) => {
                                             self.chat_input.clear();
-                                            // Помечаем сообщение как «в полёте» — следим
-                                            // за DialFailure и при необходимости
-                                            // дёрнем DHT + retry.
                                             self.pending_sends.push(PendingSend {
                                                 peer: peer_id,
                                                 text: text_to_send,
+                                                message_id,
                                                 last_send_at: Instant::now(),
                                                 dht_kicked: false,
                                                 dht_kicked_at: None,
                                                 attempts: 1,
+                                                awaiting_session: false,
                                             });
                                         }
                                         Err(_) => self.add_status(
@@ -2320,6 +2345,8 @@ impl eframe::App for App {
 
         // ===== Toasts (поверх всего, правый верхний угол) =====
         self.draw_toasts(ctx);
+
+        self.flush_chat_journal_if_dirty();
 
         ctx.request_repaint_after(Duration::from_millis(100));
     }

@@ -137,6 +137,16 @@ fn validate_delete_ids(ids: &[String]) -> bool {
         && ids.iter().all(|id| validate_message_id(id))
 }
 
+pub(crate) fn is_delete_command_json(plaintext: &[u8]) -> bool {
+    if plaintext.first() != Some(&b'{') {
+        return false;
+    }
+    serde_json::from_slice::<ChatDeleteCommand>(plaintext)
+        .ok()
+        .map(|cmd| cmd.kind == "delete" && validate_delete_ids(&cmd.message_ids))
+        .unwrap_or(false)
+}
+
 /// Разбор JSON чата после DR: сообщение или команда удаления.
 pub(crate) fn parse_decrypted_chat_frame(plaintext: &[u8]) -> Option<DecryptedChatFrame> {
     if plaintext.len() > MAX_CHAT_JSON_BYTES {

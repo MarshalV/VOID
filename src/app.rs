@@ -35,10 +35,13 @@ pub(crate) struct DeferredNetworkSpawn {
 pub(crate) struct PendingSend {
     pub(crate) peer: PeerId,
     pub(crate) text: String,
+    pub(crate) message_id: String,
     pub(crate) last_send_at: Instant,
     pub(crate) dht_kicked: bool,
     pub(crate) dht_kicked_at: Option<Instant>,
     pub(crate) attempts: u8,
+    /// Сообщение ждёт E2EE-хендшейк — не запускаем таймаут доставки.
+    pub(crate) awaiting_session: bool,
 }
 
 pub(crate) const RESEND_GRACE: Duration = Duration::from_secs(3);
@@ -105,6 +108,7 @@ pub(crate) struct App {
     pub(crate) pending_unlock: Option<VaultUnlockState>,
     pub(crate) deferred_network_spawn: Option<DeferredNetworkSpawn>,
     pub(crate) vault_master_key: Option<Zeroizing<[u8; 32]>>,
+    pub(crate) chat_journal_dirty: bool,
 }
 
 impl App {
@@ -161,6 +165,7 @@ impl App {
             pending_unlock,
             deferred_network_spawn,
             vault_master_key,
+            chat_journal_dirty: false,
         }
     }
 
@@ -513,6 +518,17 @@ impl App {
         }
     }
 
+    pub(crate) fn mark_chat_journal_dirty(&mut self) {
+        self.chat_journal_dirty = true;
+    }
+
+    pub(crate) fn flush_chat_journal_if_dirty(&mut self) {
+        if self.chat_journal_dirty {
+            self.persist_chat_journal();
+            self.chat_journal_dirty = false;
+        }
+    }
+
     pub(crate) fn ingest_chat_message(&mut self, mut msg: ChatMessage) {
         if msg.id.is_empty() {
             msg.id = new_message_id();
@@ -532,7 +548,7 @@ impl App {
 
         if let Some(b) = bucket {
             self.messages.entry(b).or_default().push(msg);
-            self.persist_chat_journal();
+            self.mark_chat_journal_dirty();
         }
     }
 
@@ -551,7 +567,7 @@ impl App {
             if let Some(msgs) = self.messages.get_mut(&peer_str) {
                 msgs.retain(|m| !message_ids.contains(&m.id));
             }
-            self.persist_chat_journal();
+            self.mark_chat_journal_dirty();
         }
 
         if matches!(scope, DeleteScope::RemoteOnly | DeleteScope::Both) {
@@ -617,10 +633,13 @@ impl App {
         let now = Instant::now();
         let mut to_drop: Vec<usize> = Vec::new();
         let mut search_cmds: Vec<PeerId> = Vec::new();
-        let mut resend_cmds: Vec<(PeerId, String)> = Vec::new();
+        let mut resend_cmds: Vec<(PeerId, String, String)> = Vec::new();
         let mut toasts: Vec<(String, ToastKind, Duration)> = Vec::new();
 
         for (idx, p) in self.pending_sends.iter_mut().enumerate() {
+            if p.awaiting_session {
+                continue;
+            }
             // Финальная сдача — после исчерпания попыток.
             if p.attempts >= MAX_ATTEMPTS {
                 if let Some(kicked_at) = p.dht_kicked_at {
@@ -657,7 +676,7 @@ impl App {
             // Фаза 2: после DHT-поиска ждём `RESEND_DELAY` и шлём повторно.
             if let Some(kicked_at) = p.dht_kicked_at {
                 if now.duration_since(kicked_at) >= RESEND_DELAY {
-                    resend_cmds.push((p.peer, p.text.clone()));
+                    resend_cmds.push((p.peer, p.text.clone(), p.message_id.clone()));
                     p.attempts = p.attempts.saturating_add(1);
                     p.last_send_at = now;
                     p.dht_kicked = false;
@@ -695,11 +714,12 @@ impl App {
         for peer in search_cmds {
             let _ = self.command_tx.try_send(UICommand::SearchPeer(peer));
         }
-        for (peer, text) in resend_cmds {
+        for (peer, text, message_id) in resend_cmds {
             let _ = self.command_tx.try_send(UICommand::SendMessage {
                 sender_name: self.local_nickname.clone(),
                 text,
                 recipient: Some(peer),
+                message_id: Some(message_id),
                 is_retry: true,
             });
         }
