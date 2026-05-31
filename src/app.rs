@@ -48,17 +48,6 @@ pub(crate) const RESEND_GRACE: Duration = Duration::from_secs(3);
 pub(crate) const RESEND_DELAY: Duration = Duration::from_secs(5);
 pub(crate) const MAX_ATTEMPTS: u8 = 2;
 
-/// Область удаления сообщений или переписки.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub(crate) enum DeleteScope {
-    /// Скрыть только у себя (локальный журнал).
-    LocalOnly,
-    /// Попросить собеседника удалить у себя.
-    RemoteOnly,
-    /// Удалить локально и отправить команду собеседнику.
-    Both,
-}
-
 pub(crate) struct App {
     pub(crate) local_peer_id: PeerId,
     pub(crate) local_nickname: String,
@@ -552,40 +541,25 @@ impl App {
         }
     }
 
-    pub(crate) fn delete_messages(
-        &mut self,
-        peer: PeerId,
-        message_ids: &[String],
-        scope: DeleteScope,
-    ) {
+    pub(crate) fn delete_messages(&mut self, peer: PeerId, message_ids: &[String]) {
         if message_ids.is_empty() {
             return;
         }
         let peer_str = peer.to_string();
-
-        if matches!(scope, DeleteScope::LocalOnly | DeleteScope::Both) {
-            if let Some(msgs) = self.messages.get_mut(&peer_str) {
-                msgs.retain(|m| !message_ids.contains(&m.id));
-            }
-            self.mark_chat_journal_dirty();
+        if let Some(msgs) = self.messages.get_mut(&peer_str) {
+            msgs.retain(|m| !message_ids.contains(&m.id));
         }
-
-        if matches!(scope, DeleteScope::RemoteOnly | DeleteScope::Both) {
-            let _ = self.command_tx.try_send(UICommand::DeleteMessages {
-                recipient: peer,
-                message_ids: message_ids.to_vec(),
-            });
-        }
+        self.mark_chat_journal_dirty();
     }
 
-    pub(crate) fn delete_conversation(&mut self, peer: PeerId, scope: DeleteScope) {
+    pub(crate) fn delete_conversation(&mut self, peer: PeerId) {
         let peer_str = peer.to_string();
         let ids: Vec<String> = self
             .messages
             .get(&peer_str)
             .map(|v| v.iter().map(|m| m.id.clone()).collect())
             .unwrap_or_default();
-        self.delete_messages(peer, &ids, scope);
+        self.delete_messages(peer, &ids);
     }
 
     /// Сохраняет ник и записную книгу в `vault.bin` (AES-GCM под мастер-ключом).

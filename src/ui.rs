@@ -12,8 +12,8 @@ use std::time::{Duration, Instant};
 use tracing::warn;
 
 use crate::{
-    file_transfer, parse_seed_input, new_message_id, App, ChatMessage, DeleteScope,
-    FileTransferProgress, NetworkEvent, PendingSend, UICommand, RESEND_GRACE,
+    file_transfer, parse_seed_input, new_message_id, App, ChatMessage, FileTransferProgress,
+    NetworkEvent, PendingSend, UICommand, RESEND_GRACE,
 };
 
 /// TTL для коротких системных toast'ов.
@@ -1166,13 +1166,6 @@ impl eframe::App for App {
 
                     self.ingest_chat_message(msg);
                 }
-                NetworkEvent::ChatDelete { from, message_ids } => {
-                    let peer_str = from.to_string();
-                    if let Some(msgs) = self.messages.get_mut(&peer_str) {
-                        msgs.retain(|m| !message_ids.contains(&m.id));
-                    }
-                    self.mark_chat_journal_dirty();
-                }
                 NetworkEvent::Status(msg) => {
                     self.add_status(msg);
                 }
@@ -1540,7 +1533,7 @@ impl eframe::App for App {
         }
 
         // ===== Шапка активного чата =====
-        let mut chat_clear_scope: Option<DeleteScope> = None;
+        let mut chat_clear_requested = false;
         egui::TopBottomPanel::top("chat_header")
             .frame(
                 egui::Frame::none()
@@ -1634,22 +1627,8 @@ impl eframe::App for App {
                                 )
                                 .on_hover_text("Переписка");
                             chat_menu.context_menu(|ui| {
-                                ui.label(
-                                    egui::RichText::new("Очистить переписку")
-                                        .color(palette::TEXT_MUTED)
-                                        .size(11.0),
-                                );
-                                ui.separator();
-                                if ui.button("Только у меня").clicked() {
-                                    chat_clear_scope = Some(DeleteScope::LocalOnly);
-                                    ui.close_menu();
-                                }
-                                if ui.button("Только у собеседника").clicked() {
-                                    chat_clear_scope = Some(DeleteScope::RemoteOnly);
-                                    ui.close_menu();
-                                }
-                                if ui.button("У обоих").clicked() {
-                                    chat_clear_scope = Some(DeleteScope::Both);
+                                if ui.button("🗑 Очистить переписку").clicked() {
+                                    chat_clear_requested = true;
                                     ui.close_menu();
                                 }
                             });
@@ -1686,15 +1665,14 @@ impl eframe::App for App {
                 });
             });
 
-        if let Some(scope) = chat_clear_scope {
+        if chat_clear_requested {
             if let Ok(peer) = self.selected_chat.parse::<PeerId>() {
-                self.delete_conversation(peer, scope);
-                let label = match scope {
-                    DeleteScope::LocalOnly => "Переписка удалена только у вас",
-                    DeleteScope::RemoteOnly => "Запрос на удаление отправлен собеседнику",
-                    DeleteScope::Both => "Переписка удалена у вас и запрос отправлен собеседнику",
-                };
-                self.push_toast(label.into(), ToastKind::Info, TOAST_TTL_SHORT);
+                self.delete_conversation(peer);
+                self.push_toast(
+                    "Переписка удалена только у вас".into(),
+                    ToastKind::Info,
+                    TOAST_TTL_SHORT,
+                );
             }
         }
 
@@ -2213,7 +2191,7 @@ impl eframe::App for App {
                     .cloned()
                     .unwrap_or_default();
                 let me_str = self.local_peer_id.to_string();
-                let mut pending_msg_delete: Option<(String, DeleteScope)> = None;
+                let mut pending_msg_delete: Option<String> = None;
 
                 egui::ScrollArea::vertical()
                     .id_salt("chat_stream")
@@ -2309,25 +2287,8 @@ impl eframe::App for App {
                                         });
                                     });
                                 bubble.response.context_menu(|ui| {
-                                    ui.label(
-                                        egui::RichText::new("Удалить сообщение")
-                                            .color(palette::TEXT_MUTED)
-                                            .size(11.0),
-                                    );
-                                    ui.separator();
-                                    if ui.button("Только у меня").clicked() {
-                                        pending_msg_delete =
-                                            Some((msg_id.clone(), DeleteScope::LocalOnly));
-                                        ui.close_menu();
-                                    }
-                                    if ui.button("Только у собеседника").clicked() {
-                                        pending_msg_delete =
-                                            Some((msg_id.clone(), DeleteScope::RemoteOnly));
-                                        ui.close_menu();
-                                    }
-                                    if ui.button("У обоих").clicked() {
-                                        pending_msg_delete =
-                                            Some((msg_id.clone(), DeleteScope::Both));
+                                    if ui.button("🗑 Удалить").clicked() {
+                                        pending_msg_delete = Some(msg_id.clone());
                                         ui.close_menu();
                                     }
                                 });
@@ -2336,9 +2297,9 @@ impl eframe::App for App {
                         ui.add_space(12.0);
                     });
 
-                if let Some((msg_id, scope)) = pending_msg_delete {
+                if let Some(msg_id) = pending_msg_delete {
                     if let Ok(peer) = self.selected_chat.parse::<PeerId>() {
-                        self.delete_messages(peer, &[msg_id], scope);
+                        self.delete_messages(peer, &[msg_id]);
                     }
                 }
             });
