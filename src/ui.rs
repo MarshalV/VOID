@@ -165,20 +165,6 @@ impl App {
         });
     }
 
-    fn push_toast_force(&mut self, text: String, kind: ToastKind, ttl: Duration) {
-        let expires_at = Instant::now() + ttl;
-        if let Some(t) = self.toasts.iter_mut().find(|t| t.text == text) {
-            t.expires_at = expires_at;
-            t.kind = kind;
-            return;
-        }
-        self.toasts.push(Toast {
-            text,
-            expires_at,
-            kind,
-        });
-    }
-
     /// Уведомление: у собеседника запрошенные сообщения уже удалены.
     fn notify_peer_delete_missing(&mut self, peer: PeerId, missing: &[String]) -> bool {
         if missing.is_empty() {
@@ -198,13 +184,20 @@ impl App {
             )
         };
         self.add_status(text.clone());
-        self.delete_banners
-            .push((Instant::now() + DELETE_BANNER_TTL, text.clone()));
-        if self.delete_banners.len() > 5 {
-            let drop_n = self.delete_banners.len() - 5;
-            self.delete_banners.drain(0..drop_n);
+        let expires = Instant::now() + DELETE_BANNER_TTL;
+        if let Some((exp, _)) = self
+            .delete_banners
+            .iter_mut()
+            .find(|(_, t)| t == &text)
+        {
+            *exp = expires;
+        } else {
+            self.delete_banners.push((expires, text));
+            if self.delete_banners.len() > 5 {
+                let drop_n = self.delete_banners.len() - 5;
+                self.delete_banners.drain(0..drop_n);
+            }
         }
-        self.push_toast_force(text, ToastKind::Warn, TOAST_TTL_LONG);
         true
     }
 
