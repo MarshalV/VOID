@@ -20,8 +20,8 @@ use crate::bootstrap::{parse_seed_input, peer_id_from_multiaddr, void_bootstrap_
 use crate::crypto;
 use crate::file_transfer;
 use crate::protocol::{
-    build_v1_hello, parse_decrypted_chat_json, verify_hello_transport_binding, ChatMessage,
-    V1Packet,
+    build_delete_command_json, build_v1_hello, new_message_id, parse_decrypted_chat_frame,
+    verify_hello_transport_binding, ChatMessage, DecryptedChatFrame, V1Packet,
 };
 
 fn is_junk_addr(ma: &Multiaddr) -> bool {
@@ -119,6 +119,11 @@ pub(crate) enum NetworkEvent {
     Connected(PeerId),
     Disconnected(PeerId),
     ChatMessage(ChatMessage),
+    /// Удаление сообщений по запросу собеседника (E2EE `kind: delete`).
+    ChatDelete {
+        from: PeerId,
+        message_ids: Vec<String>,
+    },
     Status(String),
     PublicIpConfirmed(String),
     /// Снимок PeerId в локальной таблице Kademlia (для UI «узлы сети»).
@@ -283,6 +288,11 @@ pub(crate) enum UICommand {
         text: String,
         recipient: Option<PeerId>,
         is_retry: bool,
+    },
+    /// Попросить собеседника удалить сообщения по id (E2EE `kind: delete`).
+    DeleteMessages {
+        recipient: PeerId,
+        message_ids: Vec<String>,
     },
     // ─── Файловый sub-протокол ──────────────────────────────────────────────
     /// Отправить файл пиру. Сетевой таск читает файл и инициирует Offer.
@@ -999,6 +1009,7 @@ pub async fn run_chat_network(
                                     "UI_SEND"
                                 );
                                 let msg = ChatMessage {
+                                    id: new_message_id(),
                                     sender_id: local_peer_id.to_string(),
                                     sender_name: sender_name.clone(),
                                     recipient_id: recipient.map(|p| p.to_string()),
@@ -1071,6 +1082,61 @@ pub async fn run_chat_network(
                                     debug!("[{}] ⚠️ Попытка отправить сообщение без получателя (Global Chat отключен)", now);
                                 }
                                 let _ = event_tx.send(NetworkEvent::ChatMessage(msg)).await;
+                            }
+                            UICommand::DeleteMessages { recipient, message_ids } => {
+                                let now = chrono::Local::now().format("%H:%M:%S").to_string();
+                                let Some(json_data) = build_delete_command_json(&message_ids)
+                                else {
+                                    let _ = event_tx
+                                        .send(NetworkEvent::Status(
+                                            "❌ Некорректный список id для удаления.".into(),
+                                        ))
+                                        .await;
+                                    continue;
+                                };
+                                if let Some(session) = sessions.get_mut(&recipient) {
+                                    if let Ok((header, ciphertext)) =
+                                        session.encrypt_payload(json_data.as_slice())
+                                    {
+                                        let packet = V1Packet::Encrypted { header, ciphertext };
+                                        let req_id = swarm
+                                            .behaviour_mut()
+                                            .request_response
+                                            .send_request(&recipient, packet);
+                                        outbound_msg_requests.insert(req_id, recipient);
+                                        debug!(
+                                            "[{}] 🗑 E2EE: delete-command → {}",
+                                            now,
+                                            &recipient.to_string()[..8]
+                                        );
+                                    }
+                                } else if !pending_handshakes.contains_key(&recipient) {
+                                    let ephem_secret =
+                                        crypto::StaticSecret::random_from_rng(&mut rand::rngs::OsRng);
+                                    let ephem_pub = crypto::PublicKey::from(&ephem_secret);
+                                    if let Some(hello) = build_v1_hello(
+                                        &local_key,
+                                        local_peer_id,
+                                        recipient,
+                                        my_public_key,
+                                        ephem_pub,
+                                    ) {
+                                        pending_handshakes.insert(recipient, ephem_secret);
+                                        let _ = swarm
+                                            .behaviour_mut()
+                                            .request_response
+                                            .send_request(&recipient, hello);
+                                    }
+                                    pending_messages
+                                        .entry(recipient)
+                                        .or_default()
+                                        .push(json_data);
+                                } else {
+                                    pending_messages
+                                        .entry(recipient)
+                                        .or_default()
+                                        .push(json_data);
+                                }
                             }
                             // ─── Файловый sub-протокол ──────────────────────
                             UICommand::SendFile { recipient, path, kind } => {
@@ -1435,17 +1501,36 @@ pub async fn run_chat_network(
                                                                 &event_tx,
                                                             )
                                                             .await;
-                                                        } else if let Some(msg) =
-                                                            parse_decrypted_chat_json(&plaintext)
+                                                        } else if let Some(frame) =
+                                                            parse_decrypted_chat_frame(&plaintext)
                                                         {
-                                                            debug!(
-                                                                "[{}] 🔒 E2EE: Сообщение ДЕШИФРОВАНО от {}",
-                                                                now,
-                                                                &peer.to_string()[..8]
-                                                            );
-                                                            let _ = event_tx
-                                                                .send(NetworkEvent::ChatMessage(msg))
-                                                                .await;
+                                                            match frame {
+                                                                DecryptedChatFrame::Message(msg) => {
+                                                                    debug!(
+                                                                        "[{}] 🔒 E2EE: Сообщение ДЕШИФРОВАНО от {}",
+                                                                        now,
+                                                                        &peer.to_string()[..8]
+                                                                    );
+                                                                    let _ = event_tx
+                                                                        .send(NetworkEvent::ChatMessage(msg))
+                                                                        .await;
+                                                                }
+                                                                DecryptedChatFrame::Delete {
+                                                                    message_ids,
+                                                                } => {
+                                                                    debug!(
+                                                                        "[{}] 🗑 E2EE: delete-command от {}",
+                                                                        now,
+                                                                        &peer.to_string()[..8]
+                                                                    );
+                                                                    let _ = event_tx
+                                                                        .send(NetworkEvent::ChatDelete {
+                                                                            from: peer,
+                                                                            message_ids,
+                                                                        })
+                                                                        .await;
+                                                                }
+                                                            }
                                                         }
                                                     }
                                                     Err(_) => {
@@ -1556,12 +1641,26 @@ pub async fn run_chat_network(
                                                             &event_tx,
                                                         )
                                                         .await;
-                                                    } else if let Some(msg) =
-                                                        parse_decrypted_chat_json(&plaintext)
+                                                    } else if let Some(frame) =
+                                                        parse_decrypted_chat_frame(&plaintext)
                                                     {
-                                                        let _ = event_tx
-                                                            .send(NetworkEvent::ChatMessage(msg))
-                                                            .await;
+                                                        match frame {
+                                                            DecryptedChatFrame::Message(msg) => {
+                                                                let _ = event_tx
+                                                                    .send(NetworkEvent::ChatMessage(msg))
+                                                                    .await;
+                                                            }
+                                                            DecryptedChatFrame::Delete {
+                                                                message_ids,
+                                                            } => {
+                                                                let _ = event_tx
+                                                                    .send(NetworkEvent::ChatDelete {
+                                                                        from: peer,
+                                                                        message_ids,
+                                                                    })
+                                                                    .await;
+                                                            }
+                                                        }
                                                     }
                                                 }
                                             }

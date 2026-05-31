@@ -1,3 +1,4 @@
+mod chat_store;
 mod crypto;
 mod file_transfer;
 mod ui;
@@ -8,7 +9,7 @@ mod network;
 mod protocol;
 mod vault;
 
-pub(crate) use app::{App, PendingSend, RESEND_GRACE};
+pub(crate) use app::{App, DeleteScope, PendingSend, RESEND_GRACE};
 pub(crate) use bootstrap::parse_seed_input;
 pub(crate) use protocol::ChatMessage;
 pub(crate) use network::{NetworkEvent, UICommand};

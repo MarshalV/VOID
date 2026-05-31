@@ -12,10 +12,11 @@ use tokio::sync::mpsc;
 use tracing::{info, warn};
 use zeroize::{Zeroize, Zeroizing};
 
+use crate::chat_store::ChatJournal;
 use crate::crypto;
 use crate::file_transfer;
 use crate::network::{run_chat_network, NetworkEvent, UICommand};
-use crate::protocol::{ChatMessage, FileTransferProgress};
+use crate::protocol::{new_message_id, ChatMessage, FileTransferProgress};
 use crate::ui::{setup_custom_style, truncate_text, Toast, ToastKind, TOAST_TTL_LONG, TOAST_TTL_SHORT};
 use crate::vault::{AddressBookEntry, Storage, VaultUnlockKind, VaultUnlockState};
 
@@ -43,6 +44,17 @@ pub(crate) struct PendingSend {
 pub(crate) const RESEND_GRACE: Duration = Duration::from_secs(3);
 pub(crate) const RESEND_DELAY: Duration = Duration::from_secs(5);
 pub(crate) const MAX_ATTEMPTS: u8 = 2;
+
+/// Область удаления сообщений или переписки.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum DeleteScope {
+    /// Скрыть только у себя (локальный журнал).
+    LocalOnly,
+    /// Попросить собеседника удалить у себя.
+    RemoteOnly,
+    /// Удалить локально и отправить команду собеседнику.
+    Both,
+}
 
 pub(crate) struct App {
     pub(crate) local_peer_id: PeerId,
@@ -450,7 +462,21 @@ impl App {
         self.contact_addrs = addrs_map;
         self._local_static = static_secret;
         self.pending_unlock = None;
-        self.vault_master_key = Some(master_arr);
+        self.vault_master_key = Some(master_arr.clone());
+
+        match ChatJournal::load(&master_arr) {
+            Ok(loaded) => {
+                self.messages = loaded;
+                self.ensure_message_ids();
+                info!(
+                    "Загружено {} переписок из chat_journal.bin",
+                    self.messages.len()
+                );
+            }
+            Err(e) => {
+                warn!("VOID: не удалось загрузить chat_journal.bin: {}", e);
+            }
+        }
 
         info!("=== VOID P2P Chat ===");
         info!("Ваш Peer ID: {}", self.local_peer_id);
@@ -465,6 +491,85 @@ impl App {
         ctx.send_viewport_cmd(egui::ViewportCommand::Title(format!("VOID Chat [{}]", tit)));
 
         self.add_status("Vault разблокирован, сеть запущена.".into());
+    }
+
+    fn ensure_message_ids(&mut self) {
+        for msgs in self.messages.values_mut() {
+            for msg in msgs.iter_mut() {
+                if msg.id.is_empty() {
+                    msg.id = new_message_id();
+                }
+            }
+        }
+    }
+
+    /// Сохраняет переписки в `chat_journal.bin` (AES-GCM под мастер-ключом vault).
+    pub(crate) fn persist_chat_journal(&self) {
+        let Some(ref vault_master_key) = self.vault_master_key else {
+            return;
+        };
+        if let Err(e) = ChatJournal::save(vault_master_key, &self.messages) {
+            warn!("VOID: не удалось сохранить chat_journal.bin: {}", e);
+        }
+    }
+
+    pub(crate) fn ingest_chat_message(&mut self, mut msg: ChatMessage) {
+        if msg.id.is_empty() {
+            msg.id = new_message_id();
+        }
+
+        let bucket = if let Some(ref target) = msg.recipient_id {
+            if target == &self.local_peer_id.to_string() {
+                Some(msg.sender_id.clone())
+            } else if msg.sender_id == self.local_peer_id.to_string() {
+                Some(target.clone())
+            } else {
+                None
+            }
+        } else {
+            None
+        };
+
+        if let Some(b) = bucket {
+            self.messages.entry(b).or_default().push(msg);
+            self.persist_chat_journal();
+        }
+    }
+
+    pub(crate) fn delete_messages(
+        &mut self,
+        peer: PeerId,
+        message_ids: &[String],
+        scope: DeleteScope,
+    ) {
+        if message_ids.is_empty() {
+            return;
+        }
+        let peer_str = peer.to_string();
+
+        if matches!(scope, DeleteScope::LocalOnly | DeleteScope::Both) {
+            if let Some(msgs) = self.messages.get_mut(&peer_str) {
+                msgs.retain(|m| !message_ids.contains(&m.id));
+            }
+            self.persist_chat_journal();
+        }
+
+        if matches!(scope, DeleteScope::RemoteOnly | DeleteScope::Both) {
+            let _ = self.command_tx.try_send(UICommand::DeleteMessages {
+                recipient: peer,
+                message_ids: message_ids.to_vec(),
+            });
+        }
+    }
+
+    pub(crate) fn delete_conversation(&mut self, peer: PeerId, scope: DeleteScope) {
+        let peer_str = peer.to_string();
+        let ids: Vec<String> = self
+            .messages
+            .get(&peer_str)
+            .map(|v| v.iter().map(|m| m.id.clone()).collect())
+            .unwrap_or_default();
+        self.delete_messages(peer, &ids, scope);
     }
 
     /// Сохраняет ник и записную книгу в `vault.bin` (AES-GCM под мастер-ключом).

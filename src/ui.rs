@@ -12,8 +12,8 @@ use std::time::{Duration, Instant};
 use tracing::warn;
 
 use crate::{
-    file_transfer, parse_seed_input, App, ChatMessage, FileTransferProgress, NetworkEvent,
-    PendingSend, UICommand, RESEND_GRACE,
+    file_transfer, parse_seed_input, App, ChatMessage, DeleteScope, FileTransferProgress,
+    NetworkEvent, PendingSend, UICommand, RESEND_GRACE,
 };
 
 /// TTL для коротких системных toast'ов.
@@ -467,6 +467,7 @@ impl App {
                         }
                     }
                     self.persist_vault();
+                    self.persist_chat_journal();
                 }
 
                 ui.add_space(14.0);
@@ -1161,22 +1162,14 @@ impl eframe::App for App {
                         }
                     }
 
-                    // Route message
-                    let bucket = if let Some(ref target) = msg.recipient_id {
-                        if target == &self.local_peer_id.to_string() {
-                            Some(msg.sender_id.clone())
-                        } else if msg.sender_id == self.local_peer_id.to_string() {
-                            Some(target.clone())
-                        } else {
-                            None
-                        }
-                    } else {
-                        None // Ignore global messages
-                    };
-
-                    if let Some(b) = bucket {
-                        self.messages.entry(b).or_default().push(msg);
+                    self.ingest_chat_message(msg);
+                }
+                NetworkEvent::ChatDelete { from, message_ids } => {
+                    let peer_str = from.to_string();
+                    if let Some(msgs) = self.messages.get_mut(&peer_str) {
+                        msgs.retain(|m| !message_ids.contains(&m.id));
                     }
+                    self.persist_chat_journal();
                 }
                 NetworkEvent::Status(msg) => {
                     self.add_status(msg);
@@ -1231,10 +1224,12 @@ impl eframe::App for App {
                     self.pending_sends.retain(|p| p.peer != peer);
                     let removed_name = self.known_peers.remove(&peer);
                     self.contact_addrs.remove(&peer);
+                    self.messages.remove(&peer.to_string());
                     if self.selected_chat == peer.to_string() {
                         self.selected_chat.clear();
                     }
                     self.persist_vault();
+                    self.persist_chat_journal();
                     let label = removed_name
                         .unwrap_or_else(|| format!("{}…", &peer.to_string()[..10]));
                     self.push_toast(
@@ -1252,10 +1247,12 @@ impl eframe::App for App {
                     // отправки. Чаще всего это bootstrap из void-bootstrap.txt.
                     if self.known_peers.remove(&peer).is_some() {
                         self.contact_addrs.remove(&peer);
+                        self.messages.remove(&peer.to_string());
                         if self.selected_chat == peer.to_string() {
                             self.selected_chat.clear();
                         }
                         self.persist_vault();
+                        self.persist_chat_journal();
                         self.push_toast(
                             format!(
                                 "ℹ️ {}… — DHT/bootstrap-узел, не собеседник. Убран из контактов.",
@@ -1519,6 +1516,7 @@ impl eframe::App for App {
         }
 
         // ===== Шапка активного чата =====
+        let mut chat_clear_scope: Option<DeleteScope> = None;
         egui::TopBottomPanel::top("chat_header")
             .frame(
                 egui::Frame::none()
@@ -1599,6 +1597,40 @@ impl eframe::App for App {
                         );
                     }
                     ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                        if !self.selected_chat.is_empty() {
+                            let chat_menu = ui
+                                .add(
+                                    egui::Button::new(
+                                        egui::RichText::new("⋮")
+                                            .size(20.0)
+                                            .color(palette::TEXT),
+                                    )
+                                    .fill(egui::Color32::TRANSPARENT)
+                                    .stroke(egui::Stroke::NONE),
+                                )
+                                .on_hover_text("Переписка");
+                            chat_menu.context_menu(|ui| {
+                                ui.label(
+                                    egui::RichText::new("Очистить переписку")
+                                        .color(palette::TEXT_MUTED)
+                                        .size(11.0),
+                                );
+                                ui.separator();
+                                if ui.button("Только у меня").clicked() {
+                                    chat_clear_scope = Some(DeleteScope::LocalOnly);
+                                    ui.close_menu();
+                                }
+                                if ui.button("Только у собеседника").clicked() {
+                                    chat_clear_scope = Some(DeleteScope::RemoteOnly);
+                                    ui.close_menu();
+                                }
+                                if ui.button("У обоих").clicked() {
+                                    chat_clear_scope = Some(DeleteScope::Both);
+                                    ui.close_menu();
+                                }
+                            });
+                            ui.add_space(6.0);
+                        }
                         if ui
                             .add(
                                 egui::Button::new(
@@ -1629,6 +1661,18 @@ impl eframe::App for App {
                     });
                 });
             });
+
+        if let Some(scope) = chat_clear_scope {
+            if let Ok(peer) = self.selected_chat.parse::<PeerId>() {
+                self.delete_conversation(peer, scope);
+                let label = match scope {
+                    DeleteScope::LocalOnly => "Переписка удалена только у вас",
+                    DeleteScope::RemoteOnly => "Запрос на удаление отправлен собеседнику",
+                    DeleteScope::Both => "Переписка удалена у вас и запрос отправлен собеседнику",
+                };
+                self.push_toast(label.into(), ToastKind::Info, TOAST_TTL_SHORT);
+            }
+        }
 
         // ===== Панель файловых предложений и прогресса =====
         // Показываем только если есть что отобразить и выбран чат.
@@ -2144,6 +2188,7 @@ impl eframe::App for App {
                     .cloned()
                     .unwrap_or_default();
                 let me_str = self.local_peer_id.to_string();
+                let mut pending_msg_delete: Option<(String, DeleteScope)> = None;
 
                 egui::ScrollArea::vertical()
                     .id_salt("chat_stream")
@@ -2191,7 +2236,8 @@ impl eframe::App for App {
                                     palette::BUBBLE_THEM
                                 };
 
-                                egui::Frame::none()
+                                let msg_id = msg.id.clone();
+                                let bubble = egui::Frame::none()
                                     .fill(bubble_bg)
                                     .rounding(egui::Rounding {
                                         nw: 16.0,
@@ -2237,10 +2283,39 @@ impl eframe::App for App {
                                             );
                                         });
                                     });
+                                bubble.response.context_menu(|ui| {
+                                    ui.label(
+                                        egui::RichText::new("Удалить сообщение")
+                                            .color(palette::TEXT_MUTED)
+                                            .size(11.0),
+                                    );
+                                    ui.separator();
+                                    if ui.button("Только у меня").clicked() {
+                                        pending_msg_delete =
+                                            Some((msg_id.clone(), DeleteScope::LocalOnly));
+                                        ui.close_menu();
+                                    }
+                                    if ui.button("Только у собеседника").clicked() {
+                                        pending_msg_delete =
+                                            Some((msg_id.clone(), DeleteScope::RemoteOnly));
+                                        ui.close_menu();
+                                    }
+                                    if ui.button("У обоих").clicked() {
+                                        pending_msg_delete =
+                                            Some((msg_id.clone(), DeleteScope::Both));
+                                        ui.close_menu();
+                                    }
+                                });
                             });
                         }
                         ui.add_space(12.0);
                     });
+
+                if let Some((msg_id, scope)) = pending_msg_delete {
+                    if let Ok(peer) = self.selected_chat.parse::<PeerId>() {
+                        self.delete_messages(peer, &[msg_id], scope);
+                    }
+                }
             });
 
         // ===== Toasts (поверх всего, правый верхний угол) =====

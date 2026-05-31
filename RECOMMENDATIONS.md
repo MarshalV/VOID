@@ -34,7 +34,6 @@ VOID — зрелый **alpha** по сети и E2EE: libp2p, Noise, Double Rat
 
 | # | Действие | Приоритет |
 |---|----------|-----------|
-| 1.1 | Разбить на модули: `bootstrap.rs`, `vault.rs`, `protocol.rs`, `network.rs`, `app.rs` | P1 |
 | 1.2 | Добавить **CI** (`.github/workflows`): `cargo test`, `cargo clippy`, `cargo fmt --check` | P0 |
 | 1.3 | В CI: `cargo audit` и/или `cargo deny` (см. [SECURITY_REVISION.md](./SECURITY_REVISION.md) §7.3) | P0 |
 | 1.4 | Добавить файл **`LICENSE`** в корень репозитория | P0 |

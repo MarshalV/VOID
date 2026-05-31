@@ -1,6 +1,7 @@
 //! Протокол чата `/void/chat/1.0.0`: Hello, E2EE-пакеты, лимиты JSON.
 
 use libp2p::PeerId;
+use rand::RngCore;
 use serde::{Deserialize, Serialize};
 
 use crate::crypto;
@@ -8,12 +9,34 @@ use crate::file_transfer;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub(crate) struct ChatMessage {
+    #[serde(default)]
+    pub(crate) id: String,
     pub(crate) sender_id: String,
     pub(crate) sender_name: String,
     pub(crate) recipient_id: Option<String>,
     pub(crate) text: String,
     pub(crate) timestamp: String,
 }
+
+pub(crate) fn new_message_id() -> String {
+    let mut bytes = [0u8; 16];
+    rand::thread_rng().fill_bytes(&mut bytes);
+    bytes.iter().map(|b| format!("{:02x}", b)).collect()
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct ChatDeleteCommand {
+    kind: String,
+    message_ids: Vec<String>,
+}
+
+pub(crate) enum DecryptedChatFrame {
+    Message(ChatMessage),
+    Delete { message_ids: Vec<String> },
+}
+
+const MAX_MESSAGE_ID_BYTES: usize = 64;
+const MAX_DELETE_IDS: usize = 256;
 
 /// Лимиты JSON чата после `decrypt_payload` (защита от DoS по памяти).
 const MAX_CHAT_JSON_BYTES: usize = 64 * 1024;
@@ -104,6 +127,34 @@ fn sign_hello_transport_binding(
     transport.sign(&msg).ok()
 }
 
+fn validate_message_id(id: &str) -> bool {
+    !id.is_empty() && id.len() <= MAX_MESSAGE_ID_BYTES
+}
+
+fn validate_delete_ids(ids: &[String]) -> bool {
+    !ids.is_empty()
+        && ids.len() <= MAX_DELETE_IDS
+        && ids.iter().all(|id| validate_message_id(id))
+}
+
+/// Разбор JSON чата после DR: сообщение или команда удаления.
+pub(crate) fn parse_decrypted_chat_frame(plaintext: &[u8]) -> Option<DecryptedChatFrame> {
+    if plaintext.len() > MAX_CHAT_JSON_BYTES {
+        return None;
+    }
+    if plaintext.first() != Some(&b'{') {
+        return None;
+    }
+    if let Ok(cmd) = serde_json::from_slice::<ChatDeleteCommand>(plaintext) {
+        if cmd.kind == "delete" && validate_delete_ids(&cmd.message_ids) {
+            return Some(DecryptedChatFrame::Delete {
+                message_ids: cmd.message_ids,
+            });
+        }
+    }
+    parse_decrypted_chat_json(plaintext).map(DecryptedChatFrame::Message)
+}
+
 /// Разбор JSON чата после DR: верхняя граница буфера и длины полей.
 pub(crate) fn parse_decrypted_chat_json(plaintext: &[u8]) -> Option<ChatMessage> {
     if plaintext.len() > MAX_CHAT_JSON_BYTES {
@@ -113,6 +164,9 @@ pub(crate) fn parse_decrypted_chat_json(plaintext: &[u8]) -> Option<ChatMessage>
         return None;
     }
     let msg: ChatMessage = serde_json::from_slice(plaintext).ok()?;
+    if !msg.id.is_empty() && !validate_message_id(&msg.id) {
+        return None;
+    }
     if msg.sender_id.len() > MAX_CHAT_SENDER_ID_BYTES
         || msg.sender_name.len() > MAX_CHAT_SENDER_NAME_BYTES
         || msg.text.len() > MAX_CHAT_TEXT_BYTES
@@ -126,6 +180,17 @@ pub(crate) fn parse_decrypted_chat_json(plaintext: &[u8]) -> Option<ChatMessage>
         }
     }
     Some(msg)
+}
+
+pub(crate) fn build_delete_command_json(message_ids: &[String]) -> Option<Vec<u8>> {
+    if !validate_delete_ids(message_ids) {
+        return None;
+    }
+    let cmd = ChatDeleteCommand {
+        kind: "delete".into(),
+        message_ids: message_ids.to_vec(),
+    };
+    serde_json::to_vec(&cmd).ok()
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
