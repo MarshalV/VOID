@@ -87,6 +87,13 @@ impl SharedChatMessages {
     }
 }
 
+/// Синхронное уведомление UI о missing в delete_ack (минуя tokio — надёжно на Windows).
+#[derive(Clone, Debug)]
+pub(crate) struct DeleteNotify {
+    pub peer: PeerId,
+    pub missing: Vec<String>,
+}
+
 /// Параметры отложенного запуска сетевого таска после разблокировки vault.
 pub(crate) struct DeferredNetworkSpawn {
     pub event_tx: mpsc::Sender<NetworkEvent>,
@@ -94,6 +101,7 @@ pub(crate) struct DeferredNetworkSpawn {
     pub command_tx_for_mdns: mpsc::Sender<UICommand>,
     pub void_bootstraps: Vec<Multiaddr>,
     pub chat_messages: SharedChatMessages,
+    pub delete_notify_tx: std::sync::mpsc::Sender<DeleteNotify>,
 }
 
 /// Сообщение в очереди ожидания доставки. Если в течение `RESEND_GRACE` после
@@ -150,6 +158,9 @@ pub(crate) struct App {
     pub(crate) dht_routing_total: usize,
     pub(crate) command_tx: mpsc::Sender<UICommand>,
     pub(crate) event_rx: mpsc::Receiver<NetworkEvent>,
+    pub(crate) delete_notify_rx: std::sync::mpsc::Receiver<DeleteNotify>,
+    /// Короткие баннеры в чате (надёжнее toast на Windows).
+    pub(crate) delete_banners: Vec<(Instant, String)>,
     pub(crate) _sessions: HashMap<libp2p::PeerId, crypto::SecureSession>,
     pub(crate) _local_static: crypto::StaticSecret,
     pub(crate) pending_sends: Vec<PendingSend>,
@@ -188,6 +199,7 @@ impl App {
         initial_contact_addrs: HashMap<PeerId, Vec<Multiaddr>>,
         command_tx: mpsc::Sender<UICommand>,
         event_rx: mpsc::Receiver<NetworkEvent>,
+        delete_notify_rx: std::sync::mpsc::Receiver<DeleteNotify>,
         chat_messages: SharedChatMessages,
     ) -> Self {
         setup_custom_style(&cc.egui_ctx);
@@ -217,6 +229,8 @@ impl App {
             dht_routing_total: 0,
             command_tx,
             event_rx,
+            delete_notify_rx,
+            delete_banners: Vec::new(),
             _sessions: HashMap::new(),
             _local_static: local_static,
             pending_sends: Vec::new(),
@@ -455,6 +469,7 @@ impl App {
                     dn_sp.void_bootstraps,
                     contact_addrs_flat,
                     dn_sp.chat_messages.clone(),
+                    dn_sp.delete_notify_tx.clone(),
                 ));
                 self.apply_unlock_success(
                     ctx,
@@ -501,6 +516,7 @@ impl App {
                     dn_sp.void_bootstraps,
                     Vec::new(),
                     dn_sp.chat_messages.clone(),
+                    dn_sp.delete_notify_tx.clone(),
                 ));
 
                 self.apply_unlock_success(

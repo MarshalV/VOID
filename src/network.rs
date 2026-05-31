@@ -17,7 +17,7 @@ use tokio::sync::mpsc;
 use tracing::{debug, warn};
 
 use crate::bootstrap::{parse_seed_input, peer_id_from_multiaddr, void_bootstrap_multiaddrs};
-use crate::app::SharedChatMessages;
+use crate::app::{DeleteNotify, SharedChatMessages};
 use crate::crypto;
 use crate::file_transfer;
 use crate::protocol::{
@@ -555,6 +555,26 @@ fn send_delete_ack_response(
     None
 }
 
+fn emit_delete_ack_to_ui(
+    event_tx: &mpsc::Sender<NetworkEvent>,
+    delete_notify_tx: &std::sync::mpsc::Sender<DeleteNotify>,
+    peer: PeerId,
+    deleted: Vec<String>,
+    missing: Vec<String>,
+) {
+    if !missing.is_empty() {
+        let _ = delete_notify_tx.send(DeleteNotify {
+            peer,
+            missing: missing.clone(),
+        });
+    }
+    let _ = event_tx.try_send(NetworkEvent::DeleteAckResult {
+        peer,
+        deleted,
+        missing,
+    });
+}
+
 pub async fn run_chat_network(
     mut command_rx: mpsc::Receiver<UICommand>,
     event_tx: mpsc::Sender<NetworkEvent>,
@@ -564,6 +584,7 @@ pub async fn run_chat_network(
     void_bootstraps: Vec<Multiaddr>,
     contact_seed_addrs: Vec<(PeerId, Multiaddr)>,
     chat_messages: SharedChatMessages,
+    delete_notify_tx: std::sync::mpsc::Sender<DeleteNotify>,
 ) {
         let mut sessions: HashMap<PeerId, crypto::SecureSession> = HashMap::new();
         let mut pending_handshakes: HashMap<PeerId, crypto::StaticSecret> = HashMap::new();
@@ -1734,16 +1755,16 @@ pub async fn run_chat_network(
                                                     (Vec::new(), requested_ids.clone())
                                                 }
                                             }
-                                            V1Packet::Ack => (requested_ids.clone(), Vec::new()),
+                                            V1Packet::Ack => (Vec::new(), requested_ids.clone()),
                                             _ => (Vec::new(), requested_ids.clone()),
                                         };
-                                        let _ = event_tx
-                                            .send(NetworkEvent::DeleteAckResult {
-                                                peer: ack_peer,
-                                                deleted,
-                                                missing,
-                                            })
-                                            .await;
+                                        emit_delete_ack_to_ui(
+                                            &event_tx,
+                                            &delete_notify_tx,
+                                            ack_peer,
+                                            deleted,
+                                            missing,
+                                        );
                                     }
                                     match response {
                                         V1Packet::Hello {

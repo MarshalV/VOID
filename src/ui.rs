@@ -27,6 +27,8 @@ enum ConversationClearAction {
 pub(crate) const TOAST_TTL_SHORT: Duration = Duration::from_secs(4);
 /// TTL для важных уведомлений (ошибки доставки и т.п.).
 pub(crate) const TOAST_TTL_LONG: Duration = Duration::from_secs(7);
+/// TTL баннера «сообщение уже удалено» в ленте чата.
+const DELETE_BANNER_TTL: Duration = Duration::from_secs(12);
 
 /// Плавающее уведомление в правом верхнем углу.
 pub(crate) struct Toast {
@@ -163,6 +165,20 @@ impl App {
         });
     }
 
+    fn push_toast_force(&mut self, text: String, kind: ToastKind, ttl: Duration) {
+        let expires_at = Instant::now() + ttl;
+        if let Some(t) = self.toasts.iter_mut().find(|t| t.text == text) {
+            t.expires_at = expires_at;
+            t.kind = kind;
+            return;
+        }
+        self.toasts.push(Toast {
+            text,
+            expires_at,
+            kind,
+        });
+    }
+
     /// Уведомление: у собеседника запрошенные сообщения уже удалены.
     fn notify_peer_delete_missing(&mut self, peer: PeerId, missing: &[String]) -> bool {
         if missing.is_empty() {
@@ -182,8 +198,24 @@ impl App {
             )
         };
         self.add_status(text.clone());
-        self.push_toast(text, ToastKind::Warn, TOAST_TTL_LONG);
+        self.delete_banners
+            .push((Instant::now() + DELETE_BANNER_TTL, text.clone()));
+        if self.delete_banners.len() > 5 {
+            let drop_n = self.delete_banners.len() - 5;
+            self.delete_banners.drain(0..drop_n);
+        }
+        self.push_toast_force(text, ToastKind::Warn, TOAST_TTL_LONG);
         true
+    }
+
+    fn poll_delete_notifications(&mut self) -> bool {
+        let mut any = false;
+        while let Ok(n) = self.delete_notify_rx.try_recv() {
+            if self.notify_peer_delete_missing(n.peer, &n.missing) {
+                any = true;
+            }
+        }
+        any
     }
 
     // =====================================================================
@@ -1076,6 +1108,8 @@ impl eframe::App for App {
             return;
         }
 
+        let mut repaint_for_notify = self.poll_delete_notifications();
+
         self.known_peers.remove(&self.local_peer_id);
 
         // ── Поллинг результата выбора папки сохранения ────────────────────
@@ -1112,8 +1146,6 @@ impl eframe::App for App {
         if self.pending_accept.is_some() {
             ctx.request_repaint_after(Duration::from_millis(50));
         }
-
-        let mut repaint_for_notify = false;
 
         while let Ok(event) = self.event_rx.try_recv() {
             match event {
@@ -1201,11 +1233,7 @@ impl eframe::App for App {
 
                     self.ingest_chat_message(msg);
                 }
-                NetworkEvent::DeleteAckResult { peer, deleted: _, missing } => {
-                    if self.notify_peer_delete_missing(peer, &missing) {
-                        repaint_for_notify = true;
-                    }
-                }
+                NetworkEvent::DeleteAckResult { .. } => {}
                 NetworkEvent::Status(msg) => {
                     self.add_status(msg);
                 }
@@ -1442,6 +1470,8 @@ impl eframe::App for App {
             }
         }
 
+        repaint_for_notify |= self.poll_delete_notifications();
+
         if repaint_for_notify {
             ctx.request_repaint();
         }
@@ -1450,9 +1480,13 @@ impl eframe::App for App {
         self.tick_pending_sends();
         let now = Instant::now();
         self.toasts.retain(|t| t.expires_at > now);
+        self.delete_banners.retain(|(exp, _)| *exp > now);
 
         // Чтобы фоновые таймеры (retry/toast) тикали без активности пользователя.
-        if !self.pending_sends.is_empty() || !self.toasts.is_empty() {
+        if !self.pending_sends.is_empty()
+            || !self.toasts.is_empty()
+            || !self.delete_banners.is_empty()
+        {
             ctx.request_repaint_after(Duration::from_millis(250));
         }
 
@@ -2253,6 +2287,27 @@ impl eframe::App for App {
                     .unwrap_or_default();
                 let me_str = self.local_peer_id.to_string();
                 let mut pending_msg_delete: Option<(String, DeleteScope)> = None;
+
+                let now_banners = Instant::now();
+                for (_, banner_text) in self
+                    .delete_banners
+                    .iter()
+                    .filter(|(exp, _)| *exp > now_banners)
+                {
+                    egui::Frame::none()
+                        .fill(egui::Color32::from_rgba_premultiplied(255, 120, 60, 38))
+                        .stroke(egui::Stroke::new(1.0, palette::ACCENT))
+                        .rounding(8.0)
+                        .inner_margin(egui::Margin::symmetric(14.0, 10.0))
+                        .show(ui, |ui| {
+                            ui.label(
+                                egui::RichText::new(banner_text)
+                                    .color(palette::ACCENT)
+                                    .strong(),
+                            );
+                        });
+                    ui.add_space(8.0);
+                }
 
                 egui::ScrollArea::vertical()
                     .id_salt("chat_stream")
