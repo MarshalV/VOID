@@ -609,6 +609,39 @@ impl App {
         self.delete_messages(peer, &ids, scope);
     }
 
+    /// Применяет входящую delete-команду от собеседника (только его сообщения).
+    pub(crate) fn apply_incoming_delete(
+        &mut self,
+        from: PeerId,
+        message_ids: &[String],
+    ) -> (Vec<String>, Vec<String>) {
+        let peer_str = from.to_string();
+        let from_str = from.to_string();
+        let mut deleted = Vec::new();
+        let mut missing = Vec::new();
+
+        if let Some(msgs) = self.messages.get_mut(&peer_str) {
+            for id in message_ids {
+                if msgs
+                    .iter()
+                    .any(|m| m.id == *id && m.sender_id == from_str)
+                {
+                    deleted.push(id.clone());
+                } else {
+                    missing.push(id.clone());
+                }
+            }
+            if !deleted.is_empty() {
+                msgs.retain(|m| !(deleted.contains(&m.id) && m.sender_id == from_str));
+                self.mark_chat_journal_dirty();
+            }
+        } else {
+            missing.extend(message_ids.iter().cloned());
+        }
+
+        (deleted, missing)
+    }
+
     /// Сохраняет ник и записную книгу в `vault.bin` (AES-GCM под мастер-ключом).
     pub(crate) fn persist_vault(&self) {
         let Some(ref vault_master_key) = self.vault_master_key else {

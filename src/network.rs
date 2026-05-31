@@ -20,9 +20,10 @@ use crate::bootstrap::{parse_seed_input, peer_id_from_multiaddr, void_bootstrap_
 use crate::crypto;
 use crate::file_transfer;
 use crate::protocol::{
-    build_delete_command_json, build_v1_hello, is_delete_command_json, new_message_id,
-    parse_decrypted_chat_frame, verify_hello_transport_binding, ChatMessage, DecryptedChatFrame,
-    V1Packet,
+    build_delete_ack_json, build_delete_command_json, build_v1_hello,
+    delete_command_message_ids, is_delete_command_json,
+    new_message_id, parse_decrypted_chat_frame, verify_hello_transport_binding, ChatMessage,
+    DecryptedChatFrame, V1Packet,
 };
 
 fn is_junk_addr(ma: &Multiaddr) -> bool {
@@ -121,9 +122,17 @@ pub(crate) enum NetworkEvent {
     Disconnected(PeerId),
     ChatMessage(ChatMessage),
     /// Удаление копий своих сообщений у собеседника (`kind: delete`).
-    ChatDelete {
+    ChatDeleteApply {
         from: PeerId,
         message_ids: Vec<String>,
+        reply: tokio::sync::oneshot::Sender<(Vec<String>, Vec<String>)>,
+    },
+    /// Результат удаления у собеседника (`kind: delete_ack`).
+    DeleteAckResult {
+        peer: PeerId,
+        #[allow(dead_code)]
+        deleted: Vec<String>,
+        missing: Vec<String>,
     },
     Status(String),
     PublicIpConfirmed(String),
@@ -456,11 +465,12 @@ async fn send_encrypted_chat_payload(
     >,
     outbound_delete_requests: &mut HashMap<
         libp2p::request_response::OutboundRequestId,
-        PeerId,
+        (PeerId, Vec<String>),
     >,
     event_tx: &mpsc::Sender<NetworkEvent>,
     peer: PeerId,
     json_data: Vec<u8>,
+    delete_track_ids: Option<&[String]>,
     now: &str,
 ) -> bool {
     let Some(session) = sessions.get_mut(&peer) else {
@@ -478,7 +488,11 @@ async fn send_encrypted_chat_payload(
     let packet = V1Packet::Encrypted { header, ciphertext };
     let req_id = swarm.behaviour_mut().request_response.send_request(&peer, packet);
     if is_delete_command_json(json_data.as_slice()) {
-        outbound_delete_requests.insert(req_id, peer);
+        let ids = delete_track_ids
+            .map(|v| v.to_vec())
+            .or_else(|| delete_command_message_ids(json_data.as_slice()))
+            .unwrap_or_default();
+        outbound_delete_requests.insert(req_id, (peer, ids));
     } else {
         outbound_msg_requests.insert(req_id, peer);
         let _ = event_tx.send(NetworkEvent::MessageOnWire(peer)).await;
@@ -500,7 +514,7 @@ async fn flush_pending_encrypted_messages(
     >,
     outbound_delete_requests: &mut HashMap<
         libp2p::request_response::OutboundRequestId,
-        PeerId,
+        (PeerId, Vec<String>),
     >,
     event_tx: &mpsc::Sender<NetworkEvent>,
     peer: PeerId,
@@ -519,10 +533,54 @@ async fn flush_pending_encrypted_messages(
             event_tx,
             peer,
             data,
+            None,
             now,
         )
         .await;
     }
+}
+
+async fn apply_incoming_delete_via_ui(
+    event_tx: &mpsc::Sender<NetworkEvent>,
+    from: PeerId,
+    message_ids: Vec<String>,
+) -> (Vec<String>, Vec<String>) {
+    let (reply_tx, reply_rx) = tokio::sync::oneshot::channel();
+    if event_tx
+        .send(NetworkEvent::ChatDeleteApply {
+            from,
+            message_ids,
+            reply: reply_tx,
+        })
+        .await
+        .is_err()
+    {
+        return (Vec::new(), Vec::new());
+    }
+    match tokio::time::timeout(Duration::from_secs(2), reply_rx).await {
+        Ok(Ok(result)) => result,
+        _ => (Vec::new(), Vec::new()),
+    }
+}
+
+fn send_delete_ack_response(
+    session: &mut crypto::SecureSession,
+    channel: libp2p::request_response::ResponseChannel<V1Packet>,
+    swarm: &mut libp2p::Swarm<ChatBehaviour>,
+    deleted: &[String],
+    missing: &[String],
+) -> Option<libp2p::request_response::ResponseChannel<V1Packet>> {
+    let Some(json) = build_delete_ack_json(deleted, missing) else {
+        return Some(channel);
+    };
+    let Ok((header, ciphertext)) = session.encrypt_payload(json.as_slice()) else {
+        return Some(channel);
+    };
+    let _ = swarm.behaviour_mut().request_response.send_response(
+        channel,
+        V1Packet::Encrypted { header, ciphertext },
+    );
+    None
 }
 
 pub async fn run_chat_network(
@@ -709,8 +767,10 @@ pub async fn run_chat_network(
         // (Ack/прочее) однозначно подтвердить доставку конкретному пиру и снять
         // pending-ретраи в UI. Hello-handshake'ы сюда НЕ попадают.
         let mut outbound_msg_requests: HashMap<libp2p::request_response::OutboundRequestId, PeerId> = HashMap::new();
-        let mut outbound_delete_requests: HashMap<libp2p::request_response::OutboundRequestId, PeerId> =
-            HashMap::new();
+        let mut outbound_delete_requests: HashMap<
+            libp2p::request_response::OutboundRequestId,
+            (PeerId, Vec<String>),
+        > = HashMap::new();
         let mut dial_backoff: HashMap<PeerId, Instant> = HashMap::new();
         // Схлопываем подряд идущие `OutFailure` одному пиру: при отправке
         // сообщения без сессии мы шлём Hello + packet, и на DialFailure
@@ -1141,6 +1201,7 @@ pub async fn run_chat_network(
                                             &event_tx,
                                             peer_id,
                                             json_data,
+                                            None,
                                             &now,
                                         )
                                         .await;
@@ -1212,6 +1273,7 @@ pub async fn run_chat_network(
                                         &event_tx,
                                         recipient,
                                         json_data,
+                                        Some(&message_ids),
                                         &now,
                                     )
                                     .await;
@@ -1585,6 +1647,7 @@ pub async fn run_chat_network(
                                             }
                                         }
                                         V1Packet::Encrypted { header, ciphertext } => {
+                                            let mut response_channel = Some(channel);
                                             if let Some(session) = sessions.get_mut(&peer) {
                                                 match session.decrypt_payload(&header, &ciphertext) {
                                                     Ok(plaintext) => {
@@ -1620,13 +1683,27 @@ pub async fn run_chat_network(
                                                                 DecryptedChatFrame::Delete {
                                                                     message_ids,
                                                                 } => {
-                                                                    let _ = event_tx
-                                                                        .send(NetworkEvent::ChatDelete {
-                                                                            from: peer,
+                                                                    let (deleted, missing) =
+                                                                        apply_incoming_delete_via_ui(
+                                                                            &event_tx,
+                                                                            peer,
                                                                             message_ids,
-                                                                        })
+                                                                        )
                                                                         .await;
+                                                                    if let Some(ch) = response_channel.take() {
+                                                                        response_channel =
+                                                                            send_delete_ack_response(
+                                                                                session,
+                                                                                ch,
+                                                                                &mut swarm,
+                                                                                &deleted,
+                                                                                &missing,
+                                                                            );
+                                                                    }
                                                                 }
+                                                                DecryptedChatFrame::DeleteAck {
+                                                                    ..
+                                                                } => {}
                                                             }
                                                         }
                                                     }
@@ -1640,7 +1717,12 @@ pub async fn run_chat_network(
                                                     }
                                                 }
                                             }
-                                            let _ = swarm.behaviour_mut().request_response.send_response(channel, V1Packet::Ack);
+                                            if let Some(ch) = response_channel {
+                                                let _ = swarm
+                                                    .behaviour_mut()
+                                                    .request_response
+                                                    .send_response(ch, V1Packet::Ack);
+                                            }
                                         }
                                         V1Packet::Ack => {
                                             let _ = swarm.behaviour_mut().request_response.send_response(channel, V1Packet::Ack);
@@ -1654,8 +1736,60 @@ pub async fn run_chat_network(
                                     if let Some(delivered_peer) = outbound_msg_requests.remove(&request_id) {
                                         debug!("[{}] ✅ RR: Доставка подтверждена пиром {}", now, &delivered_peer.to_string()[..8]);
                                         let _ = event_tx.send(NetworkEvent::MessageDelivered(delivered_peer)).await;
-                                    } else {
-                                        let _ = outbound_delete_requests.remove(&request_id);
+                                    } else if let Some((ack_peer, requested_ids)) =
+                                        outbound_delete_requests.remove(&request_id)
+                                    {
+                                        match &response {
+                                            V1Packet::Encrypted { header, ciphertext } => {
+                                                if let Some(session) = sessions.get_mut(&peer) {
+                                                    if let Ok(plaintext) =
+                                                        session.decrypt_payload(header, ciphertext)
+                                                    {
+                                                        if let Some(
+                                                            DecryptedChatFrame::DeleteAck {
+                                                                deleted,
+                                                                missing,
+                                                            },
+                                                        ) = parse_decrypted_chat_frame(&plaintext)
+                                                        {
+                                                            let _ = event_tx
+                                                                .send(NetworkEvent::DeleteAckResult {
+                                                                    peer: ack_peer,
+                                                                    deleted,
+                                                                    missing,
+                                                                })
+                                                                .await;
+                                                        } else {
+                                                            let _ = event_tx
+                                                                .send(NetworkEvent::DeleteAckResult {
+                                                                    peer: ack_peer,
+                                                                    deleted: requested_ids,
+                                                                    missing: Vec::new(),
+                                                                })
+                                                                .await;
+                                                        }
+                                                    }
+                                                }
+                                            }
+                                            V1Packet::Ack => {
+                                                let _ = event_tx
+                                                    .send(NetworkEvent::DeleteAckResult {
+                                                        peer: ack_peer,
+                                                        deleted: requested_ids,
+                                                        missing: Vec::new(),
+                                                    })
+                                                    .await;
+                                            }
+                                            _ => {
+                                                let _ = event_tx
+                                                    .send(NetworkEvent::DeleteAckResult {
+                                                        peer: ack_peer,
+                                                        deleted: Vec::new(),
+                                                        missing: requested_ids,
+                                                    })
+                                                    .await;
+                                            }
+                                        }
                                     }
                                     match response {
                                         V1Packet::Hello {
@@ -1748,16 +1882,8 @@ pub async fn run_chat_network(
                                                                     .send(NetworkEvent::ChatMessage(msg))
                                                                     .await;
                                                             }
-                                                            DecryptedChatFrame::Delete {
-                                                                message_ids,
-                                                            } => {
-                                                                let _ = event_tx
-                                                                    .send(NetworkEvent::ChatDelete {
-                                                                        from: peer,
-                                                                        message_ids,
-                                                                    })
-                                                                    .await;
-                                                            }
+                                                            DecryptedChatFrame::DeleteAck { .. } => {}
+                                                            DecryptedChatFrame::Delete { .. } => {}
                                                         }
                                                     }
                                                 }

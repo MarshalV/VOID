@@ -33,9 +33,20 @@ struct ChatDeleteCommand {
     message_ids: Vec<String>,
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct ChatDeleteAck {
+    kind: String,
+    deleted: Vec<String>,
+    missing: Vec<String>,
+}
+
 pub(crate) enum DecryptedChatFrame {
     Message(ChatMessage),
     Delete { message_ids: Vec<String> },
+    DeleteAck {
+        deleted: Vec<String>,
+        missing: Vec<String>,
+    },
 }
 
 /// Лимиты JSON чата после `decrypt_payload` (защита от DoS по памяти).
@@ -138,13 +149,19 @@ fn validate_delete_ids(ids: &[String]) -> bool {
 }
 
 pub(crate) fn is_delete_command_json(plaintext: &[u8]) -> bool {
+    delete_command_message_ids(plaintext).is_some()
+}
+
+pub(crate) fn delete_command_message_ids(plaintext: &[u8]) -> Option<Vec<String>> {
     if plaintext.first() != Some(&b'{') {
-        return false;
+        return None;
     }
-    serde_json::from_slice::<ChatDeleteCommand>(plaintext)
-        .ok()
-        .map(|cmd| cmd.kind == "delete" && validate_delete_ids(&cmd.message_ids))
-        .unwrap_or(false)
+    let cmd = serde_json::from_slice::<ChatDeleteCommand>(plaintext).ok()?;
+    if cmd.kind == "delete" && validate_delete_ids(&cmd.message_ids) {
+        Some(cmd.message_ids)
+    } else {
+        None
+    }
 }
 
 pub(crate) fn parse_decrypted_chat_frame(plaintext: &[u8]) -> Option<DecryptedChatFrame> {
@@ -154,6 +171,22 @@ pub(crate) fn parse_decrypted_chat_frame(plaintext: &[u8]) -> Option<DecryptedCh
     if plaintext.first() != Some(&b'{') {
         return None;
     }
+    if let Ok(ack) = serde_json::from_slice::<ChatDeleteAck>(plaintext) {
+        if ack.kind == "delete_ack"
+            && ack.deleted.len() <= MAX_DELETE_IDS
+            && ack.missing.len() <= MAX_DELETE_IDS
+            && ack
+                .deleted
+                .iter()
+                .chain(ack.missing.iter())
+                .all(|id| validate_message_id(id))
+        {
+            return Some(DecryptedChatFrame::DeleteAck {
+                deleted: ack.deleted,
+                missing: ack.missing,
+            });
+        }
+    }
     if let Ok(cmd) = serde_json::from_slice::<ChatDeleteCommand>(plaintext) {
         if cmd.kind == "delete" && validate_delete_ids(&cmd.message_ids) {
             return Some(DecryptedChatFrame::Delete {
@@ -162,6 +195,24 @@ pub(crate) fn parse_decrypted_chat_frame(plaintext: &[u8]) -> Option<DecryptedCh
         }
     }
     parse_decrypted_chat_json(plaintext).map(DecryptedChatFrame::Message)
+}
+
+pub(crate) fn build_delete_ack_json(
+    deleted: &[String],
+    missing: &[String],
+) -> Option<Vec<u8>> {
+    if deleted.len() + missing.len() > MAX_DELETE_IDS {
+        return None;
+    }
+    if !deleted.iter().chain(missing.iter()).all(|id| validate_message_id(id)) {
+        return None;
+    }
+    let ack = ChatDeleteAck {
+        kind: "delete_ack".into(),
+        deleted: deleted.to_vec(),
+        missing: missing.to_vec(),
+    };
+    serde_json::to_vec(&ack).ok()
 }
 
 pub(crate) fn build_delete_command_json(message_ids: &[String]) -> Option<Vec<u8>> {

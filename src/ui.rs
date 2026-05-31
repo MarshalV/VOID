@@ -1173,19 +1173,31 @@ impl eframe::App for App {
 
                     self.ingest_chat_message(msg);
                 }
-                NetworkEvent::ChatDelete { from, message_ids } => {
-                    let peer_str = from.to_string();
-                    let from_str = from.to_string();
-                    if let Some(msgs) = self.messages.get_mut(&peer_str) {
-                        msgs.retain(|m| {
-                            if message_ids.contains(&m.id) {
-                                m.sender_id == from_str
-                            } else {
-                                true
-                            }
-                        });
+                NetworkEvent::ChatDeleteApply {
+                    from,
+                    message_ids,
+                    reply,
+                } => {
+                    let result = self.apply_incoming_delete(from, &message_ids);
+                    let _ = reply.send(result);
+                }
+                NetworkEvent::DeleteAckResult { peer, deleted: _, missing } => {
+                    if !missing.is_empty() {
+                        let peer_label = self
+                            .known_peers
+                            .get(&peer)
+                            .cloned()
+                            .unwrap_or_else(|| format!("{}…", &peer.to_string()[..8]));
+                        let text = if missing.len() == 1 {
+                            format!("ℹ️ У {peer_label} это сообщение уже удалено")
+                        } else {
+                            format!(
+                                "ℹ️ У {peer_label} {n} сообщ. уже удалено у собеседника",
+                                n = missing.len()
+                            )
+                        };
+                        self.push_toast(text, ToastKind::Info, TOAST_TTL_SHORT);
                     }
-                    self.mark_chat_journal_dirty();
                 }
                 NetworkEvent::Status(msg) => {
                     self.add_status(msg);
