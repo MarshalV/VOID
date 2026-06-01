@@ -12,15 +12,13 @@ use std::time::{Duration, Instant};
 use tracing::warn;
 
 use crate::{
-    file_transfer, parse_seed_input, new_message_id, App, DeleteScope,
+    file_transfer, parse_seed_input, new_message_id, App,
     FileTransferProgress, NetworkEvent, PendingSend, UICommand, RESEND_GRACE,
 };
 
 #[derive(Clone, Copy)]
 enum ConversationClearAction {
     AllLocal,
-    OwnRemoteOnly,
-    OwnBoth,
 }
 
 /// TTL для коротких системных toast'ов.
@@ -1621,20 +1619,6 @@ impl eframe::App for App {
                                 chat_clear_action = Some(ConversationClearAction::AllLocal);
                                 ui.close_menu();
                             }
-                            ui.separator();
-                            ui.label(
-                                egui::RichText::new("Мои сообщения")
-                                    .color(palette::TEXT_MUTED)
-                                    .size(11.0),
-                            );
-                            if ui.button("Только у собеседника").clicked() {
-                                chat_clear_action = Some(ConversationClearAction::OwnRemoteOnly);
-                                ui.close_menu();
-                            }
-                            if ui.button("У обоих").clicked() {
-                                chat_clear_action = Some(ConversationClearAction::OwnBoth);
-                                ui.close_menu();
-                            }
                         });
                     } else {
                         ui.label(
@@ -1684,21 +1668,10 @@ impl eframe::App for App {
 
         if let Some(action) = chat_clear_action {
             if let Ok(peer) = self.selected_chat.parse::<PeerId>() {
-                let toast = match action {
-                    ConversationClearAction::AllLocal => {
-                        self.delete_conversation_local(peer);
-                        "Переписка удалена у вас"
-                    }
-                    ConversationClearAction::OwnRemoteOnly => {
-                        self.delete_own_messages(peer, DeleteScope::RemoteOnly);
-                        "Запрос на удаление ваших сообщений отправлен"
-                    }
-                    ConversationClearAction::OwnBoth => {
-                        self.delete_own_messages(peer, DeleteScope::Both);
-                        "Ваши сообщения удалены у вас, запрос отправлен собеседнику"
-                    }
-                };
-                self.push_toast(toast.into(), ToastKind::Info, TOAST_TTL_SHORT);
+                if matches!(action, ConversationClearAction::AllLocal) {
+                    self.delete_conversation_local(peer);
+                    self.push_toast("Переписка удалена у вас".into(), ToastKind::Info, TOAST_TTL_SHORT);
+                }
             }
         }
 
@@ -2218,7 +2191,7 @@ impl eframe::App for App {
                     .cloned()
                     .unwrap_or_default();
                 let me_str = self.local_peer_id.to_string();
-                let mut pending_msg_delete: Option<(String, DeleteScope)> = None;
+                let mut pending_msg_delete: Option<String> = None;
 
                 egui::ScrollArea::vertical()
                     .id_salt("chat_stream")
@@ -2314,31 +2287,8 @@ impl eframe::App for App {
                                         });
                                     });
                                 bubble.response.context_menu(|ui| {
-                                    if is_me {
-                                        ui.label(
-                                            egui::RichText::new("Удалить сообщение")
-                                                .color(palette::TEXT_MUTED)
-                                                .size(11.0),
-                                        );
-                                        ui.separator();
-                                        if ui.button("Только у меня").clicked() {
-                                            pending_msg_delete =
-                                                Some((msg_id.clone(), DeleteScope::LocalOnly));
-                                            ui.close_menu();
-                                        }
-                                        if ui.button("Только у собеседника").clicked() {
-                                            pending_msg_delete =
-                                                Some((msg_id.clone(), DeleteScope::RemoteOnly));
-                                            ui.close_menu();
-                                        }
-                                        if ui.button("У обоих").clicked() {
-                                            pending_msg_delete =
-                                                Some((msg_id.clone(), DeleteScope::Both));
-                                            ui.close_menu();
-                                        }
-                                    } else if ui.button("🗑 Удалить у себя").clicked() {
-                                        pending_msg_delete =
-                                            Some((msg_id.clone(), DeleteScope::LocalOnly));
+                                    if ui.button("🗑 Удалить").clicked() {
+                                        pending_msg_delete = Some(msg_id.clone());
                                         ui.close_menu();
                                     }
                                 });
@@ -2347,9 +2297,9 @@ impl eframe::App for App {
                         ui.add_space(12.0);
                     });
 
-                if let Some((msg_id, scope)) = pending_msg_delete {
+                if let Some(msg_id) = pending_msg_delete {
                     if let Ok(peer) = self.selected_chat.parse::<PeerId>() {
-                        self.delete_messages(peer, &[msg_id], scope);
+                        self.delete_messages(peer, &[msg_id]);
                     }
                 }
             });

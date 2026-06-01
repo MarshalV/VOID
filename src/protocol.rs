@@ -215,17 +215,6 @@ pub(crate) fn build_delete_ack_json(
     serde_json::to_vec(&ack).ok()
 }
 
-pub(crate) fn build_delete_command_json(message_ids: &[String]) -> Option<Vec<u8>> {
-    if !validate_delete_ids(message_ids) {
-        return None;
-    }
-    let cmd = ChatDeleteCommand {
-        kind: "delete".into(),
-        message_ids: message_ids.to_vec(),
-    };
-    serde_json::to_vec(&cmd).ok()
-}
-
 /// Разбор JSON чата после DR: верхняя граница буфера и длины полей.
 pub(crate) fn parse_decrypted_chat_json(plaintext: &[u8]) -> Option<ChatMessage> {
     if plaintext.len() > MAX_CHAT_JSON_BYTES {

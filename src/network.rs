@@ -21,7 +21,7 @@ use crate::app::SharedChatMessages;
 use crate::crypto;
 use crate::file_transfer;
 use crate::protocol::{
-    build_delete_ack_json, build_delete_command_json, build_v1_hello,
+    build_delete_ack_json, build_v1_hello,
     delete_command_message_ids, is_delete_command_json,
     new_message_id, parse_decrypted_chat_frame, verify_hello_transport_binding, ChatMessage,
     DecryptedChatFrame, V1Packet,
@@ -291,11 +291,6 @@ pub(crate) enum UICommand {
         recipient: Option<PeerId>,
         message_id: Option<String>,
         is_retry: bool,
-    },
-    /// Попросить собеседника удалить копии наших сообщений по id.
-    DeleteMessages {
-        recipient: PeerId,
-        message_ids: Vec<String>,
     },
     // ─── Файловый sub-протокол ──────────────────────────────────────────────
     /// Отправить файл пиру. Сетевой таск читает файл и инициирует Offer.
@@ -1223,52 +1218,6 @@ pub async fn run_chat_network(
                                 }
                                 if !is_retry {
                                     let _ = event_tx.send(NetworkEvent::ChatMessage(msg)).await;
-                                }
-                            }
-                            UICommand::DeleteMessages { recipient, message_ids } => {
-                                let now = chrono::Local::now().format("%H:%M:%S").to_string();
-                                let Some(json_data) = build_delete_command_json(&message_ids) else {
-                                    continue;
-                                };
-                                if sessions.contains_key(&recipient) {
-                                    let _ = send_encrypted_chat_payload(
-                                        &mut swarm,
-                                        &mut sessions,
-                                        &mut outbound_msg_requests,
-                                        &mut outbound_delete_requests,
-                                        &event_tx,
-                                        recipient,
-                                        json_data,
-                                        Some(&message_ids),
-                                        &now,
-                                    )
-                                    .await;
-                                } else if !pending_handshakes.contains_key(&recipient) {
-                                    let ephem_secret =
-                                        crypto::StaticSecret::random_from_rng(&mut rand::rngs::OsRng);
-                                    let ephem_pub = crypto::PublicKey::from(&ephem_secret);
-                                    if let Some(hello) = build_v1_hello(
-                                        &local_key,
-                                        local_peer_id,
-                                        recipient,
-                                        my_public_key,
-                                        ephem_pub,
-                                    ) {
-                                        pending_handshakes.insert(recipient, ephem_secret);
-                                        let _ = swarm
-                                            .behaviour_mut()
-                                            .request_response
-                                            .send_request(&recipient, hello);
-                                    }
-                                    pending_messages
-                                        .entry(recipient)
-                                        .or_default()
-                                        .push(json_data);
-                                } else {
-                                    pending_messages
-                                        .entry(recipient)
-                                        .or_default()
-                                        .push(json_data);
                                 }
                             }
                             // ─── Файловый sub-протокол ──────────────────────
