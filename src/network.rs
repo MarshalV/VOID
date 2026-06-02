@@ -22,9 +22,10 @@ use crate::crypto;
 use crate::file_transfer;
 use crate::protocol::{
     build_delete_ack_json, build_v1_hello,
-    delete_command_message_ids, is_delete_command_json,
-    new_message_id, parse_decrypted_chat_frame, verify_hello_transport_binding, ChatMessage,
-    DecryptedChatFrame, V1Packet,
+    chat_message_id_from_json, delete_command_message_ids, is_delete_command_json,
+    is_read_command_json, new_message_id, parse_decrypted_chat_frame,
+    verify_hello_transport_binding, ChatMessage, DecryptedChatFrame, OutgoingDeliveryStatus,
+    V1Packet,
 };
 
 fn is_junk_addr(ma: &Multiaddr) -> bool {
@@ -139,13 +140,20 @@ pub(crate) enum NetworkEvent {
     /// / входящего коннекта). UI сохранит его в `contact_addrs` — тогда после
     /// рестарта связь с этим контактом поднимется сама.
     PeerAddress(PeerId, Multiaddr),
-    /// Получен Response (Ack/прочее) на ранее отправленное сообщение пиру —
-    /// Сигнал UI снять одно ожидание из `pending_sends` и не показывать ошибку.
-    MessageDelivered(PeerId),
+    /// Получен Response (Ack) на ранее отправленное сообщение — доставка подтверждена.
+    MessageDelivered { peer: PeerId, message_id: String },
+    /// Собеседник прочитал наши сообщения.
+    MessageRead { peer: PeerId, message_ids: Vec<String> },
     /// Сообщение буферизовано до E2EE-хендшейка — UI не должен торопиться с таймаутом.
     MessageAwaitingSession(PeerId),
     /// Зашифрованный пакет чата реально ушёл в сеть (не только в буфер).
-    MessageOnWire(PeerId),
+    MessageOnWire { peer: PeerId, message_id: String },
+    /// Отправка файла отложена — нет E2EE-сессии с пиром.
+    FileSendDeferred {
+        recipient: PeerId,
+        path: String,
+        kind: file_transfer::FileKind,
+    },
     // ─── Файловый sub-протокол ──────────────────────────────────────────────
     /// Входящее предложение файла — пользователь должен принять или отклонить.
     FileOffer {
@@ -291,6 +299,11 @@ pub(crate) enum UICommand {
         recipient: Option<PeerId>,
         message_id: Option<String>,
         is_retry: bool,
+    },
+    /// Уведомить собеседника, что мы прочитали его сообщения.
+    SendReadReceipt {
+        peer: PeerId,
+        message_ids: Vec<String>,
     },
     // ─── Файловый sub-протокол ──────────────────────────────────────────────
     /// Отправить файл пиру. Сетевой таск читает файл и инициирует Offer.
@@ -444,7 +457,7 @@ async fn send_encrypted_chat_payload(
     sessions: &mut HashMap<PeerId, crypto::SecureSession>,
     outbound_msg_requests: &mut HashMap<
         libp2p::request_response::OutboundRequestId,
-        PeerId,
+        (PeerId, String),
     >,
     outbound_delete_requests: &mut HashMap<
         libp2p::request_response::OutboundRequestId,
@@ -470,15 +483,20 @@ async fn send_encrypted_chat_payload(
     };
     let packet = V1Packet::Encrypted { header, ciphertext };
     let req_id = swarm.behaviour_mut().request_response.send_request(&peer, packet);
-    if is_delete_command_json(json_data.as_slice()) {
+    if is_delete_command_json(json_data.as_slice()) || is_read_command_json(json_data.as_slice()) {
         let ids = delete_track_ids
             .map(|v| v.to_vec())
             .or_else(|| delete_command_message_ids(json_data.as_slice()))
             .unwrap_or_default();
         outbound_delete_requests.insert(req_id, (peer, ids));
-    } else {
-        outbound_msg_requests.insert(req_id, peer);
-        let _ = event_tx.send(NetworkEvent::MessageOnWire(peer)).await;
+    } else if let Some(msg_id) = chat_message_id_from_json(json_data.as_slice()) {
+        outbound_msg_requests.insert(req_id, (peer, msg_id.clone()));
+        let _ = event_tx
+            .send(NetworkEvent::MessageOnWire {
+                peer,
+                message_id: msg_id,
+            })
+            .await;
     }
     debug!(
         "[{}] 📨 E2EE: пакет отправлен пиру {}",
@@ -493,7 +511,7 @@ async fn flush_pending_encrypted_messages(
     sessions: &mut HashMap<PeerId, crypto::SecureSession>,
     outbound_msg_requests: &mut HashMap<
         libp2p::request_response::OutboundRequestId,
-        PeerId,
+        (PeerId, String),
     >,
     outbound_delete_requests: &mut HashMap<
         libp2p::request_response::OutboundRequestId,
@@ -727,7 +745,10 @@ pub async fn run_chat_network(
         // RequestId → PeerId для зашифрованных сообщений, чтобы по ответу
         // (Ack/прочее) однозначно подтвердить доставку конкретному пиру и снять
         // pending-ретраи в UI. Hello-handshake'ы сюда НЕ попадают.
-        let mut outbound_msg_requests: HashMap<libp2p::request_response::OutboundRequestId, PeerId> = HashMap::new();
+        let mut outbound_msg_requests: HashMap<
+            libp2p::request_response::OutboundRequestId,
+            (PeerId, String),
+        > = HashMap::new();
         let mut outbound_delete_requests: HashMap<
             libp2p::request_response::OutboundRequestId,
             (PeerId, Vec<String>),
@@ -1130,6 +1151,7 @@ pub async fn run_chat_network(
                                     recipient_id: recipient.map(|p| p.to_string()),
                                     text: text.clone(),
                                     timestamp: chrono::Local::now().format("%H:%M").to_string(),
+                                    delivery: OutgoingDeliveryStatus::Pending,
                                 };
 
                                 let json_data = match serde_json::to_vec(&msg) {
@@ -1197,10 +1219,25 @@ pub async fn run_chat_network(
                                                 );
                                             }
                                         }
-                                        pending_messages
-                                            .entry(peer_id)
-                                            .or_default()
-                                            .push(json_data);
+                                        let msg_id_for_dedup = chat_message_id_from_json(json_data.as_slice());
+                                        let queue = pending_messages.entry(peer_id).or_default();
+                                        if let Some(ref mid) = msg_id_for_dedup {
+                                            if queue.iter().any(|b| {
+                                                chat_message_id_from_json(b.as_slice()).as_deref()
+                                                    == Some(mid.as_str())
+                                            }) {
+                                                debug!(
+                                                    "[{}] ⏭ E2EE: сообщение {} уже в буфере для {}",
+                                                    now,
+                                                    &mid[..8.min(mid.len())],
+                                                    &peer_id.to_string()[..8]
+                                                );
+                                            } else {
+                                                queue.push(json_data);
+                                            }
+                                        } else {
+                                            queue.push(json_data);
+                                        }
                                         let _ = event_tx
                                             .send(NetworkEvent::MessageAwaitingSession(peer_id))
                                             .await;
@@ -1220,9 +1257,44 @@ pub async fn run_chat_network(
                                     let _ = event_tx.send(NetworkEvent::ChatMessage(msg)).await;
                                 }
                             }
+                            UICommand::SendReadReceipt { peer, message_ids } => {
+                                let now = chrono::Local::now().format("%H:%M:%S").to_string();
+                                if message_ids.is_empty() {
+                                    continue;
+                                }
+                                let Some(json_data) =
+                                    crate::protocol::build_read_receipt_json(&message_ids)
+                                else {
+                                    continue;
+                                };
+                                if sessions.contains_key(&peer) {
+                                    let _ = send_encrypted_chat_payload(
+                                        &mut swarm,
+                                        &mut sessions,
+                                        &mut outbound_msg_requests,
+                                        &mut outbound_delete_requests,
+                                        &event_tx,
+                                        peer,
+                                        json_data,
+                                        Some(&message_ids),
+                                        &now,
+                                    )
+                                    .await;
+                                }
+                            }
                             // ─── Файловый sub-протокол ──────────────────────
                             UICommand::SendFile { recipient, path, kind } => {
                                 let now = chrono::Local::now().format("%H:%M:%S").to_string();
+                                if !sessions.contains_key(&recipient) {
+                                    let _ = event_tx
+                                        .send(NetworkEvent::FileSendDeferred {
+                                            recipient,
+                                            path,
+                                            kind,
+                                        })
+                                        .await;
+                                    continue;
+                                }
                                 match std::fs::read(&path) {
                                     Err(e) => {
                                         let _ = event_tx
@@ -1242,10 +1314,11 @@ pub async fn run_chat_network(
                                                 .await;
                                         } else if !sessions.contains_key(&recipient) {
                                             let _ = event_tx
-                                                .send(NetworkEvent::Status(
-                                                    "❌ Файл: сначала установите зашифрованный чат с этим контактом (E2EE-сессия)."
-                                                        .into(),
-                                                ))
+                                                .send(NetworkEvent::FileSendDeferred {
+                                                    recipient,
+                                                    path,
+                                                    kind,
+                                                })
                                                 .await;
                                         } else {
                                             let sha256 = file_transfer::hash_file(&data);
@@ -1614,9 +1687,17 @@ pub async fn run_chat_network(
                                                                             );
                                                                     }
                                                                 }
-                                                                DecryptedChatFrame::DeleteAck {
-                                                                    ..
-                                                                } => {}
+                                                                DecryptedChatFrame::DeleteAck => {}
+                                                                DecryptedChatFrame::Read {
+                                                                    message_ids,
+                                                                } => {
+                                                                    let _ = event_tx
+                                                                        .send(NetworkEvent::MessageRead {
+                                                                            peer,
+                                                                            message_ids,
+                                                                        })
+                                                                        .await;
+                                                                }
                                                             }
                                                         }
                                                     }
@@ -1646,9 +1727,21 @@ pub async fn run_chat_network(
                                     // Если это ответ на наше отправленное сообщение (Encrypted),
                                     // считаем доставку подтверждённой и сообщаем UI, чтобы он снял
                                     // соответствующий pending-ретрай и не показывал ошибку.
-                                    if let Some(delivered_peer) = outbound_msg_requests.remove(&request_id) {
-                                        debug!("[{}] ✅ RR: Доставка подтверждена пиром {}", now, &delivered_peer.to_string()[..8]);
-                                        let _ = event_tx.send(NetworkEvent::MessageDelivered(delivered_peer)).await;
+                                    if let Some((delivered_peer, message_id)) =
+                                        outbound_msg_requests.remove(&request_id)
+                                    {
+                                        debug!(
+                                            "[{}] ✅ RR: Доставка подтверждена пиром {} msg {}",
+                                            now,
+                                            &delivered_peer.to_string()[..8],
+                                            &message_id[..8.min(message_id.len())]
+                                        );
+                                        let _ = event_tx
+                                            .send(NetworkEvent::MessageDelivered {
+                                                peer: delivered_peer,
+                                                message_id,
+                                            })
+                                            .await;
                                     } else if outbound_delete_requests.remove(&request_id).is_some() {
                                         debug!(
                                             "[{}] ✅ RR: delete подтверждён пиром {}",
@@ -1747,8 +1840,18 @@ pub async fn run_chat_network(
                                                                     .send(NetworkEvent::ChatMessage(msg))
                                                                     .await;
                                                             }
-                                                            DecryptedChatFrame::DeleteAck { .. } => {}
+                                                            DecryptedChatFrame::DeleteAck => {}
                                                             DecryptedChatFrame::Delete { .. } => {}
+                                                            DecryptedChatFrame::Read {
+                                                                message_ids,
+                                                            } => {
+                                                                let _ = event_tx
+                                                                    .send(NetworkEvent::MessageRead {
+                                                                        peer,
+                                                                        message_ids,
+                                                                    })
+                                                                    .await;
+                                                            }
                                                         }
                                                     }
                                                 }
@@ -1899,7 +2002,7 @@ pub async fn run_chat_network(
                             // и новые Hello игнорируются (отправлялся только Ack → чат мёртв).
                             sessions.remove(&peer_id);
                             pending_handshakes.remove(&peer_id);
-                            pending_messages.remove(&peer_id);
+                            // pending_messages сохраняем — UI/ретрай переотправит после реконнекта.
 
                             // Планируем переподключение для контактов из vault.
                             // Backoff: 5 с → 20 с → 60 с → 5 мин (и далее 5 мин).

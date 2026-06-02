@@ -1,6 +1,6 @@
 //! Состояние приложения, vault unlock и логика повторной отправки.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::path::Path;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
@@ -18,8 +18,8 @@ use crate::chat_store::ChatJournal;
 use crate::crypto;
 use crate::file_transfer;
 use crate::network::{run_chat_network, NetworkEvent, UICommand};
-use crate::protocol::{new_message_id, ChatMessage, FileTransferProgress};
-use crate::ui::{setup_custom_style, truncate_text, Toast, ToastKind, TOAST_TTL_LONG, TOAST_TTL_SHORT};
+use crate::protocol::{new_message_id, ChatMessage, FileTransferProgress, OutgoingDeliveryStatus};
+use crate::ui::{setup_custom_style, Toast, ToastKind, TOAST_TTL_SHORT};
 use crate::vault::{AddressBookEntry, Storage, VaultUnlockKind, VaultUnlockState};
 
 /// Переписки, доступные и UI, и сетевому таску (входящее удаление без roundtrip через egui).
@@ -98,8 +98,9 @@ pub(crate) struct DeferredNetworkSpawn {
 
 /// Сообщение в очереди ожидания доставки. Если в течение `RESEND_GRACE` после
 /// последней попытки прилетел `SendFailedDial` (или просто прошло столько же
-/// времени без подтверждения), запускаем DHT-lookup и через `RESEND_DELAY`
-/// отправляем повторно. После `MAX_ATTEMPTS` попыток сдаёмся с toast'ом.
+/// времени без подтверждения), запускаем DHT-lookup и через `resend_delay_for_attempt`
+/// отправляем повторно. Очередь не сбрасывается, пока сообщение не доставлено
+/// или контакт не признан не-VOID.
 pub(crate) struct PendingSend {
     pub(crate) peer: PeerId,
     pub(crate) text: String,
@@ -107,14 +108,29 @@ pub(crate) struct PendingSend {
     pub(crate) last_send_at: Instant,
     pub(crate) dht_kicked: bool,
     pub(crate) dht_kicked_at: Option<Instant>,
-    pub(crate) attempts: u8,
+    pub(crate) attempts: u32,
     /// Сообщение ждёт E2EE-хендшейк — не запускаем таймаут доставки.
     pub(crate) awaiting_session: bool,
 }
 
+/// Файл в очереди до появления E2EE-сессии или сети.
+pub(crate) struct PendingFileSend {
+    pub(crate) peer: PeerId,
+    pub(crate) path: String,
+    pub(crate) kind: file_transfer::FileKind,
+    pub(crate) last_attempt: Instant,
+}
+
 pub(crate) const RESEND_GRACE: Duration = Duration::from_secs(3);
-pub(crate) const RESEND_DELAY: Duration = Duration::from_secs(5);
-pub(crate) const MAX_ATTEMPTS: u8 = 2;
+/// Базовая задержка перед повтором после DHT-поиска (растёт с числом попыток).
+pub(crate) const RESEND_DELAY_BASE: Duration = Duration::from_secs(5);
+pub(crate) const RESEND_DELAY_MAX: Duration = Duration::from_secs(300);
+
+pub(crate) fn resend_delay_for_attempt(attempts: u32) -> Duration {
+    let exp = attempts.min(6);
+    let secs = RESEND_DELAY_BASE.as_secs().saturating_mul(1u64 << exp);
+    Duration::from_secs(secs.min(RESEND_DELAY_MAX.as_secs()))
+}
 
 pub(crate) struct App {
     pub(crate) local_peer_id: PeerId,
@@ -145,6 +161,9 @@ pub(crate) struct App {
     pub(crate) _sessions: HashMap<libp2p::PeerId, crypto::SecureSession>,
     pub(crate) _local_static: crypto::StaticSecret,
     pub(crate) pending_sends: Vec<PendingSend>,
+    pub(crate) pending_file_sends: Vec<PendingFileSend>,
+    /// Прочитанные входящие — read receipt уже отправлен (не персистится).
+    pub(crate) read_receipts_sent: HashSet<(String, String)>,
     pub(crate) toasts: Vec<Toast>,
     pub(crate) chat_bg_texture: Option<egui::TextureHandle>,
     // ─── Файловый sub-протокол ──────────────────────────────────────────────
@@ -212,6 +231,8 @@ impl App {
             _sessions: HashMap::new(),
             _local_static: local_static,
             pending_sends: Vec::new(),
+            pending_file_sends: Vec::new(),
+            read_receipts_sent: HashSet::new(),
             toasts: Vec::new(),
             chat_bg_texture: None,
             incoming_file_offers: Vec::new(),
@@ -540,6 +561,8 @@ impl App {
             }
         }
 
+        self.restore_pending_outgoing();
+
         info!("=== VOID P2P Chat ===");
         info!("Ваш Peer ID: {}", self.local_peer_id);
         info!("Ваш никнейм: {}", self.local_nickname);
@@ -609,6 +632,177 @@ impl App {
         }
     }
 
+    /// Обновляет статус доставки исходящего сообщения в журнале.
+    pub(crate) fn set_outgoing_delivery(
+        &mut self,
+        peer: PeerId,
+        message_id: &str,
+        status: OutgoingDeliveryStatus,
+    ) {
+        let peer_str = peer.to_string();
+        let me = self.local_peer_id.to_string();
+        let mut changed = false;
+        if let Some(msgs) = self.messages.lock().get_mut(&peer_str) {
+            for msg in msgs.iter_mut() {
+                if msg.id == message_id && msg.sender_id == me {
+                    if status == OutgoingDeliveryStatus::Read
+                        || (status == OutgoingDeliveryStatus::Delivered
+                            && msg.delivery != OutgoingDeliveryStatus::Read)
+                    {
+                        msg.delivery = status;
+                        changed = true;
+                    }
+                }
+            }
+        }
+        if changed {
+            self.mark_chat_journal_dirty();
+        }
+    }
+
+    /// Помечает несколько исходящих сообщений как прочитанные собеседником.
+    pub(crate) fn mark_outgoing_read(&mut self, peer: PeerId, message_ids: &[String]) {
+        let peer_str = peer.to_string();
+        let me = self.local_peer_id.to_string();
+        let mut changed = false;
+        if let Some(msgs) = self.messages.lock().get_mut(&peer_str) {
+            for msg in msgs.iter_mut() {
+                if message_ids.contains(&msg.id) && msg.sender_id == me {
+                    if msg.delivery != OutgoingDeliveryStatus::Read {
+                        msg.delivery = OutgoingDeliveryStatus::Read;
+                        changed = true;
+                    }
+                }
+            }
+        }
+        if changed {
+            self.mark_chat_journal_dirty();
+        }
+    }
+
+    /// Снимает сообщение из очереди повторной отправки после подтверждения доставки.
+    pub(crate) fn complete_pending_send(&mut self, peer: PeerId, message_id: &str) {
+        self.pending_sends
+            .retain(|p| !(p.peer == peer && p.message_id == message_id));
+    }
+
+    /// Восстанавливает очередь недоставленных исходящих из журнала после рестарта.
+    pub(crate) fn restore_pending_outgoing(&mut self) {
+        let me = self.local_peer_id.to_string();
+        let snapshot: Vec<(PeerId, String, String)> = {
+            let messages = self.messages.lock();
+            let mut out = Vec::new();
+            for (peer_str, msgs) in messages.iter() {
+                let Ok(peer) = peer_str.parse::<PeerId>() else {
+                    continue;
+                };
+                for msg in msgs {
+                    if msg.sender_id == me && msg.delivery == OutgoingDeliveryStatus::Pending {
+                        out.push((peer, msg.id.clone(), msg.text.clone()));
+                    }
+                }
+            }
+            out
+        };
+
+        for (peer, message_id, text) in snapshot {
+            if self
+                .pending_sends
+                .iter()
+                .any(|p| p.message_id == message_id)
+            {
+                continue;
+            }
+            self.pending_sends.push(PendingSend {
+                peer,
+                text: text.clone(),
+                message_id: message_id.clone(),
+                last_send_at: Instant::now(),
+                dht_kicked: false,
+                dht_kicked_at: None,
+                attempts: 0,
+                awaiting_session: false,
+            });
+            let _ = self.command_tx.try_send(UICommand::SendMessage {
+                sender_name: self.local_nickname.clone(),
+                text,
+                recipient: Some(peer),
+                message_id: Some(message_id),
+                is_retry: true,
+            });
+        }
+    }
+
+    /// Отправляет read receipt для непрочитанных входящих в открытом чате.
+    pub(crate) fn flush_read_receipts_for_open_chat(&mut self) {
+        if self.selected_chat.is_empty() {
+            return;
+        }
+        let Ok(peer) = self.selected_chat.parse::<PeerId>() else {
+            return;
+        };
+        let peer_str = peer.to_string();
+        let me = self.local_peer_id.to_string();
+        let unread: Vec<String> = {
+            let msgs = self.messages.lock();
+            msgs.get(&peer_str)
+                .map(|thread| {
+                    thread
+                        .iter()
+                        .filter(|m| m.sender_id != me)
+                        .filter(|m| {
+                            !self
+                                .read_receipts_sent
+                                .contains(&(peer_str.clone(), m.id.clone()))
+                        })
+                        .map(|m| m.id.clone())
+                        .collect()
+                })
+                .unwrap_or_default()
+        };
+        if unread.is_empty() {
+            return;
+        }
+        for id in &unread {
+            self.read_receipts_sent
+                .insert((peer_str.clone(), id.clone()));
+        }
+        let _ = self.command_tx.try_send(UICommand::SendReadReceipt {
+            peer,
+            message_ids: unread,
+        });
+    }
+
+    pub(crate) fn tick_pending_file_sends(&mut self) {
+        const RETRY: Duration = Duration::from_secs(10);
+        let now = Instant::now();
+        let due: Vec<(PeerId, String, file_transfer::FileKind)> = self
+            .pending_file_sends
+            .iter()
+            .filter(|p| now.duration_since(p.last_attempt) >= RETRY)
+            .map(|p| (p.peer, p.path.clone(), p.kind))
+            .collect();
+        for (peer, path, kind) in due {
+            if let Some(slot) = self
+                .pending_file_sends
+                .iter_mut()
+                .find(|p| p.peer == peer && p.path == path)
+            {
+                slot.last_attempt = now;
+            }
+            let _ = self.command_tx.try_send(UICommand::SendFile {
+                recipient: peer,
+                path,
+                kind,
+            });
+        }
+    }
+
+    pub(crate) fn complete_pending_file_send(&mut self, peer: PeerId, path: &str) {
+        self.pending_file_sends
+            .retain(|p| !(p.peer == peer && p.path == path));
+    }
+
     /// Удаляет сообщения только в локальном диалоге (свои и чужие).
     pub(crate) fn delete_messages(&mut self, peer: PeerId, message_ids: &[String]) {
         if message_ids.is_empty() {
@@ -665,37 +859,17 @@ impl App {
         }
     }
 
-    /// Машина состояний для повторных отправок: 3 сек ждём DialFailure / тишину →
-    /// дёргаем `SearchPeer` (kad.get_closest_peers), 5 сек ждём → ретраим
-    /// `SendMessage`. После `MAX_ATTEMPTS` попыток — toast и снимаем.
+    /// Машина состояний для повторных отправок: `RESEND_GRACE` → DHT-lookup →
+    /// повтор с нарастающей задержкой. Очередь держится, пока сообщение не
+    /// доставлено или контакт не признан не-VOID.
     pub(crate) fn tick_pending_sends(&mut self) {
         let now = Instant::now();
-        let mut to_drop: Vec<usize> = Vec::new();
         let mut search_cmds: Vec<PeerId> = Vec::new();
         let mut resend_cmds: Vec<(PeerId, String, String)> = Vec::new();
         let mut toasts: Vec<(String, ToastKind, Duration)> = Vec::new();
 
-        for (idx, p) in self.pending_sends.iter_mut().enumerate() {
+        for p in self.pending_sends.iter_mut() {
             if p.awaiting_session {
-                continue;
-            }
-            // Финальная сдача — после исчерпания попыток.
-            if p.attempts >= MAX_ATTEMPTS {
-                if let Some(kicked_at) = p.dht_kicked_at {
-                    if now.duration_since(kicked_at) >= RESEND_DELAY {
-                        let name_short = format!("{}…", &p.peer.to_string()[..10]);
-                        toasts.push((
-                            format!(
-                                "✖ Не удалось доставить «{}» пиру {}",
-                                truncate_text(&p.text, 32),
-                                name_short
-                            ),
-                            ToastKind::Error,
-                            TOAST_TTL_LONG,
-                        ));
-                        to_drop.push(idx);
-                    }
-                }
                 continue;
             }
 
@@ -712,27 +886,20 @@ impl App {
                 p.dht_kicked_at = Some(now);
             }
 
-            // Фаза 2: после DHT-поиска ждём `RESEND_DELAY` и шлём повторно.
+            // Фаза 2: после DHT-поиска ждём backoff и шлём повторно.
             if let Some(kicked_at) = p.dht_kicked_at {
-                if now.duration_since(kicked_at) >= RESEND_DELAY {
+                let delay = resend_delay_for_attempt(p.attempts);
+                if now.duration_since(kicked_at) >= delay {
                     resend_cmds.push((p.peer, p.text.clone(), p.message_id.clone()));
                     p.attempts = p.attempts.saturating_add(1);
                     p.last_send_at = now;
                     p.dht_kicked = false;
                     p.dht_kicked_at = None;
 
-                    if p.attempts >= MAX_ATTEMPTS {
-                        // Сразу запустим финальный таймер «сдачи» (см. ветку выше
-                        // — сработает, когда снова пройдёт RESEND_DELAY).
-                        p.dht_kicked_at = Some(now);
-                    } else {
+                    if p.attempts <= 3 || p.attempts.is_multiple_of(6) {
                         let name_short = format!("{}…", &p.peer.to_string()[..10]);
                         toasts.push((
-                            format!(
-                                "↻ Повтор #{} → {}",
-                                p.attempts,
-                                name_short
-                            ),
+                            format!("↻ Повтор #{} → {}", p.attempts, name_short),
                             ToastKind::Warn,
                             TOAST_TTL_SHORT,
                         ));
@@ -741,12 +908,6 @@ impl App {
             }
         }
 
-        // Удаляем сданные (с конца, чтобы индексы не съехали).
-        for idx in to_drop.iter().rev() {
-            self.pending_sends.swap_remove(*idx);
-        }
-
-        // Применяем накопленные команды и toast'ы (борем borrow checker).
         for (text, kind, ttl) in toasts {
             self.push_toast(text, kind, ttl);
         }

@@ -13,7 +13,8 @@ use tracing::warn;
 
 use crate::{
     file_transfer, parse_seed_input, new_message_id, App,
-    FileTransferProgress, NetworkEvent, PendingSend, UICommand, RESEND_GRACE,
+    FileTransferProgress, NetworkEvent, OutgoingDeliveryStatus, PendingSend, UICommand,
+    RESEND_GRACE,
 };
 
 #[derive(Clone, Copy)]
@@ -934,6 +935,14 @@ pub(crate) fn truncate_text(s: &str, max_chars: usize) -> String {
     out
 }
 
+fn delivery_status_label(status: OutgoingDeliveryStatus) -> &'static str {
+    match status {
+        OutgoingDeliveryStatus::Pending => "○",
+        OutgoingDeliveryStatus::Delivered => "✓",
+        OutgoingDeliveryStatus::Read => "✓✓",
+    }
+}
+
 /// Из "2026-04-18 14:30:45" берём "14:30".
 fn short_time(ts: &str) -> String {
     let last = ts.split_whitespace().last().unwrap_or(ts);
@@ -1154,10 +1163,37 @@ impl eframe::App for App {
                             });
                         }
                     }
+                    // Файлы из очереди — повторяем отправку при появлении пира.
+                    let files: Vec<(String, file_transfer::FileKind)> = self
+                        .pending_file_sends
+                        .iter()
+                        .filter(|p| p.peer == peer)
+                        .map(|p| (p.path.clone(), p.kind))
+                        .collect();
+                    for (path, kind) in files {
+                        let _ = self.command_tx.try_send(UICommand::SendFile {
+                            recipient: peer,
+                            path,
+                            kind,
+                        });
+                    }
                 }
                 NetworkEvent::Disconnected(peer) => {
                     self.connected_peers = self.connected_peers.saturating_sub(1);
                     self.add_status(format!("❌ Отключено: {}...", &peer.to_string()[..8]));
+                    // Пир офлайн — снимаем блокировку E2EE-ожидания и ускоряем ретрай.
+                    for p in self
+                        .pending_sends
+                        .iter_mut()
+                        .filter(|p| p.peer == peer)
+                    {
+                        p.awaiting_session = false;
+                        p.dht_kicked = false;
+                        p.dht_kicked_at = None;
+                        p.last_send_at = Instant::now()
+                            .checked_sub(RESEND_GRACE + Duration::from_millis(50))
+                            .unwrap_or_else(Instant::now);
+                    }
                 }
                 NetworkEvent::ChatMessage(msg) => {
                     // Update known peers for display names
@@ -1182,16 +1218,16 @@ impl eframe::App for App {
                     self.dht_routing_lines = lines;
                     self.add_status(format!("DHT: в таблице маршрутов {} узл.", total));
                 }
-                NetworkEvent::MessageDelivered(peer) => {
-                    // Снимаем самое раннее ожидание этого пира: ретрая не будет,
-                    // ошибочный toast «✖ Не удалось доставить…» тоже не появится.
-                    if let Some(idx) = self
-                        .pending_sends
-                        .iter()
-                        .position(|p| p.peer == peer)
-                    {
-                        self.pending_sends.remove(idx);
-                    }
+                NetworkEvent::MessageDelivered { peer, message_id } => {
+                    self.set_outgoing_delivery(
+                        peer,
+                        &message_id,
+                        OutgoingDeliveryStatus::Delivered,
+                    );
+                    self.complete_pending_send(peer, &message_id);
+                }
+                NetworkEvent::MessageRead { peer, message_ids } => {
+                    self.mark_outgoing_read(peer, &message_ids);
                 }
                 NetworkEvent::MessageAwaitingSession(peer) => {
                     if let Some(p) = self
@@ -1205,25 +1241,43 @@ impl eframe::App for App {
                         p.dht_kicked_at = None;
                     }
                 }
-                NetworkEvent::MessageOnWire(peer) => {
+                NetworkEvent::MessageOnWire { peer, message_id } => {
                     if let Some(p) = self
                         .pending_sends
                         .iter_mut()
-                        .find(|p| p.peer == peer)
+                        .find(|p| p.peer == peer && p.message_id == message_id)
                     {
                         p.awaiting_session = false;
                         p.last_send_at = Instant::now();
                     }
                 }
+                NetworkEvent::FileSendDeferred { recipient, path, kind } => {
+                    if !self
+                        .pending_file_sends
+                        .iter()
+                        .any(|p| p.peer == recipient && p.path == path)
+                    {
+                        self.pending_file_sends.push(crate::app::PendingFileSend {
+                            peer: recipient,
+                            path: path.clone(),
+                            kind,
+                            last_attempt: Instant::now(),
+                        });
+                        self.add_status(format!(
+                            "⏳ Файл «{}» в очереди — ждём сеть или контакт {}",
+                            file_transfer::safe_filename(&path),
+                            &recipient.to_string()[..8.min(recipient.to_string().len())]
+                        ));
+                    }
+                }
                 NetworkEvent::SendFailedDial(peer) => {
-                    // Сразу подталкиваем самое раннее ожидающее сообщение
-                    // этому пиру к фазе DHT-lookup (сдвигаем `last_send_at`
-                    // в прошлое — следующий tick запустит retry-логику).
-                    if let Some(p) = self
+                    // Подталкиваем все ожидающие сообщения этому пиру к DHT-lookup.
+                    for p in self
                         .pending_sends
                         .iter_mut()
-                        .find(|p| p.peer == peer && !p.dht_kicked)
+                        .filter(|p| p.peer == peer && !p.dht_kicked)
                     {
+                        p.awaiting_session = false;
                         p.last_send_at = Instant::now()
                             .checked_sub(RESEND_GRACE + Duration::from_millis(50))
                             .unwrap_or_else(Instant::now);
@@ -1325,6 +1379,15 @@ impl eframe::App for App {
                     peer,
                     kind,
                 } => {
+                    if is_outgoing {
+                        if let Some(pending) = self.pending_file_sends.iter().find(|p| {
+                            p.peer == peer
+                                && file_transfer::safe_filename(&p.path) == filename
+                        }) {
+                            let path = pending.path.clone();
+                            self.complete_pending_file_send(peer, &path);
+                        }
+                    }
                     self.active_file_transfers
                         .entry(transfer_id)
                         .and_modify(|p| {
@@ -1412,11 +1475,16 @@ impl eframe::App for App {
 
         // ===== Tick: повторные отправки + истечение toast'ов =====
         self.tick_pending_sends();
+        self.tick_pending_file_sends();
+        self.flush_read_receipts_for_open_chat();
         let now = Instant::now();
         self.toasts.retain(|t| t.expires_at > now);
 
         // Чтобы фоновые таймеры (retry/toast) тикали без активности пользователя.
-        if !self.pending_sends.is_empty() || !self.toasts.is_empty() {
+        if !self.pending_sends.is_empty()
+            || !self.pending_file_sends.is_empty()
+            || !self.toasts.is_empty()
+        {
             ctx.request_repaint_after(Duration::from_millis(250));
         }
 
@@ -2020,7 +2088,7 @@ impl eframe::App for App {
                                                     if let Some(kind) = picked {
                                                         self.show_attach_menu = false;
                                                         let cmd_tx = self.command_tx.clone();
-                                                        // Открываем нативный диалог с фильтрами типа.
+                                                        let peer_for_file = peer_id;
                                                         std::thread::spawn(move || {
                                                             let mut dialog =
                                                                 rfd::FileDialog::new();
@@ -2036,7 +2104,7 @@ impl eframe::App for App {
                                                             {
                                                                 let _ = cmd_tx.try_send(
                                                                     UICommand::SendFile {
-                                                                        recipient: peer_id,
+                                                                        recipient: peer_for_file,
                                                                         path: path
                                                                             .display()
                                                                             .to_string(),
@@ -2108,7 +2176,7 @@ impl eframe::App for App {
                                                 last_send_at: Instant::now(),
                                                 dht_kicked: false,
                                                 dht_kicked_at: None,
-                                                attempts: 1,
+                                                attempts: 0,
                                                 awaiting_session: false,
                                             });
                                         }
@@ -2275,6 +2343,29 @@ impl eframe::App for App {
                                                     egui::Align::Center,
                                                 ),
                                                 |ui| {
+                                                    if is_me {
+                                                        let status_color = match msg.delivery {
+                                                            OutgoingDeliveryStatus::Read => {
+                                                                palette::ACCENT
+                                                            }
+                                                            OutgoingDeliveryStatus::Delivered => {
+                                                                palette::TEXT_MUTED
+                                                            }
+                                                            OutgoingDeliveryStatus::Pending => {
+                                                                palette::TEXT_MUTED
+                                                            }
+                                                        };
+                                                        ui.label(
+                                                            egui::RichText::new(
+                                                                delivery_status_label(
+                                                                    msg.delivery,
+                                                                ),
+                                                            )
+                                                            .size(11.0)
+                                                            .color(status_color),
+                                                        );
+                                                        ui.add_space(4.0);
+                                                    }
                                                     ui.label(
                                                         egui::RichText::new(short_time(
                                                             &msg.timestamp,

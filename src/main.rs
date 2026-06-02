@@ -11,7 +11,7 @@ mod vault;
 
 pub(crate) use app::{App, PendingSend, RESEND_GRACE, SharedChatMessages};
 pub(crate) use bootstrap::parse_seed_input;
-pub(crate) use protocol::{ChatMessage, new_message_id};
+pub(crate) use protocol::{new_message_id, OutgoingDeliveryStatus};
 pub(crate) use network::{NetworkEvent, UICommand};
 pub(crate) use protocol::FileTransferProgress;
 
