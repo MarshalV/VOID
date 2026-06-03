@@ -1227,18 +1227,37 @@ pub async fn run_chat_network(
 
                                 if let Some(peer_id) = recipient {
                                     if sessions.contains_key(&peer_id) {
-                                        let _ = send_encrypted_chat_payload(
-                                            &mut swarm,
-                                            &mut sessions,
-                                            &mut outbound_msg_requests,
-                                            &mut outbound_delete_requests,
-                                            &event_tx,
-                                            peer_id,
-                                            json_data,
-                                            None,
-                                            &now,
-                                        )
-                                        .await;
+                                        let msg_id_for_send =
+                                            chat_message_id_from_json(json_data.as_slice());
+                                        let in_flight = msg_id_for_send.as_ref().is_some_and(|mid| {
+                                            outbound_msg_requests
+                                                .values()
+                                                .any(|(p, id)| *p == peer_id && id == mid)
+                                        });
+                                        if in_flight {
+                                            debug!(
+                                                "[{}] ⏭ E2EE: {} уже в полёте к {}",
+                                                now,
+                                                msg_id_for_send
+                                                    .as_deref()
+                                                    .map(|s| &s[..8.min(s.len())])
+                                                    .unwrap_or("?"),
+                                                &peer_id.to_string()[..8]
+                                            );
+                                        } else {
+                                            let _ = send_encrypted_chat_payload(
+                                                &mut swarm,
+                                                &mut sessions,
+                                                &mut outbound_msg_requests,
+                                                &mut outbound_delete_requests,
+                                                &event_tx,
+                                                peer_id,
+                                                json_data,
+                                                None,
+                                                &now,
+                                            )
+                                            .await;
+                                        }
                                     } else {
                                         let force_hs = pending_handshakes.contains_key(&peer_id)
                                             && swarm.is_connected(&peer_id);

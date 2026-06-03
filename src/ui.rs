@@ -1132,36 +1132,14 @@ impl eframe::App for App {
                     if peer != self.local_peer_id {
                         self.select_peer_if_no_chat(peer);
                     }
-                    // Коннект появился — немедленно переотправляем зависшие
-                    // сообщения этому пиру, не дожидаясь `RESEND_GRACE`/
-                    // `RESEND_DELAY`. Без этого пользователь видит, что пир
-                    // уже в сети, но сообщение уходит только через 8+ сек.
-                    let mut to_resend: Vec<(usize, PeerId, String, String)> = Vec::new();
-                    for (idx, p) in self.pending_sends.iter().enumerate() {
-                        if p.peer == peer {
-                            to_resend.push((idx, p.peer, p.text.clone(), p.message_id.clone()));
-                        }
-                    }
-                    if !to_resend.is_empty() {
-                        let now = Instant::now();
-                        for (idx, _, _, _) in &to_resend {
-                            if let Some(p) = self.pending_sends.get_mut(*idx) {
-                                p.awaiting_session = false;
-                                p.attempts = p.attempts.saturating_add(1);
-                                p.last_send_at = now;
-                                p.dht_kicked = false;
-                                p.dht_kicked_at = None;
-                            }
-                        }
-                        for (_, peer, text, message_id) in to_resend {
-                            let _ = self.command_tx.try_send(UICommand::SendMessage {
-                                sender_name: self.local_nickname.clone(),
-                                text,
-                                recipient: Some(peer),
-                                message_id: Some(message_id),
-                                is_retry: true,
-                            });
-                        }
+                    // Сеть сама шлёт Hello и flush буфера при ConnectionEstablished —
+                    // повторный SendMessage здесь давал дубликаты у собеседника.
+                    for p in self
+                        .pending_sends
+                        .iter_mut()
+                        .filter(|p| p.peer == peer)
+                    {
+                        p.awaiting_session = false;
                     }
                     // Файлы из очереди — повторяем отправку при появлении пира.
                     let files: Vec<(String, file_transfer::FileKind)> = self
