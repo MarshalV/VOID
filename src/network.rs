@@ -22,9 +22,9 @@ use crate::crypto;
 use crate::file_transfer;
 use crate::protocol::{
     build_delete_ack_json, build_v1_hello,
-    chat_message_id_from_json, delete_command_message_ids, is_delete_command_json,
+    chat_message_id_from_json,     delete_command_message_ids, is_delete_command_json,
     is_read_command_json, new_message_id, parse_decrypted_chat_frame,
-    verify_hello_transport_binding, ChatMessage, DecryptedChatFrame, OutgoingDeliveryStatus,
+    read_command_message_ids, verify_hello_transport_binding, ChatMessage, DecryptedChatFrame, OutgoingDeliveryStatus,
     V1Packet,
 };
 
@@ -144,6 +144,8 @@ pub(crate) enum NetworkEvent {
     MessageDelivered { peer: PeerId, message_id: String },
     /// Собеседник прочитал наши сообщения.
     MessageRead { peer: PeerId, message_ids: Vec<String> },
+    /// Read receipt ушёл в сеть (локально помечаем, что повтор не нужен).
+    ReadReceiptSent { peer: PeerId, message_ids: Vec<String> },
     /// Сообщение буферизовано до E2EE-хендшейка — UI не должен торопиться с таймаутом.
     MessageAwaitingSession(PeerId),
     /// Зашифрованный пакет чата реально ушёл в сеть (не только в буфер).
@@ -497,6 +499,13 @@ async fn send_encrypted_chat_payload(
                 message_id: msg_id,
             })
             .await;
+    } else if let Some(ids) = read_command_message_ids(json_data.as_slice()) {
+        let _ = event_tx
+            .send(NetworkEvent::ReadReceiptSent {
+                peer,
+                message_ids: ids,
+            })
+            .await;
     }
     debug!(
         "[{}] 📨 E2EE: пакет отправлен пиру {}",
@@ -535,6 +544,47 @@ async fn flush_pending_encrypted_messages(
             peer,
             data,
             None,
+            now,
+        )
+        .await;
+    }
+}
+
+async fn flush_pending_read_receipts(
+    swarm: &mut libp2p::Swarm<ChatBehaviour>,
+    sessions: &mut HashMap<PeerId, crypto::SecureSession>,
+    outbound_msg_requests: &mut HashMap<
+        libp2p::request_response::OutboundRequestId,
+        (PeerId, String),
+    >,
+    outbound_delete_requests: &mut HashMap<
+        libp2p::request_response::OutboundRequestId,
+        (PeerId, Vec<String>),
+    >,
+    event_tx: &mpsc::Sender<NetworkEvent>,
+    peer: PeerId,
+    pending_read_receipts: &mut HashMap<PeerId, Vec<Vec<String>>>,
+    now: &str,
+) {
+    let Some(batches) = pending_read_receipts.remove(&peer) else {
+        return;
+    };
+    for ids in batches {
+        if ids.is_empty() {
+            continue;
+        }
+        let Some(json_data) = crate::protocol::build_read_receipt_json(&ids) else {
+            continue;
+        };
+        let _ = send_encrypted_chat_payload(
+            swarm,
+            sessions,
+            outbound_msg_requests,
+            outbound_delete_requests,
+            event_tx,
+            peer,
+            json_data,
+            Some(&ids),
             now,
         )
         .await;
@@ -625,6 +675,7 @@ pub async fn run_chat_network(
         let mut sessions: HashMap<PeerId, crypto::SecureSession> = HashMap::new();
         let mut pending_handshakes: HashMap<PeerId, crypto::StaticSecret> = HashMap::new();
         let mut pending_messages: HashMap<PeerId, Vec<Vec<u8>>> = HashMap::new();
+        let mut pending_read_receipts: HashMap<PeerId, Vec<Vec<String>>> = HashMap::new();
         let my_public_key = crypto::PublicKey::from(&local_static);
         let local_peer_id = local_key.public().to_peer_id();
 
@@ -1335,6 +1386,11 @@ pub async fn run_chat_network(
                                         &now,
                                     )
                                     .await;
+                                } else {
+                                    let queue = pending_read_receipts.entry(peer).or_default();
+                                    if !queue.iter().any(|batch| batch == &message_ids) {
+                                        queue.push(message_ids);
+                                    }
                                 }
                             }
                             // ─── Файловый sub-протокол ──────────────────────
@@ -1625,6 +1681,17 @@ pub async fn run_chat_network(
                                                             &now,
                                                         )
                                                         .await;
+                                                        flush_pending_read_receipts(
+                                                            &mut swarm,
+                                                            &mut sessions,
+                                                            &mut outbound_msg_requests,
+                                                            &mut outbound_delete_requests,
+                                                            &event_tx,
+                                                            peer,
+                                                            &mut pending_read_receipts,
+                                                            &now,
+                                                        )
+                                                        .await;
                                                         let _ = swarm.behaviour_mut().request_response.send_response(channel, V1Packet::Ack);
                                                     } else {
                                                         // Инициатор по ID, но свой Hello мы ещё не слали — завершаем как responder.
@@ -1642,6 +1709,17 @@ pub async fn run_chat_network(
                                                             &event_tx,
                                                             peer,
                                                             &mut pending_messages,
+                                                            &now,
+                                                        )
+                                                        .await;
+                                                        flush_pending_read_receipts(
+                                                            &mut swarm,
+                                                            &mut sessions,
+                                                            &mut outbound_msg_requests,
+                                                            &mut outbound_delete_requests,
+                                                            &event_tx,
+                                                            peer,
+                                                            &mut pending_read_receipts,
                                                             &now,
                                                         )
                                                         .await;
@@ -1675,6 +1753,17 @@ pub async fn run_chat_network(
                                                         &now,
                                                     )
                                                     .await;
+                                                    flush_pending_read_receipts(
+                                                        &mut swarm,
+                                                        &mut sessions,
+                                                        &mut outbound_msg_requests,
+                                                        &mut outbound_delete_requests,
+                                                        &event_tx,
+                                                        peer,
+                                                        &mut pending_read_receipts,
+                                                        &now,
+                                                    )
+                                                    .await;
 
                                                     if let Some(my_hello) = build_v1_hello(
                                                         &local_key,
@@ -1691,6 +1780,7 @@ pub async fn run_chat_network(
                                         }
                                         V1Packet::Encrypted { header, ciphertext } => {
                                             let mut response_channel = Some(channel);
+                                            let mut send_ack = false;
                                             if let Some(session) = sessions.get_mut(&peer) {
                                                 match session.decrypt_payload(&header, &ciphertext) {
                                                     Ok(plaintext) => {
@@ -1709,6 +1799,7 @@ pub async fn run_chat_network(
                                                                 &event_tx,
                                                             )
                                                             .await;
+                                                            send_ack = true;
                                                         } else if let Some(frame) =
                                                             parse_decrypted_chat_frame(&plaintext)
                                                         {
@@ -1722,6 +1813,7 @@ pub async fn run_chat_network(
                                                                     let _ = event_tx
                                                                         .send(NetworkEvent::ChatMessage(msg))
                                                                         .await;
+                                                                    send_ack = true;
                                                                 }
                                                                 DecryptedChatFrame::Delete {
                                                                     message_ids,
@@ -1742,7 +1834,9 @@ pub async fn run_chat_network(
                                                                             );
                                                                     }
                                                                 }
-                                                                DecryptedChatFrame::DeleteAck => {}
+                                                                DecryptedChatFrame::DeleteAck => {
+                                                                    send_ack = true;
+                                                                }
                                                                 DecryptedChatFrame::Read {
                                                                     message_ids,
                                                                 } => {
@@ -1752,6 +1846,7 @@ pub async fn run_chat_network(
                                                                             message_ids,
                                                                         })
                                                                         .await;
+                                                                    send_ack = true;
                                                                 }
                                                             }
                                                         }
@@ -1765,12 +1860,39 @@ pub async fn run_chat_network(
                                                         sessions.remove(&peer);
                                                     }
                                                 }
+                                            } else {
+                                                debug!(
+                                                    "[{}] ⏳ E2EE: нет сессии с {} — отвечаем Hello (без Ack)",
+                                                    now,
+                                                    &peer.to_string()[..8]
+                                                );
+                                                let ephem_secret = crypto::StaticSecret::random_from_rng(
+                                                    &mut rand::rngs::OsRng,
+                                                );
+                                                let ephem_pub =
+                                                    crypto::PublicKey::from(&ephem_secret);
+                                                if let Some(hello) = build_v1_hello(
+                                                    &local_key,
+                                                    local_peer_id,
+                                                    peer,
+                                                    my_public_key,
+                                                    ephem_pub,
+                                                ) {
+                                                    if let Some(ch) = response_channel.take() {
+                                                        let _ = swarm
+                                                            .behaviour_mut()
+                                                            .request_response
+                                                            .send_response(ch, hello);
+                                                    }
+                                                }
                                             }
-                                            if let Some(ch) = response_channel {
-                                                let _ = swarm
-                                                    .behaviour_mut()
-                                                    .request_response
-                                                    .send_response(ch, V1Packet::Ack);
+                                            if send_ack {
+                                                if let Some(ch) = response_channel {
+                                                    let _ = swarm
+                                                        .behaviour_mut()
+                                                        .request_response
+                                                        .send_response(ch, V1Packet::Ack);
+                                                }
                                             }
                                         }
                                         V1Packet::Ack => {
@@ -1779,38 +1901,49 @@ pub async fn run_chat_network(
                                     }
                                 }
                                 libp2p::request_response::Message::Response { request_id, response } => {
-                                    // Если это ответ на наше отправленное сообщение (Encrypted),
-                                    // считаем доставку подтверждённой и сообщаем UI, чтобы он снял
-                                    // соответствующий pending-ретрай и не показывал ошибку.
-                                    if let Some((delivered_peer, message_id)) =
-                                        outbound_msg_requests.remove(&request_id)
-                                    {
-                                        debug!(
-                                            "[{}] ✅ RR: Доставка подтверждена пиром {} msg {}",
-                                            now,
-                                            &delivered_peer.to_string()[..8],
-                                            &message_id[..8.min(message_id.len())]
-                                        );
-                                        let _ = event_tx
-                                            .send(NetworkEvent::MessageDelivered {
-                                                peer: delivered_peer,
-                                                message_id,
-                                            })
-                                            .await;
-                                    } else if outbound_delete_requests.remove(&request_id).is_some() {
-                                        debug!(
-                                            "[{}] ✅ RR: delete подтверждён пиром {}",
-                                            now,
-                                            &peer.to_string()[..8]
-                                        );
-                                    }
                                     match response {
+                                        V1Packet::Ack => {
+                                            if let Some((delivered_peer, message_id)) =
+                                                outbound_msg_requests.remove(&request_id)
+                                            {
+                                                debug!(
+                                                    "[{}] ✅ RR: Доставка подтверждена пиром {} msg {}",
+                                                    now,
+                                                    &delivered_peer.to_string()[..8],
+                                                    &message_id[..8.min(message_id.len())]
+                                                );
+                                                let _ = event_tx
+                                                    .send(NetworkEvent::MessageDelivered {
+                                                        peer: delivered_peer,
+                                                        message_id,
+                                                    })
+                                                    .await;
+                                            } else if outbound_delete_requests.remove(&request_id).is_some()
+                                            {
+                                                debug!(
+                                                    "[{}] ✅ RR: delete подтверждён пиром {}",
+                                                    now,
+                                                    &peer.to_string()[..8]
+                                                );
+                                            }
+                                        }
                                         V1Packet::Hello {
                                             public_key,
                                             ephemeral_key,
                                             transport_sig,
                                             transport_pubkey_pb,
                                         } => {
+                                            if let Some((retry_peer, retry_id)) =
+                                                outbound_msg_requests.remove(&request_id)
+                                            {
+                                                debug!(
+                                                    "[{}] ↻ RR: {} ответил Hello вместо Ack (msg {}), ждём ретрай",
+                                                    now,
+                                                    &peer.to_string()[..8],
+                                                    &retry_id[..8.min(retry_id.len())]
+                                                );
+                                                let _ = retry_peer;
+                                            }
                                             if peer != local_peer_id {
                                                 if !verify_hello_transport_binding(
                                                     peer,
@@ -1859,6 +1992,17 @@ pub async fn run_chat_network(
                                                             &event_tx,
                                                             peer,
                                                             &mut pending_messages,
+                                                            &now,
+                                                        )
+                                                        .await;
+                                                        flush_pending_read_receipts(
+                                                            &mut swarm,
+                                                            &mut sessions,
+                                                            &mut outbound_msg_requests,
+                                                            &mut outbound_delete_requests,
+                                                            &event_tx,
+                                                            peer,
+                                                            &mut pending_read_receipts,
                                                             &now,
                                                         )
                                                         .await;
@@ -1912,7 +2056,6 @@ pub async fn run_chat_network(
                                                 }
                                             }
                                         }
-                                        _ => {}
                                     }
                                 }
                             }
@@ -2015,7 +2158,7 @@ pub async fn run_chat_network(
                                          &sessions,
                                          &mut pending_handshakes,
                                          &now_hs,
-                                         true,
+                                         false,
                                      )
                                      .await;
                                  }

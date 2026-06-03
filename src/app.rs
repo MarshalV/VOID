@@ -763,14 +763,18 @@ impl App {
         if unread.is_empty() {
             return;
         }
-        for id in &unread {
-            self.read_receipts_sent
-                .insert((peer_str.clone(), id.clone()));
-        }
         let _ = self.command_tx.try_send(UICommand::SendReadReceipt {
             peer,
             message_ids: unread,
         });
+    }
+
+    pub(crate) fn mark_read_receipts_sent(&mut self, peer: PeerId, message_ids: &[String]) {
+        let peer_str = peer.to_string();
+        for id in message_ids {
+            self.read_receipts_sent
+                .insert((peer_str.clone(), id.clone()));
+        }
     }
 
     pub(crate) fn tick_pending_file_sends(&mut self) {

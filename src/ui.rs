@@ -1132,14 +1132,29 @@ impl eframe::App for App {
                     if peer != self.local_peer_id {
                         self.select_peer_if_no_chat(peer);
                     }
-                    // Сеть сама шлёт Hello и flush буфера при ConnectionEstablished —
-                    // повторный SendMessage здесь давал дубликаты у собеседника.
+                    // Сеть шлёт Hello и flush буфера при ConnectionEstablished.
+                    // Дополнительный retry безопасен: сеть не дублирует «в полёте».
                     for p in self
                         .pending_sends
                         .iter_mut()
                         .filter(|p| p.peer == peer)
                     {
                         p.awaiting_session = false;
+                    }
+                    let to_resend: Vec<(PeerId, String, String)> = self
+                        .pending_sends
+                        .iter()
+                        .filter(|p| p.peer == peer)
+                        .map(|p| (p.peer, p.text.clone(), p.message_id.clone()))
+                        .collect();
+                    for (peer, text, message_id) in to_resend {
+                        let _ = self.command_tx.try_send(UICommand::SendMessage {
+                            sender_name: self.local_nickname.clone(),
+                            text,
+                            recipient: Some(peer),
+                            message_id: Some(message_id),
+                            is_retry: true,
+                        });
                     }
                     // Файлы из очереди — повторяем отправку при появлении пира.
                     let files: Vec<(String, file_transfer::FileKind)> = self
@@ -1206,6 +1221,9 @@ impl eframe::App for App {
                 }
                 NetworkEvent::MessageRead { peer, message_ids } => {
                     self.mark_outgoing_read(peer, &message_ids);
+                }
+                NetworkEvent::ReadReceiptSent { peer, message_ids } => {
+                    self.mark_read_receipts_sent(peer, &message_ids);
                 }
                 NetworkEvent::MessageAwaitingSession(peer) => {
                     if let Some(p) = self
