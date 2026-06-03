@@ -935,12 +935,82 @@ pub(crate) fn truncate_text(s: &str, max_chars: usize) -> String {
     out
 }
 
-fn delivery_status_label(status: OutgoingDeliveryStatus) -> &'static str {
-    match status {
-        OutgoingDeliveryStatus::Pending => "○",
-        OutgoingDeliveryStatus::Delivered => "✓",
-        OutgoingDeliveryStatus::Read => "✓✓",
+fn paint_checkmark(
+    painter: &egui::Painter,
+    center: egui::Pos2,
+    color: egui::Color32,
+    x_offset: f32,
+) {
+    let stroke = egui::Stroke::new(1.5, color);
+    let cx = center.x + x_offset;
+    let cy = center.y;
+    painter.line_segment(
+        [egui::pos2(cx - 4.5, cy + 0.5), egui::pos2(cx - 1.5, cy + 3.5)],
+        stroke,
+    );
+    painter.line_segment(
+        [egui::pos2(cx - 1.5, cy + 3.5), egui::pos2(cx + 5.0, cy - 3.5)],
+        stroke,
+    );
+}
+
+/// Статус доставки рисуем фигурами — без Unicode (на macOS ○/✓ часто □).
+fn paint_delivery_status(
+    ui: &mut egui::Ui,
+    status: OutgoingDeliveryStatus,
+    color: egui::Color32,
+) {
+    let (rect, _) = ui.allocate_exact_size(egui::vec2(18.0, 12.0), egui::Sense::hover());
+    if !ui.is_rect_visible(rect) {
+        return;
     }
+    let painter = ui.painter();
+    match status {
+        OutgoingDeliveryStatus::Pending => {
+            let cy = rect.center().y;
+            let cx = rect.center().x;
+            let r = 1.3;
+            for dx in [-5.0_f32, 0.0, 5.0] {
+                painter.circle_filled(egui::pos2(cx + dx, cy), r, color);
+            }
+        }
+        OutgoingDeliveryStatus::Delivered => {
+            paint_checkmark(painter, rect.center(), color, 0.0);
+        }
+        OutgoingDeliveryStatus::Read => {
+            paint_checkmark(painter, rect.center(), color, -3.5);
+            paint_checkmark(painter, rect.center(), color, 2.5);
+        }
+    }
+}
+
+/// Кнопка «Отправить» — треугольник вместо символа ➤.
+fn send_message_button(ui: &mut egui::Ui) -> egui::Response {
+    let size = egui::vec2(44.0, 44.0);
+    let (rect, response) = ui.allocate_exact_size(size, egui::Sense::click());
+    if ui.is_rect_visible(rect) {
+        let rounding = egui::Rounding::same(22.0);
+        ui.painter().rect_filled(rect, rounding, palette::ACCENT);
+        if response.hovered() {
+            ui.painter().rect_stroke(
+                rect,
+                rounding,
+                egui::Stroke::new(1.0, palette::ACCENT_2),
+            );
+        }
+        let c = rect.center();
+        let tri = vec![
+            egui::pos2(c.x - 5.0, c.y - 8.0),
+            egui::pos2(c.x - 5.0, c.y + 8.0),
+            egui::pos2(c.x + 9.0, c.y),
+        ];
+        ui.painter().add(egui::Shape::convex_polygon(
+            tri,
+            palette::TEXT,
+            egui::Stroke::NONE,
+        ));
+    }
+    response
 }
 
 /// Из "2026-04-18 14:30:45" берём "14:30".
@@ -1911,7 +1981,7 @@ impl eframe::App for App {
                         let type_icon = t.kind.icon();
                         let status = if t.completed {
                             if t.is_outgoing {
-                                "Отправлен ✓".to_string()
+                                "Отправлен".to_string()
                             } else {
                                 format!("Сохранён: {}", t.saved_to)
                             }
@@ -2131,18 +2201,7 @@ impl eframe::App for App {
                                     .font(egui::TextStyle::Body),
                             );
 
-                            let send_clicked = ui
-                                .add_sized(
-                                    egui::vec2(44.0, 44.0),
-                                    egui::Button::new(
-                                        egui::RichText::new("➤")
-                                            .size(18.0)
-                                            .color(palette::TEXT),
-                                    )
-                                    .fill(palette::ACCENT)
-                                    .rounding(22.0),
-                                )
-                                .clicked();
+                            let send_clicked = send_message_button(ui).clicked();
 
                             let enter_pressed = edit.lost_focus()
                                 && ctx.input(|i| i.key_pressed(egui::Key::Enter));
@@ -2351,14 +2410,10 @@ impl eframe::App for App {
                                                                 palette::TEXT_MUTED
                                                             }
                                                         };
-                                                        ui.label(
-                                                            egui::RichText::new(
-                                                                delivery_status_label(
-                                                                    msg.delivery,
-                                                                ),
-                                                            )
-                                                            .size(11.0)
-                                                            .color(status_color),
+                                                        paint_delivery_status(
+                                                            ui,
+                                                            msg.delivery,
+                                                            status_color,
                                                         );
                                                         ui.add_space(4.0);
                                                     }
