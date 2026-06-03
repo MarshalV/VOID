@@ -541,6 +541,57 @@ async fn flush_pending_encrypted_messages(
     }
 }
 
+/// Запускает E2EE Hello, если сессии ещё нет. `force` сбрасывает «зависший»
+/// pending-handshake (например после DialFailure, когда пир был офлайн).
+async fn ensure_e2ee_handshake_started(
+    swarm: &mut libp2p::Swarm<ChatBehaviour>,
+    local_key: &libp2p::identity::Keypair,
+    local_peer_id: PeerId,
+    my_public_key: crypto::PublicKey,
+    peer_id: PeerId,
+    sessions: &HashMap<PeerId, crypto::SecureSession>,
+    pending_handshakes: &mut HashMap<PeerId, crypto::StaticSecret>,
+    now: &str,
+    force: bool,
+) -> bool {
+    if sessions.contains_key(&peer_id) {
+        return false;
+    }
+    if force {
+        pending_handshakes.remove(&peer_id);
+    } else if pending_handshakes.contains_key(&peer_id) {
+        return false;
+    }
+    let ephem_secret = crypto::StaticSecret::random_from_rng(&mut rand::rngs::OsRng);
+    let ephem_pub = crypto::PublicKey::from(&ephem_secret);
+    let Some(hello) = build_v1_hello(
+        local_key,
+        local_peer_id,
+        peer_id,
+        my_public_key,
+        ephem_pub,
+    ) else {
+        debug!(
+            "[{}] ❌ E2EE: не удалось подписать Hello для {}",
+            now,
+            &peer_id.to_string()[..8.min(peer_id.to_string().len())]
+        );
+        return false;
+    };
+    pending_handshakes.insert(peer_id, ephem_secret);
+    let _ = swarm
+        .behaviour_mut()
+        .request_response
+        .send_request(&peer_id, hello);
+    debug!(
+        "[{}] 🤝 E2EE: Hello (+Ephem) → {}{}",
+        now,
+        &peer_id.to_string()[..8.min(peer_id.to_string().len())],
+        if force { " (повтор)" } else { "" }
+    );
+    true
+}
+
 fn send_delete_ack_response(
     session: &mut crypto::SecureSession,
     channel: libp2p::request_response::ResponseChannel<V1Packet>,
@@ -1189,37 +1240,22 @@ pub async fn run_chat_network(
                                         )
                                         .await;
                                     } else {
-                                        if !pending_handshakes.contains_key(&peer_id) {
-                                            let ephem_secret = crypto::StaticSecret::random_from_rng(
-                                                &mut rand::rngs::OsRng,
-                                            );
-                                            let ephem_pub = crypto::PublicKey::from(&ephem_secret);
-                                            if let Some(hello) = build_v1_hello(
-                                                &local_key,
-                                                local_peer_id,
-                                                peer_id,
-                                                my_public_key,
-                                                ephem_pub,
-                                            ) {
-                                                pending_handshakes.insert(peer_id, ephem_secret);
-                                                let _ = swarm
-                                                    .behaviour_mut()
-                                                    .request_response
-                                                    .send_request(&peer_id, hello);
-                                                debug!(
-                                                    "[{}] 🤝 E2EE: Сессии нет, направлен Hello (+Ephem) пиру {}",
-                                                    now,
-                                                    &peer_id.to_string()[..8]
-                                                );
-                                            } else {
-                                                debug!(
-                                                    "[{}] ❌ E2EE: не удалось подписать Hello для {}",
-                                                    now,
-                                                    &peer_id.to_string()[..8]
-                                                );
-                                            }
-                                        }
-                                        let msg_id_for_dedup = chat_message_id_from_json(json_data.as_slice());
+                                        let force_hs = pending_handshakes.contains_key(&peer_id)
+                                            && swarm.is_connected(&peer_id);
+                                        let _ = ensure_e2ee_handshake_started(
+                                            &mut swarm,
+                                            &local_key,
+                                            local_peer_id,
+                                            my_public_key,
+                                            peer_id,
+                                            &sessions,
+                                            &mut pending_handshakes,
+                                            &now,
+                                            force_hs,
+                                        )
+                                        .await;
+                                        let msg_id_for_dedup =
+                                            chat_message_id_from_json(json_data.as_slice());
                                         let queue = pending_messages.entry(peer_id).or_default();
                                         if let Some(ref mid) = msg_id_for_dedup {
                                             if queue.iter().any(|b| {
@@ -1863,8 +1899,13 @@ pub async fn run_chat_network(
                             }
                         }
                         SwarmEvent::Behaviour(ChatBehaviourEvent::RequestResponse(libp2p::request_response::Event::OutboundFailure { peer, request_id, error, .. })) => {
-                            outbound_msg_requests.remove(&request_id);
-                            outbound_delete_requests.remove(&request_id);
+                            let was_msg = outbound_msg_requests.remove(&request_id).is_some();
+                            let was_delete = outbound_delete_requests.remove(&request_id).is_some();
+                            // Неотслеживаемый запрос — это Hello-handshake; сбрасываем, чтобы
+                            // повторная отправка не считала хендшейк «уже в полёте».
+                            if !was_msg && !was_delete {
+                                pending_handshakes.remove(&peer);
+                            }
                             // Дедуп: если тому же пиру прилетел такой же fail
                             // меньше секунды назад — это Hello+packet пара,
                             // логировать оба смысла нет.
@@ -1938,6 +1979,27 @@ pub async fn run_chat_network(
                             }
 
                              if peer_id != local_peer_id {
+                                 // Есть буфер исходящих, но сессии нет — сразу шлём Hello,
+                                 // не дожидаясь пока собеседник напишет первым.
+                                 if pending_messages
+                                     .get(&peer_id)
+                                     .is_some_and(|q| !q.is_empty())
+                                     && !sessions.contains_key(&peer_id)
+                                 {
+                                     let now_hs = chrono::Local::now().format("%H:%M:%S").to_string();
+                                     let _ = ensure_e2ee_handshake_started(
+                                         &mut swarm,
+                                         &local_key,
+                                         local_peer_id,
+                                         my_public_key,
+                                         peer_id,
+                                         &sessions,
+                                         &mut pending_handshakes,
+                                         &now_hs,
+                                         true,
+                                     )
+                                     .await;
+                                 }
                                  let _ = event_tx.send(NetworkEvent::Connected(peer_id)).await;
                                  let _ = event_tx.send(NetworkEvent::Status(format!("✅ СОЕДИНЕНО: {}", &peer_id.to_string()[..8]))).await;
                                  // Передаём рабочий multiaddr в UI: для Dialer — кого набирали,
