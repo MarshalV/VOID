@@ -283,6 +283,7 @@ impl App {
                 peers.sort_by(|a, b| a.1.to_lowercase().cmp(&b.1.to_lowercase()));
 
                 let mut to_remove: Vec<PeerId> = Vec::new();
+                let mut to_clear_chat: Vec<PeerId> = Vec::new();
                 let me_str = self.local_peer_id.to_string();
 
                 if peers.is_empty() {
@@ -421,6 +422,10 @@ impl App {
                             ui.output_mut(|o| o.copied_text = peer_str.clone());
                             ui.close_menu();
                         }
+                        if ui.button("Очистить чат").clicked() {
+                            to_clear_chat.push(*peer_id);
+                            ui.close_menu();
+                        }
                         if ui.button("🗑 Удалить контакт").clicked() {
                             to_remove.push(*peer_id);
                             ui.close_menu();
@@ -463,6 +468,17 @@ impl App {
                             ui.close_menu();
                         }
                     });
+                }
+
+                if !to_clear_chat.is_empty() {
+                    for pid in to_clear_chat {
+                        self.clear_conversation(pid);
+                    }
+                    self.push_toast(
+                        "Переписка очищена (контакт сохранён)".into(),
+                        ToastKind::Info,
+                        TOAST_TTL_SHORT,
+                    );
                 }
 
                 if !to_remove.is_empty() {
@@ -1803,7 +1819,7 @@ impl eframe::App for App {
         if let Some(action) = chat_clear_action {
             if let Ok(peer) = self.selected_chat.parse::<PeerId>() {
                 if matches!(action, ConversationClearAction::AllLocal) {
-                    self.delete_conversation_local(peer);
+                    self.clear_conversation(peer);
                     self.push_toast("Переписка удалена у вас".into(), ToastKind::Info, TOAST_TTL_SHORT);
                 }
             }

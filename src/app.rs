@@ -819,6 +819,15 @@ impl App {
         self.mark_chat_journal_dirty();
     }
 
+    pub(crate) fn clear_conversation(&mut self, peer: PeerId) {
+        let peer_str = peer.to_string();
+        self.delete_conversation_local(peer);
+        self.pending_sends.retain(|p| p.peer != peer);
+        self.pending_file_sends.retain(|p| p.peer != peer);
+        self.read_receipts_sent
+            .retain(|(p, _)| p != &peer_str);
+    }
+
     pub(crate) fn delete_conversation_local(&mut self, peer: PeerId) {
         let peer_str = peer.to_string();
         self.messages.lock().remove(&peer_str);
