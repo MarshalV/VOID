@@ -166,6 +166,7 @@ pub(crate) struct App {
     pub(crate) read_receipts_sent: HashSet<(String, String)>,
     pub(crate) toasts: Vec<Toast>,
     pub(crate) chat_bg_texture: Option<egui::TextureHandle>,
+    pub(crate) star_texture: Option<egui::TextureHandle>,
     // ─── Файловый sub-протокол ──────────────────────────────────────────────
     /// Входящие предложения файлов, ожидающие ответа пользователя.
     pub(crate) incoming_file_offers: Vec<file_transfer::PendingFileOffer>,
@@ -235,6 +236,7 @@ impl App {
             read_receipts_sent: HashSet::new(),
             toasts: Vec::new(),
             chat_bg_texture: None,
+            star_texture: None,
             incoming_file_offers: Vec::new(),
             active_file_transfers: HashMap::new(),
             show_attach_menu: false,

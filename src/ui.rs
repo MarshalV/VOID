@@ -69,6 +69,50 @@ impl App {
         self.chat_bg_texture.as_ref().map(|h| h.id())
     }
 
+    /// Лениво грузит `static/star.png` — белая ✦ на прозрачном фоне, цвет через tint.
+    fn ensure_star_texture(&mut self, ctx: &egui::Context) -> Option<egui::TextureId> {
+        if self.star_texture.is_none() {
+            const BYTES: &[u8] = include_bytes!("../static/star.png");
+            match image::load_from_memory(BYTES) {
+                Ok(img) => {
+                    let rgba = img.to_rgba8();
+                    let size = [rgba.width() as usize, rgba.height() as usize];
+                    let pixels = rgba.into_raw();
+                    let color_image =
+                        egui::ColorImage::from_rgba_unmultiplied(size, &pixels);
+                    let handle = ctx.load_texture(
+                        "void_star_icon",
+                        color_image,
+                        egui::TextureOptions::LINEAR,
+                    );
+                    self.star_texture = Some(handle);
+                }
+                Err(e) => {
+                    warn!(target: "void_net", "static/star.png decode: {}", e);
+                }
+            }
+        }
+        self.star_texture.as_ref().map(|h| h.id())
+    }
+
+    fn star_icon(
+        &mut self,
+        ui: &mut egui::Ui,
+        px: f32,
+        color: egui::Color32,
+    ) -> egui::Response {
+        if let Some(tex) = self.ensure_star_texture(ui.ctx()) {
+            ui.add(
+                egui::Image::new((tex, egui::vec2(px, px)))
+                    .fit_to_exact_size(egui::vec2(px, px))
+                    .tint(color),
+            )
+        } else {
+            let (_, resp) = ui.allocate_exact_size(egui::vec2(px, px), egui::Sense::hover());
+            resp
+        }
+    }
+
     /// Рендерит активные toast'ы как floating Area в правом верхнем углу,
     /// стопкой сверху вниз. Каждый toast — закруглённая «пилюля» с акцент-цветом
     /// слева и подписью.
@@ -289,7 +333,7 @@ impl App {
                 if peers.is_empty() {
                     ui.add_space(40.0);
                     ui.vertical_centered(|ui| {
-                        star_icon(ui, 40.0, palette::ACCENT_2);
+                        self.star_icon(ui, 40.0, palette::ACCENT_2);
                         ui.add_space(8.0);
                         ui.label(
                             egui::RichText::new("Контактов пока нет")
@@ -831,22 +875,6 @@ fn draw_icon_ellipsis_h(painter: &egui::Painter, rect: egui::Rect, color: egui::
     }
 }
 
-fn draw_icon_star4(painter: &egui::Painter, rect: egui::Rect, color: egui::Color32) {
-    let center = rect.center();
-    let outer = rect.width().min(rect.height()) * 0.48;
-    let inner = outer * 0.32;
-    let mut points = Vec::with_capacity(8);
-    for i in 0..8 {
-        let a = std::f32::consts::FRAC_PI_2 * i as f32 - std::f32::consts::FRAC_PI_2;
-        let r = if i % 2 == 0 { outer } else { inner };
-        points.push(egui::pos2(
-            center.x + a.cos() * r,
-            center.y + a.sin() * r,
-        ));
-    }
-    painter.add(egui::Shape::convex_polygon(points, color, egui::Stroke::NONE));
-}
-
 fn icon_button(
     ui: &mut egui::Ui,
     size: egui::Vec2,
@@ -863,14 +891,6 @@ fn icon_button(
         draw(ui.painter(), rect, color);
     }
     response.on_hover_text(hover_text)
-}
-
-fn star_icon(ui: &mut egui::Ui, px: f32, color: egui::Color32) -> egui::Response {
-    let (rect, resp) = ui.allocate_exact_size(egui::vec2(px, px), egui::Sense::hover());
-    if ui.is_rect_visible(rect) {
-        draw_icon_star4(ui.painter(), rect, color);
-    }
-    resp
 }
 
 /// Кружок-аватар с инициалом и (опц.) индикатором онлайна.
@@ -1840,7 +1860,7 @@ impl eframe::App for App {
                         });
                     } else {
                         ui.horizontal(|ui| {
-                            star_icon(ui, 20.0, palette::ACCENT);
+                            self.star_icon(ui, 20.0, palette::ACCENT);
                             ui.label(
                                 egui::RichText::new("VOID")
                                     .size(20.0)
@@ -2364,7 +2384,7 @@ impl eframe::App for App {
                         |ui| {
                             ui.vertical_centered(|ui| {
                                 ui.add_space(80.0);
-                                star_icon(ui, 96.0, palette::ACCENT_2);
+                                self.star_icon(ui, 96.0, palette::ACCENT_2);
                                 ui.add_space(14.0);
                                 ui.label(
                                     egui::RichText::new("Тишина в эфире")
