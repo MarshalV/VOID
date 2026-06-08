@@ -289,11 +289,7 @@ impl App {
                 if peers.is_empty() {
                     ui.add_space(40.0);
                     ui.vertical_centered(|ui| {
-                        ui.label(
-                            egui::RichText::new("✦")
-                                .size(40.0)
-                                .color(palette::ACCENT_2),
-                        );
+                        star_icon(ui, 40.0, palette::ACCENT_2);
                         ui.add_space(8.0);
                         ui.label(
                             egui::RichText::new("Контактов пока нет")
@@ -807,6 +803,76 @@ fn deterministic_color(seed: &str) -> egui::Color32 {
     hsv_to_rgb(hue, 0.55, 0.78)
 }
 
+// ---- Векторные UI-иконки (не зависят от системных шрифтов) ----
+
+fn draw_icon_hamburger(painter: &egui::Painter, rect: egui::Rect, color: egui::Color32) {
+    let w = rect.width() * 0.58;
+    let line_h = (rect.height() * 0.085).max(1.8);
+    let gap = rect.height() * 0.24;
+    let cx = rect.center().x;
+    let y_mid = rect.center().y;
+    for i in -1i32..=1 {
+        let y = y_mid + i as f32 * gap;
+        painter.rect_filled(
+            egui::Rect::from_center_size(egui::pos2(cx, y), egui::vec2(w, line_h)),
+            1.0,
+            color,
+        );
+    }
+}
+
+fn draw_icon_ellipsis_h(painter: &egui::Painter, rect: egui::Rect, color: egui::Color32) {
+    let r = (rect.height() * 0.09).max(2.0);
+    let gap = r * 4.2;
+    let cx = rect.center().x;
+    let cy = rect.center().y;
+    for i in -1i32..=1 {
+        painter.circle_filled(egui::pos2(cx + i as f32 * gap, cy), r, color);
+    }
+}
+
+fn draw_icon_star4(painter: &egui::Painter, rect: egui::Rect, color: egui::Color32) {
+    let center = rect.center();
+    let outer = rect.width().min(rect.height()) * 0.48;
+    let inner = outer * 0.32;
+    let mut points = Vec::with_capacity(8);
+    for i in 0..8 {
+        let a = std::f32::consts::FRAC_PI_2 * i as f32 - std::f32::consts::FRAC_PI_2;
+        let r = if i % 2 == 0 { outer } else { inner };
+        points.push(egui::pos2(
+            center.x + a.cos() * r,
+            center.y + a.sin() * r,
+        ));
+    }
+    painter.add(egui::Shape::convex_polygon(points, color, egui::Stroke::NONE));
+}
+
+fn icon_button(
+    ui: &mut egui::Ui,
+    size: egui::Vec2,
+    hover_text: &str,
+    draw: fn(&egui::Painter, egui::Rect, egui::Color32),
+) -> egui::Response {
+    let (rect, response) = ui.allocate_exact_size(size, egui::Sense::click());
+    if ui.is_rect_visible(rect) {
+        let color = if response.hovered() {
+            palette::ACCENT_2
+        } else {
+            palette::TEXT
+        };
+        draw(ui.painter(), rect, color);
+    }
+    response.on_hover_text(hover_text)
+}
+
+fn star_icon(ui: &mut egui::Ui, px: f32, color: egui::Color32) -> egui::Response {
+    let (rect, resp) = ui.allocate_exact_size(egui::vec2(px, px), egui::Sense::hover());
+    if ui.is_rect_visible(rect) {
+        draw_icon_star4(ui.painter(), rect, color);
+    }
+    resp
+}
+
 /// Кружок-аватар с инициалом и (опц.) индикатором онлайна.
 fn draw_avatar(
     ui: &mut egui::Ui,
@@ -1038,8 +1104,8 @@ fn short_time(ts: &str) -> String {
 pub(crate) fn setup_custom_style(ctx: &egui::Context) {
     use egui::{FontFamily, FontId, TextStyle};
 
-    // ----- Шрифты: добавляем системный emoji-шрифт как fallback,
-    // чтобы такие глифы как ☰, ⋯, 🛰, 🔌, 🔍, ➤ не превращались в □ -----
+    // ----- Шрифты: системные emoji/symbol-шрифты как fallback для 📎, 🛰 и т.п.
+    // UI-иконки (меню, ⋯, ✦) рисуются векторно и шрифтам не нужны. -----
     let mut fonts = egui::FontDefinitions::default();
     let candidates: &[&str] = &[
         #[cfg(target_os = "windows")]
@@ -1049,9 +1115,17 @@ pub(crate) fn setup_custom_style(ctx: &egui::Context) {
         #[cfg(target_os = "windows")]
         "C:/Windows/Fonts/segoeui.ttf",
         #[cfg(target_os = "macos")]
+        "/System/Library/Fonts/Supplemental/Arial Unicode.ttf",
+        #[cfg(target_os = "macos")]
+        "/System/Library/Fonts/SFNSText.ttf",
+        #[cfg(target_os = "macos")]
+        "/System/Library/Fonts/Helvetica.ttc",
+        #[cfg(target_os = "macos")]
         "/System/Library/Fonts/Apple Color Emoji.ttc",
         #[cfg(target_os = "linux")]
         "/usr/share/fonts/truetype/noto/NotoColorEmoji.ttf",
+        #[cfg(target_os = "linux")]
+        "/usr/share/fonts/truetype/noto/NotoSansSymbols2-Regular.ttf",
     ];
     for path in candidates {
         if let Ok(bytes) = std::fs::read(path) {
@@ -1706,23 +1780,17 @@ impl eframe::App for App {
             )
             .show(ctx, |ui| {
                 ui.horizontal(|ui| {
-                    let toggle_label = if self.show_sidebar { "≡" } else { "≡" };
-                    if ui
-                        .add(
-                            egui::Button::new(
-                                egui::RichText::new(toggle_label)
-                                    .size(18.0)
-                                    .color(palette::TEXT),
-                            )
-                            .fill(egui::Color32::TRANSPARENT)
-                            .stroke(egui::Stroke::NONE),
-                        )
-                        .on_hover_text(if self.show_sidebar {
+                    if icon_button(
+                        ui,
+                        egui::vec2(28.0, 28.0),
+                        if self.show_sidebar {
                             "Скрыть список контактов"
                         } else {
                             "Показать список контактов"
-                        })
-                        .clicked()
+                        },
+                        draw_icon_hamburger,
+                    )
+                    .clicked()
                     {
                         self.show_sidebar = !self.show_sidebar;
                     }
@@ -1771,12 +1839,15 @@ impl eframe::App for App {
                             }
                         });
                     } else {
-                        ui.label(
-                            egui::RichText::new("✦ VOID")
-                                .size(20.0)
-                                .strong()
-                                .color(palette::ACCENT),
-                        );
+                        ui.horizontal(|ui| {
+                            star_icon(ui, 20.0, palette::ACCENT);
+                            ui.label(
+                                egui::RichText::new("VOID")
+                                    .size(20.0)
+                                    .strong()
+                                    .color(palette::ACCENT),
+                            );
+                        });
                         ui.add_space(8.0);
                         ui.label(
                             egui::RichText::new("выберите контакт слева")
@@ -1784,18 +1855,13 @@ impl eframe::App for App {
                         );
                     }
                     ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                        if ui
-                            .add(
-                                egui::Button::new(
-                                    egui::RichText::new("⋯")
-                                        .size(22.0)
-                                        .color(palette::TEXT),
-                                )
-                                .fill(egui::Color32::TRANSPARENT)
-                                .stroke(egui::Stroke::NONE),
-                            )
-                            .on_hover_text("Системная консоль")
-                            .clicked()
+                        if icon_button(
+                            ui,
+                            egui::vec2(28.0, 28.0),
+                            "Системная консоль",
+                            draw_icon_ellipsis_h,
+                        )
+                        .clicked()
                         {
                             self.show_logs = !self.show_logs;
                         }
@@ -2298,11 +2364,7 @@ impl eframe::App for App {
                         |ui| {
                             ui.vertical_centered(|ui| {
                                 ui.add_space(80.0);
-                                ui.label(
-                                    egui::RichText::new("✦")
-                                        .size(96.0)
-                                        .color(palette::ACCENT_2),
-                                );
+                                star_icon(ui, 96.0, palette::ACCENT_2);
                                 ui.add_space(14.0);
                                 ui.label(
                                     egui::RichText::new("Тишина в эфире")
