@@ -833,33 +833,39 @@ impl App {
     }
 
     pub(crate) fn register_voice_path(&mut self, transfer_id_hex: &str, path: String) {
+        let mut p = std::path::PathBuf::from(&path);
+        if p.is_relative() {
+            if let Ok(cwd) = std::env::current_dir() {
+                p = cwd.join(p);
+            }
+        }
+        if let Ok(abs) = std::fs::canonicalize(&p) {
+            p = abs;
+        }
         self.voice_audio_paths
-            .insert(transfer_id_hex.to_string(), path);
+            .insert(transfer_id_hex.to_ascii_lowercase(), p.display().to_string());
     }
 
     pub(crate) fn resolve_voice_path(&self, transfer_id_hex: &str) -> Option<std::path::PathBuf> {
-        if let Some(p) = self.voice_audio_paths.get(transfer_id_hex) {
+        let tid = transfer_id_hex.to_ascii_lowercase();
+        if let Some(p) = self.voice_audio_paths.get(&tid) {
             let path = std::path::PathBuf::from(p);
-            if path.exists() {
+            if path.is_file() {
                 return Some(path);
             }
         }
-        let name = format!(
-            "{}{}.wav",
-            file_transfer::VOICE_FILENAME_PREFIX, transfer_id_hex
-        );
-        let dir = std::path::Path::new(file_transfer::VOICE_DIR);
-        let direct = dir.join(&name);
-        if direct.exists() {
+        let name = format!("{}{}.wav", file_transfer::VOICE_FILENAME_PREFIX, tid);
+        let direct = file_transfer::voice_dir_absolute().join(&name);
+        if direct.is_file() {
             return Some(direct);
         }
-        if dir.exists() {
-            if let Ok(entries) = std::fs::read_dir(dir) {
-                for entry in entries.flatten() {
-                    let fname = entry.file_name().to_string_lossy().into_owned();
-                    if fname.starts_with(&format!("{}{}", file_transfer::VOICE_FILENAME_PREFIX, transfer_id_hex)) {
-                        return Some(entry.path());
-                    }
+        let dir = file_transfer::voice_dir_absolute();
+        if let Ok(entries) = std::fs::read_dir(&dir) {
+            for entry in entries.flatten() {
+                let fname = entry.file_name().to_string_lossy().into_owned();
+                if fname.starts_with(&format!("{}{}", file_transfer::VOICE_FILENAME_PREFIX, tid))
+                {
+                    return Some(entry.path());
                 }
             }
         }
@@ -876,7 +882,18 @@ impl App {
         rand::thread_rng().fill_bytes(&mut tid);
         let message_id = new_message_id();
         let transfer_hex = transfer_id_to_hex(&tid);
-        let path_str = path.display().to_string();
+        let voice_name = file_transfer::voice_filename(&tid);
+        let local_copy = file_transfer::unique_download_path_in(
+            file_transfer::voice_dir_absolute()
+                .to_str()
+                .unwrap_or(file_transfer::VOICE_DIR),
+            &voice_name,
+        );
+        let path_str = if std::fs::copy(&path, &local_copy).is_ok() {
+            local_copy.display().to_string()
+        } else {
+            path.display().to_string()
+        };
         self.register_voice_path(&transfer_hex, path_str.clone());
         match self.command_tx.try_send(UICommand::SendVoiceMessage {
             sender_name: self.local_nickname.clone(),

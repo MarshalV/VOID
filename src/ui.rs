@@ -16,7 +16,7 @@ use crate::{
     FileTransferProgress, NetworkEvent, OutgoingDeliveryStatus, PendingSend, UICommand,
     RESEND_GRACE,
 };
-use crate::voice::{self, VoiceRecorderState};
+use crate::voice;
 
 #[derive(Clone, Copy)]
 enum ConversationClearAction {
@@ -1089,57 +1089,31 @@ fn paint_delivery_status(
 
 /// Кнопка записи голосового: микрофон / стоп / готово.
 fn voice_record_button(ui: &mut egui::Ui, recording: bool, has_ready: bool) -> egui::Response {
-    let size = egui::vec2(44.0, 44.0);
-    let (rect, response) = ui.allocate_exact_size(size, egui::Sense::click());
-    if ui.is_rect_visible(rect) {
-        let rounding = egui::Rounding::same(22.0);
-        let bg = if recording {
-            egui::Color32::from_rgb(0xe0, 0x40, 0x40)
-        } else if has_ready {
-            palette::ACCENT_2
-        } else {
-            palette::BG_PANEL
-        };
-        ui.painter().rect_filled(rect, rounding, bg);
-        if response.hovered() {
-            ui.painter().rect_stroke(
-                rect,
-                rounding,
-                egui::Stroke::new(1.0, palette::ACCENT),
-            );
-        } else {
-            ui.painter()
-                .rect_stroke(rect, rounding, egui::Stroke::new(1.0, palette::DIVIDER));
-        }
-        let c = rect.center();
-        if recording {
-            let half = 7.0;
-            ui.painter().rect_filled(
-                egui::Rect::from_center_size(c, egui::vec2(half * 2.0, half * 2.0)),
-                2.0,
-                palette::TEXT,
-            );
-        } else {
-            ui.painter()
-                .circle_stroke(c + egui::vec2(0.0, -3.0), 6.0, egui::Stroke::new(1.8, palette::TEXT));
-            ui.painter().line_segment(
-                [c + egui::vec2(-7.0, 3.0), c + egui::vec2(7.0, 3.0)],
-                egui::Stroke::new(1.8, palette::TEXT),
-            );
-            ui.painter().line_segment(
-                [c + egui::vec2(0.0, 3.0), c + egui::vec2(0.0, 8.0)],
-                egui::Stroke::new(1.8, palette::TEXT),
-            );
-        }
-    }
-    let hint = if recording {
+    let (fill, stroke, label) = if recording {
+        (
+            egui::Color32::from_rgb(0xff, 0x33, 0x33),
+            egui::Color32::from_rgb(0xff, 0xaa, 0xaa),
+            "⏹",
+        )
+    } else if has_ready {
+        (palette::ACCENT_2, palette::ACCENT, "🎤")
+    } else {
+        (palette::BG_PANEL, palette::DIVIDER, "🎤")
+    };
+    ui.add(
+        egui::Button::new(egui::RichText::new(label).size(20.0).color(palette::TEXT))
+            .fill(fill)
+            .stroke(egui::Stroke::new(1.5, stroke))
+            .min_size(egui::vec2(44.0, 44.0))
+            .rounding(22.0),
+    )
+    .on_hover_text(if recording {
         "Остановить запись"
     } else if has_ready {
         "Перезаписать голосовое"
     } else {
         "Записать голосовое"
-    };
-    response.on_hover_text(hint)
+    })
 }
 
 fn paint_voice_message(
@@ -1151,10 +1125,14 @@ fn paint_voice_message(
     let mut toggled = false;
     ui.horizontal(|ui| {
         let label = if is_playing { "⏸" } else { "▶" };
+        let btn_color = if has_audio {
+            palette::TEXT
+        } else {
+            palette::TEXT_MUTED
+        };
         if ui
-            .add_enabled(
-                has_audio,
-                egui::Button::new(egui::RichText::new(label).size(16.0).color(palette::TEXT))
+            .add(
+                egui::Button::new(egui::RichText::new(label).size(16.0).color(btn_color))
                     .fill(egui::Color32::from_rgba_premultiplied(255, 255, 255, 25))
                     .min_size(egui::vec2(34.0, 34.0))
                     .rounding(17.0),
@@ -1508,7 +1486,15 @@ impl eframe::App for App {
                         }
                     }
 
-                    self.ingest_chat_message(msg);
+                    self.ingest_chat_message(msg.clone());
+                    if let Some(ref voice) = msg.voice {
+                        if let Some(path) = self.resolve_voice_path(&voice.transfer_id) {
+                            self.register_voice_path(
+                                &voice.transfer_id,
+                                path.display().to_string(),
+                            );
+                        }
+                    }
                 }
                 NetworkEvent::Status(msg) => {
                     self.add_status(msg);
@@ -1681,10 +1667,13 @@ impl eframe::App for App {
                     kind,
                 } => {
                     if file_transfer::is_voice_filename(&filename) {
+                        let voice_dir = file_transfer::voice_dir_absolute()
+                            .to_string_lossy()
+                            .into_owned();
                         let _ = self.command_tx.try_send(UICommand::AcceptFile {
                             transfer_id,
                             from,
-                            save_dir: Some(file_transfer::VOICE_DIR.to_string()),
+                            save_dir: Some(voice_dir),
                         });
                     } else {
                         self.incoming_file_offers.push(file_transfer::PendingFileOffer {
@@ -1754,9 +1743,19 @@ impl eframe::App for App {
                     peer: _,
                 } => {
                     if file_transfer::is_voice_filename(&filename) {
-                        let tid_hex: String =
-                            transfer_id.iter().map(|b| format!("{:02x}", b)).collect();
+                        let tid_hex = file_transfer::voice_transfer_hex_from_filename(&filename)
+                            .unwrap_or_else(|| {
+                                transfer_id
+                                    .iter()
+                                    .map(|b| format!("{:02x}", b))
+                                    .collect()
+                            });
                         self.register_voice_path(&tid_hex, saved_to.clone());
+                        self.push_toast(
+                            "🔊 Голосовое загружено".into(),
+                            ToastKind::Info,
+                            TOAST_TTL_SHORT,
+                        );
                     }
                     if let Some(p) = self.active_file_transfers.get_mut(&transfer_id) {
                         p.completed = true;
@@ -1822,17 +1821,21 @@ impl eframe::App for App {
         self.tick_pending_sends();
         self.tick_pending_file_sends();
         self.tick_pending_voice_sends();
+        let was_processing = self.voice_recorder.is_processing();
         self.voice_recorder.poll();
+        if was_processing && self.voice_recorder.has_ready() {
+            self.push_toast(
+                "Голосовое готово — нажмите ▶ отправку".into(),
+                ToastKind::Info,
+                TOAST_TTL_SHORT,
+            );
+        }
+        if let Some(err) = self.voice_recorder.take_error() {
+            self.push_toast(err, ToastKind::Error, TOAST_TTL_LONG);
+        }
         self.voice_player.poll();
-        if matches!(
-            self.voice_recorder.state,
-            VoiceRecorderState::Error(_)
-        ) {
-            if let VoiceRecorderState::Error(e) =
-                std::mem::replace(&mut self.voice_recorder.state, VoiceRecorderState::Idle)
-            {
-                self.add_status(format!("⚠ {}", e));
-            }
+        if let Some(err) = self.voice_player.take_error() {
+            self.push_toast(err, ToastKind::Error, TOAST_TTL_LONG);
         }
         self.flush_read_receipts_for_open_chat();
         let now = Instant::now();
@@ -2358,6 +2361,38 @@ impl eframe::App for App {
                         bottom: 4.0,
                     })
                     .show(ui, |ui| {
+                        if self.voice_recorder.is_recording() {
+                            ui.horizontal(|ui| {
+                                ui.label(
+                                    egui::RichText::new("🔴  ЗАПИСЬ")
+                                        .size(13.0)
+                                        .strong()
+                                        .color(egui::Color32::from_rgb(0xff, 0x55, 0x55)),
+                                );
+                                if let Some(secs) = self.voice_recorder.recording_elapsed() {
+                                    ui.label(
+                                        egui::RichText::new(voice::fmt_duration(secs))
+                                            .size(13.0)
+                                            .color(palette::TEXT_MUTED),
+                                    );
+                                }
+                            });
+                            ui.add_space(4.0);
+                        } else if self.voice_recorder.is_processing() {
+                            ui.label(
+                                egui::RichText::new("⏳ Обработка записи…")
+                                    .size(13.0)
+                                    .color(palette::ACCENT_2),
+                            );
+                            ui.add_space(4.0);
+                        } else if self.voice_recorder.has_ready() {
+                            ui.label(
+                                egui::RichText::new("✓ Голосовое готово — нажмите отправку ▶")
+                                    .size(13.0)
+                                    .color(palette::ACCENT_2),
+                            );
+                            ui.add_space(4.0);
+                        }
                         ui.horizontal(|ui| {
                             // ── Кнопка прикрепления (📎) + popup-меню типов ──
                             let attach_id = egui::Id::new("attach_popup");
@@ -2482,8 +2517,14 @@ impl eframe::App for App {
                                 }
                             }
 
+                            const VOICE_BTN: f32 = 44.0;
+                            const SEND_BTN: f32 = 44.0;
+                            let buttons_w = VOICE_BTN + SEND_BTN + 6.0;
+                            let text_w = (ui.available_width() - buttons_w).max(48.0);
+
                             let recording = self.voice_recorder.is_recording();
                             let voice_ready = self.voice_recorder.has_ready();
+                            let processing = self.voice_recorder.is_processing();
                             let hint = if recording {
                                 if let Some(secs) = self.voice_recorder.recording_elapsed() {
                                     format!("Запись {}…", voice::fmt_duration(secs))
@@ -2496,9 +2537,8 @@ impl eframe::App for App {
                                 "Сообщение…".into()
                             };
 
-                            let text_w = (ui.available_width() - 100.0).max(80.0);
                             let edit = ui.add_enabled(
-                                !recording && !self.voice_recorder.is_processing(),
+                                !recording && !processing,
                                 egui::TextEdit::singleline(&mut self.chat_input)
                                     .hint_text(hint)
                                     .desired_width(text_w)
@@ -2506,14 +2546,44 @@ impl eframe::App for App {
                                     .font(egui::TextStyle::Body),
                             );
 
-                            if voice_record_button(ui, recording, voice_ready).clicked() {
+                            let record_resp = voice_record_button(
+                                ui,
+                                self.voice_recorder.is_recording(),
+                                self.voice_recorder.has_ready(),
+                            );
+                            if record_resp.clicked() {
                                 if self.selected_chat.parse::<PeerId>().is_err() {
-                                    self.add_status(
-                                        "⚠ Выберите контакт для голосового сообщения.".into(),
+                                    self.push_toast(
+                                        "Выберите контакт слева".into(),
+                                        ToastKind::Warn,
+                                        TOAST_TTL_SHORT,
                                     );
-                                } else if let Some(err) = self.voice_recorder.toggle_record() {
-                                    self.add_status(format!("⚠ {}", err));
+                                } else {
+                                    match self.voice_recorder.toggle_record() {
+                                        Ok(true) => {
+                                            self.push_toast(
+                                                "🔴 Запись — нажмите микрофон ещё раз".into(),
+                                                ToastKind::Info,
+                                                TOAST_TTL_SHORT,
+                                            );
+                                            ctx.request_repaint();
+                                        }
+                                        Ok(false) => {
+                                            self.push_toast(
+                                                "Обработка записи…".into(),
+                                                ToastKind::Info,
+                                                TOAST_TTL_SHORT,
+                                            );
+                                            ctx.request_repaint();
+                                        }
+                                        Err(e) => {
+                                            self.push_toast(e, ToastKind::Error, TOAST_TTL_LONG);
+                                        }
+                                    }
                                 }
+                            }
+                            if recording {
+                                ctx.request_repaint_after(Duration::from_millis(100));
                             }
 
                             let send_clicked = send_message_button(ui).clicked();
@@ -2530,7 +2600,7 @@ impl eframe::App for App {
                             let send_voice = (send_clicked || enter_pressed)
                                 && voice_ready
                                 && !recording
-                                && !self.voice_recorder.is_processing();
+                                && !processing;
 
                             let send_text = (send_clicked || enter_pressed)
                                 && !self.chat_input.is_empty()
@@ -2813,8 +2883,26 @@ impl eframe::App for App {
                     }
                 }
                 if let Some(tid) = voice_toggle {
-                    if let Some(path) = self.resolve_voice_path(&tid) {
-                        self.voice_player.toggle(&tid, &path);
+                    match self.resolve_voice_path(&tid) {
+                        Some(path) => {
+                            if let Some(err) = self.voice_player.toggle(&tid, &path) {
+                                self.push_toast(err, ToastKind::Error, TOAST_TTL_LONG);
+                            } else {
+                                self.push_toast(
+                                    "▶ Воспроизведение…".into(),
+                                    ToastKind::Info,
+                                    TOAST_TTL_SHORT,
+                                );
+                                ctx.request_repaint();
+                            }
+                        }
+                        None => {
+                            self.push_toast(
+                                "Аудио ещё загружается — подождите".into(),
+                                ToastKind::Warn,
+                                TOAST_TTL_SHORT,
+                            );
+                        }
                     }
                 }
             });

@@ -31,7 +31,6 @@ webpki-roots = "1"
 rfd = { version = "0.15", default-features = false, features = ["file-handle-inner"] }
 cpal = "0.15"
 hound = "3.5"
-rodio = { version = "0.19", default-features = false, features = ["wav"] }
 
 
 [profile.dev]

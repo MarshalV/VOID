@@ -258,7 +258,12 @@ async fn apply_incoming_file_chunk(
                     {
                         file_transfer::unique_download_path_in(dir, &fname)
                     } else if file_transfer::is_voice_filename(&fname) {
-                        file_transfer::unique_download_path_in(file_transfer::VOICE_DIR, &fname)
+                        file_transfer::unique_download_path_in(
+                            file_transfer::voice_dir_absolute()
+                                .to_str()
+                                .unwrap_or(file_transfer::VOICE_DIR),
+                            &fname,
+                        )
                     } else {
                         file_transfer::unique_download_path(&fname)
                     };
@@ -2712,6 +2717,32 @@ pub async fn run_chat_network(
                                                 .behaviour_mut()
                                                 .file_rr
                                                 .send_response(channel, FilePacket::Ack);
+
+                                            if file_transfer::is_voice_filename(&safe) {
+                                                // Голосовые принимаем сразу в сети — без roundtrip через UI.
+                                                if let Some(inc) =
+                                                    incoming_transfers.get_mut(&transfer_id)
+                                                {
+                                                    inc.save_dir = Some(
+                                                        file_transfer::voice_dir_absolute()
+                                                            .to_string_lossy()
+                                                            .into_owned(),
+                                                    );
+                                                }
+                                                let accept =
+                                                    FilePacket::Accept { transfer_id };
+                                                swarm
+                                                    .behaviour_mut()
+                                                    .file_rr
+                                                    .send_request(&peer, accept);
+                                                debug!(
+                                                    "[{}] 🔊 FILE: auto-Accept голосового {:x?} от {}",
+                                                    now,
+                                                    &transfer_id[..4],
+                                                    &peer.to_string()[..8]
+                                                );
+                                            }
+
                                             let _ = event_tx
                                                 .send(NetworkEvent::FileOffer {
                                                     transfer_id,

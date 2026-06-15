@@ -1,16 +1,21 @@
-//! Запись голосовых сообщений с системного микрофона (cpal default input) и воспроизведение.
+//! Запись и воспроизведение голосовых (cpal + WinMM на Windows).
 
-use std::io::BufReader;
 use std::path::{Path, PathBuf};
-use std::sync::{mpsc, Arc, Mutex};
-use std::time::Instant;
+use std::sync::atomic::{AtomicBool, Ordering};
+#[cfg(not(target_os = "windows"))]
+use std::sync::atomic::AtomicUsize;
+use std::sync::mpsc::{self, Receiver, SyncSender, TrySendError};
+use std::sync::Arc;
+use std::time::{Duration, Instant};
 
 use cpal::traits::{DeviceTrait, HostTrait, StreamTrait};
 use cpal::SampleFormat;
-use rodio::{Decoder, OutputStream, Sink};
 
-/// Максимальная длительность записи (сек).
+pub(crate) const VOICE_SAMPLE_RATE: u32 = 48_000;
 pub(crate) const MAX_VOICE_DURATION_SECS: f32 = 300.0;
+
+const CAPTURE_DRAIN_MS: u64 = 300;
+const MIN_RECORD_SECS: f32 = 0.4;
 
 pub(crate) enum VoiceRecorderState {
     Idle,
@@ -52,6 +57,16 @@ impl VoiceRecorder {
         };
     }
 
+    pub(crate) fn take_error(&mut self) -> Option<String> {
+        if let VoiceRecorderState::Error(e) =
+            std::mem::replace(&mut self.state, VoiceRecorderState::Idle)
+        {
+            Some(e)
+        } else {
+            None
+        }
+    }
+
     pub(crate) fn is_recording(&self) -> bool {
         matches!(self.state, VoiceRecorderState::Recording { .. })
     }
@@ -90,29 +105,32 @@ impl VoiceRecorder {
             let _ = tx.send(());
         }
         self.done_rx = None;
-        self.state = VoiceRecorderState::Idle;
+        if !self.is_processing() {
+            self.state = VoiceRecorderState::Idle;
+        }
     }
 
-    /// Начать / остановить запись. Возвращает текст ошибки, если не удалось начать.
-    pub(crate) fn toggle_record(&mut self) -> Option<String> {
+    pub(crate) fn toggle_record(&mut self) -> Result<bool, String> {
         if self.is_processing() {
-            return None;
+            return Err("Подождите, идёт обработка записи".into());
         }
         if self.is_recording() {
             self.stop_recording();
-            return None;
+            return Ok(false);
         }
         self.clear();
-        self.start_recording()
+        self.start_recording()?;
+        Ok(true)
     }
 
-    fn start_recording(&mut self) -> Option<String> {
+    fn start_recording(&mut self) -> Result<(), String> {
         let (stop_tx, stop_rx) = mpsc::channel::<()>();
         let (done_tx, done_rx) = mpsc::channel();
         self.stop_tx = Some(stop_tx);
         self.done_rx = Some(done_rx);
 
         std::thread::spawn(move || {
+            init_audio_thread();
             let result = record_from_default_input(stop_rx);
             let _ = done_tx.send(result);
         });
@@ -120,7 +138,7 @@ impl VoiceRecorder {
         self.state = VoiceRecorderState::Recording {
             started: Instant::now(),
         };
-        None
+        Ok(())
     }
 
     fn stop_recording(&mut self) {
@@ -133,92 +151,193 @@ impl VoiceRecorder {
     }
 }
 
-fn record_from_default_input(stop_rx: mpsc::Receiver<()>) -> Result<(PathBuf, f32), String> {
+fn init_audio_thread() {
+    #[cfg(target_os = "windows")]
+    {
+        use std::ffi::c_void;
+        #[link(name = "ole32")]
+        extern "system" {
+            fn CoInitializeEx(reserved: *const c_void, co_init: u32) -> i32;
+        }
+        const COINIT_MULTITHREADED: u32 = 0x0;
+        unsafe {
+            let _ = CoInitializeEx(std::ptr::null(), COINIT_MULTITHREADED);
+        }
+    }
+}
+
+fn pick_input_config(device: &cpal::Device) -> Result<cpal::SupportedStreamConfig, String> {
+    if let Ok(cfg) = device.default_input_config() {
+        return Ok(cfg);
+    }
+    let configs: Vec<_> = device
+        .supported_input_configs()
+        .map_err(|e| format!("Микрофон: {}", e))?
+        .filter(|c| {
+            matches!(
+                c.sample_format(),
+                SampleFormat::F32 | SampleFormat::I16 | SampleFormat::I32 | SampleFormat::U16
+            )
+        })
+        .collect();
+    configs
+        .into_iter()
+        .next()
+        .map(|c| c.with_max_sample_rate())
+        .ok_or_else(|| "Нет подходящего формата микрофона".into())
+}
+
+fn record_from_default_input(stop_rx: Receiver<()>) -> Result<(PathBuf, f32), String> {
     let host = cpal::default_host();
     let device = host
         .default_input_device()
         .ok_or_else(|| "Системный микрофон не найден".to_string())?;
-    let config = device
-        .default_input_config()
-        .map_err(|e| format!("Не удалось открыть микрофон: {}", e))?;
+    let device_name = device.name().unwrap_or_else(|_| "?".into());
+    let config = pick_input_config(&device)
+        .map_err(|e| format!("{} ({})", e, device_name))?;
 
     let sample_rate = config.sample_rate().0;
     let channels = config.channels() as usize;
-    let samples: Arc<Mutex<Vec<f32>>> = Arc::new(Mutex::new(Vec::new()));
-    let samples_cb = samples.clone();
+    let (sample_tx, sample_rx) = mpsc::sync_channel::<Vec<f32>>(512);
+    let err_flag = Arc::new(AtomicBool::new(false));
 
-    let stream = match config.sample_format() {
-        SampleFormat::F32 => device
-            .build_input_stream(
-                &config.into(),
-                move |data: &[f32], _| {
-                    samples_cb.lock().unwrap().extend_from_slice(data);
-                },
-                |e| tracing::warn!("cpal stream error: {}", e),
-                None,
-            )
-            .map_err(|e| format!("Ошибка потока записи: {}", e))?,
-        SampleFormat::I16 => device
-            .build_input_stream(
-                &config.into(),
-                move |data: &[i16], _| {
-                    let mut buf = samples_cb.lock().unwrap();
-                    buf.extend(data.iter().map(|&v| v as f32 / i16::MAX as f32));
-                },
-                |e| tracing::warn!("cpal stream error: {}", e),
-                None,
-            )
-            .map_err(|e| format!("Ошибка потока записи: {}", e))?,
-        SampleFormat::U16 => device
-            .build_input_stream(
-                &config.into(),
-                move |data: &[u16], _| {
-                    let mut buf = samples_cb.lock().unwrap();
-                    buf.extend(
-                        data.iter()
-                            .map(|&v| (v as f32 - u16::MAX as f32 / 2.0) / (u16::MAX as f32 / 2.0)),
-                    );
-                },
-                |e| tracing::warn!("cpal stream error: {}", e),
-                None,
-            )
-            .map_err(|e| format!("Ошибка потока записи: {}", e))?,
-        other => return Err(format!("Неподдерживаемый формат микрофона: {:?}", other)),
-    };
-
+    let stream = build_input_stream(&device, &config, sample_tx, err_flag.clone())?;
     stream
         .play()
         .map_err(|e| format!("Не удалось начать запись: {}", e))?;
 
-    let max_samples = (sample_rate as f32 * MAX_VOICE_DURATION_SECS) as usize * channels;
+    let started = Instant::now();
+    let mut stop_requested = false;
+    let mut samples: Vec<f32> = Vec::new();
+
+    let max_samples =
+        (sample_rate as f32 * MAX_VOICE_DURATION_SECS) as usize * channels.max(1);
+
     loop {
         if stop_rx.try_recv().is_ok() {
+            stop_requested = true;
+        }
+        if err_flag.load(Ordering::Relaxed) {
+            return Err(format!("Ошибка потока записи ({})", device_name));
+        }
+
+        while let Ok(chunk) = sample_rx.try_recv() {
+            samples.extend(chunk);
+        }
+
+        let elapsed = started.elapsed().as_secs_f32();
+        if stop_requested && elapsed >= MIN_RECORD_SECS {
             break;
         }
-        if samples.lock().unwrap().len() >= max_samples {
+        if samples.len() >= max_samples {
             break;
         }
-        std::thread::sleep(std::time::Duration::from_millis(50));
+        std::thread::sleep(Duration::from_millis(10));
+    }
+
+    std::thread::sleep(Duration::from_millis(CAPTURE_DRAIN_MS));
+    while let Ok(chunk) = sample_rx.try_recv() {
+        samples.extend(chunk);
     }
     drop(stream);
 
-    let raw = samples.lock().unwrap().clone();
-    if raw.is_empty() {
-        return Err("Запись пуста — проверьте микрофон".into());
+    if samples.is_empty() {
+        return Err(format!(
+            "Запись пуста ({device_name}). Разрешите микрофон для VOID: Параметры → Конфиденциальность → Микрофон."
+        ));
     }
 
-    let mono = downmix_to_mono(&raw, channels);
+    let mono = downmix_to_mono(&samples, channels);
     let duration_secs = mono.len() as f32 / sample_rate as f32;
-    if duration_secs < 0.3 {
-        return Err("Слишком короткая запись".into());
+    if duration_secs < MIN_RECORD_SECS {
+        return Err("Слишком короткая запись — удерживайте микрофон дольше".into());
     }
+
+    let mono = if sample_rate == VOICE_SAMPLE_RATE {
+        mono
+    } else {
+        resample_linear(&mono, sample_rate, VOICE_SAMPLE_RATE)
+    };
+    let duration_secs = mono.len() as f32 / VOICE_SAMPLE_RATE as f32;
 
     let path = std::env::temp_dir().join(format!(
         "void_voice_{}.wav",
         chrono::Local::now().format("%Y%m%d_%H%M%S_%f")
     ));
-    write_wav_mono(&path, &mono, sample_rate)?;
+    write_wav_mono(&path, &mono, VOICE_SAMPLE_RATE)?;
     Ok((path, duration_secs))
+}
+
+fn build_input_stream(
+    device: &cpal::Device,
+    config: &cpal::SupportedStreamConfig,
+    sample_tx: SyncSender<Vec<f32>>,
+    err_flag: Arc<AtomicBool>,
+) -> Result<cpal::Stream, String> {
+    let err_cb = {
+        let err_flag = err_flag.clone();
+        move |_e: cpal::StreamError| {
+            err_flag.store(true, Ordering::Relaxed);
+        }
+    };
+
+    let stream_cfg: cpal::StreamConfig = config.clone().into();
+    let push = move |chunk: Vec<f32>| {
+        match sample_tx.try_send(chunk) {
+            Ok(()) => {}
+            Err(TrySendError::Full(_)) => {}
+            Err(TrySendError::Disconnected(_)) => {}
+        }
+    };
+
+    let stream = match config.sample_format() {
+        SampleFormat::F32 => device
+            .build_input_stream(
+                &stream_cfg,
+                move |data: &[f32], _| push(data.to_vec()),
+                err_cb,
+                None,
+            )
+            .map_err(|e| format!("Поток F32: {}", e))?,
+        SampleFormat::I16 => device
+            .build_input_stream(
+                &stream_cfg,
+                move |data: &[i16], _| {
+                    push(data.iter().map(|&v| v as f32 / i16::MAX as f32).collect());
+                },
+                err_cb,
+                None,
+            )
+            .map_err(|e| format!("Поток I16: {}", e))?,
+        SampleFormat::U16 => device
+            .build_input_stream(
+                &stream_cfg,
+                move |data: &[u16], _| {
+                    push(
+                        data.iter()
+                            .map(|&v| {
+                                (v as f32 - u16::MAX as f32 / 2.0) / (u16::MAX as f32 / 2.0)
+                            })
+                            .collect(),
+                    );
+                },
+                err_cb,
+                None,
+            )
+            .map_err(|e| format!("Поток U16: {}", e))?,
+        SampleFormat::I32 => device
+            .build_input_stream(
+                &stream_cfg,
+                move |data: &[i32], _| {
+                    push(data.iter().map(|&v| v as f32 / i32::MAX as f32).collect());
+                },
+                err_cb,
+                None,
+            )
+            .map_err(|e| format!("Поток I32: {}", e))?,
+        other => return Err(format!("Формат микрофона {:?} не поддерживается", other)),
+    };
+    Ok(stream)
 }
 
 fn downmix_to_mono(samples: &[f32], channels: usize) -> Vec<f32> {
@@ -235,6 +354,24 @@ fn downmix_to_mono(samples: &[f32], channels: usize) -> Vec<f32> {
     mono
 }
 
+fn resample_linear(input: &[f32], from_rate: u32, to_rate: u32) -> Vec<f32> {
+    if from_rate == 0 || to_rate == 0 || input.is_empty() || from_rate == to_rate {
+        return input.to_vec();
+    }
+    let ratio = from_rate as f64 / to_rate as f64;
+    let out_len = ((input.len() as f64) / ratio).ceil() as usize;
+    let mut out = Vec::with_capacity(out_len.max(1));
+    for i in 0..out_len {
+        let src_pos = i as f64 * ratio;
+        let idx = src_pos.floor() as usize;
+        let frac = (src_pos - idx as f64) as f32;
+        let s0 = input.get(idx).copied().unwrap_or(0.0);
+        let s1 = input.get(idx.saturating_add(1)).copied().unwrap_or(s0);
+        out.push(s0 + (s1 - s0) * frac);
+    }
+    out
+}
+
 fn write_wav_mono(path: &Path, samples: &[f32], sample_rate: u32) -> Result<(), String> {
     let spec = hound::WavSpec {
         channels: 1,
@@ -245,8 +382,7 @@ fn write_wav_mono(path: &Path, samples: &[f32], sample_rate: u32) -> Result<(), 
     let mut writer =
         hound::WavWriter::create(path, spec).map_err(|e| format!("Не удалось создать WAV: {}", e))?;
     for &s in samples {
-        let clamped = s.clamp(-1.0, 1.0);
-        let sample = (clamped * i16::MAX as f32) as i16;
+        let sample = (s.clamp(-1.0, 1.0) * i16::MAX as f32) as i16;
         writer
             .write_sample(sample)
             .map_err(|e| format!("Ошибка записи WAV: {}", e))?;
@@ -260,70 +396,225 @@ fn write_wav_mono(path: &Path, samples: &[f32], sample_rate: u32) -> Result<(), 
 // ─── Воспроизведение ─────────────────────────────────────────────────────────
 
 pub(crate) struct VoicePlayer {
-    sink: Option<Sink>,
-    _output: Option<OutputStream>,
+    stop_tx: Option<mpsc::Sender<()>>,
+    done_rx: Option<mpsc::Receiver<Result<(), String>>>,
     pub(crate) playing_id: Option<String>,
+    last_error: Option<String>,
 }
 
 impl VoicePlayer {
     pub(crate) fn new() -> Self {
         Self {
-            sink: None,
-            _output: None,
+            stop_tx: None,
+            done_rx: None,
             playing_id: None,
+            last_error: None,
         }
+    }
+
+    pub(crate) fn take_error(&mut self) -> Option<String> {
+        self.last_error.take()
     }
 
     pub(crate) fn is_playing(&self, transfer_id: &str) -> bool {
         self.playing_id.as_deref() == Some(transfer_id)
-            && self
-                .sink
-                .as_ref()
-                .is_some_and(|s| !s.empty() && !s.is_paused())
     }
 
-    pub(crate) fn toggle(&mut self, transfer_id: &str, path: &Path) {
+    pub(crate) fn toggle(&mut self, transfer_id: &str, path: &Path) -> Option<String> {
         if self.is_playing(transfer_id) {
             self.stop();
-            return;
+            return None;
         }
         self.stop();
-        let Ok((output, stream_handle)) = OutputStream::try_default() else {
-            return;
-        };
-        let Ok(file) = std::fs::File::open(path) else {
-            return;
-        };
-        let Ok(source) = Decoder::new(BufReader::new(file)) else {
-            return;
-        };
-        let Ok(sink) = Sink::try_new(&stream_handle) else {
-            return;
-        };
-        sink.append(source);
-        self.sink = Some(sink);
-        self._output = Some(output);
+
+        if !path.is_file() {
+            return Some(format!("Аудиофайл не найден: {}", path.display()));
+        }
+
+        let (done_tx, done_rx) = mpsc::channel();
+        self.done_rx = Some(done_rx);
         self.playing_id = Some(transfer_id.to_string());
+
+        let path = path.to_path_buf();
+        std::thread::spawn(move || {
+            init_audio_thread();
+            let result = play_wav_file(&path);
+            let _ = done_tx.send(result);
+        });
+        None
     }
 
     pub(crate) fn stop(&mut self) {
-        if let Some(sink) = self.sink.take() {
-            sink.stop();
+        if let Some(tx) = self.stop_tx.take() {
+            let _ = tx.send(());
         }
-        self._output = None;
         self.playing_id = None;
     }
 
     pub(crate) fn poll(&mut self) {
-        if let Some(sink) = &self.sink {
-            if sink.empty() {
-                self.stop();
-            }
+        let Some(rx) = self.done_rx.as_ref() else {
+            return;
+        };
+        let Ok(result) = rx.try_recv() else {
+            return;
+        };
+        self.done_rx = None;
+        self.playing_id = None;
+        if let Err(e) = result {
+            self.last_error = Some(e);
         }
     }
 }
 
-/// Форматирует длительность «0:05».
+fn play_wav_file(path: &Path) -> Result<(), String> {
+    #[cfg(target_os = "windows")]
+    {
+        return play_wav_winmm(path);
+    }
+    #[cfg(not(target_os = "windows"))]
+    {
+        play_wav_cpal(path)
+    }
+}
+
+#[cfg(target_os = "windows")]
+fn play_wav_winmm(path: &Path) -> Result<(), String> {
+    use std::os::windows::ffi::OsStrExt;
+
+    #[link(name = "winmm")]
+    extern "system" {
+        fn PlaySoundW(psz_sound: *const u16, hmod: *mut std::ffi::c_void, fdw_sound: u32) -> i32;
+    }
+    const SND_FILENAME: u32 = 0x0002_0000;
+    const SND_SYNC: u32 = 0x0000_0000;
+
+    let wide: Vec<u16> = path.as_os_str().encode_wide().chain(Some(0)).collect();
+    let ok = unsafe { PlaySoundW(wide.as_ptr(), std::ptr::null_mut(), SND_FILENAME | SND_SYNC) };
+    if ok == 0 {
+        Err(format!("PlaySoundW не смог воспроизвести {}", path.display()))
+    } else {
+        Ok(())
+    }
+}
+
+#[cfg(not(target_os = "windows"))]
+fn play_wav_cpal(path: &Path) -> Result<(), String> {
+    use cpal::traits::{DeviceTrait, HostTrait, StreamTrait};
+
+    let (mono, src_rate) = read_wav_mono_f32(path)?;
+    let mono = if src_rate == VOICE_SAMPLE_RATE {
+        mono
+    } else {
+        resample_linear(&mono, src_rate, VOICE_SAMPLE_RATE)
+    };
+
+    let host = cpal::default_host();
+    let device = host
+        .default_output_device()
+        .ok_or_else(|| "Устройство воспроизведения не найдено".to_string())?;
+    let config = device
+        .default_output_config()
+        .map_err(|e| format!("Выход аудио: {}", e))?;
+
+    let out_ch = config.channels() as usize;
+    let out_rate = config.sample_rate().0;
+    let pcm = Arc::new(if out_rate == VOICE_SAMPLE_RATE {
+        mono
+    } else {
+        resample_linear(&mono, VOICE_SAMPLE_RATE, out_rate)
+    });
+    let frame_pos = Arc::new(AtomicUsize::new(0));
+    let total_frames = pcm.len();
+    let stream = build_output_stream(&device, &config, pcm, frame_pos.clone(), out_ch)?;
+    stream
+        .play()
+        .map_err(|e| format!("Не удалось начать воспроизведение: {}", e))?;
+
+    while frame_pos.load(Ordering::Relaxed) < total_frames {
+        std::thread::sleep(Duration::from_millis(15));
+    }
+    Ok(())
+}
+
+#[cfg(not(target_os = "windows"))]
+fn build_output_stream(
+    device: &cpal::Device,
+    config: &cpal::SupportedStreamConfig,
+    pcm: Arc<Vec<f32>>,
+    frame_pos: Arc<AtomicUsize>,
+    output_channels: usize,
+) -> Result<cpal::Stream, String> {
+    let stream_cfg: cpal::StreamConfig = config.clone().into();
+    let ch = output_channels.max(1);
+
+    macro_rules! write_frames {
+        ($out:expr, $to_sample:expr) => {{
+            let mut pos = frame_pos.load(Ordering::Relaxed);
+            for frame in $out.chunks_mut(ch) {
+                let s = pcm.get(pos).copied().unwrap_or(0.0);
+                let v = $to_sample(s);
+                for slot in frame.iter_mut() {
+                    *slot = v;
+                }
+                pos += 1;
+            }
+            frame_pos.store(pos, Ordering::Relaxed);
+        }};
+    }
+
+    match config.sample_format() {
+        SampleFormat::F32 => device
+            .build_output_stream(
+                &stream_cfg,
+                move |out: &mut [f32], _| write_frames!(out, |s: f32| s),
+                |_| {},
+                None,
+            )
+            .map_err(|e| format!("Выход F32: {}", e)),
+        SampleFormat::I16 => device
+            .build_output_stream(
+                &stream_cfg,
+                move |out: &mut [i16], _| {
+                    write_frames!(out, |s: f32| (s.clamp(-1.0, 1.0) * i16::MAX as f32) as i16)
+                },
+                |_| {},
+                None,
+            )
+            .map_err(|e| format!("Выход I16: {}", e)),
+        other => Err(format!("Формат выхода {:?} не поддерживается", other)),
+    }
+}
+
+#[cfg(not(target_os = "windows"))]
+fn read_wav_mono_f32(path: &Path) -> Result<(Vec<f32>, u32), String> {
+    let mut reader = hound::WavReader::open(path).map_err(|e| format!("WAV: {}", e))?;
+    let spec = reader.spec();
+    let channels = spec.channels as usize;
+
+    let raw: Vec<f32> = match (spec.sample_format, spec.bits_per_sample) {
+        (hound::SampleFormat::Int, 16) => reader
+            .samples::<i16>()
+            .map(|s| s.unwrap_or(0) as f32 / i16::MAX as f32)
+            .collect(),
+        (hound::SampleFormat::Int, 32) => reader
+            .samples::<i32>()
+            .map(|s| s.unwrap_or(0) as f32 / i32::MAX as f32)
+            .collect(),
+        (hound::SampleFormat::Float, 32) => reader
+            .samples::<f32>()
+            .map(|s| s.unwrap_or(0.0))
+            .collect(),
+        _ => {
+            return Err(format!(
+                "WAV {} бит {:?}",
+                spec.bits_per_sample, spec.sample_format
+            ));
+        }
+    };
+
+    Ok((downmix_to_mono(&raw, channels.max(1)), spec.sample_rate))
+}
+
 pub(crate) fn fmt_duration(secs: f32) -> String {
     let total = secs.max(0.0).round() as u32;
     format!("{}:{:02}", total / 60, total % 60)
