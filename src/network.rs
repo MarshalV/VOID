@@ -24,8 +24,8 @@ use crate::protocol::{
     build_delete_ack_json, build_v1_hello,
     chat_message_id_from_json,     delete_command_message_ids, is_delete_command_json,
     is_read_command_json, new_message_id, parse_decrypted_chat_frame,
-    read_command_message_ids, verify_hello_transport_binding, ChatMessage, DecryptedChatFrame, OutgoingDeliveryStatus,
-    V1Packet,
+    read_command_message_ids, verify_hello_transport_binding, transfer_id_to_hex, ChatMessage,
+    DecryptedChatFrame, OutgoingDeliveryStatus, VoiceMeta, V1Packet,
 };
 
 fn is_junk_addr(ma: &Multiaddr) -> bool {
@@ -156,6 +156,14 @@ pub(crate) enum NetworkEvent {
         path: String,
         kind: file_transfer::FileKind,
     },
+    /// Голосовое сообщение отложено — нет E2EE-сессии.
+    VoiceSendDeferred {
+        recipient: PeerId,
+        path: String,
+        duration_secs: f32,
+        message_id: String,
+        transfer_id: [u8; 16],
+    },
     // ─── Файловый sub-протокол ──────────────────────────────────────────────
     /// Входящее предложение файла — пользователь должен принять или отклонить.
     FileOffer {
@@ -249,6 +257,8 @@ async fn apply_incoming_file_chunk(
                         .and_then(|t| t.save_dir.clone())
                     {
                         file_transfer::unique_download_path_in(dir, &fname)
+                    } else if file_transfer::is_voice_filename(&fname) {
+                        file_transfer::unique_download_path_in(file_transfer::VOICE_DIR, &fname)
                     } else {
                         file_transfer::unique_download_path(&fname)
                     };
@@ -313,6 +323,16 @@ pub(crate) enum UICommand {
         recipient: PeerId,
         path: String,
         kind: file_transfer::FileKind,
+    },
+    /// Голосовое сообщение: ChatMessage + file-transfer с фиксированным transfer_id.
+    SendVoiceMessage {
+        sender_name: String,
+        recipient: PeerId,
+        path: String,
+        duration_secs: f32,
+        message_id: String,
+        transfer_id: [u8; 16],
+        is_retry: bool,
     },
     /// Пользователь принял входящее предложение файла.
     AcceptFile {
@@ -1254,6 +1274,7 @@ pub async fn run_chat_network(
                                     text: text.clone(),
                                     timestamp: chrono::Local::now().format("%H:%M").to_string(),
                                     delivery: OutgoingDeliveryStatus::Pending,
+                                    voice: None,
                                 };
 
                                 let json_data = match serde_json::to_vec(&msg) {
@@ -1484,6 +1505,153 @@ pub async fn run_chat_network(
                                             let _ = event_tx
                                                 .send(NetworkEvent::FileProgress {
                                                     transfer_id: tid,
+                                                    sent_chunks: 0,
+                                                    total_chunks,
+                                                    filename,
+                                                    total_size,
+                                                    is_outgoing: true,
+                                                    peer: recipient,
+                                                    kind: file_kind,
+                                                })
+                                                .await;
+                                        }
+                                    }
+                                }
+                            }
+                            UICommand::SendVoiceMessage {
+                                sender_name,
+                                recipient,
+                                path,
+                                duration_secs,
+                                message_id,
+                                transfer_id,
+                                is_retry,
+                            } => {
+                                let now = chrono::Local::now().format("%H:%M:%S").to_string();
+                                let msg = ChatMessage {
+                                    id: message_id.clone(),
+                                    sender_id: local_peer_id.to_string(),
+                                    sender_name: sender_name.clone(),
+                                    recipient_id: Some(recipient.to_string()),
+                                    text: String::new(),
+                                    timestamp: chrono::Local::now().format("%H:%M").to_string(),
+                                    delivery: OutgoingDeliveryStatus::Pending,
+                                    voice: Some(VoiceMeta {
+                                        transfer_id: transfer_id_to_hex(&transfer_id),
+                                        duration_secs,
+                                    }),
+                                };
+
+                                let json_data = match serde_json::to_vec(&msg) {
+                                    Ok(v) => v,
+                                    Err(e) => {
+                                        let _ = event_tx
+                                            .send(NetworkEvent::Status(format!(
+                                                "❌ Не удалось сериализовать голосовое: {}",
+                                                e
+                                            )))
+                                            .await;
+                                        continue;
+                                    }
+                                };
+
+                                if !sessions.contains_key(&recipient) {
+                                    let _ = event_tx
+                                        .send(NetworkEvent::VoiceSendDeferred {
+                                            recipient,
+                                            path,
+                                            duration_secs,
+                                            message_id,
+                                            transfer_id,
+                                        })
+                                        .await;
+                                    if !is_retry {
+                                        let _ = event_tx.send(NetworkEvent::ChatMessage(msg)).await;
+                                    }
+                                    continue;
+                                }
+
+                                let msg_id_for_send =
+                                    chat_message_id_from_json(json_data.as_slice());
+                                let in_flight = msg_id_for_send.as_ref().is_some_and(|mid| {
+                                    outbound_msg_requests
+                                        .values()
+                                        .any(|(p, id)| *p == recipient && id == mid)
+                                });
+                                if !in_flight {
+                                    let _ = send_encrypted_chat_payload(
+                                        &mut swarm,
+                                        &mut sessions,
+                                        &mut outbound_msg_requests,
+                                        &mut outbound_delete_requests,
+                                        &event_tx,
+                                        recipient,
+                                        json_data,
+                                        None,
+                                        &now,
+                                    )
+                                    .await;
+                                }
+
+                                if !is_retry {
+                                    let _ = event_tx.send(NetworkEvent::ChatMessage(msg)).await;
+                                }
+
+                                match std::fs::read(&path) {
+                                    Err(e) => {
+                                        let _ = event_tx
+                                            .send(NetworkEvent::Status(format!(
+                                                "❌ Не удалось прочитать голосовое «{}»: {}",
+                                                path, e
+                                            )))
+                                            .await;
+                                    }
+                                    Ok(data) => {
+                                        if data.len() as u64 > file_transfer::MAX_FILE_SIZE {
+                                            let _ = event_tx
+                                                .send(NetworkEvent::Status(
+                                                    "❌ Голосовое сообщение слишком большое".into(),
+                                                ))
+                                                .await;
+                                        } else {
+                                            let sha256 = file_transfer::hash_file(&data);
+                                            let chunks = file_transfer::split_into_chunks(&data);
+                                            let total_chunks = chunks.len() as u32;
+                                            let total_size = data.len() as u64;
+                                            let filename =
+                                                file_transfer::voice_filename(&transfer_id);
+                                            let file_kind = file_transfer::FileKind::Audio;
+                                            let is_relay = relay_peers.contains(&recipient);
+                                            let offer = file_transfer::FilePacket::Offer {
+                                                transfer_id,
+                                                filename: filename.clone(),
+                                                total_size,
+                                                total_chunks,
+                                                sha256,
+                                                kind: file_kind,
+                                            };
+                                            swarm
+                                                .behaviour_mut()
+                                                .file_rr
+                                                .send_request(&recipient, offer);
+
+                                            let transfer = file_transfer::OutgoingTransfer {
+                                                peer: recipient,
+                                                transfer_id,
+                                                filename: filename.clone(),
+                                                chunks,
+                                                next_chunk: 0,
+                                                total_size,
+                                                is_relay,
+                                                last_chunk_at: Instant::now(),
+                                                accepted: false,
+                                                kind: file_kind,
+                                            };
+                                            outgoing_transfers.insert(transfer_id, transfer);
+
+                                            let _ = event_tx
+                                                .send(NetworkEvent::FileProgress {
+                                                    transfer_id,
                                                     sent_chunks: 0,
                                                     total_chunks,
                                                     filename,

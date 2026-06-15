@@ -2,6 +2,7 @@ mod chat_store;
 mod crypto;
 mod file_transfer;
 mod ui;
+mod voice;
 
 mod app;
 mod bootstrap;

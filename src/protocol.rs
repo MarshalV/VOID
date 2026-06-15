@@ -20,6 +20,26 @@ pub(crate) enum OutgoingDeliveryStatus {
     Read,
 }
 
+/// Метаданные голосового сообщения (аудио передаётся отдельным file-transfer).
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub(crate) struct VoiceMeta {
+    /// 32 hex-символа (16 байт transfer_id).
+    pub(crate) transfer_id: String,
+    pub(crate) duration_secs: f32,
+}
+
+pub(crate) fn transfer_id_to_hex(tid: &[u8; 16]) -> String {
+    tid.iter().map(|b| format!("{:02x}", b)).collect()
+}
+
+fn validate_voice_meta(v: &VoiceMeta) -> bool {
+    v.transfer_id.len() == 32
+        && v.transfer_id.chars().all(|c| c.is_ascii_hexdigit())
+        && v.duration_secs > 0.0
+        && v.duration_secs.is_finite()
+        && v.duration_secs <= 3600.0
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub(crate) struct ChatMessage {
     #[serde(default)]
@@ -32,6 +52,9 @@ pub(crate) struct ChatMessage {
     /// Только для исходящих: ○ / ✓ / ✓✓.
     #[serde(default)]
     pub(crate) delivery: OutgoingDeliveryStatus,
+    /// Голосовое сообщение: аудио по `transfer_id` в file sub-протоколе.
+    #[serde(default)]
+    pub(crate) voice: Option<VoiceMeta>,
 }
 
 pub(crate) fn new_message_id() -> String {
@@ -295,6 +318,14 @@ pub(crate) fn parse_decrypted_chat_json(plaintext: &[u8]) -> Option<ChatMessage>
         || msg.text.len() > MAX_CHAT_TEXT_BYTES
         || msg.timestamp.len() > MAX_CHAT_TIMESTAMP_BYTES
     {
+        return None;
+    }
+    if let Some(ref voice) = msg.voice {
+        if !validate_voice_meta(voice) {
+            return None;
+        }
+    }
+    if msg.text.is_empty() && msg.voice.is_none() {
         return None;
     }
     if let Some(ref r) = msg.recipient_id {

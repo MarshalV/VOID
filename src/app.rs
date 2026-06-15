@@ -18,9 +18,10 @@ use crate::chat_store::ChatJournal;
 use crate::crypto;
 use crate::file_transfer;
 use crate::network::{run_chat_network, NetworkEvent, UICommand};
-use crate::protocol::{new_message_id, ChatMessage, FileTransferProgress, OutgoingDeliveryStatus};
+use crate::protocol::{new_message_id, transfer_id_to_hex, ChatMessage, FileTransferProgress, OutgoingDeliveryStatus};
 use crate::ui::{setup_custom_style, Toast, ToastKind, TOAST_TTL_SHORT};
 use crate::vault::{AddressBookEntry, Storage, VaultUnlockKind, VaultUnlockState};
+use crate::voice::{VoicePlayer, VoiceRecorder};
 
 /// Переписки, доступные и UI, и сетевому таску (входящее удаление без roundtrip через egui).
 #[derive(Clone)]
@@ -121,6 +122,17 @@ pub(crate) struct PendingFileSend {
     pub(crate) last_attempt: Instant,
 }
 
+/// Голосовое сообщение в очереди до E2EE-сессии.
+#[derive(Clone)]
+pub(crate) struct PendingVoiceSend {
+    pub(crate) peer: PeerId,
+    pub(crate) path: String,
+    pub(crate) duration_secs: f32,
+    pub(crate) message_id: String,
+    pub(crate) transfer_id: [u8; 16],
+    pub(crate) last_attempt: Instant,
+}
+
 pub(crate) const RESEND_GRACE: Duration = Duration::from_secs(3);
 /// Базовая задержка перед повтором после DHT-поиска (растёт с числом попыток).
 pub(crate) const RESEND_DELAY_BASE: Duration = Duration::from_secs(5);
@@ -174,6 +186,13 @@ pub(crate) struct App {
     pub(crate) active_file_transfers: HashMap<[u8; 16], FileTransferProgress>,
     /// Флаг: показывать popup-меню выбора типа вложения.
     pub(crate) show_attach_menu: bool,
+    /// Запись голосовых с системного микрофона.
+    pub(crate) voice_recorder: VoiceRecorder,
+    /// Воспроизведение голосовых в чате.
+    pub(crate) voice_player: VoicePlayer,
+    /// Локальные пути WAV по transfer_id (hex).
+    pub(crate) voice_audio_paths: HashMap<String, String>,
+    pub(crate) pending_voice_sends: Vec<PendingVoiceSend>,
     /// Ожидаемый результат выбора папки сохранения: `(rx, transfer_id, from_peer)`.
     /// Поллим `try_recv()` каждый кадр; `None` = выбор не идёт.
     pub(crate) pending_accept: Option<(
@@ -240,6 +259,10 @@ impl App {
             incoming_file_offers: Vec::new(),
             active_file_transfers: HashMap::new(),
             show_attach_menu: false,
+            voice_recorder: VoiceRecorder::new(),
+            voice_player: VoicePlayer::new(),
+            voice_audio_paths: HashMap::new(),
+            pending_voice_sends: Vec::new(),
             pending_accept: None,
             pending_unlock,
             deferred_network_spawn,
@@ -809,6 +832,122 @@ impl App {
             .retain(|p| !(p.peer == peer && p.path == path));
     }
 
+    pub(crate) fn register_voice_path(&mut self, transfer_id_hex: &str, path: String) {
+        self.voice_audio_paths
+            .insert(transfer_id_hex.to_string(), path);
+    }
+
+    pub(crate) fn resolve_voice_path(&self, transfer_id_hex: &str) -> Option<std::path::PathBuf> {
+        if let Some(p) = self.voice_audio_paths.get(transfer_id_hex) {
+            let path = std::path::PathBuf::from(p);
+            if path.exists() {
+                return Some(path);
+            }
+        }
+        let name = format!(
+            "{}{}.wav",
+            file_transfer::VOICE_FILENAME_PREFIX, transfer_id_hex
+        );
+        let dir = std::path::Path::new(file_transfer::VOICE_DIR);
+        let direct = dir.join(&name);
+        if direct.exists() {
+            return Some(direct);
+        }
+        if dir.exists() {
+            if let Ok(entries) = std::fs::read_dir(dir) {
+                for entry in entries.flatten() {
+                    let fname = entry.file_name().to_string_lossy().into_owned();
+                    if fname.starts_with(&format!("{}{}", file_transfer::VOICE_FILENAME_PREFIX, transfer_id_hex)) {
+                        return Some(entry.path());
+                    }
+                }
+            }
+        }
+        None
+    }
+
+    pub(crate) fn send_voice_message(
+        &mut self,
+        peer: PeerId,
+        path: std::path::PathBuf,
+        duration_secs: f32,
+    ) -> Result<(), &'static str> {
+        let mut tid = [0u8; 16];
+        rand::thread_rng().fill_bytes(&mut tid);
+        let message_id = new_message_id();
+        let transfer_hex = transfer_id_to_hex(&tid);
+        let path_str = path.display().to_string();
+        self.register_voice_path(&transfer_hex, path_str.clone());
+        match self.command_tx.try_send(UICommand::SendVoiceMessage {
+            sender_name: self.local_nickname.clone(),
+            recipient: peer,
+            path: path_str.clone(),
+            duration_secs,
+            message_id: message_id.clone(),
+            transfer_id: tid,
+            is_retry: false,
+        }) {
+            Ok(()) => {
+                self.pending_voice_sends.push(PendingVoiceSend {
+                    peer,
+                    path: path_str,
+                    duration_secs,
+                    message_id: message_id.clone(),
+                    transfer_id: tid,
+                    last_attempt: Instant::now(),
+                });
+                self.pending_sends.push(PendingSend {
+                    peer,
+                    text: String::new(),
+                    message_id,
+                    last_send_at: Instant::now(),
+                    dht_kicked: false,
+                    dht_kicked_at: None,
+                    attempts: 0,
+                    awaiting_session: false,
+                });
+                Ok(())
+            }
+            Err(_) => Err("Очередь к сети переполнена"),
+        }
+    }
+
+    pub(crate) fn complete_pending_voice_send(&mut self, peer: PeerId, message_id: &str) {
+        self.pending_voice_sends.retain(|p| {
+            !(p.peer == peer && p.message_id == message_id)
+        });
+    }
+
+    pub(crate) fn tick_pending_voice_sends(&mut self) {
+        const RETRY: Duration = Duration::from_secs(10);
+        let now = Instant::now();
+        let due: Vec<PendingVoiceSend> = self
+            .pending_voice_sends
+            .iter()
+            .filter(|p| now.duration_since(p.last_attempt) >= RETRY)
+            .cloned()
+            .collect();
+        for item in due {
+            if !std::path::Path::new(&item.path).exists() {
+                continue;
+            }
+            if let Some(slot) = self.pending_voice_sends.iter_mut().find(|p| {
+                p.peer == item.peer && p.message_id == item.message_id
+            }) {
+                slot.last_attempt = now;
+            }
+            let _ = self.command_tx.try_send(UICommand::SendVoiceMessage {
+                sender_name: self.local_nickname.clone(),
+                recipient: item.peer,
+                path: item.path,
+                duration_secs: item.duration_secs,
+                message_id: item.message_id,
+                transfer_id: item.transfer_id,
+                is_retry: true,
+            });
+        }
+    }
+
     /// Удаляет сообщения только в локальном диалоге (свои и чужие).
     pub(crate) fn delete_messages(&mut self, peer: PeerId, message_ids: &[String]) {
         if message_ids.is_empty() {
@@ -826,6 +965,7 @@ impl App {
         self.delete_conversation_local(peer);
         self.pending_sends.retain(|p| p.peer != peer);
         self.pending_file_sends.retain(|p| p.peer != peer);
+        self.pending_voice_sends.retain(|p| p.peer != peer);
         self.read_receipts_sent
             .retain(|(p, _)| p != &peer_str);
     }

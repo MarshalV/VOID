@@ -103,6 +103,29 @@ pub const DIRECT_CHUNK_DELAY: Duration = Duration::from_millis(5);
 /// Папка для сохранения принятых файлов.
 pub const DOWNLOADS_DIR: &str = "void_downloads";
 
+/// Подпапка для голосовых сообщений (автоприём без диалога).
+pub const VOICE_DIR: &str = "void_downloads/voice";
+
+/// Префикс имени файла голосового сообщения.
+pub const VOICE_FILENAME_PREFIX: &str = "void_voice_";
+
+/// Имя WAV-файла для голосового сообщения по transfer_id.
+pub fn voice_filename(transfer_id: &[u8; 16]) -> String {
+    format!(
+        "{}{}.wav",
+        VOICE_FILENAME_PREFIX,
+        transfer_id
+            .iter()
+            .map(|b| format!("{:02x}", b))
+            .collect::<String>()
+    )
+}
+
+/// Голосовое сообщение по имени файла (не обычное аудио-вложение).
+pub fn is_voice_filename(name: &str) -> bool {
+    name.starts_with(VOICE_FILENAME_PREFIX) && name.ends_with(".wav")
+}
+
 /// Префикс открытого текста перед Double Ratchet: не начинается с `{`, чтобы отличаться от JSON чата.
 pub const FILE_CHUNK_E2EE_MAGIC: &[u8; 4] = b"VfC1";
 
