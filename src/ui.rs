@@ -2552,14 +2552,7 @@ impl eframe::App for App {
                                 self.voice_recorder.has_ready(),
                             );
                             if record_resp.clicked() {
-                                if self.selected_chat.parse::<PeerId>().is_err() {
-                                    self.push_toast(
-                                        "Выберите контакт слева".into(),
-                                        ToastKind::Warn,
-                                        TOAST_TTL_SHORT,
-                                    );
-                                } else {
-                                    match self.voice_recorder.toggle_record() {
+                                match self.voice_recorder.toggle_record() {
                                         Ok(true) => {
                                             self.push_toast(
                                                 "🔴 Запись — нажмите микрофон ещё раз".into(),
@@ -2580,7 +2573,6 @@ impl eframe::App for App {
                                             self.push_toast(e, ToastKind::Error, TOAST_TTL_LONG);
                                         }
                                     }
-                                }
                             }
                             if recording {
                                 ctx.request_repaint_after(Duration::from_millis(100));
