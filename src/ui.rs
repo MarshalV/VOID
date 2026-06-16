@@ -1863,7 +1863,7 @@ impl eframe::App for App {
                     is_outgoing,
                     peer: _,
                 } => {
-                    if file_transfer::is_voice_filename(&filename) {
+                    if file_transfer::is_voice_filename(&filename) && !saved_to.trim().is_empty() {
                         let tid_hex = file_transfer::voice_transfer_hex_from_filename(&filename)
                             .unwrap_or_else(|| {
                                 transfer_id
@@ -2657,6 +2657,7 @@ impl eframe::App for App {
                     }
                 }
                 if let Some(tid) = voice_toggle {
+                    self.link_voice_file_if_present(&tid);
                     match self.resolve_voice_path(&tid) {
                         Some(path) => {
                             if let Some(err) = self.voice_player.toggle(&tid, &path) {

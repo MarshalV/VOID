@@ -644,6 +644,8 @@ impl App {
             msg.id = new_message_id();
         }
 
+        let voice_tid = msg.voice.as_ref().map(|v| v.transfer_id.clone());
+
         let bucket = if let Some(ref target) = msg.recipient_id {
             if target == &self.local_peer_id.to_string() {
                 Some(msg.sender_id.clone())
@@ -664,6 +666,9 @@ impl App {
             }
             entry.push(msg);
             self.mark_chat_journal_dirty();
+        }
+        if let Some(tid) = voice_tid {
+            self.link_voice_file_if_present(&tid);
         }
     }
 
@@ -860,6 +865,9 @@ impl App {
     }
 
     pub(crate) fn register_voice_path(&mut self, transfer_id_hex: &str, path: String) {
+        if path.trim().is_empty() {
+            return;
+        }
         let mut p = std::path::PathBuf::from(&path);
         if p.is_relative() {
             if let Ok(cwd) = std::env::current_dir() {
@@ -869,8 +877,44 @@ impl App {
         if let Ok(abs) = std::fs::canonicalize(&p) {
             p = abs;
         }
+        if !p.is_file() {
+            return;
+        }
         self.voice_audio_paths
             .insert(transfer_id_hex.to_ascii_lowercase(), p.display().to_string());
+    }
+
+    /// Ищет WAV на диске и привязывает к transfer_id (после приёма или загрузки журнала).
+    pub(crate) fn link_voice_file_if_present(&mut self, transfer_id_hex: &str) {
+        let tid = transfer_id_hex.to_ascii_lowercase();
+        if let Some(p) = self.voice_audio_paths.get(&tid) {
+            if std::path::Path::new(p).is_file() {
+                return;
+            }
+            self.voice_audio_paths.remove(&tid);
+        }
+        if let Some(path) = self.lookup_voice_file_on_disk(&tid) {
+            self.register_voice_path(&tid, path.display().to_string());
+        }
+    }
+
+    fn lookup_voice_file_on_disk(&self, tid: &str) -> Option<std::path::PathBuf> {
+        let name = format!("{}{}.wav", file_transfer::VOICE_FILENAME_PREFIX, tid);
+        let direct = file_transfer::voice_dir_absolute().join(&name);
+        if direct.is_file() {
+            return Some(direct);
+        }
+        let dir = file_transfer::voice_dir_absolute();
+        if let Ok(entries) = std::fs::read_dir(&dir) {
+            let prefix = format!("{}{}", file_transfer::VOICE_FILENAME_PREFIX, tid);
+            for entry in entries.flatten() {
+                let fname = entry.file_name().to_string_lossy().into_owned();
+                if fname.starts_with(&prefix) && fname.ends_with(".wav") {
+                    return Some(entry.path());
+                }
+            }
+        }
+        None
     }
 
     pub(crate) fn resolve_voice_path(&self, transfer_id_hex: &str) -> Option<std::path::PathBuf> {
@@ -881,22 +925,7 @@ impl App {
                 return Some(path);
             }
         }
-        let name = format!("{}{}.wav", file_transfer::VOICE_FILENAME_PREFIX, tid);
-        let direct = file_transfer::voice_dir_absolute().join(&name);
-        if direct.is_file() {
-            return Some(direct);
-        }
-        let dir = file_transfer::voice_dir_absolute();
-        if let Ok(entries) = std::fs::read_dir(&dir) {
-            for entry in entries.flatten() {
-                let fname = entry.file_name().to_string_lossy().into_owned();
-                if fname.starts_with(&format!("{}{}", file_transfer::VOICE_FILENAME_PREFIX, tid))
-                {
-                    return Some(entry.path());
-                }
-            }
-        }
-        None
+        self.lookup_voice_file_on_disk(&tid)
     }
 
     pub(crate) fn send_voice_message(

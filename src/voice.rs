@@ -3,9 +3,7 @@
 use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
-use std::sync::atomic::{AtomicBool, Ordering};
-#[cfg(not(target_os = "windows"))]
-use std::sync::atomic::AtomicUsize;
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::mpsc::{self, Receiver, SyncSender, TrySendError};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
@@ -281,7 +279,7 @@ impl VoiceRecorder {
     }
 }
 
-pub(crate) const VOICE_BUILD: &str = "v5e-fix";
+pub(crate) const VOICE_BUILD: &str = "v5f-play";
 
 /// CLI: `--voice-probe` | `--voice-record <wav> <stop-file>`
 pub(crate) fn run_cli_mode() -> Option<i32> {
@@ -597,11 +595,14 @@ impl VoicePlayer {
     }
 
     pub(crate) fn is_playing(&self, transfer_id: &str) -> bool {
-        self.playing_id.as_deref() == Some(transfer_id)
+        self.playing_id
+            .as_deref()
+            .is_some_and(|id| id.eq_ignore_ascii_case(transfer_id))
     }
 
     pub(crate) fn toggle(&mut self, transfer_id: &str, path: &Path) -> Option<String> {
-        if self.is_playing(transfer_id) {
+        let tid = transfer_id.to_ascii_lowercase();
+        if self.is_playing(&tid) {
             self.stop();
             return None;
         }
@@ -613,7 +614,7 @@ impl VoicePlayer {
 
         let (done_tx, done_rx) = mpsc::channel();
         self.done_rx = Some(done_rx);
-        self.playing_id = Some(transfer_id.to_string());
+        self.playing_id = Some(tid);
 
         let path = path.to_path_buf();
         std::thread::spawn(move || {
@@ -643,13 +644,30 @@ impl VoicePlayer {
 }
 
 fn play_wav_file(path: &Path) -> Result<(), String> {
-    #[cfg(target_os = "windows")]
-    {
-        return play_wav_winmm(path);
+    let path = normalize_playback_path(path);
+    voice_log(&format!("play {}", path.display()));
+    match play_wav_cpal(&path) {
+        Ok(()) => Ok(()),
+        Err(cpal_err) => {
+            #[cfg(target_os = "windows")]
+            {
+                play_wav_winmm(&path)
+                    .map_err(|winmm_err| format!("cpal: {cpal_err}; winmm: {winmm_err}"))
+            }
+            #[cfg(not(target_os = "windows"))]
+            {
+                Err(cpal_err)
+            }
+        }
     }
-    #[cfg(not(target_os = "windows"))]
-    {
-        play_wav_cpal(path)
+}
+
+fn normalize_playback_path(path: &Path) -> PathBuf {
+    let s = path.display().to_string();
+    if let Some(stripped) = s.strip_prefix(r"\\?\") {
+        PathBuf::from(stripped)
+    } else {
+        path.to_path_buf()
     }
 }
 
@@ -673,7 +691,6 @@ fn play_wav_winmm(path: &Path) -> Result<(), String> {
     }
 }
 
-#[cfg(not(target_os = "windows"))]
 fn play_wav_cpal(path: &Path) -> Result<(), String> {
     use cpal::traits::{DeviceTrait, HostTrait, StreamTrait};
 
@@ -712,7 +729,6 @@ fn play_wav_cpal(path: &Path) -> Result<(), String> {
     Ok(())
 }
 
-#[cfg(not(target_os = "windows"))]
 fn build_output_stream(
     device: &cpal::Device,
     config: &cpal::SupportedStreamConfig,
@@ -761,7 +777,6 @@ fn build_output_stream(
     }
 }
 
-#[cfg(not(target_os = "windows"))]
 fn read_wav_mono_f32(path: &Path) -> Result<(Vec<f32>, u32), String> {
     let mut reader = hound::WavReader::open(path).map_err(|e| format!("WAV: {e}"))?;
     let spec = reader.spec();
