@@ -18,7 +18,10 @@ use crate::chat_store::ChatJournal;
 use crate::crypto;
 use crate::file_transfer;
 use crate::network::{run_chat_network, NetworkEvent, UICommand};
-use crate::protocol::{new_message_id, transfer_id_to_hex, ChatMessage, FileTransferProgress, OutgoingDeliveryStatus};
+use crate::protocol::{
+    new_message_id, transfer_id_to_hex, ChatMessage, FileTransferProgress, OutgoingDeliveryStatus,
+    VoiceMeta,
+};
 use crate::ui::{setup_custom_style, Toast, ToastKind, TOAST_TTL_SHORT};
 use crate::vault::{AddressBookEntry, Storage, VaultUnlockKind, VaultUnlockState};
 use crate::voice::{VoicePlayer, VoiceRecorder};
@@ -654,8 +657,30 @@ impl App {
         };
 
         if let Some(b) = bucket {
-            self.messages.lock().entry(b).or_default().push(msg);
+            let mut messages = self.messages.lock();
+            let entry = messages.entry(b).or_default();
+            if entry.iter().any(|m| m.id == msg.id) {
+                return;
+            }
+            entry.push(msg);
             self.mark_chat_journal_dirty();
+        }
+    }
+
+    /// Отправляет готовое голосовое, если выбран контакт. Иначе оставляет `Ready`.
+    pub(crate) fn try_dispatch_ready_voice(&mut self) -> Option<String> {
+        if !self.voice_recorder.has_ready() {
+            return None;
+        }
+        let peer = self.selected_chat.parse::<PeerId>().ok()?;
+        let (path, duration) = self.voice_recorder.take_ready()?;
+        let dur = crate::voice::fmt_duration(duration);
+        match self.send_voice_message(peer, path, duration) {
+            Ok(()) => Some(format!("🎤 Голосовое {dur} отправлено")),
+            Err(e) => {
+                self.add_status(format!("⚠ {}", e));
+                None
+            }
         }
     }
 
@@ -897,6 +922,19 @@ impl App {
             path.display().to_string()
         };
         self.register_voice_path(&transfer_hex, path_str.clone());
+        self.ingest_chat_message(ChatMessage {
+            id: message_id.clone(),
+            sender_id: self.local_peer_id.to_string(),
+            sender_name: self.local_nickname.clone(),
+            recipient_id: Some(peer.to_string()),
+            text: String::new(),
+            timestamp: chrono::Local::now().format("%H:%M").to_string(),
+            delivery: OutgoingDeliveryStatus::Pending,
+            voice: Some(VoiceMeta {
+                transfer_id: transfer_hex.clone(),
+                duration_secs,
+            }),
+        });
         match self.command_tx.try_send(UICommand::SendVoiceMessage {
             sender_name: self.local_nickname.clone(),
             recipient: peer,

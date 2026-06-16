@@ -31,6 +31,10 @@ use vault::{detect_vault_unlock_kind, VaultUnlockState};
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn Error>> {
+    if let Some(code) = voice::run_cli_mode() {
+        std::process::exit(code);
+    }
+
     let _ = tracing_subscriber::fmt()
         .with_env_filter(
             tracing_subscriber::EnvFilter::try_from_default_env().unwrap_or_else(|_| {

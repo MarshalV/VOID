@@ -1090,11 +1090,11 @@ fn paint_delivery_status(
 /// Кнопка записи голосового.
 fn voice_record_button(
     ui: &mut egui::Ui,
-    recording: bool,
+    on_air: bool,
     processing: bool,
     has_ready: bool,
 ) -> egui::Response {
-    let (fill, stroke, label) = if recording {
+    let (fill, stroke, label) = if on_air {
         (
             egui::Color32::from_rgb(0xff, 0x22, 0x22),
             egui::Color32::from_rgb(0xff, 0x88, 0x88),
@@ -1103,7 +1103,11 @@ fn voice_record_button(
     } else if processing {
         (palette::BG_PANEL, palette::TEXT_MUTED, "⏳")
     } else if has_ready {
-        (palette::ACCENT_2, palette::ACCENT, "🎤")
+        (
+            egui::Color32::from_rgb(0x80, 0x30, 0x30),
+            egui::Color32::from_rgb(0xff, 0x88, 0x88),
+            "✖",
+        )
     } else {
         (palette::BG_PANEL, palette::DIVIDER, "🎤")
     };
@@ -1114,15 +1118,70 @@ fn voice_record_button(
             .min_size(egui::vec2(44.0, 44.0))
             .rounding(22.0),
     )
-    .on_hover_text(if recording {
-        "Нажмите, чтобы остановить"
+    .on_hover_text(if on_air {
+        "Нажмите, чтобы остановить запись"
     } else if processing {
         "Обработка…"
     } else if has_ready {
-        "Новая запись"
+        "Отменить голосовое"
     } else {
         "Записать голосовое"
     })
+}
+
+/// Полоса вместо поля ввода во время записи / обработки / готовности.
+fn paint_voice_composer_strip(
+    ui: &mut egui::Ui,
+    on_air: bool,
+    processing: bool,
+    has_ready: bool,
+    elapsed_secs: Option<f32>,
+    ready_secs: Option<f32>,
+) {
+    let (fill, title, subtitle) = if processing {
+        (
+            egui::Color32::from_rgb(70, 50, 140),
+            "⏳  Обработка записи…".into(),
+            "Подождите пару секунд",
+        )
+    } else if on_air {
+        let dur = voice::fmt_duration(elapsed_secs.unwrap_or(0.0));
+        (
+            egui::Color32::from_rgb(190, 28, 28),
+            format!("🔴  ЗАПИСЬ  {dur}"),
+            "Нажмите ⏹ на микрофоне, чтобы остановить",
+        )
+    } else if has_ready {
+        let dur = voice::fmt_duration(ready_secs.unwrap_or(0.0));
+        (
+            egui::Color32::from_rgb(40, 110, 50),
+            format!("✓  Голосовое {dur} готово"),
+            "Нажмите ▶ справа, чтобы отправить",
+        )
+    } else {
+        return;
+    };
+
+    egui::Frame::none()
+        .fill(fill)
+        .rounding(14.0)
+        .inner_margin(egui::Margin::symmetric(14.0, 10.0))
+        .show(ui, |ui| {
+            ui.set_width(ui.available_width());
+            ui.vertical(|ui| {
+                ui.label(
+                    egui::RichText::new(title)
+                        .size(16.0)
+                        .strong()
+                        .color(egui::Color32::WHITE),
+                );
+                ui.label(
+                    egui::RichText::new(subtitle)
+                        .size(12.5)
+                        .color(egui::Color32::from_rgb(235, 235, 235)),
+                );
+            });
+        });
 }
 
 fn paint_voice_message(
@@ -1183,13 +1242,18 @@ fn paint_voice_message(
     toggled
 }
 
-/// Кнопка «Отправить» — треугольник вместо символа ➤.
-fn send_message_button(ui: &mut egui::Ui) -> egui::Response {
+/// Кнопка «Отправить» — треугольник; при готовом голосовом подсвечивается зелёным.
+fn send_message_button(ui: &mut egui::Ui, voice_ready: bool) -> egui::Response {
     let size = egui::vec2(44.0, 44.0);
     let (rect, response) = ui.allocate_exact_size(size, egui::Sense::click());
     if ui.is_rect_visible(rect) {
         let rounding = egui::Rounding::same(22.0);
-        ui.painter().rect_filled(rect, rounding, palette::ACCENT);
+        let fill = if voice_ready {
+            egui::Color32::from_rgb(50, 160, 70)
+        } else {
+            palette::ACCENT
+        };
+        ui.painter().rect_filled(rect, rounding, fill);
         if response.hovered() {
             ui.painter().rect_stroke(
                 rect,
@@ -1209,7 +1273,11 @@ fn send_message_button(ui: &mut egui::Ui) -> egui::Response {
             egui::Stroke::NONE,
         ));
     }
-    response
+    response.on_hover_text(if voice_ready {
+        "Отправить голосовое"
+    } else {
+        "Отправить"
+    })
 }
 
 /// Из "2026-04-18 14:30:45" берём "14:30".
@@ -1329,6 +1397,28 @@ pub(crate) fn setup_custom_style(ctx: &egui::Context) {
     style.spacing.button_padding  = egui::vec2(12.0, 8.0);
     style.spacing.menu_margin     = egui::Margin::same(8.0);
     ctx.set_style(style);
+}
+
+impl App {
+    /// Опрос записи и автоотправка готового голосового.
+    fn voice_poll_tick(&mut self) {
+        if self.voice_recorder.poll() {
+            if let Some(msg) = self.try_dispatch_ready_voice() {
+                self.push_toast(msg, ToastKind::Info, TOAST_TTL_SHORT);
+            } else if self.voice_recorder.has_ready() {
+                let dur = self
+                    .voice_recorder
+                    .ready_duration()
+                    .map(voice::fmt_duration)
+                    .unwrap_or_else(|| "?".into());
+                self.push_toast(
+                    format!("✓ Голосовое {dur} — нажмите ▶"),
+                    ToastKind::Info,
+                    TOAST_TTL_LONG,
+                );
+            }
+        }
+    }
 }
 
 impl eframe::App for App {
@@ -1852,20 +1942,7 @@ impl eframe::App for App {
         self.tick_pending_sends();
         self.tick_pending_file_sends();
         self.tick_pending_voice_sends();
-        let was_processing = self.voice_recorder.is_processing();
-        self.voice_recorder.poll();
-        if was_processing && self.voice_recorder.has_ready() {
-            let dur = self
-                .voice_recorder
-                .ready_duration()
-                .map(voice::fmt_duration)
-                .unwrap_or_else(|| "?".into());
-            self.push_toast(
-                format!("✓ Голосовое {dur} — нажмите ▶ отправку"),
-                ToastKind::Info,
-                TOAST_TTL_SHORT,
-            );
-        }
+        self.voice_poll_tick();
         if let Some(err) = self.voice_recorder.take_error() {
             self.add_status(format!("⚠ Микрофон: {err}"));
             self.push_toast(err.clone(), ToastKind::Error, TOAST_TTL_LONG);
@@ -1887,11 +1964,12 @@ impl eframe::App for App {
         if !self.pending_sends.is_empty()
             || !self.pending_file_sends.is_empty()
             || !self.pending_voice_sends.is_empty()
-            || self.voice_recorder.is_recording()
+            || self.voice_recorder.on_air()
             || self.voice_recorder.is_processing()
+            || self.voice_recorder.has_ready()
             || !self.toasts.is_empty()
         {
-            ctx.request_repaint_after(Duration::from_millis(250));
+            ctx.request_repaint_after(Duration::from_millis(33));
         }
 
         // ===== Системная консоль (overlay-окно) =====
@@ -2379,406 +2457,6 @@ impl eframe::App for App {
                 .retain(|_, t| !t.completed);
         }
 
-        // ===== Поле ввода (нижняя панель) =====
-        egui::TopBottomPanel::bottom("chat_input")
-            .frame(
-                egui::Frame::none()
-                    .fill(palette::BG_CHAT)
-                    .inner_margin(egui::Margin {
-                        left: 18.0,
-                        right: 18.0,
-                        top: 10.0,
-                        bottom: 14.0,
-                    }),
-            )
-            .show(ctx, |ui| {
-                egui::Frame::none()
-                    .fill(palette::BG_CARD)
-                    .stroke(egui::Stroke::new(1.0, palette::DIVIDER))
-                    .rounding(24.0)
-                    .inner_margin(egui::Margin {
-                        left: 18.0,
-                        right: 6.0,
-                        top: 4.0,
-                        bottom: 4.0,
-                    })
-                    .show(ui, |ui| {
-                        if self.voice_recorder.is_recording() {
-                            ui.horizontal(|ui| {
-                                ui.label(
-                                    egui::RichText::new("🔴  ЗАПИСЬ — нажмите микрофон ещё раз")
-                                        .size(13.0)
-                                        .strong()
-                                        .color(egui::Color32::from_rgb(0xff, 0x55, 0x55)),
-                                );
-                                if let Some(secs) = self.voice_recorder.recording_elapsed() {
-                                    ui.label(
-                                        egui::RichText::new(voice::fmt_duration(secs))
-                                            .size(13.0)
-                                            .color(palette::TEXT_MUTED),
-                                    );
-                                }
-                            });
-                            ui.add_space(4.0);
-                        } else if self.voice_recorder.is_processing() {
-                            ui.label(
-                                egui::RichText::new("⏳ Обработка записи…")
-                                    .size(13.0)
-                                    .color(palette::ACCENT_2),
-                            );
-                            ui.add_space(4.0);
-                        } else if self.voice_recorder.has_ready() {
-                            ui.label(
-                                egui::RichText::new("✓ Голосовое готово — нажмите отправку ▶")
-                                    .size(13.0)
-                                    .color(palette::ACCENT_2),
-                            );
-                            ui.add_space(4.0);
-                        }
-                        ui.horizontal(|ui| {
-                            // ── Кнопка прикрепления (📎) + popup-меню типов ──
-                            let attach_id = egui::Id::new("attach_popup");
-                            let attach_btn = ui
-                                .add_sized(
-                                    egui::vec2(36.0, 36.0),
-                                    egui::Button::new(
-                                        egui::RichText::new("📎")
-                                            .size(18.0)
-                                            .color(if self.show_attach_menu {
-                                                palette::ACCENT
-                                            } else {
-                                                palette::TEXT_MUTED
-                                            }),
-                                    )
-                                    .fill(egui::Color32::TRANSPARENT)
-                                    .stroke(egui::Stroke::NONE),
-                                )
-                                .on_hover_text("Прикрепить файл");
-
-                            if attach_btn.clicked() {
-                                if self.selected_chat.parse::<PeerId>().is_ok() {
-                                    self.show_attach_menu = !self.show_attach_menu;
-                                } else {
-                                    self.add_status(
-                                        "⚠ Выберите контакт для отправки файла.".into(),
-                                    );
-                                }
-                            }
-
-                            // Popup-меню с тремя кнопками типов.
-                            if self.show_attach_menu {
-                                if let Some(peer_id) = self.selected_chat.parse::<PeerId>().ok() {
-                                    let popup_pos = attach_btn.rect.left_top()
-                                        - egui::vec2(0.0, 128.0);
-
-                                    egui::Area::new(attach_id)
-                                        .order(egui::Order::Foreground)
-                                        .fixed_pos(popup_pos)
-                                        .show(ctx, |ui| {
-                                            egui::Frame::none()
-                                                .fill(palette::BG_PANEL)
-                                                .stroke(egui::Stroke::new(
-                                                    1.0,
-                                                    palette::DIVIDER,
-                                                ))
-                                                .rounding(12.0)
-                                                .inner_margin(egui::Margin::same(8.0))
-                                                .shadow(egui::epaint::Shadow {
-                                                    offset: egui::vec2(0.0, 4.0),
-                                                    blur: 16.0,
-                                                    spread: 0.0,
-                                                    color: egui::Color32::from_rgba_premultiplied(
-                                                        0, 0, 0, 140,
-                                                    ),
-                                                })
-                                                .show(ui, |ui| {
-                                                    ui.set_min_width(140.0);
-
-                                                    // Три кнопки: Image / Audio / File
-                                                    let kinds = [
-                                                        (file_transfer::FileKind::Image,  "🖼  Изображение"),
-                                                        (file_transfer::FileKind::Audio,  "🎵  Аудио"),
-                                                        (file_transfer::FileKind::Other,  "📄  Файл"),
-                                                    ];
-                                                    let mut picked: Option<file_transfer::FileKind> = None;
-                                                    for (kind, label) in kinds {
-                                                        if ui
-                                                            .add(
-                                                                egui::Button::new(
-                                                                    egui::RichText::new(label)
-                                                                        .size(13.5)
-                                                                        .color(palette::TEXT),
-                                                                )
-                                                                .fill(egui::Color32::TRANSPARENT)
-                                                                .min_size(egui::vec2(124.0, 32.0)),
-                                                            )
-                                                            .clicked()
-                                                        {
-                                                            picked = Some(kind);
-                                                        }
-                                                    }
-
-                                                    if let Some(kind) = picked {
-                                                        self.show_attach_menu = false;
-                                                        let cmd_tx = self.command_tx.clone();
-                                                        let peer_for_file = peer_id;
-                                                        std::thread::spawn(move || {
-                                                            let mut dialog =
-                                                                rfd::FileDialog::new();
-                                                            let exts = kind.extensions();
-                                                            if !exts.is_empty() {
-                                                                dialog = dialog.add_filter(
-                                                                    kind.label(),
-                                                                    exts,
-                                                                );
-                                                            }
-                                                            if let Some(path) =
-                                                                dialog.pick_file()
-                                                            {
-                                                                let _ = cmd_tx.try_send(
-                                                                    UICommand::SendFile {
-                                                                        recipient: peer_for_file,
-                                                                        path: path
-                                                                            .display()
-                                                                            .to_string(),
-                                                                        kind,
-                                                                    },
-                                                                );
-                                                            }
-                                                        });
-                                                    }
-                                                });
-                                        });
-
-                                    // Закрываем popup при клике в другом месте.
-                                    if ctx.input(|i| i.pointer.any_click())
-                                        && !attach_btn.clicked()
-                                    {
-                                        self.show_attach_menu = false;
-                                    }
-                                }
-                            }
-
-                            let recording = self.voice_recorder.is_recording();
-                            let voice_ready = self.voice_recorder.has_ready();
-                            let processing = self.voice_recorder.is_processing();
-                            let voice_busy = recording || processing;
-                            let hint = if recording {
-                                if let Some(secs) = self.voice_recorder.recording_elapsed() {
-                                    format!("Запись {}…", voice::fmt_duration(secs))
-                                } else {
-                                    "Запись…".into()
-                                }
-                            } else if processing {
-                                "Обработка записи…".into()
-                            } else if voice_ready {
-                                "Голосовое готово — нажмите отправку".into()
-                            } else {
-                                "Сообщение…".into()
-                            };
-
-                            // Кнопки справа рисуем первыми (RTL), чтобы поле ввода их не перекрывало.
-                            let (send_clicked, record_resp, edit) = ui
-                                .with_layout(
-                                    egui::Layout::right_to_left(egui::Align::Center),
-                                    |ui| {
-                                        let send_resp = send_message_button(ui);
-                                        let record_resp = voice_record_button(
-                                            ui,
-                                            recording,
-                                            processing,
-                                            voice_ready,
-                                        );
-                                        let edit = ui
-                                            .with_layout(
-                                                egui::Layout::left_to_right(egui::Align::Center),
-                                                |ui| {
-                                                    ui.set_width(ui.available_width());
-                                                    ui.add_enabled(
-                                                        !voice_busy,
-                                                        egui::TextEdit::singleline(
-                                                            &mut self.chat_input,
-                                                        )
-                                                        .hint_text(hint)
-                                                        .frame(false)
-                                                        .font(egui::TextStyle::Body),
-                                                    )
-                                                },
-                                            )
-                                            .inner;
-                                        (send_resp.clicked(), record_resp, edit)
-                                    },
-                                )
-                                .inner;
-
-                            if record_resp.clicked() {
-                                match self.voice_recorder.handle_mic_click() {
-                                    voice::MicClick::Started => {
-                                        self.add_status("🔴 Запись голосового…".into());
-                                        self.push_toast(
-                                            "🔴 Запись — нажмите микрофон ещё раз".into(),
-                                            ToastKind::Info,
-                                            TOAST_TTL_SHORT,
-                                        );
-                                    }
-                                    voice::MicClick::Stopped => {
-                                        self.add_status("⏳ Обработка голосового…".into());
-                                        self.push_toast(
-                                            "Обработка записи…".into(),
-                                            ToastKind::Info,
-                                            TOAST_TTL_SHORT,
-                                        );
-                                    }
-                                    voice::MicClick::Busy => {
-                                        self.push_toast(
-                                            "Подождите, идёт обработка…".into(),
-                                            ToastKind::Warn,
-                                            TOAST_TTL_SHORT,
-                                        );
-                                    }
-                                    voice::MicClick::Error(e) => {
-                                        self.add_status(format!("⚠ Микрофон: {e}"));
-                                        self.push_toast(e.clone(), ToastKind::Error, TOAST_TTL_LONG);
-                                        rfd::MessageDialog::new()
-                                            .set_title("VOID — микрофон")
-                                            .set_description(&e)
-                                            .set_level(rfd::MessageLevel::Error)
-                                            .show();
-                                    }
-                                }
-                                ctx.request_repaint();
-                            }
-                            if voice_busy {
-                                ctx.request_repaint_after(Duration::from_millis(50));
-                            }
-
-                            let enter_pressed = edit.lost_focus()
-                                && ctx.input(|i| i.key_pressed(egui::Key::Enter));
-
-                            let recipient = if self.selected_chat.is_empty() {
-                                None
-                            } else {
-                                self.selected_chat.parse::<PeerId>().ok()
-                            };
-
-                            let send_voice = (send_clicked || enter_pressed)
-                                && voice_ready
-                                && !voice_busy;
-
-                            let send_text = (send_clicked || enter_pressed)
-                                && !self.chat_input.is_empty()
-                                && !voice_busy
-                                && !voice_ready;
-
-                            if send_voice {
-                                if let Some(peer_id) = recipient {
-                                    if let Some((path, _duration)) =
-                                        self.voice_recorder.take_ready()
-                                    {
-                                        match self.send_voice_message(peer_id, path, _duration) {
-                                            Ok(()) => {}
-                                            Err(e) => self.add_status(format!("⚠ {}", e)),
-                                        }
-                                    }
-                                } else if self.selected_chat.is_empty() {
-                                    self.add_status(
-                                        "⚠ Выберите контакт слева, чтобы отправить сообщение."
-                                            .into(),
-                                    );
-                                } else {
-                                    self.add_status(
-                                        "⚠ Некорректный Peer ID в выбранном чате.".into(),
-                                    );
-                                }
-                                if enter_pressed {
-                                    edit.request_focus();
-                                }
-                            } else if send_text {
-                                if let Some(peer_id) = recipient {
-                                    let text_to_send = self.chat_input.clone();
-                                    let message_id = new_message_id();
-                                    match self.command_tx.try_send(UICommand::SendMessage {
-                                        sender_name: self.local_nickname.clone(),
-                                        text: text_to_send.clone(),
-                                        recipient: Some(peer_id),
-                                        message_id: Some(message_id.clone()),
-                                        is_retry: false,
-                                    }) {
-                                        Ok(()) => {
-                                            self.chat_input.clear();
-                                            self.pending_sends.push(PendingSend {
-                                                peer: peer_id,
-                                                text: text_to_send,
-                                                message_id,
-                                                last_send_at: Instant::now(),
-                                                dht_kicked: false,
-                                                dht_kicked_at: None,
-                                                attempts: 0,
-                                                awaiting_session: false,
-                                            });
-                                        }
-                                        Err(_) => self.add_status(
-                                            "⚠ Очередь к сети переполнена, повторите отправку."
-                                                .into(),
-                                        ),
-                                    }
-                                } else if self.selected_chat.is_empty() {
-                                    self.add_status(
-                                        "⚠ Выберите контакт слева, чтобы отправить сообщение."
-                                            .into(),
-                                    );
-                                } else {
-                                    self.add_status(
-                                        "⚠ Некорректный Peer ID в выбранном чате.".into(),
-                                    );
-                                }
-                                if enter_pressed {
-                                    edit.request_focus();
-                                }
-                            } else if (send_clicked || enter_pressed)
-                                && recording
-                            {
-                                self.add_status(
-                                    "⚠ Сначала остановите запись (кнопка микрофона).".into(),
-                                );
-                            }
-                        });
-                    });
-            });
-
-        // Оверлей записи — невозможно не заметить.
-        if self.voice_recorder.is_recording() {
-            let secs = self
-                .voice_recorder
-                .recording_elapsed()
-                .unwrap_or(0.0);
-            egui::Area::new(egui::Id::new("voice_recording_overlay"))
-                .order(egui::Order::Foreground)
-                .anchor(egui::Align2::CENTER_TOP, egui::vec2(0.0, 72.0))
-                .show(ctx, |ui| {
-                    egui::Frame::none()
-                        .fill(egui::Color32::from_rgba_premultiplied(180, 20, 20, 230))
-                        .rounding(16.0)
-                        .inner_margin(egui::Margin::symmetric(20.0, 12.0))
-                        .show(ui, |ui| {
-                            ui.label(
-                                egui::RichText::new(format!(
-                                    "🔴  ЗАПИСЬ  {}",
-                                    voice::fmt_duration(secs)
-                                ))
-                                .size(18.0)
-                                .strong()
-                                .color(egui::Color32::WHITE),
-                            );
-                            ui.label(
-                                egui::RichText::new("Нажмите ⏹ на микрофоне, чтобы остановить")
-                                    .size(13.0)
-                                    .color(egui::Color32::from_rgb(255, 210, 210)),
-                            );
-                        });
-                });
-        }
-
         // ===== История чата (фоновое изображение + bubbles) =====
         let bg_tex = self.ensure_chat_bg(ctx);
         let bg_tex_size = self
@@ -3003,11 +2681,430 @@ impl eframe::App for App {
                 }
             });
 
+        // ===== Поле ввода (нижняя панель) =====
+        self.voice_poll_tick();
+        egui::TopBottomPanel::bottom("chat_input")
+            .frame(
+                egui::Frame::none()
+                    .fill(palette::BG_CHAT)
+                    .inner_margin(egui::Margin {
+                        left: 18.0,
+                        right: 18.0,
+                        top: 10.0,
+                        bottom: 14.0,
+                    }),
+            )
+            .show(ctx, |ui| {
+                egui::Frame::none()
+                    .fill(palette::BG_CARD)
+                    .stroke({
+                        let on_air = self.voice_recorder.on_air();
+                        let voice_ready = self.voice_recorder.has_ready();
+                        if on_air {
+                            egui::Stroke::new(2.5, egui::Color32::from_rgb(255, 70, 70))
+                        } else if voice_ready {
+                            egui::Stroke::new(2.0, egui::Color32::from_rgb(50, 180, 70))
+                        } else {
+                            egui::Stroke::new(1.0, palette::DIVIDER)
+                        }
+                    })
+                    .rounding(24.0)
+                    .inner_margin(egui::Margin {
+                        left: 18.0,
+                        right: 6.0,
+                        top: 4.0,
+                        bottom: 4.0,
+                    })
+                    .show(ui, |ui| {
+                        let on_air = self.voice_recorder.on_air();
+                        let processing = self.voice_recorder.is_processing();
+                        let voice_ready = self.voice_recorder.has_ready();
+                        let voice_mode = on_air || processing || voice_ready;
+
+                        if voice_mode {
+                            paint_voice_composer_strip(
+                                ui,
+                                on_air,
+                                processing,
+                                voice_ready,
+                                self.voice_recorder.recording_elapsed(),
+                                self.voice_recorder.ready_duration(),
+                            );
+                            ui.add_space(6.0);
+                        }
+
+                        ui.horizontal(|ui| {
+                            // ── Кнопка прикрепления (📎) + popup-меню типов ──
+                            let attach_id = egui::Id::new("attach_popup");
+                            let attach_btn = ui
+                                .add_enabled(
+                                    !voice_mode,
+                                    egui::Button::new(
+                                        egui::RichText::new("📎")
+                                            .size(18.0)
+                                            .color(if self.show_attach_menu {
+                                                palette::ACCENT
+                                            } else {
+                                                palette::TEXT_MUTED
+                                            }),
+                                    )
+                                    .fill(egui::Color32::TRANSPARENT)
+                                    .stroke(egui::Stroke::NONE)
+                                    .min_size(egui::vec2(36.0, 36.0)),
+                                )
+                                .on_hover_text("Прикрепить файл");
+
+                            if attach_btn.clicked() {
+                                if self.selected_chat.parse::<PeerId>().is_ok() {
+                                    self.show_attach_menu = !self.show_attach_menu;
+                                } else {
+                                    self.add_status(
+                                        "⚠ Выберите контакт для отправки файла.".into(),
+                                    );
+                                }
+                            }
+
+                            // Popup-меню с тремя кнопками типов.
+                            if self.show_attach_menu {
+                                if let Some(peer_id) = self.selected_chat.parse::<PeerId>().ok() {
+                                    let popup_pos = attach_btn.rect.left_top()
+                                        - egui::vec2(0.0, 128.0);
+
+                                    egui::Area::new(attach_id)
+                                        .order(egui::Order::Foreground)
+                                        .fixed_pos(popup_pos)
+                                        .show(ctx, |ui| {
+                                            egui::Frame::none()
+                                                .fill(palette::BG_PANEL)
+                                                .stroke(egui::Stroke::new(
+                                                    1.0,
+                                                    palette::DIVIDER,
+                                                ))
+                                                .rounding(12.0)
+                                                .inner_margin(egui::Margin::same(8.0))
+                                                .shadow(egui::epaint::Shadow {
+                                                    offset: egui::vec2(0.0, 4.0),
+                                                    blur: 16.0,
+                                                    spread: 0.0,
+                                                    color: egui::Color32::from_rgba_premultiplied(
+                                                        0, 0, 0, 140,
+                                                    ),
+                                                })
+                                                .show(ui, |ui| {
+                                                    ui.set_min_width(140.0);
+
+                                                    // Три кнопки: Image / Audio / File
+                                                    let kinds = [
+                                                        (file_transfer::FileKind::Image,  "🖼  Изображение"),
+                                                        (file_transfer::FileKind::Audio,  "🎵  Аудио"),
+                                                        (file_transfer::FileKind::Other,  "📄  Файл"),
+                                                    ];
+                                                    let mut picked: Option<file_transfer::FileKind> = None;
+                                                    for (kind, label) in kinds {
+                                                        if ui
+                                                            .add(
+                                                                egui::Button::new(
+                                                                    egui::RichText::new(label)
+                                                                        .size(13.5)
+                                                                        .color(palette::TEXT),
+                                                                )
+                                                                .fill(egui::Color32::TRANSPARENT)
+                                                                .min_size(egui::vec2(124.0, 32.0)),
+                                                            )
+                                                            .clicked()
+                                                        {
+                                                            picked = Some(kind);
+                                                        }
+                                                    }
+
+                                                    if let Some(kind) = picked {
+                                                        self.show_attach_menu = false;
+                                                        let cmd_tx = self.command_tx.clone();
+                                                        let peer_for_file = peer_id;
+                                                        std::thread::spawn(move || {
+                                                            let mut dialog =
+                                                                rfd::FileDialog::new();
+                                                            let exts = kind.extensions();
+                                                            if !exts.is_empty() {
+                                                                dialog = dialog.add_filter(
+                                                                    kind.label(),
+                                                                    exts,
+                                                                );
+                                                            }
+                                                            if let Some(path) =
+                                                                dialog.pick_file()
+                                                            {
+                                                                let _ = cmd_tx.try_send(
+                                                                    UICommand::SendFile {
+                                                                        recipient: peer_for_file,
+                                                                        path: path
+                                                                            .display()
+                                                                            .to_string(),
+                                                                        kind,
+                                                                    },
+                                                                );
+                                                            }
+                                                        });
+                                                    }
+                                                });
+                                        });
+
+                                    // Закрываем popup при клике в другом месте.
+                                    if ctx.input(|i| i.pointer.any_click())
+                                        && !attach_btn.clicked()
+                                    {
+                                        self.show_attach_menu = false;
+                                    }
+                                }
+                            }
+
+                            let mut enter_pressed = false;
+                            let mut text_focus: Option<egui::Response> = None;
+
+                            // Кнопки справа рисуем первыми (RTL), чтобы поле ввода их не перекрывало.
+                            let (send_clicked, record_resp) = ui
+                                .with_layout(
+                                    egui::Layout::right_to_left(egui::Align::Center),
+                                    |ui| {
+                                        let send_resp =
+                                            send_message_button(ui, voice_ready);
+                                        let record_resp = voice_record_button(
+                                            ui,
+                                            on_air,
+                                            processing,
+                                            voice_ready,
+                                        );
+                                        if !voice_mode {
+                                            ui.with_layout(
+                                                egui::Layout::left_to_right(egui::Align::Center),
+                                                |ui| {
+                                                    ui.set_width(ui.available_width());
+                                                    let resp = ui.add(
+                                                        egui::TextEdit::singleline(
+                                                            &mut self.chat_input,
+                                                        )
+                                                        .hint_text("Сообщение…")
+                                                        .frame(false)
+                                                        .font(egui::TextStyle::Body),
+                                                    );
+                                                    text_focus = Some(resp);
+                                                },
+                                            );
+                                        } else {
+                                            ui.add_space(ui.available_width().max(0.0));
+                                        }
+                                        (send_resp.clicked(), record_resp)
+                                    },
+                                )
+                                .inner;
+
+                            if let Some(ref focus) = text_focus {
+                                enter_pressed = focus.lost_focus()
+                                    && ctx.input(|i| i.key_pressed(egui::Key::Enter));
+                            }
+
+                            if record_resp.clicked() {
+                                match self.voice_recorder.handle_mic_click() {
+                                    voice::MicClick::Started => {}
+                                    voice::MicClick::Stopped => {
+                                        self.voice_poll_tick();
+                                    }
+                                    voice::MicClick::Busy => {
+                                        self.push_toast(
+                                            "Подождите, идёт обработка…".into(),
+                                            ToastKind::Warn,
+                                            TOAST_TTL_SHORT,
+                                        );
+                                    }
+                                    voice::MicClick::DiscardedReady => {
+                                        self.push_toast(
+                                            "Голосовое отменено".into(),
+                                            ToastKind::Info,
+                                            TOAST_TTL_SHORT,
+                                        );
+                                    }
+                                    voice::MicClick::Error(e) => {
+                                        self.add_status(format!("⚠ Микрофон: {e}"));
+                                        self.push_toast(e.clone(), ToastKind::Error, TOAST_TTL_LONG);
+                                        rfd::MessageDialog::new()
+                                            .set_title("VOID — микрофон")
+                                            .set_description(&e)
+                                            .set_level(rfd::MessageLevel::Error)
+                                            .show();
+                                    }
+                                }
+                                ctx.request_repaint();
+                            }
+
+                            if send_clicked {
+                                if self.voice_recorder.has_ready() {
+                                    if let Some(msg) = self.try_dispatch_ready_voice() {
+                                        self.push_toast(msg, ToastKind::Info, TOAST_TTL_SHORT);
+                                    } else if self.voice_recorder.has_ready() {
+                                        self.add_status(
+                                            "⚠ Выберите контакт слева, чтобы отправить голосовое."
+                                                .into(),
+                                        );
+                                    }
+                                } else if self.voice_recorder.is_processing() {
+                                    self.push_toast(
+                                        "Подождите, обработка записи…".into(),
+                                        ToastKind::Warn,
+                                        TOAST_TTL_SHORT,
+                                    );
+                                }
+                            }
+
+                            let recipient = if self.selected_chat.is_empty() {
+                                None
+                            } else {
+                                self.selected_chat.parse::<PeerId>().ok()
+                            };
+
+                            let send_text = (send_clicked || enter_pressed)
+                                && !self.chat_input.is_empty()
+                                && !voice_mode;
+
+                            if send_text {
+                                if let Some(peer_id) = recipient {
+                                    let text_to_send = self.chat_input.clone();
+                                    let message_id = new_message_id();
+                                    match self.command_tx.try_send(UICommand::SendMessage {
+                                        sender_name: self.local_nickname.clone(),
+                                        text: text_to_send.clone(),
+                                        recipient: Some(peer_id),
+                                        message_id: Some(message_id.clone()),
+                                        is_retry: false,
+                                    }) {
+                                        Ok(()) => {
+                                            self.chat_input.clear();
+                                            self.pending_sends.push(PendingSend {
+                                                peer: peer_id,
+                                                text: text_to_send,
+                                                message_id,
+                                                last_send_at: Instant::now(),
+                                                dht_kicked: false,
+                                                dht_kicked_at: None,
+                                                attempts: 0,
+                                                awaiting_session: false,
+                                            });
+                                        }
+                                        Err(_) => self.add_status(
+                                            "⚠ Очередь к сети переполнена, повторите отправку."
+                                                .into(),
+                                        ),
+                                    }
+                                } else if self.selected_chat.is_empty() {
+                                    self.add_status(
+                                        "⚠ Выберите контакт слева, чтобы отправить сообщение."
+                                            .into(),
+                                    );
+                                } else {
+                                    self.add_status(
+                                        "⚠ Некорректный Peer ID в выбранном чате.".into(),
+                                    );
+                                }
+                                if enter_pressed {
+                                    if let Some(ref focus) = text_focus {
+                                        focus.request_focus();
+                                    }
+                                }
+                            } else if (send_clicked || enter_pressed) && on_air {
+                                self.add_status(
+                                    "⚠ Сначала остановите запись (кнопка микрофона).".into(),
+                                );
+                            }
+                        });
+                    });
+            });
+
         // ===== Toasts (поверх всего, правый верхний угол) =====
         self.draw_toasts(ctx);
 
+        // Оверлей записи — рисуем ПОСЛЕДНИМ, поверх чата.
+        if self.voice_recorder.on_air() {
+            let secs = self
+                .voice_recorder
+                .recording_elapsed()
+                .unwrap_or(0.0);
+            egui::Area::new(egui::Id::new("voice_recording_overlay"))
+                .order(egui::Order::Foreground)
+                .anchor(egui::Align2::CENTER_TOP, egui::vec2(0.0, 48.0))
+                .interactable(false)
+                .show(ctx, |ui| {
+                    egui::Frame::none()
+                        .fill(egui::Color32::from_rgb(200, 30, 30))
+                        .stroke(egui::Stroke::new(2.0, egui::Color32::WHITE))
+                        .rounding(20.0)
+                        .inner_margin(egui::Margin::symmetric(28.0, 14.0))
+                        .show(ui, |ui| {
+                            ui.label(
+                                egui::RichText::new(format!(
+                                    "🔴  ЗАПИСЬ  {}",
+                                    voice::fmt_duration(secs)
+                                ))
+                                .size(22.0)
+                                .strong()
+                                .color(egui::Color32::WHITE),
+                            );
+                            ui.label(
+                                egui::RichText::new("Нажмите ⏹ ещё раз, чтобы остановить")
+                                    .size(14.0)
+                                    .color(egui::Color32::from_rgb(255, 220, 220)),
+                            );
+                        });
+                });
+        } else if self.voice_recorder.is_processing() {
+            egui::Area::new(egui::Id::new("voice_processing_overlay"))
+                .order(egui::Order::Foreground)
+                .anchor(egui::Align2::CENTER_TOP, egui::vec2(0.0, 48.0))
+                .interactable(false)
+                .show(ctx, |ui| {
+                    egui::Frame::none()
+                        .fill(egui::Color32::from_rgb(80, 60, 160))
+                        .rounding(20.0)
+                        .inner_margin(egui::Margin::symmetric(24.0, 12.0))
+                        .show(ui, |ui| {
+                            ui.label(
+                                egui::RichText::new("⏳  Обработка записи…")
+                                    .size(18.0)
+                                    .strong()
+                                    .color(egui::Color32::WHITE),
+                            );
+                        });
+                });
+        } else if self.voice_recorder.has_ready() {
+            if let Some(dur) = self.voice_recorder.ready_duration() {
+                egui::Area::new(egui::Id::new("voice_ready_overlay"))
+                    .order(egui::Order::Foreground)
+                    .anchor(egui::Align2::CENTER_TOP, egui::vec2(0.0, 48.0))
+                    .interactable(false)
+                    .show(ctx, |ui| {
+                        egui::Frame::none()
+                            .fill(egui::Color32::from_rgb(60, 120, 60))
+                            .rounding(20.0)
+                            .inner_margin(egui::Margin::symmetric(24.0, 12.0))
+                            .show(ui, |ui| {
+                                ui.label(
+                                    egui::RichText::new(format!(
+                                        "✓  Голосовое {} — нажмите ▶",
+                                        voice::fmt_duration(dur)
+                                    ))
+                                    .size(18.0)
+                                    .strong()
+                                    .color(egui::Color32::WHITE),
+                                );
+                            });
+                    });
+            }
+        }
+
         self.flush_chat_journal_if_dirty();
 
-        ctx.request_repaint_after(Duration::from_millis(100));
+        if self.voice_recorder.mic_active() || self.voice_recorder.has_ready() {
+            ctx.request_repaint_after(Duration::from_millis(33));
+        } else {
+            ctx.request_repaint_after(Duration::from_millis(100));
+        }
     }
 }

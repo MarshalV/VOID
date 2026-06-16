@@ -1,8 +1,8 @@
 //! Запись и воспроизведение голосовых (cpal + WinMM на Windows).
 
-use std::fs::OpenOptions;
 use std::io::Write;
 use std::path::{Path, PathBuf};
+use std::process::{Child, Command, Stdio};
 use std::sync::atomic::{AtomicBool, Ordering};
 #[cfg(not(target_os = "windows"))]
 use std::sync::atomic::AtomicUsize;
@@ -30,8 +30,10 @@ pub(crate) enum VoiceRecorderState {
 
 pub(crate) struct VoiceRecorder {
     pub(crate) state: VoiceRecorderState,
-    stop_tx: Option<mpsc::Sender<()>>,
-    done_rx: Option<mpsc::Receiver<Result<(PathBuf, f32), String>>>,
+    child: Option<Child>,
+    wav_path: PathBuf,
+    stop_path: PathBuf,
+    recording_started: Option<Instant>,
     processing_since: Option<Instant>,
     pub(crate) last_status: String,
 }
@@ -40,6 +42,7 @@ pub(crate) enum MicClick {
     Started,
     Stopped,
     Busy,
+    DiscardedReady,
     Error(String),
 }
 
@@ -47,14 +50,17 @@ impl VoiceRecorder {
     pub(crate) fn new() -> Self {
         Self {
             state: VoiceRecorderState::Idle,
-            stop_tx: None,
-            done_rx: None,
+            child: None,
+            wav_path: PathBuf::new(),
+            stop_path: PathBuf::new(),
+            recording_started: None,
             processing_since: None,
             last_status: String::new(),
         }
     }
 
-    pub(crate) fn poll(&mut self) {
+    /// `true`, если запись только что перешла в `Ready`.
+    pub(crate) fn poll(&mut self) -> bool {
         if matches!(self.state, VoiceRecorderState::Processing) {
             if let Some(since) = self.processing_since {
                 if since.elapsed() >= PROCESSING_TIMEOUT {
@@ -66,35 +72,50 @@ impl VoiceRecorder {
             }
         }
 
-        if !matches!(
-            self.state,
-            VoiceRecorderState::Recording { .. } | VoiceRecorderState::Processing
-        ) {
-            return;
-        }
+        let Some(child) = self.child.as_mut() else {
+            return false;
+        };
 
-        let Some(rx) = self.done_rx.as_ref() else {
-            return;
-        };
-        let Ok(result) = rx.try_recv() else {
-            return;
-        };
-        self.done_rx = None;
-        self.processing_since = None;
-        self.state = match result {
-            Ok((path, duration_secs)) => {
-                self.last_status =
-                    format!("Голосовое {} готово", fmt_duration(duration_secs));
-                VoiceRecorderState::Ready {
-                    path,
-                    duration_secs,
+        match child.try_wait() {
+            Ok(Some(status)) => {
+                self.child = None;
+                self.recording_started = None;
+                voice_log(&format!("child exit: {status}"));
+                if status.success() && self.wav_path.is_file() {
+                    match wav_duration(&self.wav_path) {
+                        Ok(duration_secs) => {
+                            self.last_status =
+                                format!("Голосовое {} готово", fmt_duration(duration_secs));
+                            self.state = VoiceRecorderState::Ready {
+                                path: self.wav_path.clone(),
+                                duration_secs,
+                            };
+                            voice_log(&format!(
+                                "ready {} ({duration_secs:.2}s)",
+                                self.wav_path.display()
+                            ));
+                            return true;
+                        }
+                        Err(e) => {
+                            self.state = self.set_error(e);
+                        }
+                    }
+                } else {
+                    let exe = std::env::current_exe()
+                        .map(|p| p.display().to_string())
+                        .unwrap_or_default();
+                    self.state = self.set_error(format!(
+                        "Запись не удалась (код {status}). Разрешите микрофон для: {exe}"
+                    ));
                 }
             }
+            Ok(None) => {}
             Err(e) => {
-                voice_log(&format!("record done err: {e}"));
-                self.set_error(e)
+                self.child = None;
+                self.state = self.set_error(format!("Ошибка ожидания записи: {e}"));
             }
-        };
+        }
+        false
     }
 
     fn set_error(&mut self, e: String) -> VoiceRecorderState {
@@ -116,6 +137,16 @@ impl VoiceRecorder {
         matches!(self.state, VoiceRecorderState::Recording { .. })
     }
 
+    /// Идёт запись (по состоянию или живой дочерний процесс).
+    pub(crate) fn on_air(&self) -> bool {
+        self.is_recording() || (self.child.is_some() && !self.is_processing())
+    }
+
+    /// Микрофон занят (запись или обработка), в т.ч. если дочерний процесс ещё жив.
+    pub(crate) fn mic_active(&self) -> bool {
+        self.on_air() || self.is_processing()
+    }
+
     pub(crate) fn is_processing(&self) -> bool {
         matches!(self.state, VoiceRecorderState::Processing)
     }
@@ -124,17 +155,12 @@ impl VoiceRecorder {
         matches!(self.state, VoiceRecorderState::Ready { .. })
     }
 
-    pub(crate) fn is_busy(&self) -> bool {
-        self.is_recording() || self.is_processing()
-    }
-
     pub(crate) fn recording_elapsed(&self) -> Option<f32> {
-        match &self.state {
-            VoiceRecorderState::Recording { started } => {
-                Some(started.elapsed().as_secs_f32())
-            }
-            _ => None,
+        if let VoiceRecorderState::Recording { started } = &self.state {
+            return Some(started.elapsed().as_secs_f32());
         }
+        self.recording_started
+            .map(|t| t.elapsed().as_secs_f32())
     }
 
     pub(crate) fn take_ready(&mut self) -> Option<(PathBuf, f32)> {
@@ -157,21 +183,25 @@ impl VoiceRecorder {
         }
     }
 
+    pub(crate) fn discard_ready(&mut self) {
+        if self.has_ready() {
+            self.state = VoiceRecorderState::Idle;
+            self.last_status.clear();
+        }
+    }
+
     pub(crate) fn handle_mic_click(&mut self) -> MicClick {
         if self.is_processing() {
-            if self
-                .processing_since
-                .is_some_and(|t| t.elapsed() >= Duration::from_secs(2))
-            {
-                self.force_reset();
-            } else {
-                return MicClick::Busy;
-            }
+            return MicClick::Busy;
         }
-        if self.is_recording() {
+        if self.on_air() {
             self.stop_recording();
             self.last_status = "Обработка записи…".into();
             return MicClick::Stopped;
+        }
+        if self.has_ready() {
+            self.discard_ready();
+            return MicClick::DiscardedReady;
         }
         match self.start_recording() {
             Ok(()) => {
@@ -182,56 +212,138 @@ impl VoiceRecorder {
         }
     }
 
+    fn cleanup_child(&mut self) {
+        if !self.stop_path.as_os_str().is_empty() {
+            let _ = std::fs::write(&self.stop_path, b"stop");
+        }
+        if let Some(mut child) = self.child.take() {
+            let _ = child.kill();
+            let _ = child.wait();
+        }
+    }
+
     fn start_recording(&mut self) -> Result<(), String> {
         if self.has_ready() {
-            self.state = VoiceRecorderState::Idle;
+            return Err("Сначала отправьте или отмените голосовое (▶ или ✖)".into());
         }
-        let (stop_tx, stop_rx) = mpsc::channel::<()>();
-        let (done_tx, done_rx) = mpsc::channel();
+        self.cleanup_child();
 
-        std::thread::spawn(move || {
-            let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-                record_from_default_input(stop_rx)
-            }))
-            .unwrap_or_else(|_| Err("Внутренняя ошибка записи".into()));
-            if let Err(ref e) = result {
-                voice_log(&format!("thread result err: {e}"));
-            }
-            let _ = done_tx.send(result);
-        });
+        let stamp = chrono::Local::now().format("%Y%m%d_%H%M%S_%f");
+        let wav_path = std::env::temp_dir().join(format!("void_voice_{stamp}.wav"));
+        let stop_path = std::env::temp_dir().join(format!("void_voice_{stamp}.stop"));
+        let _ = std::fs::remove_file(&wav_path);
+        let _ = std::fs::remove_file(&stop_path);
 
-        self.stop_tx = Some(stop_tx);
-        self.done_rx = Some(done_rx);
-        self.state = VoiceRecorderState::Recording {
-            started: Instant::now(),
-        };
-        voice_log("recording started (UI state)");
+        let exe = std::env::current_exe().map_err(|e| format!("exe: {e}"))?;
+        voice_log(&format!(
+            "spawn {} --voice-record {} {}",
+            exe.display(),
+            wav_path.display(),
+            stop_path.display()
+        ));
+
+        let child = Command::new(&exe)
+            .arg("--voice-record")
+            .arg(&wav_path)
+            .arg(&stop_path)
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn()
+            .map_err(|e| format!("Не удалось запустить запись: {e}"))?;
+
+        self.child = Some(child);
+        self.wav_path = wav_path;
+        self.stop_path = stop_path;
+        let started = Instant::now();
+        self.recording_started = Some(started);
+        self.state = VoiceRecorderState::Recording { started };
         Ok(())
     }
 
     fn stop_recording(&mut self) {
-        if let Some(tx) = self.stop_tx.take() {
-            let _ = tx.send(());
-        }
-        if self.is_recording() {
+        if self.on_air() {
+            if !self.stop_path.as_os_str().is_empty() {
+                let _ = std::fs::write(&self.stop_path, b"stop");
+            }
             self.processing_since = Some(Instant::now());
             self.state = VoiceRecorderState::Processing;
-            voice_log("recording stop requested");
+            voice_log("stop file written");
         }
     }
 
     fn force_reset(&mut self) {
-        if let Some(tx) = self.stop_tx.take() {
-            let _ = tx.send(());
-        }
-        self.done_rx = None;
+        self.cleanup_child();
         self.processing_since = None;
+        self.recording_started = None;
         self.state = VoiceRecorderState::Idle;
         self.last_status.clear();
     }
 }
 
-pub(crate) const VOICE_BUILD: &str = "v4-winmanifest";
+pub(crate) const VOICE_BUILD: &str = "v5e-fix";
+
+/// CLI: `--voice-probe` | `--voice-record <wav> <stop-file>`
+pub(crate) fn run_cli_mode() -> Option<i32> {
+    let args: Vec<String> = std::env::args().collect();
+    match args.get(1).map(|s| s.as_str()) {
+        Some("--voice-probe") => {
+            let code = match probe_microphone() {
+                Ok(name) => {
+                    println!("OK: {name}");
+                    0
+                }
+                Err(e) => {
+                    eprintln!("ERR: {e}");
+                    1
+                }
+            };
+            Some(code)
+        }
+        Some("--voice-record") => {
+            let out = args.get(2).cloned().unwrap_or_default();
+            let stop = args.get(3).cloned().unwrap_or_default();
+            if out.is_empty() || stop.is_empty() {
+                eprintln!("usage: --voice-record <out.wav> <stop-file>");
+                return Some(2);
+            }
+            let code = match cli_record(PathBuf::from(out), PathBuf::from(stop)) {
+                Ok(secs) => {
+                    println!("OK: {secs:.2}");
+                    0
+                }
+                Err(e) => {
+                    voice_log(&format!("cli err: {e}"));
+                    eprintln!("ERR: {e}");
+                    1
+                }
+            };
+            Some(code)
+        }
+        _ => None,
+    }
+}
+
+fn cli_record(out: PathBuf, stop_file: PathBuf) -> Result<f32, String> {
+    voice_log(&format!(
+        "cli start -> {} stop={}",
+        out.display(),
+        stop_file.display()
+    ));
+    let (stop_tx, stop_rx) = mpsc::channel::<()>();
+    let stop_flag = stop_file.clone();
+    std::thread::spawn(move || {
+        let started = Instant::now();
+        while !stop_flag.exists() {
+            if started.elapsed().as_secs_f32() >= MAX_VOICE_DURATION_SECS {
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(40));
+        }
+        let _ = stop_tx.send(());
+    });
+    record_to_wav(stop_rx, &out)
+}
 
 /// Быстрая проверка микрофона при старте.
 pub(crate) fn probe_microphone() -> Result<String, String> {
@@ -270,7 +382,7 @@ fn pick_input_config(device: &cpal::Device) -> Result<cpal::SupportedStreamConfi
         .map_err(|e| format!("Микрофон: {e}"))
 }
 
-fn record_from_default_input(stop_rx: Receiver<()>) -> Result<(PathBuf, f32), String> {
+fn record_to_wav(stop_rx: Receiver<()>, out: &Path) -> Result<f32, String> {
     let host = cpal::default_host();
     let device = host
         .default_input_device()
@@ -346,13 +458,15 @@ fn record_from_default_input(stop_rx: Receiver<()>) -> Result<(PathBuf, f32), St
     };
     let duration_secs = mono.len() as f32 / VOICE_SAMPLE_RATE as f32;
 
-    let path = std::env::temp_dir().join(format!(
-        "void_voice_{}.wav",
-        chrono::Local::now().format("%Y%m%d_%H%M%S_%f")
-    ));
-    write_wav_mono(&path, &mono, VOICE_SAMPLE_RATE)?;
-    voice_log(&format!("saved {} ({duration_secs:.2}s)", path.display()));
-    Ok((path, duration_secs))
+    write_wav_mono(out, &mono, VOICE_SAMPLE_RATE)?;
+    voice_log(&format!("saved {} ({duration_secs:.2}s)", out.display()));
+    Ok(duration_secs)
+}
+
+fn wav_duration(path: &Path) -> Result<f32, String> {
+    let reader = hound::WavReader::open(path).map_err(|e| format!("WAV: {e}"))?;
+    let spec = reader.spec();
+    Ok(reader.len() as f32 / spec.sample_rate as f32)
 }
 
 fn build_input_stream(
