@@ -279,7 +279,7 @@ impl VoiceRecorder {
     }
 }
 
-pub(crate) const VOICE_BUILD: &str = "v5f-play";
+pub(crate) const VOICE_BUILD: &str = "v5g-click";
 
 /// CLI: `--voice-probe` | `--voice-record <wav> <stop-file>`
 pub(crate) fn run_cli_mode() -> Option<i32> {
@@ -312,6 +312,24 @@ pub(crate) fn run_cli_mode() -> Option<i32> {
                 }
                 Err(e) => {
                     voice_log(&format!("cli err: {e}"));
+                    eprintln!("ERR: {e}");
+                    1
+                }
+            };
+            Some(code)
+        }
+        Some("--voice-play") => {
+            let path = args.get(2).cloned().unwrap_or_default();
+            if path.is_empty() {
+                eprintln!("usage: --voice-play <file.wav>");
+                return Some(2);
+            }
+            let code = match play_wav_file(Path::new(&path)) {
+                Ok(()) => {
+                    println!("OK: played {}", path);
+                    0
+                }
+                Err(e) => {
                     eprintln!("ERR: {e}");
                     1
                 }
@@ -357,7 +375,7 @@ pub(crate) fn probe_microphone() -> Result<String, String> {
     Ok(name)
 }
 
-fn voice_log(msg: &str) {
+pub(crate) fn voice_log(msg: &str) {
     let dir = crate::file_transfer::voice_dir_absolute();
     let _ = std::fs::create_dir_all(&dir);
     let path = dir.join("void_voice.log");

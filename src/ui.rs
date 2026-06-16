@@ -1190,56 +1190,74 @@ fn paint_voice_message(
     has_audio: bool,
     is_playing: bool,
 ) -> bool {
-    let mut toggled = false;
-    ui.horizontal(|ui| {
+    let width = ui.available_width().min(260.0).max(160.0);
+    let height = 38.0;
+    let (rect, response) =
+        ui.allocate_exact_size(egui::vec2(width, height), egui::Sense::click());
+
+    if ui.is_rect_visible(rect) {
+        let painter = ui.painter();
         let label = if is_playing { "⏸" } else { "▶" };
-        let btn_color = if has_audio {
+        let icon_center = egui::pos2(rect.left() + 20.0, rect.center().y);
+        let icon_color = if has_audio {
             palette::TEXT
         } else {
             palette::TEXT_MUTED
         };
-        if ui
-            .add(
-                egui::Button::new(egui::RichText::new(label).size(16.0).color(btn_color))
-                    .fill(egui::Color32::from_rgba_premultiplied(255, 255, 255, 25))
-                    .min_size(egui::vec2(34.0, 34.0))
-                    .rounding(17.0),
-            )
-            .clicked()
-        {
-            toggled = true;
-        }
-        ui.add_space(6.0);
-        ui.horizontal(|ui| {
-            ui.set_height(28.0);
-            for i in 0..14 {
-                let phase = (i as f32 * 0.55 + duration_secs * 0.3).sin();
-                let h = 6.0 + phase.abs() * 14.0;
-                let bar = egui::Rect::from_min_size(
-                    ui.cursor().min,
-                    egui::vec2(3.0, h),
-                );
-                ui.painter().rect_filled(
-                    bar,
-                    1.5,
-                    if has_audio {
-                        palette::ACCENT_2
-                    } else {
-                        palette::TEXT_MUTED
-                    },
-                );
-                ui.add_space(5.0);
-            }
-        });
-        ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-            ui.label(
-                egui::RichText::new(voice::fmt_duration(duration_secs))
-                    .size(12.5)
-                    .color(palette::TEXT_MUTED),
+        painter.circle_filled(
+            icon_center,
+            16.0,
+            egui::Color32::from_rgba_premultiplied(255, 255, 255, 30),
+        );
+        painter.text(
+            icon_center,
+            egui::Align2::CENTER_CENTER,
+            label,
+            egui::FontId::proportional(14.0),
+            icon_color,
+        );
+
+        let bar_left = rect.left() + 42.0;
+        let bar_y = rect.center().y;
+        for i in 0..12 {
+            let phase = (i as f32 * 0.55 + duration_secs * 0.3).sin();
+            let h = 5.0 + phase.abs() * 12.0;
+            let x = bar_left + i as f32 * 8.0;
+            let bar = egui::Rect::from_center_size(
+                egui::pos2(x, bar_y),
+                egui::vec2(3.0, h),
             );
-        });
-    });
-    toggled
+            painter.rect_filled(
+                bar,
+                1.5,
+                if has_audio {
+                    palette::ACCENT_2
+                } else {
+                    palette::TEXT_MUTED
+                },
+            );
+        }
+
+        painter.text(
+            rect.right_top() + egui::vec2(-6.0, 6.0),
+            egui::Align2::RIGHT_TOP,
+            voice::fmt_duration(duration_secs),
+            egui::FontId::proportional(11.0),
+            palette::TEXT_MUTED,
+        );
+    }
+
+    response
+        .on_hover_text(if has_audio {
+            if is_playing {
+                "Остановить"
+            } else {
+                "Воспроизвести"
+            }
+        } else {
+            "Аудио загружается…"
+        })
+        .clicked()
 }
 
 /// Кнопка «Отправить» — треугольник; при готовом голосовом подсвечивается зелёным.
@@ -2510,7 +2528,8 @@ impl eframe::App for App {
                     .unwrap_or_default();
                 let me_str = self.local_peer_id.to_string();
                 let mut pending_msg_delete: Option<String> = None;
-                let mut voice_toggle: Option<String> = None;
+                let chat_peer = self.selected_chat.clone();
+                self.relink_voice_messages_in_chat(&chat_peer);
 
                 egui::ScrollArea::vertical()
                     .id_salt("chat_stream")
@@ -2596,7 +2615,7 @@ impl eframe::App for App {
                                                     has_audio,
                                                     is_playing,
                                                 ) {
-                                                    voice_toggle = Some(tid);
+                                                    self.request_voice_play(tid);
                                                 }
                                             } else if !msg.text.is_empty() {
                                                 ui.label(
@@ -2654,30 +2673,6 @@ impl eframe::App for App {
                 if let Some(msg_id) = pending_msg_delete {
                     if let Ok(peer) = self.selected_chat.parse::<PeerId>() {
                         self.delete_messages(peer, &[msg_id]);
-                    }
-                }
-                if let Some(tid) = voice_toggle {
-                    self.link_voice_file_if_present(&tid);
-                    match self.resolve_voice_path(&tid) {
-                        Some(path) => {
-                            if let Some(err) = self.voice_player.toggle(&tid, &path) {
-                                self.push_toast(err, ToastKind::Error, TOAST_TTL_LONG);
-                            } else {
-                                self.push_toast(
-                                    "▶ Воспроизведение…".into(),
-                                    ToastKind::Info,
-                                    TOAST_TTL_SHORT,
-                                );
-                                ctx.request_repaint();
-                            }
-                        }
-                        None => {
-                            self.push_toast(
-                                "Аудио ещё загружается — подождите".into(),
-                                ToastKind::Warn,
-                                TOAST_TTL_SHORT,
-                            );
-                        }
                     }
                 }
             });
@@ -3102,7 +3097,11 @@ impl eframe::App for App {
 
         self.flush_chat_journal_if_dirty();
 
+        self.process_pending_voice_play(ctx);
+
         if self.voice_recorder.mic_active() || self.voice_recorder.has_ready() {
+            ctx.request_repaint_after(Duration::from_millis(33));
+        } else if self.voice_player.playing_id.is_some() {
             ctx.request_repaint_after(Duration::from_millis(33));
         } else {
             ctx.request_repaint_after(Duration::from_millis(100));

@@ -22,7 +22,7 @@ use crate::protocol::{
     new_message_id, transfer_id_to_hex, ChatMessage, FileTransferProgress, OutgoingDeliveryStatus,
     VoiceMeta,
 };
-use crate::ui::{setup_custom_style, Toast, ToastKind, TOAST_TTL_SHORT};
+use crate::ui::{setup_custom_style, Toast, ToastKind, TOAST_TTL_LONG, TOAST_TTL_SHORT};
 use crate::vault::{AddressBookEntry, Storage, VaultUnlockKind, VaultUnlockState};
 use crate::voice::{VoicePlayer, VoiceRecorder};
 
@@ -196,6 +196,8 @@ pub(crate) struct App {
     pub(crate) voice_player: VoicePlayer,
     /// Локальные пути WAV по transfer_id (hex).
     pub(crate) voice_audio_paths: HashMap<String, String>,
+    /// Клик по голосовому bubble (обрабатывается в конце кадра).
+    pub(crate) pending_voice_play: Option<String>,
     pub(crate) pending_voice_sends: Vec<PendingVoiceSend>,
     /// Ожидаемый результат выбора папки сохранения: `(rx, transfer_id, from_peer)`.
     /// Поллим `try_recv()` каждый кадр; `None` = выбор не идёт.
@@ -267,6 +269,7 @@ impl App {
             voice_probe_done: false,
             voice_player: VoicePlayer::new(),
             voice_audio_paths: HashMap::new(),
+            pending_voice_play: None,
             pending_voice_sends: Vec::new(),
             pending_accept: None,
             pending_unlock,
@@ -882,6 +885,11 @@ impl App {
         }
         self.voice_audio_paths
             .insert(transfer_id_hex.to_ascii_lowercase(), p.display().to_string());
+        crate::voice::voice_log(&format!(
+            "registered {} -> {}",
+            transfer_id_hex.to_ascii_lowercase(),
+            p.display()
+        ));
     }
 
     /// Ищет WAV на диске и привязывает к transfer_id (после приёма или загрузки журнала).
@@ -915,6 +923,56 @@ impl App {
             }
         }
         None
+    }
+
+    pub(crate) fn request_voice_play(&mut self, transfer_id: String) {
+        crate::voice::voice_log(&format!("click {transfer_id}"));
+        self.pending_voice_play = Some(transfer_id);
+    }
+
+    pub(crate) fn relink_voice_messages_in_chat(&mut self, peer_str: &str) {
+        let tids: Vec<String> = self
+            .messages
+            .lock()
+            .get(peer_str)
+            .map(|msgs| {
+                msgs.iter()
+                    .filter_map(|m| m.voice.as_ref().map(|v| v.transfer_id.clone()))
+                    .collect()
+            })
+            .unwrap_or_default();
+        for tid in tids {
+            self.link_voice_file_if_present(&tid);
+        }
+    }
+
+    pub(crate) fn process_pending_voice_play(&mut self, ctx: &egui::Context) {
+        let Some(tid) = self.pending_voice_play.take() else {
+            return;
+        };
+        self.link_voice_file_if_present(&tid);
+        match self.resolve_voice_path(&tid) {
+            Some(path) => {
+                if let Some(err) = self.voice_player.toggle(&tid, &path) {
+                    self.push_toast(err, ToastKind::Error, TOAST_TTL_LONG);
+                } else {
+                    self.push_toast(
+                        "▶ Воспроизведение…".into(),
+                        ToastKind::Info,
+                        TOAST_TTL_SHORT,
+                    );
+                    ctx.request_repaint();
+                }
+            }
+            None => {
+                crate::voice::voice_log(&format!("resolve miss: {tid}"));
+                self.push_toast(
+                    format!("Аудиофайл не найден ({tid})"),
+                    ToastKind::Error,
+                    TOAST_TTL_LONG,
+                );
+            }
+        }
     }
 
     pub(crate) fn resolve_voice_path(&self, transfer_id_hex: &str) -> Option<std::path::PathBuf> {
