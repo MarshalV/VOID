@@ -188,6 +188,8 @@ pub(crate) struct App {
     pub(crate) show_attach_menu: bool,
     /// Запись голосовых с системного микрофона.
     pub(crate) voice_recorder: VoiceRecorder,
+    /// Удержание кнопки микрофона (hold-to-record).
+    pub(crate) voice_mic_held: bool,
     /// Воспроизведение голосовых в чате.
     pub(crate) voice_player: VoicePlayer,
     /// Локальные пути WAV по transfer_id (hex).
@@ -260,6 +262,7 @@ impl App {
             active_file_transfers: HashMap::new(),
             show_attach_menu: false,
             voice_recorder: VoiceRecorder::new(),
+            voice_mic_held: false,
             voice_player: VoicePlayer::new(),
             voice_audio_paths: HashMap::new(),
             pending_voice_sends: Vec::new(),

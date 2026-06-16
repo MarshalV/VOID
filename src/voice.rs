@@ -15,10 +15,11 @@ pub(crate) const VOICE_SAMPLE_RATE: u32 = 48_000;
 pub(crate) const MAX_VOICE_DURATION_SECS: f32 = 300.0;
 
 const CAPTURE_DRAIN_MS: u64 = 300;
-const MIN_RECORD_SECS: f32 = 0.4;
+const MIN_RECORD_SECS: f32 = 0.25;
 
 pub(crate) enum VoiceRecorderState {
     Idle,
+    Starting,
     Recording { started: Instant },
     Processing,
     Ready { path: PathBuf, duration_secs: f32 },
@@ -29,10 +30,14 @@ pub(crate) struct VoiceRecorder {
     pub(crate) state: VoiceRecorderState,
     stop_tx: Option<mpsc::Sender<()>>,
     done_rx: Option<mpsc::Receiver<Result<(PathBuf, f32), String>>>,
+    ready_rx: Option<mpsc::Receiver<Result<(), String>>>,
     processing_since: Option<Instant>,
+    starting_since: Option<Instant>,
+    stop_when_ready: bool,
 }
 
 const PROCESSING_TIMEOUT: Duration = Duration::from_secs(12);
+const STARTING_TIMEOUT: Duration = Duration::from_secs(5);
 
 impl VoiceRecorder {
     pub(crate) fn new() -> Self {
@@ -40,12 +45,48 @@ impl VoiceRecorder {
             state: VoiceRecorderState::Idle,
             stop_tx: None,
             done_rx: None,
+            ready_rx: None,
             processing_since: None,
+            starting_since: None,
+            stop_when_ready: false,
         }
     }
 
     pub(crate) fn poll(&mut self) {
-        if matches!(self.state, VoiceRecorderState::Processing { .. }) {
+        if matches!(self.state, VoiceRecorderState::Starting) {
+            if let Some(since) = self.starting_since {
+                if since.elapsed() >= STARTING_TIMEOUT {
+                    self.abort_start("Микрофон не отвечает".into());
+                }
+            }
+            if let Some(rx) = self.ready_rx.as_ref() {
+                if let Ok(result) = rx.try_recv() {
+                    self.ready_rx = None;
+                    self.starting_since = None;
+                    match result {
+                        Ok(()) => {
+                            if self.stop_when_ready {
+                                self.stop_when_ready = false;
+                                self.state = VoiceRecorderState::Recording {
+                                    started: Instant::now(),
+                                };
+                                self.stop_recording();
+                            } else {
+                                self.state = VoiceRecorderState::Recording {
+                                    started: Instant::now(),
+                                };
+                            }
+                        }
+                        Err(e) => {
+                            self.stop_when_ready = false;
+                            self.state = VoiceRecorderState::Error(e);
+                        }
+                    }
+                }
+            }
+        }
+
+        if matches!(self.state, VoiceRecorderState::Processing) {
             if let Some(since) = self.processing_since {
                 if since.elapsed() >= PROCESSING_TIMEOUT {
                     self.stop_tx = None;
@@ -118,22 +159,51 @@ impl VoiceRecorder {
         }
     }
 
-    pub(crate) fn toggle_record(&mut self) -> Result<bool, String> {
-        if self.is_processing() {
-            return Err("Подождите, идёт обработка записи".into());
+    pub(crate) fn is_starting(&self) -> bool {
+        matches!(self.state, VoiceRecorderState::Starting)
+    }
+
+    pub(crate) fn is_busy(&self) -> bool {
+        self.is_starting() || self.is_recording() || self.is_processing()
+    }
+
+    pub(crate) fn ready_duration(&self) -> Option<f32> {
+        match &self.state {
+            VoiceRecorderState::Ready { duration_secs, .. } => Some(*duration_secs),
+            _ => None,
         }
-        if self.is_recording() {
-            self.stop_recording();
-            return Ok(false);
+    }
+
+    pub(crate) fn begin_record(&mut self) -> Result<(), String> {
+        if self.is_busy() {
+            return Ok(());
         }
         if self.has_ready() {
             self.state = VoiceRecorderState::Idle;
         }
-        self.start_recording()?;
-        Ok(true)
+        self.stop_when_ready = false;
+        self.spawn_record_thread()
     }
 
-    fn start_recording(&mut self) -> Result<(), String> {
+    pub(crate) fn end_record(&mut self) {
+        if self.is_recording() {
+            self.stop_recording();
+        } else if self.is_starting() {
+            self.stop_when_ready = true;
+        }
+    }
+
+    fn abort_start(&mut self, reason: String) {
+        if let Some(tx) = self.stop_tx.take() {
+            let _ = tx.send(());
+        }
+        self.ready_rx = None;
+        self.starting_since = None;
+        self.stop_when_ready = false;
+        self.state = VoiceRecorderState::Error(reason);
+    }
+
+    fn spawn_record_thread(&mut self) -> Result<(), String> {
         let (stop_tx, stop_rx) = mpsc::channel::<()>();
         let (ready_tx, ready_rx) = mpsc::channel::<Result<(), String>>();
         let (done_tx, done_rx) = mpsc::channel();
@@ -143,31 +213,15 @@ impl VoiceRecorder {
             let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
                 record_from_default_input(stop_rx, ready_tx)
             }))
-            .unwrap_or_else(|_| {
-                Err("Внутренняя ошибка записи".into())
-            });
+            .unwrap_or_else(|_| Err("Внутренняя ошибка записи".into()));
             let _ = done_tx.send(result);
         });
 
-        match ready_rx.recv_timeout(Duration::from_secs(3)) {
-            Ok(Ok(())) => {}
-            Ok(Err(e)) => return Err(e),
-            Err(mpsc::RecvTimeoutError::Timeout) => {
-                return Err(
-                    "Микрофон не отвечает. Проверьте: Параметры → Конфиденциальность → Микрофон."
-                        .into(),
-                );
-            }
-            Err(mpsc::RecvTimeoutError::Disconnected) => {
-                return Err("Не удалось открыть микрофон".into());
-            }
-        }
-
         self.stop_tx = Some(stop_tx);
         self.done_rx = Some(done_rx);
-        self.state = VoiceRecorderState::Recording {
-            started: Instant::now(),
-        };
+        self.ready_rx = Some(ready_rx);
+        self.starting_since = Some(Instant::now());
+        self.state = VoiceRecorderState::Starting;
         Ok(())
     }
 
@@ -198,6 +252,10 @@ fn init_audio_thread() {
 }
 
 fn pick_input_config(device: &cpal::Device) -> Result<cpal::SupportedStreamConfig, String> {
+    // На Windows надёжнее системный профиль по умолчанию (часто 48–192 kHz).
+    if let Ok(cfg) = device.default_input_config() {
+        return Ok(cfg);
+    }
     let configs: Vec<_> = device
         .supported_input_configs()
         .map_err(|e| format!("Микрофон: {}", e))?
@@ -208,25 +266,6 @@ fn pick_input_config(device: &cpal::Device) -> Result<cpal::SupportedStreamConfi
             )
         })
         .collect();
-
-    if configs.is_empty() {
-        return device
-            .default_input_config()
-            .map_err(|e| format!("Нет формата микрофона: {}", e));
-    }
-
-    // Предпочитаем 48 kHz — меньше нагрузка, стабильнее на WASAPI.
-    if let Some(c) = configs
-        .iter()
-        .find(|c| c.min_sample_rate().0 <= VOICE_SAMPLE_RATE && c.max_sample_rate().0 >= VOICE_SAMPLE_RATE)
-    {
-        return Ok(c.with_sample_rate(cpal::SampleRate(VOICE_SAMPLE_RATE)));
-    }
-
-    if let Ok(cfg) = device.default_input_config() {
-        return Ok(cfg);
-    }
-
     configs
         .into_iter()
         .next()
@@ -333,11 +372,7 @@ fn build_input_stream(
         }
     };
 
-    let mut stream_cfg: cpal::StreamConfig = config.clone().into();
-    #[cfg(target_os = "windows")]
-    {
-        stream_cfg.buffer_size = cpal::BufferSize::Fixed(2048);
-    }
+    let stream_cfg: cpal::StreamConfig = config.clone().into();
 
     let push = move |chunk: Vec<f32>| {
         match sample_tx.try_send(chunk) {

@@ -1087,32 +1087,51 @@ fn paint_delivery_status(
     }
 }
 
-/// Кнопка записи голосового: микрофон / стоп / готово.
-fn voice_record_button(ui: &mut egui::Ui, recording: bool, has_ready: bool) -> egui::Response {
-    let (fill, stroke, label) = if recording {
+/// Кнопка записи голосового: удерживайте для записи.
+fn voice_record_button(
+    ui: &mut egui::Ui,
+    recording: bool,
+    starting: bool,
+    has_ready: bool,
+) -> egui::Response {
+    let active = recording || starting;
+    let (fill, stroke, label) = if active {
         (
-            egui::Color32::from_rgb(0xff, 0x33, 0x33),
-            egui::Color32::from_rgb(0xff, 0xaa, 0xaa),
-            "⏹",
+            egui::Color32::from_rgb(0xff, 0x22, 0x22),
+            egui::Color32::from_rgb(0xff, 0x88, 0x88),
+            if recording { "⏺" } else { "…" },
         )
     } else if has_ready {
         (palette::ACCENT_2, palette::ACCENT, "🎤")
     } else {
         (palette::BG_PANEL, palette::DIVIDER, "🎤")
     };
-    ui.add(
-        egui::Button::new(egui::RichText::new(label).size(20.0).color(palette::TEXT))
-            .fill(fill)
-            .stroke(egui::Stroke::new(1.5, stroke))
-            .min_size(egui::vec2(44.0, 44.0))
-            .rounding(22.0),
-    )
-    .on_hover_text(if recording {
-        "Остановить запись"
+    let size = egui::vec2(44.0, 44.0);
+    let (rect, response) = ui.allocate_exact_size(size, egui::Sense::click_and_drag());
+    if ui.is_rect_visible(rect) {
+        let rounding = egui::Rounding::same(22.0);
+        if active {
+            let pulse = (ui.input(|i| i.time) * 4.0).sin() * 0.5 + 0.5;
+            let glow = egui::Color32::from_rgba_premultiplied(255, 40, 40, (80.0 + pulse * 120.0) as u8);
+            let grow = 3.0 + pulse as f32 * 3.0;
+            ui.painter().rect_filled(rect.expand(grow), rounding, glow);
+        }
+        ui.painter().rect_filled(rect, rounding, fill);
+        ui.painter().rect_stroke(rect, rounding, egui::Stroke::new(2.0, stroke));
+        ui.painter().text(
+            rect.center(),
+            egui::Align2::CENTER_CENTER,
+            label,
+            egui::FontId::proportional(20.0),
+            palette::TEXT,
+        );
+    }
+    response.on_hover_text(if active {
+        "Отпустите, чтобы остановить"
     } else if has_ready {
-        "Перезаписать голосовое"
+        "Удерживайте для перезаписи"
     } else {
-        "Записать голосовое"
+        "Удерживайте для записи голосового"
     })
 }
 
@@ -1824,8 +1843,13 @@ impl eframe::App for App {
         let was_processing = self.voice_recorder.is_processing();
         self.voice_recorder.poll();
         if was_processing && self.voice_recorder.has_ready() {
+            let dur = self
+                .voice_recorder
+                .ready_duration()
+                .map(voice::fmt_duration)
+                .unwrap_or_else(|| "?".into());
             self.push_toast(
-                "Голосовое готово — нажмите ▶ отправку".into(),
+                format!("✓ Голосовое {dur} — нажмите ▶ отправку"),
                 ToastKind::Info,
                 TOAST_TTL_SHORT,
             );
@@ -1846,6 +1870,7 @@ impl eframe::App for App {
             || !self.pending_file_sends.is_empty()
             || !self.pending_voice_sends.is_empty()
             || self.voice_recorder.is_recording()
+            || self.voice_recorder.is_starting()
             || self.voice_recorder.is_processing()
             || !self.toasts.is_empty()
         {
@@ -2361,10 +2386,14 @@ impl eframe::App for App {
                         bottom: 4.0,
                     })
                     .show(ui, |ui| {
-                        if self.voice_recorder.is_recording() {
+                        if self.voice_recorder.is_recording() || self.voice_recorder.is_starting() {
                             ui.horizontal(|ui| {
                                 ui.label(
-                                    egui::RichText::new("🔴  ЗАПИСЬ")
+                                    egui::RichText::new(if self.voice_recorder.is_starting() {
+                                        "🔴  Подключение микрофона…"
+                                    } else {
+                                        "🔴  ЗАПИСЬ — отпустите кнопку"
+                                    })
                                         .size(13.0)
                                         .strong()
                                         .color(egui::Color32::from_rgb(0xff, 0x55, 0x55)),
@@ -2523,14 +2552,18 @@ impl eframe::App for App {
                             let text_w = (ui.available_width() - buttons_w).max(48.0);
 
                             let recording = self.voice_recorder.is_recording();
+                            let starting = self.voice_recorder.is_starting();
                             let voice_ready = self.voice_recorder.has_ready();
                             let processing = self.voice_recorder.is_processing();
+                            let voice_busy = recording || starting || processing;
                             let hint = if recording {
                                 if let Some(secs) = self.voice_recorder.recording_elapsed() {
                                     format!("Запись {}…", voice::fmt_duration(secs))
                                 } else {
                                     "Запись…".into()
                                 }
+                            } else if starting {
+                                "Подключение микрофона…".into()
                             } else if voice_ready {
                                 "Голосовое готово — нажмите отправку".into()
                             } else {
@@ -2538,7 +2571,7 @@ impl eframe::App for App {
                             };
 
                             let edit = ui.add_enabled(
-                                !recording && !processing,
+                                !voice_busy,
                                 egui::TextEdit::singleline(&mut self.chat_input)
                                     .hint_text(hint)
                                     .desired_width(text_w)
@@ -2548,34 +2581,26 @@ impl eframe::App for App {
 
                             let record_resp = voice_record_button(
                                 ui,
-                                self.voice_recorder.is_recording(),
-                                self.voice_recorder.has_ready(),
+                                recording,
+                                starting,
+                                voice_ready,
                             );
-                            if record_resp.clicked() {
-                                match self.voice_recorder.toggle_record() {
-                                        Ok(true) => {
-                                            self.push_toast(
-                                                "🔴 Запись — нажмите микрофон ещё раз".into(),
-                                                ToastKind::Info,
-                                                TOAST_TTL_SHORT,
-                                            );
-                                            ctx.request_repaint();
-                                        }
-                                        Ok(false) => {
-                                            self.push_toast(
-                                                "Обработка записи…".into(),
-                                                ToastKind::Info,
-                                                TOAST_TTL_SHORT,
-                                            );
-                                            ctx.request_repaint();
-                                        }
-                                        Err(e) => {
-                                            self.push_toast(e, ToastKind::Error, TOAST_TTL_LONG);
-                                        }
-                                    }
+                            let mic_down = record_resp.is_pointer_button_down_on();
+                            if mic_down && !self.voice_recorder.is_busy() {
+                                if let Err(e) = self.voice_recorder.begin_record() {
+                                    self.push_toast(e, ToastKind::Error, TOAST_TTL_LONG);
+                                } else {
+                                    ctx.request_repaint();
+                                }
                             }
-                            if recording {
-                                ctx.request_repaint_after(Duration::from_millis(100));
+                            if self.voice_mic_held && !mic_down {
+                                self.voice_recorder.end_record();
+                                ctx.request_repaint();
+                            }
+                            self.voice_mic_held = mic_down;
+
+                            if voice_busy {
+                                ctx.request_repaint_after(Duration::from_millis(50));
                             }
 
                             let send_clicked = send_message_button(ui).clicked();
@@ -2591,12 +2616,11 @@ impl eframe::App for App {
 
                             let send_voice = (send_clicked || enter_pressed)
                                 && voice_ready
-                                && !recording
-                                && !processing;
+                                && !voice_busy;
 
                             let send_text = (send_clicked || enter_pressed)
                                 && !self.chat_input.is_empty()
-                                && !recording
+                                && !voice_busy
                                 && !voice_ready;
 
                             if send_voice {
