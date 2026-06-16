@@ -231,10 +231,36 @@ impl VoiceRecorder {
     }
 }
 
+pub(crate) const VOICE_BUILD: &str = "v4-winmanifest";
+
+/// Быстрая проверка микрофона при старте.
+pub(crate) fn probe_microphone() -> Result<String, String> {
+    let host = cpal::default_host();
+    let device = host
+        .default_input_device()
+        .ok_or_else(|| "Системный микрофон не найден".to_string())?;
+    let name = device.name().map_err(|e| format!("Микрофон: {e}"))?;
+    device
+        .default_input_config()
+        .map_err(|e| format!("Профиль микрофона: {e}"))?;
+    voice_log(&format!("probe ok: {name}"));
+    Ok(name)
+}
+
 fn voice_log(msg: &str) {
-    let path = std::env::temp_dir().join("void_voice.log");
-    if let Ok(mut f) = OpenOptions::new().create(true).append(true).open(path) {
-        let _ = writeln!(f, "[{}] {msg}", chrono::Local::now().format("%H:%M:%S%.3f"));
+    let dir = crate::file_transfer::voice_dir_absolute();
+    let _ = std::fs::create_dir_all(&dir);
+    let path = dir.join("void_voice.log");
+    if let Ok(mut f) = std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(path)
+    {
+        let _ = writeln!(
+            f,
+            "[{}] {msg}",
+            chrono::Local::now().format("%Y-%m-%d %H:%M:%S")
+        );
     }
 }
 

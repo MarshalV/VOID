@@ -1339,6 +1339,28 @@ impl eframe::App for App {
 
         self.known_peers.remove(&self.local_peer_id);
 
+        ctx.send_viewport_cmd(egui::ViewportCommand::Title(format!(
+            "VOID Chat [{}]",
+            voice::VOICE_BUILD
+        )));
+
+        if !self.voice_probe_done {
+            self.voice_probe_done = true;
+            match voice::probe_microphone() {
+                Ok(name) => {
+                    self.add_status(format!("🎤 Микрофон: {name} ({})", voice::VOICE_BUILD));
+                }
+                Err(e) => {
+                    self.add_status(format!("⚠ Микрофон недоступен: {e}"));
+                    self.push_toast(
+                        format!("Микрофон: {e}"),
+                        ToastKind::Error,
+                        TOAST_TTL_LONG,
+                    );
+                }
+            }
+        }
+
         // ── Поллинг результата выбора папки сохранения ────────────────────
         // Проверяем, не вернул ли пользователь результат из диалога папки.
         let accept_result: Option<(Option<String>, [u8; 16], PeerId)> =
@@ -1846,7 +1868,12 @@ impl eframe::App for App {
         }
         if let Some(err) = self.voice_recorder.take_error() {
             self.add_status(format!("⚠ Микрофон: {err}"));
-            self.push_toast(err, ToastKind::Error, TOAST_TTL_LONG);
+            self.push_toast(err.clone(), ToastKind::Error, TOAST_TTL_LONG);
+            rfd::MessageDialog::new()
+                .set_title("VOID — микрофон")
+                .set_description(&err)
+                .set_level(rfd::MessageLevel::Error)
+                .show();
         }
         self.voice_player.poll();
         if let Some(err) = self.voice_player.take_error() {
@@ -2611,10 +2638,14 @@ impl eframe::App for App {
                                     }
                                     voice::MicClick::Error(e) => {
                                         self.add_status(format!("⚠ Микрофон: {e}"));
-                                        self.push_toast(e, ToastKind::Error, TOAST_TTL_LONG);
+                                        self.push_toast(e.clone(), ToastKind::Error, TOAST_TTL_LONG);
+                                        rfd::MessageDialog::new()
+                                            .set_title("VOID — микрофон")
+                                            .set_description(&e)
+                                            .set_level(rfd::MessageLevel::Error)
+                                            .show();
                                     }
                                 }
-                                self.voice_recorder.poll();
                                 ctx.request_repaint();
                             }
                             if voice_busy {
