@@ -1189,11 +1189,11 @@ fn paint_voice_message(
     duration_secs: f32,
     has_audio: bool,
     is_playing: bool,
-) -> bool {
+) {
     let width = ui.available_width().min(260.0).max(160.0);
     let height = 38.0;
-    let (rect, response) =
-        ui.allocate_exact_size(egui::vec2(width, height), egui::Sense::click());
+    let (rect, _response) =
+        ui.allocate_exact_size(egui::vec2(width, height), egui::Sense::hover());
 
     if ui.is_rect_visible(rect) {
         let painter = ui.painter();
@@ -1246,18 +1246,6 @@ fn paint_voice_message(
             palette::TEXT_MUTED,
         );
     }
-
-    response
-        .on_hover_text(if has_audio {
-            if is_playing {
-                "Остановить"
-            } else {
-                "Воспроизвести"
-            }
-        } else {
-            "Аудио загружается…"
-        })
-        .clicked()
 }
 
 /// Кнопка «Отправить» — треугольник; при готовом голосовом подсвечивается зелёным.
@@ -2528,6 +2516,7 @@ impl eframe::App for App {
                     .unwrap_or_default();
                 let me_str = self.local_peer_id.to_string();
                 let mut pending_msg_delete: Option<String> = None;
+                let mut voice_play: Option<String> = None;
                 let chat_peer = self.selected_chat.clone();
                 self.relink_voice_messages_in_chat(&chat_peer);
 
@@ -2609,14 +2598,12 @@ impl eframe::App for App {
                                                     self.resolve_voice_path(&tid).is_some();
                                                 let is_playing =
                                                     self.voice_player.is_playing(&tid);
-                                                if paint_voice_message(
+                                                paint_voice_message(
                                                     ui,
                                                     voice.duration_secs,
                                                     has_audio,
                                                     is_playing,
-                                                ) {
-                                                    self.request_voice_play(tid);
-                                                }
+                                                );
                                             } else if !msg.text.is_empty() {
                                                 ui.label(
                                                     egui::RichText::new(&msg.text)
@@ -2659,6 +2646,16 @@ impl eframe::App for App {
                                             );
                                         });
                                     });
+                                if msg.voice.is_some() {
+                                    let tid = msg.voice.as_ref().unwrap().transfer_id.clone();
+                                    let click = bubble
+                                        .response
+                                        .interact(egui::Sense::click())
+                                        .on_hover_text("Воспроизвести / остановить");
+                                    if click.clicked() {
+                                        voice_play = Some(tid);
+                                    }
+                                }
                                 bubble.response.context_menu(|ui| {
                                     if ui.button("🗑 Удалить").clicked() {
                                         pending_msg_delete = Some(msg_id.clone());
@@ -2674,6 +2671,9 @@ impl eframe::App for App {
                     if let Ok(peer) = self.selected_chat.parse::<PeerId>() {
                         self.delete_messages(peer, &[msg_id]);
                     }
+                }
+                if let Some(tid) = voice_play {
+                    self.request_voice_play(tid);
                 }
             });
 

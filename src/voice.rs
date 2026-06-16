@@ -279,7 +279,7 @@ impl VoiceRecorder {
     }
 }
 
-pub(crate) const VOICE_BUILD: &str = "v5g-click";
+pub(crate) const VOICE_BUILD: &str = "v5h-bubble";
 
 /// CLI: `--voice-probe` | `--voice-record <wav> <stop-file>`
 pub(crate) fn run_cli_mode() -> Option<i32> {
