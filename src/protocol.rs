@@ -32,6 +32,18 @@ pub(crate) fn transfer_id_to_hex(tid: &[u8; 16]) -> String {
     tid.iter().map(|b| format!("{:02x}", b)).collect()
 }
 
+pub(crate) fn transfer_id_from_hex(hex: &str) -> Option<[u8; 16]> {
+    let hex = hex.trim();
+    if hex.len() != 32 || !hex.chars().all(|c| c.is_ascii_hexdigit()) {
+        return None;
+    }
+    let mut tid = [0u8; 16];
+    for i in 0..16 {
+        tid[i] = u8::from_str_radix(&hex[i * 2..i * 2 + 2], 16).ok()?;
+    }
+    Some(tid)
+}
+
 fn validate_voice_meta(v: &VoiceMeta) -> bool {
     v.transfer_id.len() == 32
         && v.transfer_id.chars().all(|c| c.is_ascii_hexdigit())

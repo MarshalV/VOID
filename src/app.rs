@@ -19,8 +19,8 @@ use crate::crypto;
 use crate::file_transfer;
 use crate::network::{run_chat_network, NetworkEvent, UICommand};
 use crate::protocol::{
-    new_message_id, transfer_id_to_hex, ChatMessage, FileTransferProgress, OutgoingDeliveryStatus,
-    VoiceMeta,
+    new_message_id, transfer_id_from_hex, transfer_id_to_hex, ChatMessage, FileTransferProgress,
+    OutgoingDeliveryStatus, VoiceMeta,
 };
 use crate::ui::{setup_custom_style, Toast, ToastKind, TOAST_TTL_LONG, TOAST_TTL_SHORT};
 use crate::vault::{AddressBookEntry, Storage, VaultUnlockKind, VaultUnlockState};
@@ -749,7 +749,7 @@ impl App {
     /// Восстанавливает очередь недоставленных исходящих из журнала после рестарта.
     pub(crate) fn restore_pending_outgoing(&mut self) {
         let me = self.local_peer_id.to_string();
-        let snapshot: Vec<(PeerId, String, String)> = {
+        let snapshot: Vec<(PeerId, ChatMessage)> = {
             let messages = self.messages.lock();
             let mut out = Vec::new();
             for (peer_str, msgs) in messages.iter() {
@@ -758,25 +758,61 @@ impl App {
                 };
                 for msg in msgs {
                     if msg.sender_id == me && msg.delivery == OutgoingDeliveryStatus::Pending {
-                        out.push((peer, msg.id.clone(), msg.text.clone()));
+                        out.push((peer, msg.clone()));
                     }
                 }
             }
             out
         };
 
-        for (peer, message_id, text) in snapshot {
+        for (peer, msg) in snapshot {
+            if let Some(voice) = msg.voice.clone() {
+                let Some(transfer_id) = transfer_id_from_hex(&voice.transfer_id) else {
+                    continue;
+                };
+                if self
+                    .pending_voice_sends
+                    .iter()
+                    .any(|p| p.message_id == msg.id)
+                {
+                    continue;
+                }
+                let Some(path) = self.resolve_voice_path(&voice.transfer_id) else {
+                    continue;
+                };
+                self.pending_voice_sends.push(PendingVoiceSend {
+                    peer,
+                    path: path.display().to_string(),
+                    duration_secs: voice.duration_secs.max(0.1),
+                    message_id: msg.id.clone(),
+                    transfer_id,
+                    last_attempt: Instant::now(),
+                });
+                let _ = self.command_tx.try_send(UICommand::SendVoiceMessage {
+                    sender_name: self.local_nickname.clone(),
+                    recipient: peer,
+                    path: path.display().to_string(),
+                    duration_secs: voice.duration_secs.max(0.1),
+                    message_id: msg.id,
+                    transfer_id,
+                    is_retry: true,
+                });
+                continue;
+            }
+            if msg.text.is_empty() {
+                continue;
+            }
             if self
                 .pending_sends
                 .iter()
-                .any(|p| p.message_id == message_id)
+                .any(|p| p.message_id == msg.id)
             {
                 continue;
             }
             self.pending_sends.push(PendingSend {
                 peer,
-                text: text.clone(),
-                message_id: message_id.clone(),
+                text: msg.text.clone(),
+                message_id: msg.id.clone(),
                 last_send_at: Instant::now(),
                 dht_kicked: false,
                 dht_kicked_at: None,
@@ -785,9 +821,9 @@ impl App {
             });
             let _ = self.command_tx.try_send(UICommand::SendMessage {
                 sender_name: self.local_nickname.clone(),
-                text,
+                text: msg.text,
                 recipient: Some(peer),
-                message_id: Some(message_id),
+                message_id: Some(msg.id),
                 is_retry: true,
             });
         }
@@ -992,6 +1028,7 @@ impl App {
         path: std::path::PathBuf,
         duration_secs: f32,
     ) -> Result<(), &'static str> {
+        let duration_secs = duration_secs.max(0.1);
         let mut tid = [0u8; 16];
         rand::thread_rng().fill_bytes(&mut tid);
         let message_id = new_message_id();
@@ -1040,26 +1077,15 @@ impl App {
                     transfer_id: tid,
                     last_attempt: Instant::now(),
                 });
-                self.pending_sends.push(PendingSend {
-                    peer,
-                    text: String::new(),
-                    message_id,
-                    last_send_at: Instant::now(),
-                    dht_kicked: false,
-                    dht_kicked_at: None,
-                    attempts: 0,
-                    awaiting_session: false,
-                });
                 Ok(())
             }
             Err(_) => Err("Очередь к сети переполнена"),
         }
     }
 
-    pub(crate) fn complete_pending_voice_send(&mut self, peer: PeerId, message_id: &str) {
-        self.pending_voice_sends.retain(|p| {
-            !(p.peer == peer && p.message_id == message_id)
-        });
+    pub(crate) fn complete_pending_voice_send_by_transfer(&mut self, transfer_id: &[u8; 16]) {
+        self.pending_voice_sends
+            .retain(|p| p.transfer_id != *transfer_id);
     }
 
     pub(crate) fn tick_pending_voice_sends(&mut self) {

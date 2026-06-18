@@ -1638,7 +1638,6 @@ impl eframe::App for App {
                         OutgoingDeliveryStatus::Delivered,
                     );
                     self.complete_pending_send(peer, &message_id);
-                    self.complete_pending_voice_send(peer, &message_id);
                 }
                 NetworkEvent::MessageRead { peer, message_ids } => {
                     self.mark_outgoing_read(peer, &message_ids);
@@ -1744,6 +1743,7 @@ impl eframe::App for App {
                     // Пир физически не поддерживает чат. Ретраить бессмысленно —
                     // снимаем все ожидания ему и удаляем из контактов.
                     self.pending_sends.retain(|p| p.peer != peer);
+                    self.pending_voice_sends.retain(|p| p.peer != peer);
                     let removed_name = self.known_peers.remove(&peer);
                     self.contact_addrs.remove(&peer);
                     self.messages.lock().remove(&peer.to_string());
@@ -1869,6 +1869,9 @@ impl eframe::App for App {
                     is_outgoing,
                     peer: _,
                 } => {
+                    if is_outgoing && file_transfer::is_voice_filename(&filename) {
+                        self.complete_pending_voice_send_by_transfer(&transfer_id);
+                    }
                     if file_transfer::is_voice_filename(&filename) && !saved_to.trim().is_empty() {
                         let tid_hex = file_transfer::voice_transfer_hex_from_filename(&filename)
                             .unwrap_or_else(|| {

@@ -1561,18 +1561,54 @@ pub async fn run_chat_network(
                                 };
 
                                 if !sessions.contains_key(&recipient) {
+                                    let force_hs = pending_handshakes.contains_key(&recipient)
+                                        && swarm.is_connected(&recipient);
+                                    let _ = ensure_e2ee_handshake_started(
+                                        &mut swarm,
+                                        &local_key,
+                                        local_peer_id,
+                                        my_public_key,
+                                        recipient,
+                                        &sessions,
+                                        &mut pending_handshakes,
+                                        &now,
+                                        force_hs,
+                                    )
+                                    .await;
+                                    let msg_id_for_dedup =
+                                        chat_message_id_from_json(json_data.as_slice());
+                                    let queue = pending_messages.entry(recipient).or_default();
+                                    if let Some(ref mid) = msg_id_for_dedup {
+                                        if !queue.iter().any(|b| {
+                                            chat_message_id_from_json(b.as_slice()).as_deref()
+                                                == Some(mid.as_str())
+                                        }) {
+                                            queue.push(json_data);
+                                        }
+                                    } else {
+                                        queue.push(json_data);
+                                    }
+                                    let _ = event_tx
+                                        .send(NetworkEvent::MessageAwaitingSession(recipient))
+                                        .await;
                                     let _ = event_tx
                                         .send(NetworkEvent::VoiceSendDeferred {
                                             recipient,
                                             path,
                                             duration_secs,
-                                            message_id,
+                                            message_id: message_id.clone(),
                                             transfer_id,
                                         })
                                         .await;
                                     if !is_retry {
                                         let _ = event_tx.send(NetworkEvent::ChatMessage(msg)).await;
                                     }
+                                    debug!(
+                                        "[{}] ⏳ E2EE: голосовое {} буферизовано до хендшейка с {}",
+                                        now,
+                                        &message_id[..8.min(message_id.len())],
+                                        &recipient.to_string()[..8]
+                                    );
                                     continue;
                                 }
 
