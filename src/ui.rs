@@ -2463,222 +2463,7 @@ impl eframe::App for App {
                 .retain(|_, t| !t.completed);
         }
 
-        // ===== История чата (фоновое изображение + bubbles) =====
-        let bg_tex = self.ensure_chat_bg(ctx);
-        let bg_tex_size = self
-            .chat_bg_texture
-            .as_ref()
-            .map(|h| h.size_vec2())
-            .unwrap_or(egui::Vec2::ZERO);
-        egui::CentralPanel::default()
-            .frame(egui::Frame::none().fill(palette::BG_CHAT))
-            .show(ctx, |ui| {
-                let bg_rect = ui.max_rect();
-                if let Some(tex_id) = bg_tex {
-                    draw_chat_bg_image(ui.painter(), bg_rect, tex_id, bg_tex_size);
-                } else {
-                    draw_starfield(ui.painter(), bg_rect);
-                }
-
-                if self.selected_chat.is_empty() {
-                    ui.allocate_ui_with_layout(
-                        ui.available_size(),
-                        egui::Layout::centered_and_justified(egui::Direction::TopDown),
-                        |ui| {
-                            ui.vertical_centered(|ui| {
-                                ui.add_space(80.0);
-                                self.star_icon(ui, 96.0, palette::ACCENT_2);
-                                ui.add_space(14.0);
-                                ui.label(
-                                    egui::RichText::new("Тишина в эфире")
-                                        .size(22.0)
-                                        .strong()
-                                        .color(palette::TEXT),
-                                );
-                                ui.add_space(6.0);
-                                ui.label(
-                                    egui::RichText::new(
-                                        "Выберите контакт слева — и начнём сеанс связи через VOID.",
-                                    )
-                                    .color(palette::TEXT_MUTED),
-                                );
-                            });
-                        },
-                    );
-                    return;
-                }
-
-                let messages = self
-                    .messages
-                    .lock()
-                    .get(&self.selected_chat)
-                    .cloned()
-                    .unwrap_or_default();
-                let me_str = self.local_peer_id.to_string();
-                let mut pending_msg_delete: Option<String> = None;
-                let mut voice_play: Option<String> = None;
-                let chat_peer = self.selected_chat.clone();
-                self.relink_voice_messages_in_chat(&chat_peer);
-
-                egui::ScrollArea::vertical()
-                    .id_salt("chat_stream")
-                    .stick_to_bottom(true)
-                    .auto_shrink([false, false])
-                    .show(ui, |ui| {
-                        ui.add_space(12.0);
-
-                        if messages.is_empty() {
-                            ui.add_space(40.0);
-                            ui.vertical_centered(|ui| {
-                                ui.label(
-                                    egui::RichText::new(
-                                        "Сообщений пока нет — отправьте первое ↓",
-                                    )
-                                    .color(palette::TEXT_MUTED),
-                                );
-                            });
-                        }
-
-                        for msg in &messages {
-                            let is_me = msg.sender_id == me_str;
-                            ui.add_space(6.0);
-                            ui.horizontal(|ui| {
-                                let avail = ui.available_width();
-                                let max_w = (avail * 0.66).min(560.0).max(180.0);
-
-                                if is_me {
-                                    ui.add_space((avail - max_w - 28.0).max(0.0));
-                                } else {
-                                    ui.add_space(20.0);
-                                    draw_avatar(
-                                        ui,
-                                        &msg.sender_id,
-                                        &msg.sender_name,
-                                        30.0,
-                                        None,
-                                    );
-                                    ui.add_space(8.0);
-                                }
-
-                                let bubble_bg = if is_me {
-                                    palette::BUBBLE_ME
-                                } else {
-                                    palette::BUBBLE_THEM
-                                };
-
-                                let msg_id = msg.id.clone();
-                                let bubble = egui::Frame::none()
-                                    .fill(bubble_bg)
-                                    .rounding(egui::Rounding {
-                                        nw: 16.0,
-                                        ne: 16.0,
-                                        sw: if is_me { 16.0 } else { 4.0 },
-                                        se: if is_me { 4.0 } else { 16.0 },
-                                    })
-                                    .inner_margin(egui::Margin {
-                                        left: 14.0,
-                                        right: 14.0,
-                                        top: 8.0,
-                                        bottom: 6.0,
-                                    })
-                                    .show(ui, |ui| {
-                                        ui.set_max_width(max_w);
-                                        ui.vertical(|ui| {
-                                            if !is_me {
-                                                ui.label(
-                                                    egui::RichText::new(&msg.sender_name)
-                                                        .size(12.5)
-                                                        .strong()
-                                                        .color(palette::ACCENT_2),
-                                                );
-                                            }
-                                            if let Some(ref voice) = msg.voice {
-                                                let tid = voice.transfer_id.clone();
-                                                let has_audio =
-                                                    self.resolve_voice_path(&tid).is_some();
-                                                let is_playing =
-                                                    self.voice_player.is_playing(&tid);
-                                                paint_voice_message(
-                                                    ui,
-                                                    voice.duration_secs,
-                                                    has_audio,
-                                                    is_playing,
-                                                );
-                                            } else if !msg.text.is_empty() {
-                                                ui.label(
-                                                    egui::RichText::new(&msg.text)
-                                                        .size(14.5)
-                                                        .color(palette::TEXT),
-                                                );
-                                            }
-                                            ui.with_layout(
-                                                egui::Layout::right_to_left(
-                                                    egui::Align::Center,
-                                                ),
-                                                |ui| {
-                                                    if is_me {
-                                                        let status_color = match msg.delivery {
-                                                            OutgoingDeliveryStatus::Read => {
-                                                                palette::ACCENT
-                                                            }
-                                                            OutgoingDeliveryStatus::Delivered => {
-                                                                palette::TEXT_MUTED
-                                                            }
-                                                            OutgoingDeliveryStatus::Pending => {
-                                                                palette::TEXT_MUTED
-                                                            }
-                                                        };
-                                                        paint_delivery_status(
-                                                            ui,
-                                                            msg.delivery,
-                                                            status_color,
-                                                        );
-                                                        ui.add_space(4.0);
-                                                    }
-                                                    ui.label(
-                                                        egui::RichText::new(short_time(
-                                                            &msg.timestamp,
-                                                        ))
-                                                        .size(10.5)
-                                                        .color(palette::TEXT_MUTED),
-                                                    );
-                                                },
-                                            );
-                                        });
-                                    });
-                                if msg.voice.is_some() {
-                                    let tid = msg.voice.as_ref().unwrap().transfer_id.clone();
-                                    let click = bubble
-                                        .response
-                                        .interact(egui::Sense::click())
-                                        .on_hover_text("Воспроизвести / остановить");
-                                    if click.clicked() {
-                                        voice_play = Some(tid);
-                                    }
-                                }
-                                bubble.response.context_menu(|ui| {
-                                    if ui.button("🗑 Удалить").clicked() {
-                                        pending_msg_delete = Some(msg_id.clone());
-                                        ui.close_menu();
-                                    }
-                                });
-                            });
-                        }
-                        ui.add_space(12.0);
-                    });
-
-                if let Some(msg_id) = pending_msg_delete {
-                    if let Ok(peer) = self.selected_chat.parse::<PeerId>() {
-                        self.delete_messages(peer, &[msg_id]);
-                    }
-                }
-                if let Some(tid) = voice_play {
-                    self.request_voice_play(tid);
-                }
-            });
-
-        // ===== Поле ввода (нижняя панель) =====
-        self.voice_poll_tick();
+        // ===== Поле ввода (нижняя панель) — до CentralPanel, чтобы не перекрывать ленту =====
         egui::TopBottomPanel::bottom("chat_input")
             .frame(
                 egui::Frame::none()
@@ -3012,6 +2797,222 @@ impl eframe::App for App {
                             }
                         });
                     });
+            });
+
+        // ===== История чата (фоновое изображение + bubbles) =====
+        let bg_tex = self.ensure_chat_bg(ctx);
+        let bg_tex_size = self
+            .chat_bg_texture
+            .as_ref()
+            .map(|h| h.size_vec2())
+            .unwrap_or(egui::Vec2::ZERO);
+        egui::CentralPanel::default()
+            .frame(egui::Frame::none().fill(palette::BG_CHAT))
+            .show(ctx, |ui| {
+                let bg_rect = ui.max_rect();
+                if let Some(tex_id) = bg_tex {
+                    draw_chat_bg_image(ui.painter(), bg_rect, tex_id, bg_tex_size);
+                } else {
+                    draw_starfield(ui.painter(), bg_rect);
+                }
+
+                if self.selected_chat.is_empty() {
+                    ui.allocate_ui_with_layout(
+                        ui.available_size(),
+                        egui::Layout::centered_and_justified(egui::Direction::TopDown),
+                        |ui| {
+                            ui.vertical_centered(|ui| {
+                                ui.add_space(80.0);
+                                self.star_icon(ui, 96.0, palette::ACCENT_2);
+                                ui.add_space(14.0);
+                                ui.label(
+                                    egui::RichText::new("Тишина в эфире")
+                                        .size(22.0)
+                                        .strong()
+                                        .color(palette::TEXT),
+                                );
+                                ui.add_space(6.0);
+                                ui.label(
+                                    egui::RichText::new(
+                                        "Выберите контакт слева — и начнём сеанс связи через VOID.",
+                                    )
+                                    .color(palette::TEXT_MUTED),
+                                );
+                            });
+                        },
+                    );
+                    return;
+                }
+
+                let messages = self
+                    .messages
+                    .lock()
+                    .get(&self.selected_chat)
+                    .cloned()
+                    .unwrap_or_default();
+                let me_str = self.local_peer_id.to_string();
+                let mut pending_msg_delete: Option<String> = None;
+                let mut voice_play: Option<String> = None;
+                let chat_peer = self.selected_chat.clone();
+                self.relink_voice_messages_in_chat(&chat_peer);
+
+                let chat_stream_height = ui.available_height();
+                egui::ScrollArea::vertical()
+                    .id_salt("chat_stream")
+                    .stick_to_bottom(true)
+                    .auto_shrink([false, false])
+                    .max_height(chat_stream_height)
+                    .show(ui, |ui| {
+                        ui.add_space(12.0);
+
+                        if messages.is_empty() {
+                            ui.add_space(40.0);
+                            ui.vertical_centered(|ui| {
+                                ui.label(
+                                    egui::RichText::new(
+                                        "Сообщений пока нет — отправьте первое ↓",
+                                    )
+                                    .color(palette::TEXT_MUTED),
+                                );
+                            });
+                        }
+
+                        for msg in &messages {
+                            let is_me = msg.sender_id == me_str;
+                            ui.add_space(6.0);
+                            ui.horizontal(|ui| {
+                                let avail = ui.available_width();
+                                let max_w = (avail * 0.66).min(560.0).max(180.0);
+
+                                if is_me {
+                                    ui.add_space((avail - max_w - 28.0).max(0.0));
+                                } else {
+                                    ui.add_space(20.0);
+                                    draw_avatar(
+                                        ui,
+                                        &msg.sender_id,
+                                        &msg.sender_name,
+                                        30.0,
+                                        None,
+                                    );
+                                    ui.add_space(8.0);
+                                }
+
+                                let bubble_bg = if is_me {
+                                    palette::BUBBLE_ME
+                                } else {
+                                    palette::BUBBLE_THEM
+                                };
+
+                                let msg_id = msg.id.clone();
+                                let bubble = egui::Frame::none()
+                                    .fill(bubble_bg)
+                                    .rounding(egui::Rounding {
+                                        nw: 16.0,
+                                        ne: 16.0,
+                                        sw: if is_me { 16.0 } else { 4.0 },
+                                        se: if is_me { 4.0 } else { 16.0 },
+                                    })
+                                    .inner_margin(egui::Margin {
+                                        left: 14.0,
+                                        right: 14.0,
+                                        top: 8.0,
+                                        bottom: 6.0,
+                                    })
+                                    .show(ui, |ui| {
+                                        ui.set_max_width(max_w);
+                                        ui.vertical(|ui| {
+                                            if !is_me {
+                                                ui.label(
+                                                    egui::RichText::new(&msg.sender_name)
+                                                        .size(12.5)
+                                                        .strong()
+                                                        .color(palette::ACCENT_2),
+                                                );
+                                            }
+                                            if let Some(ref voice) = msg.voice {
+                                                let tid = voice.transfer_id.clone();
+                                                let has_audio =
+                                                    self.resolve_voice_path(&tid).is_some();
+                                                let is_playing =
+                                                    self.voice_player.is_playing(&tid);
+                                                paint_voice_message(
+                                                    ui,
+                                                    voice.duration_secs,
+                                                    has_audio,
+                                                    is_playing,
+                                                );
+                                            } else if !msg.text.is_empty() {
+                                                ui.label(
+                                                    egui::RichText::new(&msg.text)
+                                                        .size(14.5)
+                                                        .color(palette::TEXT),
+                                                );
+                                            }
+                                            ui.with_layout(
+                                                egui::Layout::right_to_left(
+                                                    egui::Align::Center,
+                                                ),
+                                                |ui| {
+                                                    if is_me {
+                                                        let status_color = match msg.delivery {
+                                                            OutgoingDeliveryStatus::Read => {
+                                                                palette::ACCENT
+                                                            }
+                                                            OutgoingDeliveryStatus::Delivered => {
+                                                                palette::TEXT_MUTED
+                                                            }
+                                                            OutgoingDeliveryStatus::Pending => {
+                                                                palette::TEXT_MUTED
+                                                            }
+                                                        };
+                                                        paint_delivery_status(
+                                                            ui,
+                                                            msg.delivery,
+                                                            status_color,
+                                                        );
+                                                        ui.add_space(4.0);
+                                                    }
+                                                    ui.label(
+                                                        egui::RichText::new(short_time(
+                                                            &msg.timestamp,
+                                                        ))
+                                                        .size(10.5)
+                                                        .color(palette::TEXT_MUTED),
+                                                    );
+                                                },
+                                            );
+                                        });
+                                    });
+                                if msg.voice.is_some() {
+                                    let tid = msg.voice.as_ref().unwrap().transfer_id.clone();
+                                    let click = bubble
+                                        .response
+                                        .interact(egui::Sense::click())
+                                        .on_hover_text("Воспроизвести / остановить");
+                                    if click.clicked() {
+                                        voice_play = Some(tid);
+                                    }
+                                }
+                                bubble.response.context_menu(|ui| {
+                                    if ui.button("🗑 Удалить").clicked() {
+                                        pending_msg_delete = Some(msg_id.clone());
+                                        ui.close_menu();
+                                    }
+                                });
+                            });
+                        }
+                        ui.add_space(12.0);
+                    });
+
+                if let Some(msg_id) = pending_msg_delete {
+                    if let Ok(peer) = self.selected_chat.parse::<PeerId>() {
+                        self.delete_messages(peer, &[msg_id]);
+                    }
+                }
+                if let Some(tid) = voice_play {
+                    self.request_voice_play(tid);
+                }
             });
 
         // ===== Toasts (поверх всего, правый верхний угол) =====
