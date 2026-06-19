@@ -467,7 +467,8 @@ fn build_void_swarm(
             }
 
             let rr_config = libp2p::request_response::Config::default()
-                .with_request_timeout(Duration::from_secs(30));
+                .with_request_timeout(Duration::from_secs(30))
+                .with_max_concurrent_streams(256);
             let rr_protocol = libp2p::StreamProtocol::new("/void/chat/1.0.0");
             let rr_behaviour = libp2p::request_response::json::Behaviour::<V1Packet, V1Packet>::new(
                 [(rr_protocol, libp2p::request_response::ProtocolSupport::Full)],
@@ -475,7 +476,8 @@ fn build_void_swarm(
             );
 
             let file_rr_config = libp2p::request_response::Config::default()
-                .with_request_timeout(Duration::from_secs(300));
+                .with_request_timeout(Duration::from_secs(300))
+                .with_max_concurrent_streams(256);
             let file_rr_protocol = libp2p::StreamProtocol::new(file_transfer::FILE_PROTOCOL_ID);
             let file_rr_behaviour = libp2p::request_response::json::Behaviour::<
                 file_transfer::FilePacket,
@@ -585,6 +587,11 @@ async fn send_encrypted_chat_payload(
     true
 }
 
+struct PendingVoiceTransfer {
+    path: String,
+    transfer_id: [u8; 16],
+}
+
 async fn flush_pending_encrypted_messages(
     swarm: &mut libp2p::Swarm<ChatBehaviour>,
     sessions: &mut HashMap<PeerId, crypto::SecureSession>,
@@ -615,6 +622,111 @@ async fn flush_pending_encrypted_messages(
             data,
             None,
             now,
+        )
+        .await;
+    }
+}
+
+async fn start_voice_file_transfer(
+    swarm: &mut libp2p::Swarm<ChatBehaviour>,
+    outgoing_transfers: &mut HashMap<[u8; 16], file_transfer::OutgoingTransfer>,
+    relay_peers: &HashSet<PeerId>,
+    event_tx: &mpsc::Sender<NetworkEvent>,
+    recipient: PeerId,
+    path: &str,
+    transfer_id: [u8; 16],
+) {
+    if outgoing_transfers.contains_key(&transfer_id) {
+        return;
+    }
+    match std::fs::read(path) {
+        Err(e) => {
+            let _ = event_tx
+                .send(NetworkEvent::Status(format!(
+                    "❌ Не удалось прочитать голосовое «{}»: {}",
+                    path, e
+                )))
+                .await;
+        }
+        Ok(data) => {
+            if data.len() as u64 > file_transfer::MAX_FILE_SIZE {
+                let _ = event_tx
+                    .send(NetworkEvent::Status(
+                        "❌ Голосовое сообщение слишком большое".into(),
+                    ))
+                    .await;
+            } else {
+                let sha256 = file_transfer::hash_file(&data);
+                let chunks = file_transfer::split_into_chunks(&data);
+                let total_chunks = chunks.len() as u32;
+                let total_size = data.len() as u64;
+                let filename = file_transfer::voice_filename(&transfer_id);
+                let file_kind = file_transfer::FileKind::Audio;
+                let is_relay = relay_peers.contains(&recipient);
+                let offer = file_transfer::FilePacket::Offer {
+                    transfer_id,
+                    filename: filename.clone(),
+                    total_size,
+                    total_chunks,
+                    sha256,
+                    kind: file_kind,
+                };
+                swarm
+                    .behaviour_mut()
+                    .file_rr
+                    .send_request(&recipient, offer);
+
+                let transfer = file_transfer::OutgoingTransfer {
+                    peer: recipient,
+                    transfer_id,
+                    filename: filename.clone(),
+                    chunks,
+                    next_chunk: 0,
+                    total_size,
+                    is_relay,
+                    last_chunk_at: Instant::now(),
+                    accepted: false,
+                    kind: file_kind,
+                };
+                outgoing_transfers.insert(transfer_id, transfer);
+
+                let _ = event_tx
+                    .send(NetworkEvent::FileProgress {
+                        transfer_id,
+                        sent_chunks: 0,
+                        total_chunks,
+                        filename,
+                        total_size,
+                        is_outgoing: true,
+                        peer: recipient,
+                        kind: file_kind,
+                    })
+                    .await;
+            }
+        }
+    }
+}
+
+async fn flush_pending_voice_transfers(
+    swarm: &mut libp2p::Swarm<ChatBehaviour>,
+    outgoing_transfers: &mut HashMap<[u8; 16], file_transfer::OutgoingTransfer>,
+    relay_peers: &HashSet<PeerId>,
+    event_tx: &mpsc::Sender<NetworkEvent>,
+    peer: PeerId,
+    pending_voice_transfers: &mut HashMap<PeerId, Vec<PendingVoiceTransfer>>,
+) {
+    let Some(queue) = pending_voice_transfers.remove(&peer) else {
+        return;
+    };
+    for item in queue {
+        start_voice_file_transfer(
+            swarm,
+            outgoing_transfers,
+            relay_peers,
+            event_tx,
+            peer,
+            &item.path,
+            item.transfer_id,
         )
         .await;
     }
@@ -745,6 +857,8 @@ pub async fn run_chat_network(
         let mut sessions: HashMap<PeerId, crypto::SecureSession> = HashMap::new();
         let mut pending_handshakes: HashMap<PeerId, crypto::StaticSecret> = HashMap::new();
         let mut pending_messages: HashMap<PeerId, Vec<Vec<u8>>> = HashMap::new();
+        let mut pending_voice_transfers: HashMap<PeerId, Vec<PendingVoiceTransfer>> =
+            HashMap::new();
         let mut pending_read_receipts: HashMap<PeerId, Vec<Vec<String>>> = HashMap::new();
         let my_public_key = crypto::PublicKey::from(&local_static);
         let local_peer_id = local_key.public().to_peer_id();
@@ -1637,6 +1751,16 @@ pub async fn run_chat_network(
                                     } else {
                                         queue.push(json_data);
                                     }
+                                    let vq = pending_voice_transfers.entry(recipient).or_default();
+                                    if !vq
+                                        .iter()
+                                        .any(|v| v.transfer_id == transfer_id)
+                                    {
+                                        vq.push(PendingVoiceTransfer {
+                                            path: path.clone(),
+                                            transfer_id,
+                                        });
+                                    }
                                     let _ = event_tx
                                         .send(NetworkEvent::MessageAwaitingSession(recipient))
                                         .await;
@@ -1661,99 +1785,41 @@ pub async fn run_chat_network(
                                     continue;
                                 }
 
-                                let msg_id_for_send =
-                                    chat_message_id_from_json(json_data.as_slice());
-                                let in_flight = msg_id_for_send.as_ref().is_some_and(|mid| {
-                                    outbound_msg_requests
-                                        .values()
-                                        .any(|(p, id)| *p == recipient && id == mid)
-                                });
-                                if !in_flight {
-                                    let _ = send_encrypted_chat_payload(
-                                        &mut swarm,
-                                        &mut sessions,
-                                        &mut outbound_msg_requests,
-                                        &mut outbound_delete_requests,
-                                        &event_tx,
-                                        recipient,
-                                        json_data,
-                                        None,
-                                        &now,
-                                    )
-                                    .await;
-                                }
-
                                 if !is_retry {
+                                    let msg_id_for_send =
+                                        chat_message_id_from_json(json_data.as_slice());
+                                    let in_flight = msg_id_for_send.as_ref().is_some_and(|mid| {
+                                        outbound_msg_requests
+                                            .values()
+                                            .any(|(p, id)| *p == recipient && id == mid)
+                                    });
+                                    if !in_flight {
+                                        let _ = send_encrypted_chat_payload(
+                                            &mut swarm,
+                                            &mut sessions,
+                                            &mut outbound_msg_requests,
+                                            &mut outbound_delete_requests,
+                                            &event_tx,
+                                            recipient,
+                                            json_data,
+                                            None,
+                                            &now,
+                                        )
+                                        .await;
+                                    }
                                     let _ = event_tx.send(NetworkEvent::ChatMessage(msg)).await;
                                 }
 
-                                match std::fs::read(&path) {
-                                    Err(e) => {
-                                        let _ = event_tx
-                                            .send(NetworkEvent::Status(format!(
-                                                "❌ Не удалось прочитать голосовое «{}»: {}",
-                                                path, e
-                                            )))
-                                            .await;
-                                    }
-                                    Ok(data) => {
-                                        if data.len() as u64 > file_transfer::MAX_FILE_SIZE {
-                                            let _ = event_tx
-                                                .send(NetworkEvent::Status(
-                                                    "❌ Голосовое сообщение слишком большое".into(),
-                                                ))
-                                                .await;
-                                        } else {
-                                            let sha256 = file_transfer::hash_file(&data);
-                                            let chunks = file_transfer::split_into_chunks(&data);
-                                            let total_chunks = chunks.len() as u32;
-                                            let total_size = data.len() as u64;
-                                            let filename =
-                                                file_transfer::voice_filename(&transfer_id);
-                                            let file_kind = file_transfer::FileKind::Audio;
-                                            let is_relay = relay_peers.contains(&recipient);
-                                            let offer = file_transfer::FilePacket::Offer {
-                                                transfer_id,
-                                                filename: filename.clone(),
-                                                total_size,
-                                                total_chunks,
-                                                sha256,
-                                                kind: file_kind,
-                                            };
-                                            swarm
-                                                .behaviour_mut()
-                                                .file_rr
-                                                .send_request(&recipient, offer);
-
-                                            let transfer = file_transfer::OutgoingTransfer {
-                                                peer: recipient,
-                                                transfer_id,
-                                                filename: filename.clone(),
-                                                chunks,
-                                                next_chunk: 0,
-                                                total_size,
-                                                is_relay,
-                                                last_chunk_at: Instant::now(),
-                                                accepted: false,
-                                                kind: file_kind,
-                                            };
-                                            outgoing_transfers.insert(transfer_id, transfer);
-
-                                            let _ = event_tx
-                                                .send(NetworkEvent::FileProgress {
-                                                    transfer_id,
-                                                    sent_chunks: 0,
-                                                    total_chunks,
-                                                    filename,
-                                                    total_size,
-                                                    is_outgoing: true,
-                                                    peer: recipient,
-                                                    kind: file_kind,
-                                                })
-                                                .await;
-                                        }
-                                    }
-                                }
+                                start_voice_file_transfer(
+                                    &mut swarm,
+                                    &mut outgoing_transfers,
+                                    &relay_peers,
+                                    &event_tx,
+                                    recipient,
+                                    &path,
+                                    transfer_id,
+                                )
+                                .await;
                             }
                             UICommand::AcceptFile { transfer_id, from, save_dir } => {
                                 // Сохраняем выбранную директорию в состояние передачи.
@@ -1951,6 +2017,15 @@ pub async fn run_chat_network(
                                                             &now,
                                                         )
                                                         .await;
+                                                        flush_pending_voice_transfers(
+                                                            &mut swarm,
+                                                            &mut outgoing_transfers,
+                                                            &relay_peers,
+                                                            &event_tx,
+                                                            peer,
+                                                            &mut pending_voice_transfers,
+                                                        )
+                                                        .await;
                                                         let _ = swarm.behaviour_mut().request_response.send_response(channel, V1Packet::Ack);
                                                     } else {
                                                         // Инициатор по ID, но свой Hello мы ещё не слали — завершаем как responder.
@@ -1980,6 +2055,15 @@ pub async fn run_chat_network(
                                                             peer,
                                                             &mut pending_read_receipts,
                                                             &now,
+                                                        )
+                                                        .await;
+                                                        flush_pending_voice_transfers(
+                                                            &mut swarm,
+                                                            &mut outgoing_transfers,
+                                                            &relay_peers,
+                                                            &event_tx,
+                                                            peer,
+                                                            &mut pending_voice_transfers,
                                                         )
                                                         .await;
 
@@ -2021,6 +2105,15 @@ pub async fn run_chat_network(
                                                         peer,
                                                         &mut pending_read_receipts,
                                                         &now,
+                                                    )
+                                                    .await;
+                                                    flush_pending_voice_transfers(
+                                                        &mut swarm,
+                                                        &mut outgoing_transfers,
+                                                        &relay_peers,
+                                                        &event_tx,
+                                                        peer,
+                                                        &mut pending_voice_transfers,
                                                     )
                                                     .await;
 
@@ -2263,6 +2356,15 @@ pub async fn run_chat_network(
                                                             peer,
                                                             &mut pending_read_receipts,
                                                             &now,
+                                                        )
+                                                        .await;
+                                                        flush_pending_voice_transfers(
+                                                            &mut swarm,
+                                                            &mut outgoing_transfers,
+                                                            &relay_peers,
+                                                            &event_tx,
+                                                            peer,
+                                                            &mut pending_voice_transfers,
                                                         )
                                                         .await;
                                                     }

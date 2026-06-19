@@ -1089,7 +1089,7 @@ impl App {
     }
 
     pub(crate) fn tick_pending_voice_sends(&mut self) {
-        const RETRY: Duration = Duration::from_secs(10);
+        const RETRY: Duration = Duration::from_secs(3);
         let now = Instant::now();
         let due: Vec<PendingVoiceSend> = self
             .pending_voice_sends
