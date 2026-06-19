@@ -116,6 +116,51 @@ fn kad_routing_peer_ids(kad: &mut kad::Behaviour<kad::store::MemoryStore>) -> Ve
     v.sort_by_key(|p| p.to_string());
     v
 }
+
+/// Ключ DHT для регистрации/поиска VOID-клиента по PeerId.
+fn peer_dht_record_key(peer_id: PeerId) -> kad::RecordKey {
+    kad::RecordKey::new(&peer_id.to_bytes())
+}
+
+fn peer_id_from_dht_key(key: &kad::RecordKey) -> Option<PeerId> {
+    PeerId::from_bytes(key.as_ref()).ok()
+}
+
+/// Объявляем себя провайдером своего PeerId в DHT, чтобы другие клиенты
+/// находили нас через `get_providers`, а не только через XOR-близость.
+fn publish_self_in_dht(kad: &mut kad::Behaviour<kad::store::MemoryStore>, local_peer_id: PeerId) {
+    let key = peer_dht_record_key(local_peer_id);
+    if let Err(e) = kad.start_providing(key) {
+        debug!("DHT start_providing: {:?}", e);
+    }
+}
+
+fn dial_peer_best_effort(
+    swarm: &mut libp2p::Swarm<ChatBehaviour>,
+    peer_id: PeerId,
+    addrs: Vec<Multiaddr>,
+) {
+    let clean: Vec<Multiaddr> = addrs
+        .into_iter()
+        .filter(|a| !is_junk_addr(a))
+        .collect();
+    let opts = if clean.is_empty() {
+        DialOpts::peer_id(peer_id)
+            .condition(libp2p::swarm::dial_opts::PeerCondition::DisconnectedAndNotDialing)
+            .build()
+    } else {
+        DialOpts::peer_id(peer_id)
+            .condition(libp2p::swarm::dial_opts::PeerCondition::DisconnectedAndNotDialing)
+            .addresses(clean)
+            .build()
+    };
+    if let Err(e) = swarm.dial(opts) {
+        let s = format!("{:?}", e);
+        if !s.contains("Condition") {
+            debug!("dial {}: {:?}", &peer_id.to_string()[..8.min(peer_id.to_string().len())], e);
+        }
+    }
+}
 pub(crate) enum NetworkEvent {
     NewListenAddr(Multiaddr),
     MdnsDiscovered(PeerId, Multiaddr),
@@ -402,8 +447,8 @@ fn build_void_swarm(
 
             let kad_store = kad::store::MemoryStore::new(local_peer_id);
             let mut kad_config = kad::Config::new(StreamProtocol::new("/void/kad/1.0.0"));
-            kad_config.set_periodic_bootstrap_interval(Some(Duration::from_secs(5 * 60)));
-            kad_config.set_query_timeout(Duration::from_secs(60));
+            kad_config.set_periodic_bootstrap_interval(Some(Duration::from_secs(2 * 60)));
+            kad_config.set_query_timeout(Duration::from_secs(15));
             let mut kad = kad::Behaviour::with_config(local_peer_id, kad_store, kad_config);
             kad.set_mode(Some(libp2p::kad::Mode::Server));
 
@@ -458,7 +503,7 @@ fn build_void_swarm(
                 ping: ping::Behaviour::new(
                     ping::Config::new()
                         .with_interval(Duration::from_secs(20))
-                        .with_timeout(Duration::from_secs(20)),
+                        .with_timeout(Duration::from_secs(40)),
                 ),
                 identify: identify::Behaviour::new(
                     identify::Config::new("/void/v1".into(), key.public())
@@ -843,17 +888,32 @@ pub async fn run_chat_network(
                     &pid.to_string()[..8],
                     addrs.len()
                 );
-                let opts = DialOpts::peer_id(*pid)
-                    .condition(libp2p::swarm::dial_opts::PeerCondition::DisconnectedAndNotDialing)
-                    .addresses(addrs.clone())
-                    .build();
-                if let Err(e) = swarm.dial(opts) {
-                    let s = format!("{:?}", e);
-                    if !s.contains("Condition") {
-                        warn!("contact dial {}: {:?}", pid, e);
-                    }
+                dial_peer_best_effort(&mut swarm, *pid, addrs.clone());
+            }
+        }
+
+        // Bootstrap-узлы: явный dial + регистрация в DHT. Без прямого dial
+        // kad.bootstrap() часто не наполняет таблицу достаточно быстро.
+        {
+            let mut grouped: HashMap<PeerId, Vec<Multiaddr>> = HashMap::new();
+            for ma in &void_bootstraps {
+                if let Some(pid) = peer_id_from_multiaddr(ma) {
+                    grouped.entry(pid).or_default().push(ma.clone());
                 }
             }
+            for (pid, addrs) in grouped {
+                debug!(
+                    "🌐 Стартовый dial bootstrap {} ({} адр.)",
+                    &pid.to_string()[..8],
+                    addrs.len()
+                );
+                dial_peer_best_effort(&mut swarm, pid, addrs);
+            }
+        }
+
+        publish_self_in_dht(&mut swarm.behaviour_mut().kad, local_peer_id);
+        if !void_bootstraps.is_empty() {
+            let _ = swarm.behaviour_mut().kad.bootstrap();
         }
 
         let mut peer_addrs: HashMap<PeerId, Vec<Multiaddr>> = HashMap::new();
@@ -915,12 +975,16 @@ pub async fn run_chat_network(
             m
         };
         let mut reconnect_queue: HashMap<PeerId, (Instant, u32)> = HashMap::new();
-        let mut reconnect_tick = tokio::time::interval(Duration::from_secs(15));
+        let vault_contact_ids: HashSet<PeerId> =
+            contact_seed_addrs.iter().map(|(p, _)| *p).collect();
+        let mut reconnect_tick = tokio::time::interval(Duration::from_secs(5));
         reconnect_tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+        let mut provider_tick = tokio::time::interval(Duration::from_secs(10 * 60));
+        provider_tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
 
         loop {
             tokio::select! {
-                // ─── Tick: переподключение к контактам (15 с) ────────────────
+                // ─── Tick: переподключение к контактам (5 с) ────────────────
                 _ = reconnect_tick.tick() => {
                     let now = Instant::now();
                     let connected: HashSet<PeerId> = swarm.connected_peers().copied().collect();
@@ -950,29 +1014,12 @@ pub async fn run_chat_network(
                             clean.len(),
                             attempt
                         );
-                        let opts = DialOpts::peer_id(pid)
-                            .condition(
-                                libp2p::swarm::dial_opts::PeerCondition::DisconnectedAndNotDialing,
-                            )
-                            .addresses(clean)
-                            .build();
-                        if let Err(e) = swarm.dial(opts) {
-                            let s = format!("{:?}", e);
-                            if !s.contains("Condition") {
-                                // Обновляем время следующей попытки (следующий backoff-шаг).
-                                if let Some(entry) = reconnect_queue.get_mut(&pid) {
-                                    let next_delay = match entry.1 {
-                                        0..=1 => Duration::from_secs(20),
-                                        2 => Duration::from_secs(60),
-                                        _ => Duration::from_secs(300),
-                                    };
-                                    entry.0 = Instant::now() + next_delay;
-                                    entry.1 += 1;
-                                }
-                                warn!("reconnect dial {}: {:?}", &pid.to_string()[..8], e);
-                            }
-                        }
+                        dial_peer_best_effort(&mut swarm, pid, clean);
                     }
+                }
+                // ─── Tick: переобъявление себя в DHT (каждые 10 мин) ───────
+                _ = provider_tick.tick() => {
+                    publish_self_in_dht(&mut swarm.behaviour_mut().kad, local_peer_id);
                 }
                 // ─── Tick: отправка очередных чанков с rate-limit ───────────
                 _ = chunk_tick.tick() => {
@@ -1121,8 +1168,10 @@ pub async fn run_chat_network(
                                     ));
                                 } else {
                                     let _ = event_tx.send(NetworkEvent::Status(
-                                        format!("🔍 Запрос DHT: {}… (если кандидатов 0 — задайте VOID bootstrap или полный multiaddr)", &peer_id.to_string()[..16])
+                                        format!("🔍 Запрос DHT: {}… (providers + closest)", &peer_id.to_string()[..16])
                                     )).await;
+                                    let key = peer_dht_record_key(peer_id);
+                                    swarm.behaviour_mut().kad.get_providers(key);
                                     swarm.behaviour_mut().kad.get_closest_peers(peer_id);
                                 }
                             }
@@ -1758,6 +1807,7 @@ pub async fn run_chat_network(
 
                             if is_external {
                                 debug!("  (Внешний/Relay): {}/p2p/{}", address, local_peer_id);
+                                publish_self_in_dht(&mut swarm.behaviour_mut().kad, local_peer_id);
                                 let _ = event_tx.send(NetworkEvent::NewListenAddr(address.clone())).await;
                                 swarm.add_external_address(address.clone());
 
@@ -2292,6 +2342,17 @@ pub async fn run_chat_network(
                             match error {
                                 libp2p::request_response::OutboundFailure::DialFailure => {
                                     if !is_dup {
+                                        if let Some(addrs) = reconnect_targets.get(&peer) {
+                                            dial_peer_best_effort(
+                                                &mut swarm,
+                                                peer,
+                                                addrs.clone(),
+                                            );
+                                        }
+                                        swarm
+                                            .behaviour_mut()
+                                            .kad
+                                            .get_providers(peer_dht_record_key(peer));
                                         let _ = event_tx.send(NetworkEvent::SendFailedDial(peer)).await;
                                     }
                                 }
@@ -2310,6 +2371,8 @@ pub async fn run_chat_network(
                         }
                         SwarmEvent::ExternalAddrConfirmed { address } => {
                             debug!("🌍 ВНЕШНИЙ АДРЕС ПОДТВЕРЖДЕН: {}", address);
+                            publish_self_in_dht(&mut swarm.behaviour_mut().kad, local_peer_id);
+                            let _ = swarm.behaviour_mut().kad.bootstrap();
                             let _ = event_tx.send(NetworkEvent::Status(
                                 format!("🌍 ГЛОБАЛЬНЫЙ АДРЕС: Вы доступны из интернета!")
                             )).await;
@@ -2329,6 +2392,7 @@ pub async fn run_chat_network(
                             pending_dials.remove(&peer_id);
                             // Соединение установлено — снимаем задание на реконнект.
                             reconnect_queue.remove(&peer_id);
+                            publish_self_in_dht(&mut swarm.behaviour_mut().kad, local_peer_id);
 
                             // Определяем, идёт ли соединение через relay.
                             let is_relay_conn = match endpoint {
@@ -2350,13 +2414,14 @@ pub async fn run_chat_network(
                             }
 
                              if peer_id != local_peer_id {
-                                 // Есть буфер исходящих, но сессии нет — сразу шлём Hello,
+                                 // Есть буфер исходящих или это контакт из vault — сразу шлём Hello,
                                  // не дожидаясь пока собеседник напишет первым.
-                                 if pending_messages
-                                     .get(&peer_id)
-                                     .is_some_and(|q| !q.is_empty())
-                                     && !sessions.contains_key(&peer_id)
-                                 {
+                                 let needs_handshake = !sessions.contains_key(&peer_id)
+                                     && (vault_contact_ids.contains(&peer_id)
+                                         || pending_messages
+                                             .get(&peer_id)
+                                             .is_some_and(|q| !q.is_empty()));
+                                 if needs_handshake {
                                      let now_hs = chrono::Local::now().format("%H:%M:%S").to_string();
                                      let _ = ensure_e2ee_handshake_started(
                                          &mut swarm,
@@ -2438,7 +2503,7 @@ pub async fn run_chat_network(
                             // pending_messages сохраняем — UI/ретрай переотправит после реконнекта.
 
                             // Планируем переподключение для контактов из vault.
-                            // Backoff: 5 с → 20 с → 60 с → 5 мин (и далее 5 мин).
+                            // Backoff: 2 с → 5 с → 15 с → 60 с (и далее 60 с).
                             if reconnect_targets.contains_key(&peer_id) {
                                 // Не накапливаем reconnect-очередь для уже-диалящихся (swarm сам retry).
                                 let attempt = reconnect_queue
@@ -2446,10 +2511,10 @@ pub async fn run_chat_network(
                                     .map(|(_, a)| *a)
                                     .unwrap_or(0);
                                 let delay = match attempt {
-                                    0 => Duration::from_secs(5),
-                                    1 => Duration::from_secs(20),
-                                    2 => Duration::from_secs(60),
-                                    _ => Duration::from_secs(300),
+                                    0 => Duration::from_secs(2),
+                                    1 => Duration::from_secs(5),
+                                    2 => Duration::from_secs(15),
+                                    _ => Duration::from_secs(60),
                                 };
                                 reconnect_queue.insert(
                                     peer_id,
@@ -2597,6 +2662,64 @@ pub async fn run_chat_network(
 
                         SwarmEvent::Behaviour(ChatBehaviourEvent::Kad(kad::Event::OutboundQueryProgressed { result, .. })) => {
                             match result {
+                                libp2p::kad::QueryResult::GetProviders(Ok(ok)) => {
+                                    match ok {
+                                        kad::GetProvidersOk::FoundProviders { key, providers } => {
+                                            if let Some(wanted) = peer_id_from_dht_key(&key) {
+                                                if providers.contains(&wanted) {
+                                                    debug!(
+                                                        "📍 DHT get_providers: {} онлайн (провайдер найден)",
+                                                        &wanted.to_string()[..8]
+                                                    );
+                                                    if let Some(addrs) = kad_local_addrs_for_peer(
+                                                        &mut swarm.behaviour_mut().kad,
+                                                        wanted,
+                                                    ) {
+                                                        let _ = event_tx
+                                                            .send(NetworkEvent::Status(format!(
+                                                                "📍 DHT: {} найден ({} адр.) — набор",
+                                                                &wanted.to_string()[..12],
+                                                                addrs.len()
+                                                            )))
+                                                            .await;
+                                                        let _ = command_tx_for_mdns.try_send(
+                                                            UICommand::DialPeer(wanted, addrs),
+                                                        );
+                                                    } else {
+                                                        dial_peer_best_effort(&mut swarm, wanted, vec![]);
+                                                        let _ = event_tx
+                                                            .send(NetworkEvent::Status(format!(
+                                                                "📍 DHT: {} зарегистрирован — набор…",
+                                                                &wanted.to_string()[..12]
+                                                            )))
+                                                            .await;
+                                                    }
+                                                }
+                                            }
+                                        }
+                                        kad::GetProvidersOk::FinishedWithNoAdditionalRecord { .. } => {}
+                                    }
+                                }
+                                libp2p::kad::QueryResult::GetProviders(Err(e)) => {
+                                    debug!("⚠️ Kademlia get_providers: {:?}", e);
+                                    if let Some(wanted) = peer_id_from_dht_key(e.key()) {
+                                        if let Some(addrs) = kad_local_addrs_for_peer(
+                                            &mut swarm.behaviour_mut().kad,
+                                            wanted,
+                                        ) {
+                                            let _ = event_tx
+                                                .send(NetworkEvent::Status(format!(
+                                                    "⏱ DHT providers timeout для {} — локальная таблица ({} адр.)",
+                                                    &wanted.to_string()[..8],
+                                                    addrs.len()
+                                                )))
+                                                .await;
+                                            let _ = command_tx_for_mdns.try_send(
+                                                UICommand::DialPeer(wanted, addrs),
+                                            );
+                                        }
+                                    }
+                                }
                                  libp2p::kad::QueryResult::GetClosestPeers(Ok(ok)) => {
                                     debug!(
                                         "🔍 Kademlia: get_closest_peers готов (кандидатов: {}).",

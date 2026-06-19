@@ -136,9 +136,9 @@ pub(crate) struct PendingVoiceSend {
     pub(crate) last_attempt: Instant,
 }
 
-pub(crate) const RESEND_GRACE: Duration = Duration::from_secs(3);
+pub(crate) const RESEND_GRACE: Duration = Duration::from_secs(1);
 /// Базовая задержка перед повтором после DHT-поиска (растёт с числом попыток).
-pub(crate) const RESEND_DELAY_BASE: Duration = Duration::from_secs(5);
+pub(crate) const RESEND_DELAY_BASE: Duration = Duration::from_secs(2);
 pub(crate) const RESEND_DELAY_MAX: Duration = Duration::from_secs(300);
 
 pub(crate) fn resend_delay_for_attempt(attempts: u32) -> Duration {
