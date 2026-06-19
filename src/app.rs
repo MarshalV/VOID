@@ -196,8 +196,6 @@ pub(crate) struct App {
     pub(crate) voice_player: VoicePlayer,
     /// Локальные пути WAV по transfer_id (hex).
     pub(crate) voice_audio_paths: HashMap<String, String>,
-    /// Клик по голосовому bubble (обрабатывается в конце кадра).
-    pub(crate) pending_voice_play: Option<String>,
     pub(crate) pending_voice_sends: Vec<PendingVoiceSend>,
     /// Ожидаемый результат выбора папки сохранения: `(rx, transfer_id, from_peer)`.
     /// Поллим `try_recv()` каждый кадр; `None` = выбор не идёт.
@@ -269,7 +267,6 @@ impl App {
             voice_probe_done: false,
             voice_player: VoicePlayer::new(),
             voice_audio_paths: HashMap::new(),
-            pending_voice_play: None,
             pending_voice_sends: Vec::new(),
             pending_accept: None,
             pending_unlock,
@@ -961,11 +958,6 @@ impl App {
         None
     }
 
-    pub(crate) fn request_voice_play(&mut self, transfer_id: String) {
-        crate::voice::voice_log(&format!("click {transfer_id}"));
-        self.pending_voice_play = Some(transfer_id);
-    }
-
     pub(crate) fn relink_voice_messages_in_chat(&mut self, peer_str: &str) {
         let tids: Vec<String> = self
             .messages
@@ -982,28 +974,57 @@ impl App {
         }
     }
 
-    pub(crate) fn process_pending_voice_play(&mut self, ctx: &egui::Context) {
-        let Some(tid) = self.pending_voice_play.take() else {
-            return;
-        };
-        self.link_voice_file_if_present(&tid);
-        match self.resolve_voice_path(&tid) {
+    pub(crate) fn apply_voice_click(
+        &mut self,
+        ctx: &egui::Context,
+        transfer_id: String,
+        toggle: bool,
+        seek_ratio: Option<f32>,
+    ) {
+        if toggle {
+            crate::voice::voice_log(&format!("toggle {transfer_id}"));
+        } else if let Some(ratio) = seek_ratio {
+            crate::voice::voice_log(&format!("seek {transfer_id} at {ratio:.2}"));
+        }
+        self.link_voice_file_if_present(&transfer_id);
+        match self.resolve_voice_path(&transfer_id) {
             Some(path) => {
-                if let Some(err) = self.voice_player.toggle(&tid, &path) {
-                    self.push_toast(err, ToastKind::Error, TOAST_TTL_LONG);
-                } else {
-                    self.push_toast(
-                        "▶ Воспроизведение…".into(),
-                        ToastKind::Info,
-                        TOAST_TTL_SHORT,
-                    );
-                    ctx.request_repaint();
+                if toggle {
+                    match self.voice_player.toggle(&transfer_id, &path) {
+                        Ok(true) => {
+                            self.push_toast(
+                                "▶ Воспроизведение…".into(),
+                                ToastKind::Info,
+                                TOAST_TTL_SHORT,
+                            );
+                            ctx.request_repaint();
+                        }
+                        Ok(false) => {
+                            self.push_toast(
+                                "⏹ Остановлено".into(),
+                                ToastKind::Info,
+                                TOAST_TTL_SHORT,
+                            );
+                            ctx.request_repaint();
+                        }
+                        Err(err) => {
+                            self.push_toast(err, ToastKind::Error, TOAST_TTL_LONG);
+                        }
+                    }
+                } else if let Some(ratio) = seek_ratio {
+                    if let Err(err) =
+                        self.voice_player.play_from(&transfer_id, &path, ratio)
+                    {
+                        self.push_toast(err, ToastKind::Error, TOAST_TTL_LONG);
+                    } else {
+                        ctx.request_repaint();
+                    }
                 }
             }
             None => {
-                crate::voice::voice_log(&format!("resolve miss: {tid}"));
+                crate::voice::voice_log(&format!("resolve miss: {transfer_id}"));
                 self.push_toast(
-                    format!("Аудиофайл не найден ({tid})"),
+                    format!("Аудиофайл не найден ({transfer_id})"),
                     ToastKind::Error,
                     TOAST_TTL_LONG,
                 );

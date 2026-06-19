@@ -1184,68 +1184,117 @@ fn paint_voice_composer_strip(
         });
 }
 
-fn paint_voice_message(
+struct VoiceMessageLayout {
+    wave_rect: egui::Rect,
+}
+
+fn voice_message_ui(
     ui: &mut egui::Ui,
     duration_secs: f32,
     has_audio: bool,
     is_playing: bool,
-) {
+    progress_ratio: Option<f32>,
+) -> VoiceMessageLayout {
     let width = ui.available_width().min(260.0).max(160.0);
     let height = 38.0;
-    let (rect, _response) =
-        ui.allocate_exact_size(egui::vec2(width, height), egui::Sense::hover());
+    let progress = progress_ratio.unwrap_or(0.0).clamp(0.0, 1.0);
+    let display_secs = if is_playing {
+        duration_secs * progress
+    } else {
+        duration_secs
+    };
+    let mut wave_rect = egui::Rect::NOTHING;
 
-    if ui.is_rect_visible(rect) {
+    ui.horizontal(|ui| {
+        ui.spacing_mut().item_spacing.x = 0.0;
+
+        let play_size = egui::vec2(40.0, height);
+        let (play_rect, _) =
+            ui.allocate_exact_size(play_size, egui::Sense::hover());
+
+        let wave_width = (width - 40.0 - 36.0).max(40.0);
+        let (wr, _) = ui.allocate_exact_size(
+            egui::vec2(wave_width, height),
+            egui::Sense::hover(),
+        );
+        wave_rect = wr;
+
+        let (time_rect, _) =
+            ui.allocate_exact_size(egui::vec2(36.0, height), egui::Sense::hover());
+
         let painter = ui.painter();
-        let label = if is_playing { "⏸" } else { "▶" };
-        let icon_center = egui::pos2(rect.left() + 20.0, rect.center().y);
-        let icon_color = if has_audio {
-            palette::TEXT
-        } else {
-            palette::TEXT_MUTED
-        };
-        painter.circle_filled(
-            icon_center,
-            16.0,
-            egui::Color32::from_rgba_premultiplied(255, 255, 255, 30),
-        );
-        painter.text(
-            icon_center,
-            egui::Align2::CENTER_CENTER,
-            label,
-            egui::FontId::proportional(14.0),
-            icon_color,
-        );
-
-        let bar_left = rect.left() + 42.0;
-        let bar_y = rect.center().y;
-        for i in 0..12 {
-            let phase = (i as f32 * 0.55 + duration_secs * 0.3).sin();
-            let h = 5.0 + phase.abs() * 12.0;
-            let x = bar_left + i as f32 * 8.0;
-            let bar = egui::Rect::from_center_size(
-                egui::pos2(x, bar_y),
-                egui::vec2(3.0, h),
+        if ui.is_rect_visible(play_rect) {
+            let label = if is_playing { "⏹" } else { "▶" };
+            let icon_center = play_rect.center();
+            let icon_color = if has_audio {
+                palette::TEXT
+            } else {
+                palette::TEXT_MUTED
+            };
+            painter.circle_filled(
+                icon_center,
+                16.0,
+                egui::Color32::from_rgba_premultiplied(255, 255, 255, 30),
             );
-            painter.rect_filled(
-                bar,
-                1.5,
-                if has_audio {
-                    palette::ACCENT_2
-                } else {
-                    palette::TEXT_MUTED
-                },
+            painter.text(
+                icon_center,
+                egui::Align2::CENTER_CENTER,
+                label,
+                egui::FontId::proportional(14.0),
+                icon_color,
             );
         }
 
-        painter.text(
-            rect.right_top() + egui::vec2(-6.0, 6.0),
-            egui::Align2::RIGHT_TOP,
-            voice::fmt_duration(duration_secs),
-            egui::FontId::proportional(11.0),
-            palette::TEXT_MUTED,
-        );
-    }
+        if ui.is_rect_visible(wr) {
+            let bar_left = wr.left();
+            let bar_width = wr.width().max(1.0);
+            let bar_y = wr.center().y;
+            for i in 0..12 {
+                let t = (i as f32 + 0.5) / 12.0;
+                let phase = (i as f32 * 0.55 + duration_secs * 0.3).sin();
+                let h = 5.0 + phase.abs() * 12.0;
+                let x = bar_left + (i as f32 + 0.5) * (bar_width / 12.0);
+                let bar = egui::Rect::from_center_size(
+                    egui::pos2(x, bar_y),
+                    egui::vec2(3.0, h),
+                );
+                let played = t <= progress;
+                painter.rect_filled(
+                    bar,
+                    1.5,
+                    if !has_audio {
+                        palette::TEXT_MUTED
+                    } else if played {
+                        palette::ACCENT
+                    } else {
+                        palette::ACCENT_2
+                    },
+                );
+            }
+            if has_audio && is_playing {
+                let head_x = bar_left + bar_width * progress;
+                painter.line_segment(
+                    [
+                        egui::pos2(head_x, wr.top() + 4.0),
+                        egui::pos2(head_x, wr.bottom() - 4.0),
+                    ],
+                    egui::Stroke::new(1.5, palette::TEXT),
+                );
+            }
+        }
+
+        if ui.is_rect_visible(time_rect) {
+            painter.text(
+                time_rect.right_top() + egui::vec2(-2.0, 4.0),
+                egui::Align2::RIGHT_TOP,
+                voice::fmt_duration(display_secs),
+                egui::FontId::proportional(11.0),
+                palette::TEXT_MUTED,
+            );
+        }
+    });
+
+    VoiceMessageLayout { wave_rect }
 }
 
 /// Кнопка «Отправить» — треугольник; при готовом голосовом подсвечивается зелёным.
@@ -1960,10 +2009,6 @@ impl eframe::App for App {
                 .set_description(&err)
                 .set_level(rfd::MessageLevel::Error)
                 .show();
-        }
-        self.voice_player.poll();
-        if let Some(err) = self.voice_player.take_error() {
-            self.push_toast(err, ToastKind::Error, TOAST_TTL_LONG);
         }
         self.flush_read_receipts_for_open_chat();
         let now = Instant::now();
@@ -2855,7 +2900,7 @@ impl eframe::App for App {
                     .unwrap_or_default();
                 let me_str = self.local_peer_id.to_string();
                 let mut pending_msg_delete: Option<String> = None;
-                let mut voice_play: Option<String> = None;
+                let mut voice_actions: Vec<(String, bool, Option<f32>)> = Vec::new();
                 let chat_peer = self.selected_chat.clone();
                 self.relink_voice_messages_in_chat(&chat_peer);
 
@@ -2908,6 +2953,7 @@ impl eframe::App for App {
                                 };
 
                                 let msg_id = msg.id.clone();
+                                let mut voice_bubble: Option<(egui::Rect, bool, bool)> = None;
                                 let bubble = egui::Frame::none()
                                     .fill(bubble_bg)
                                     .rounding(egui::Rounding {
@@ -2934,17 +2980,27 @@ impl eframe::App for App {
                                                 );
                                             }
                                             if let Some(ref voice) = msg.voice {
-                                                let tid = voice.transfer_id.clone();
                                                 let has_audio =
-                                                    self.resolve_voice_path(&tid).is_some();
-                                                let is_playing =
-                                                    self.voice_player.is_playing(&tid);
-                                                paint_voice_message(
+                                                    self.resolve_voice_path(&voice.transfer_id)
+                                                        .is_some();
+                                                let is_playing = self
+                                                    .voice_player
+                                                    .is_playing(&voice.transfer_id);
+                                                let progress = self
+                                                    .voice_player
+                                                    .progress_ratio(&voice.transfer_id);
+                                                let layout = voice_message_ui(
                                                     ui,
                                                     voice.duration_secs,
                                                     has_audio,
                                                     is_playing,
+                                                    progress,
                                                 );
+                                                voice_bubble = Some((
+                                                    layout.wave_rect,
+                                                    has_audio,
+                                                    is_playing,
+                                                ));
                                             } else if !msg.text.is_empty() {
                                                 ui.label(
                                                     egui::RichText::new(&msg.text)
@@ -2987,15 +3043,36 @@ impl eframe::App for App {
                                             );
                                         });
                                     });
-                                if msg.voice.is_some() {
-                                    let tid = msg.voice.as_ref().unwrap().transfer_id.clone();
+                                if let (Some(ref voice), Some((wave_rect, has_audio, is_playing))) =
+                                    (msg.voice.as_ref(), voice_bubble)
+                                {
+                                    let tid = voice.transfer_id.clone();
                                     let click = bubble
                                         .response
-                                        .interact(egui::Sense::click())
-                                        .on_hover_text("Воспроизвести / остановить");
+                                        .interact(egui::Sense::click());
                                     if click.clicked() {
-                                        voice_play = Some(tid);
+                                        let pos = click
+                                            .interact_pointer_pos()
+                                            .or_else(|| ui.ctx().pointer_latest_pos());
+                                        let seek = has_audio
+                                            && pos.is_some_and(|p| wave_rect.contains(p));
+                                        if seek {
+                                            let p = pos.unwrap();
+                                            let ratio = ((p.x - wave_rect.left())
+                                                / wave_rect.width())
+                                                .clamp(0.0, 1.0);
+                                            voice_actions.push((tid, false, Some(ratio)));
+                                        } else {
+                                            voice_actions.push((tid, true, None));
+                                        }
                                     }
+                                    click.on_hover_text(if is_playing {
+                                        "⏹ Остановить"
+                                    } else if has_audio {
+                                        "▶ Воспроизвести · шкала — перемотка"
+                                    } else {
+                                        "Аудиофайл ещё не загружен"
+                                    });
                                 }
                                 bubble.response.context_menu(|ui| {
                                     if ui.button("🗑 Удалить").clicked() {
@@ -3013,8 +3090,8 @@ impl eframe::App for App {
                         self.delete_messages(peer, &[msg_id]);
                     }
                 }
-                if let Some(tid) = voice_play {
-                    self.request_voice_play(tid);
+                for (tid, toggle, seek) in voice_actions {
+                    self.apply_voice_click(ctx, tid, toggle, seek);
                 }
             });
 
@@ -3101,7 +3178,10 @@ impl eframe::App for App {
 
         self.flush_chat_journal_if_dirty();
 
-        self.process_pending_voice_play(ctx);
+        self.voice_player.poll();
+        if let Some(err) = self.voice_player.take_error() {
+            self.push_toast(err, ToastKind::Error, TOAST_TTL_LONG);
+        }
 
         if self.voice_recorder.mic_active() || self.voice_recorder.has_ready() {
             ctx.request_repaint_after(Duration::from_millis(33));

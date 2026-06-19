@@ -324,7 +324,9 @@ pub(crate) fn run_cli_mode() -> Option<i32> {
                 eprintln!("usage: --voice-play <file.wav>");
                 return Some(2);
             }
-            let code = match play_wav_file(Path::new(&path)) {
+            let stop_flag = AtomicBool::new(false);
+            let frame_pos = Arc::new(AtomicUsize::new(0));
+            let code = match play_wav_file(Path::new(&path), &stop_flag, 0.0, frame_pos) {
                 Ok(()) => {
                     println!("OK: played {}", path);
                     0
@@ -485,6 +487,15 @@ fn wav_duration(path: &Path) -> Result<f32, String> {
     Ok(reader.len() as f32 / spec.sample_rate as f32)
 }
 
+fn playback_pcm_frames(path: &Path) -> Result<usize, String> {
+    let (mono, src_rate) = read_wav_mono_f32(path)?;
+    Ok(if src_rate == VOICE_SAMPLE_RATE {
+        mono.len()
+    } else {
+        resample_linear(&mono, src_rate, VOICE_SAMPLE_RATE).len()
+    })
+}
+
 fn build_input_stream(
     device: &cpal::Device,
     config: &cpal::SupportedStreamConfig,
@@ -597,6 +608,10 @@ pub(crate) struct VoicePlayer {
     done_rx: Option<mpsc::Receiver<Result<(), String>>>,
     pub(crate) playing_id: Option<String>,
     last_error: Option<String>,
+    stop_flag: Option<Arc<AtomicBool>>,
+    frame_pos: Option<Arc<AtomicUsize>>,
+    total_frames: usize,
+    duration_secs: f32,
 }
 
 impl VoicePlayer {
@@ -605,6 +620,10 @@ impl VoicePlayer {
             done_rx: None,
             playing_id: None,
             last_error: None,
+            stop_flag: None,
+            frame_pos: None,
+            total_frames: 0,
+            duration_secs: 0.0,
         }
     }
 
@@ -618,32 +637,73 @@ impl VoicePlayer {
             .is_some_and(|id| id.eq_ignore_ascii_case(transfer_id))
     }
 
-    pub(crate) fn toggle(&mut self, transfer_id: &str, path: &Path) -> Option<String> {
+    /// Доля пройденного времени [0..1] для активного голосового.
+    pub(crate) fn progress_ratio(&self, transfer_id: &str) -> Option<f32> {
+        if !self.is_playing(transfer_id) || self.total_frames == 0 {
+            return None;
+        }
+        let pos = self.frame_pos.as_ref()?.load(Ordering::Relaxed);
+        Some((pos as f32 / self.total_frames as f32).clamp(0.0, 1.0))
+    }
+
+    /// `true` = запущено, `false` = остановлено.
+    pub(crate) fn toggle(&mut self, transfer_id: &str, path: &Path) -> Result<bool, String> {
         let tid = transfer_id.to_ascii_lowercase();
         if self.is_playing(&tid) {
             self.stop();
-            return None;
+            return Ok(false);
         }
-        self.stop();
+        self.play_from(&tid, path, 0.0)?;
+        Ok(true)
+    }
+
+    /// Воспроизвести (или перемотать) с позиции `start_ratio` ∈ [0, 1].
+    pub(crate) fn play_from(
+        &mut self,
+        transfer_id: &str,
+        path: &Path,
+        start_ratio: f32,
+    ) -> Result<(), String> {
+        let tid = transfer_id.to_ascii_lowercase();
+        if self.playing_id.is_some() || self.done_rx.is_some() {
+            self.stop();
+        }
 
         if !path.is_file() {
-            return Some(format!("Аудиофайл не найден: {}", path.display()));
+            return Err(format!("Аудиофайл не найден: {}", path.display()));
         }
 
+        let duration_secs = wav_duration(path).unwrap_or(0.0);
+        self.total_frames = playback_pcm_frames(path).unwrap_or(0);
+        let stop_flag = Arc::new(AtomicBool::new(false));
+        let frame_pos = Arc::new(AtomicUsize::new(0));
         let (done_tx, done_rx) = mpsc::channel();
+        self.stop_flag = Some(stop_flag.clone());
+        self.frame_pos = Some(frame_pos.clone());
         self.done_rx = Some(done_rx);
         self.playing_id = Some(tid);
+        self.duration_secs = duration_secs;
 
         let path = path.to_path_buf();
+        let ratio = start_ratio.clamp(0.0, 1.0);
         std::thread::spawn(move || {
-            let result = play_wav_file(&path);
+            let result = play_wav_file(&path, &stop_flag, ratio, frame_pos);
             let _ = done_tx.send(result);
         });
-        None
+        Ok(())
     }
 
     pub(crate) fn stop(&mut self) {
+        if let Some(flag) = &self.stop_flag {
+            flag.store(true, Ordering::Relaxed);
+        }
+        #[cfg(target_os = "windows")]
+        stop_winmm_playback();
+        self.done_rx = None;
+        self.stop_flag = None;
         self.playing_id = None;
+        self.frame_pos = None;
+        self.total_frames = 0;
     }
 
     pub(crate) fn poll(&mut self) {
@@ -654,22 +714,38 @@ impl VoicePlayer {
             return;
         };
         self.done_rx = None;
+        self.stop_flag = None;
+        self.frame_pos = None;
         self.playing_id = None;
+        self.total_frames = 0;
         if let Err(e) = result {
             self.last_error = Some(e);
         }
     }
 }
 
-fn play_wav_file(path: &Path) -> Result<(), String> {
+fn play_wav_file(
+    path: &Path,
+    stop_flag: &AtomicBool,
+    start_ratio: f32,
+    frame_pos: Arc<AtomicUsize>,
+) -> Result<(), String> {
     let path = normalize_playback_path(path);
-    voice_log(&format!("play {}", path.display()));
-    match play_wav_cpal(&path) {
+    voice_log(&format!("play {} from {:.0}%", path.display(), start_ratio * 100.0));
+    match play_wav_cpal(&path, stop_flag, start_ratio, frame_pos) {
         Ok(()) => Ok(()),
         Err(cpal_err) => {
+            if stop_flag.load(Ordering::Relaxed) {
+                return Ok(());
+            }
+            if start_ratio > 0.001 {
+                return Err(format!(
+                    "Перемотка недоступна (cpal: {cpal_err}). Попробуйте с начала."
+                ));
+            }
             #[cfg(target_os = "windows")]
             {
-                play_wav_winmm(&path)
+                play_wav_winmm(&path, stop_flag)
                     .map_err(|winmm_err| format!("cpal: {cpal_err}; winmm: {winmm_err}"))
             }
             #[cfg(not(target_os = "windows"))]
@@ -690,7 +766,16 @@ fn normalize_playback_path(path: &Path) -> PathBuf {
 }
 
 #[cfg(target_os = "windows")]
-fn play_wav_winmm(path: &Path) -> Result<(), String> {
+fn stop_winmm_playback() {
+    #[link(name = "winmm")]
+    extern "system" {
+        fn PlaySoundW(psz_sound: *const u16, hmod: *mut std::ffi::c_void, fdw_sound: u32) -> i32;
+    }
+    let _ = unsafe { PlaySoundW(std::ptr::null(), std::ptr::null_mut(), 0) };
+}
+
+#[cfg(target_os = "windows")]
+fn play_wav_winmm(path: &Path, stop_flag: &AtomicBool) -> Result<(), String> {
     use std::os::windows::ffi::OsStrExt;
 
     #[link(name = "winmm")]
@@ -698,18 +783,34 @@ fn play_wav_winmm(path: &Path) -> Result<(), String> {
         fn PlaySoundW(psz_sound: *const u16, hmod: *mut std::ffi::c_void, fdw_sound: u32) -> i32;
     }
     const SND_FILENAME: u32 = 0x0002_0000;
-    const SND_SYNC: u32 = 0x0000_0000;
+    const SND_ASYNC: u32 = 0x0001;
 
+    let duration = wav_duration(path).unwrap_or(30.0);
     let wide: Vec<u16> = path.as_os_str().encode_wide().chain(Some(0)).collect();
-    let ok = unsafe { PlaySoundW(wide.as_ptr(), std::ptr::null_mut(), SND_FILENAME | SND_SYNC) };
+    let ok = unsafe { PlaySoundW(wide.as_ptr(), std::ptr::null_mut(), SND_FILENAME | SND_ASYNC) };
     if ok == 0 {
-        Err(format!("PlaySoundW не смог воспроизвести {}", path.display()))
-    } else {
-        Ok(())
+        return Err(format!("PlaySoundW не смог воспроизвести {}", path.display()));
     }
+
+    let started = Instant::now();
+    let max_wait = Duration::from_secs_f32(duration + 1.0);
+    while started.elapsed() < max_wait {
+        if stop_flag.load(Ordering::Relaxed) {
+            stop_winmm_playback();
+            voice_log("play stopped (winmm)");
+            return Ok(());
+        }
+        std::thread::sleep(Duration::from_millis(40));
+    }
+    Ok(())
 }
 
-fn play_wav_cpal(path: &Path) -> Result<(), String> {
+fn play_wav_cpal(
+    path: &Path,
+    stop_flag: &AtomicBool,
+    start_ratio: f32,
+    frame_pos: Arc<AtomicUsize>,
+) -> Result<(), String> {
     use cpal::traits::{DeviceTrait, HostTrait, StreamTrait};
 
     let (mono, src_rate) = read_wav_mono_f32(path)?;
@@ -734,14 +835,19 @@ fn play_wav_cpal(path: &Path) -> Result<(), String> {
     } else {
         resample_linear(&mono, VOICE_SAMPLE_RATE, out_rate)
     });
-    let frame_pos = Arc::new(AtomicUsize::new(0));
     let total_frames = pcm.len();
+    let start_frame = ((start_ratio.clamp(0.0, 1.0) * total_frames as f32) as usize).min(total_frames);
+    frame_pos.store(start_frame, Ordering::Relaxed);
     let stream = build_output_stream(&device, &config, pcm, frame_pos.clone(), out_ch)?;
     stream
         .play()
         .map_err(|e| format!("Не удалось начать воспроизведение: {e}"))?;
 
     while frame_pos.load(Ordering::Relaxed) < total_frames {
+        if stop_flag.load(Ordering::Relaxed) {
+            voice_log("play stopped (cpal)");
+            return Ok(());
+        }
         std::thread::sleep(Duration::from_millis(15));
     }
     Ok(())
