@@ -31,6 +31,7 @@ webpki-roots = "1"
 rfd = { version = "0.15", default-features = false, features = ["file-handle-inner"] }
 cpal = "0.15"
 hound = "3.5"
+lofty = "0.22"
 
 
 [profile.dev]

@@ -649,6 +649,11 @@ async fn start_voice_file_transfer(
                 .await;
         }
         Ok(data) => {
+            let data = crate::metadata_strip::strip_metadata_for_send(
+                &file_transfer::voice_filename(&transfer_id),
+                file_transfer::FileKind::Audio,
+                data,
+            );
             if data.len() as u64 > file_transfer::MAX_FILE_SIZE {
                 let _ = event_tx
                     .send(NetworkEvent::Status(
@@ -1605,6 +1610,18 @@ pub async fn run_chat_network(
                                             .await;
                                     }
                                     Ok(data) => {
+                                        let filename = file_transfer::safe_filename(&path);
+                                        // Уточняем тип по реальному расширению файла
+                                        let file_kind = if kind == file_transfer::FileKind::Other {
+                                            file_transfer::FileKind::from_filename(&filename)
+                                        } else {
+                                            kind
+                                        };
+                                        let data = crate::metadata_strip::strip_metadata_for_send(
+                                            &filename,
+                                            file_kind,
+                                            data,
+                                        );
                                         if data.len() as u64 > file_transfer::MAX_FILE_SIZE {
                                             let _ = event_tx
                                                 .send(NetworkEvent::Status(format!(
@@ -1625,13 +1642,6 @@ pub async fn run_chat_network(
                                             let chunks = file_transfer::split_into_chunks(&data);
                                             let total_chunks = chunks.len() as u32;
                                             let total_size = data.len() as u64;
-                                            let filename = file_transfer::safe_filename(&path);
-                                            // Уточняем тип по реальному расширению файла
-                                            let file_kind = if kind == file_transfer::FileKind::Other {
-                                                file_transfer::FileKind::from_filename(&filename)
-                                            } else {
-                                                kind
-                                            };
 
                                             let mut tid = [0u8; 16];
                                             rand::RngCore::fill_bytes(&mut rand::thread_rng(), &mut tid);
