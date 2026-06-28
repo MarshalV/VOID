@@ -32,6 +32,9 @@ rfd = { version = "0.15", default-features = false, features = ["file-handle-inn
 cpal = "0.15"
 hound = "3.5"
 lofty = "0.22"
+mp4ameta = "0.13"
+lopdf = "0.34"
+zip = "2.2"
 
 
 [profile.dev]
