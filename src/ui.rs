@@ -1580,6 +1580,7 @@ impl eframe::App for App {
                     self.add_status(format!("⏳ Оффлайн (MDNS): {}", &peer.to_string()[..8]));
                 }
                 NetworkEvent::InitialConnectedPeers(peers) => {
+                    self.add_status(format!("📋 Начальные пиры: {}", peers.len()));
                     for peer in peers {
                         self.connected_peer_ids.insert(peer);
                         self.connected_peers = self.connected_peer_ids.len();
