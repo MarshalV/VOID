@@ -135,6 +135,20 @@ fn publish_self_in_dht(kad: &mut kad::Behaviour<kad::store::MemoryStore>, local_
     }
 }
 
+/// Протокол identify у VOID-клиента (см. `identify::Config::new` в `build_void_swarm`).
+const VOID_IDENTIFY_PROTOCOL: &str = "/void/v1";
+
+fn peer_advertises_void_chat(info: &identify::Info) -> bool {
+    info.protocols
+        .iter()
+        .any(|p| p.as_ref() == "/void/chat/1.0.0")
+}
+
+/// VOID-мессенджер объявляет `/void/v1` в identify. Bootstrap/DHT-узлы — нет.
+fn peer_is_void_messenger(info: &identify::Info) -> bool {
+    info.protocol_version == VOID_IDENTIFY_PROTOCOL
+}
+
 fn dial_peer_best_effort(
     swarm: &mut libp2p::Swarm<ChatBehaviour>,
     peer_id: PeerId,
@@ -1094,8 +1108,6 @@ pub async fn run_chat_network(
             m
         };
         let mut reconnect_queue: HashMap<PeerId, (Instant, u32)> = HashMap::new();
-        let vault_contact_ids: HashSet<PeerId> =
-            contact_seed_addrs.iter().map(|(p, _)| *p).collect();
         let mut reconnect_tick = tokio::time::interval(Duration::from_secs(5));
         reconnect_tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
         let mut provider_tick = tokio::time::interval(Duration::from_secs(10 * 60));
@@ -2438,6 +2450,13 @@ pub async fn run_chat_network(
                             // повторная отправка не считала хендшейк «уже в полёте».
                             if !was_msg && !was_delete {
                                 pending_handshakes.remove(&peer);
+                                // Hello упал — UI не должен вечно ждать E2EE-сессию.
+                                if pending_messages
+                                    .get(&peer)
+                                    .is_some_and(|q| !q.is_empty())
+                                {
+                                    let _ = event_tx.send(NetworkEvent::SendFailedDial(peer)).await;
+                                }
                             }
                             // Дедуп: если тому же пиру прилетел такой же fail
                             // меньше секунды назад — это Hello+packet пара,
@@ -2526,13 +2545,9 @@ pub async fn run_chat_network(
                             }
 
                              if peer_id != local_peer_id {
-                                 // Есть буфер исходящих или это контакт из vault — сразу шлём Hello,
-                                 // не дожидаясь пока собеседник напишет первым.
-                                 let needs_handshake = !sessions.contains_key(&peer_id)
-                                     && (vault_contact_ids.contains(&peer_id)
-                                         || pending_messages
-                                             .get(&peer_id)
-                                             .is_some_and(|q| !q.is_empty()));
+                                 // Сразу шлём Hello любому подключённому пиру без E2EE-сессии
+                                 // (mDNS, vault, DHT-dial) — иначе оба ждут первого сообщения.
+                                 let needs_handshake = !sessions.contains_key(&peer_id);
                                  if needs_handshake {
                                      let now_hs = chrono::Local::now().format("%H:%M:%S").to_string();
                                      let _ = ensure_e2ee_handshake_started(
@@ -2693,22 +2708,52 @@ pub async fn run_chat_network(
 
                         SwarmEvent::Behaviour(ChatBehaviourEvent::Identify(identify::Event::Received { peer_id, info, .. })) => {
                             let now = chrono::Local::now().format("%H:%M:%S").to_string();
-                            let has_chat = info
-                                .protocols
-                                .iter()
-                                .any(|p| p.as_ref() == "/void/chat/1.0.0");
+                            let has_chat = peer_advertises_void_chat(&info);
+                            let is_void = peer_is_void_messenger(&info);
                             debug!(
                                 "[{}] 🆔 Identify: {} — {} listen, {} протоколов{}",
                                 now,
                                 peer_id,
                                 info.listen_addrs.len(),
                                 info.protocols.len(),
-                                if has_chat { "" } else { "  ⚠️ БЕЗ /void/chat/1.0.0 (bootstrap/чужая версия)" }
+                                if has_chat {
+                                    ""
+                                } else if is_void {
+                                    "  (VOID, список протоколов ещё неполный)"
+                                } else {
+                                    "  ⚠️ БЕЗ /void/chat/1.0.0 (bootstrap/чужая версия)"
+                                }
                             );
-                            if !has_chat && peer_id != local_peer_id {
+                            // Первый identify на свежем коннекте часто приходит ДО того, как
+                            // libp2p успевает зарегистрировать /void/chat/1.0.0. Не удаляем
+                            // собеседника по пустому или неполному списку — только явные
+                            // bootstrap/чужие узлы (protocol_version != /void/v1).
+                            if !has_chat
+                                && !is_void
+                                && !info.protocols.is_empty()
+                                && peer_id != local_peer_id
+                            {
                                 let _ = event_tx
                                     .send(NetworkEvent::PeerIsNotVoidChat(peer_id))
                                     .await;
+                            }
+                            if is_void
+                                && !sessions.contains_key(&peer_id)
+                                && swarm.is_connected(&peer_id)
+                                && peer_id != local_peer_id
+                            {
+                                let _ = ensure_e2ee_handshake_started(
+                                    &mut swarm,
+                                    &local_key,
+                                    local_peer_id,
+                                    my_public_key,
+                                    peer_id,
+                                    &sessions,
+                                    &mut pending_handshakes,
+                                    &now,
+                                    false,
+                                )
+                                .await;
                             }
                             for addr in info.listen_addrs {
                                 // Не тащим к себе заведомо-невалидные адреса пира
@@ -2737,7 +2782,7 @@ pub async fn run_chat_network(
                                 // Если это настоящий VOID-клиент — сохраним его
                                 // listen-адрес в контактной книге, чтобы связь поднялась
                                 // после рестарта без ручного ПОДКЛЮЧИТЬ.
-                                if has_chat && peer_id != local_peer_id {
+                                if (has_chat || is_void) && peer_id != local_peer_id {
                                     let _ = event_tx
                                         .send(NetworkEvent::PeerAddress(peer_id, a))
                                         .await;

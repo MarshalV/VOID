@@ -140,6 +140,8 @@ pub(crate) const RESEND_GRACE: Duration = Duration::from_secs(1);
 /// Базовая задержка перед повтором после DHT-поиска (растёт с числом попыток).
 pub(crate) const RESEND_DELAY_BASE: Duration = Duration::from_secs(2);
 pub(crate) const RESEND_DELAY_MAX: Duration = Duration::from_secs(300);
+/// Сколько ждём E2EE-хендшейк, прежде чем снова разрешить DHT-ретрай.
+pub(crate) const SESSION_WAIT_TIMEOUT: Duration = Duration::from_secs(20);
 
 pub(crate) fn resend_delay_for_attempt(attempts: u32) -> Duration {
     let exp = attempts.min(6);
@@ -1216,7 +1218,14 @@ impl App {
 
         for p in self.pending_sends.iter_mut() {
             if p.awaiting_session {
-                continue;
+                if now.duration_since(p.last_send_at) >= SESSION_WAIT_TIMEOUT {
+                    p.awaiting_session = false;
+                    p.last_send_at = now
+                        .checked_sub(RESEND_GRACE + Duration::from_millis(50))
+                        .unwrap_or(now);
+                } else {
+                    continue;
+                }
             }
 
             // Фаза 1: ждём `RESEND_GRACE` после последней попытки, потом дёргаем DHT.
