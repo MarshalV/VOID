@@ -1634,7 +1634,6 @@ impl eframe::App for App {
                 }
                 NetworkEvent::Disconnected(peer) => {
                     self.connected_peers = self.connected_peers.saturating_sub(1);
-                    self.connected_peer_ids.remove(&peer);
                     self.add_status(format!("❌ Отключено: {}...", &peer.to_string()[..8]));
                     // Пир офлайн — снимаем блокировку E2EE-ожидания и ускоряем ретрай.
                     for p in self
