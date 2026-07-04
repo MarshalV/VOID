@@ -144,20 +144,70 @@ fn peer_advertises_void_chat(info: &identify::Info) -> bool {
         .any(|p| p.as_ref() == "/void/chat/1.0.0")
 }
 
-/// VOID-мессенджер объявляет `/void/v1` в identify. Bootstrap/DHT-узлы — нет.
-fn peer_is_void_messenger(info: &identify::Info) -> bool {
-    info.protocol_version == VOID_IDENTIFY_PROTOCOL
+/// VOID bootstrap-node использует тот же `/void/v1`, но agent `void-bootstrap-node/*`.
+fn peer_is_bootstrap_agent(info: &identify::Info) -> bool {
+    info.agent_version.starts_with("void-bootstrap-node")
+}
+
+/// Адреса для listen через relay v2: `<relay>/p2p/<relay_id>/p2p-circuit`.
+fn relay_circuit_listen_addrs(relay_addrs: &[Multiaddr]) -> Vec<Multiaddr> {
+    let mut out = Vec::new();
+    for addr in relay_addrs {
+        if addr.to_string().contains("p2p-circuit") {
+            continue;
+        }
+        let mut a = addr.clone();
+        a.push(libp2p::multiaddr::Protocol::P2pCircuit);
+        if !out.contains(&a) {
+            out.push(a);
+        }
+    }
+    out
+}
+
+/// Адреса для dial через relay: `<relay>/p2p-circuit/p2p/<target>`.
+fn relay_circuit_dial_addrs(relay_addrs: &[Multiaddr], target: PeerId) -> Vec<Multiaddr> {
+    let mut out = Vec::new();
+    for addr in relay_addrs {
+        if addr.to_string().contains("p2p-circuit") {
+            continue;
+        }
+        let mut a = addr.clone();
+        a.push(libp2p::multiaddr::Protocol::P2pCircuit);
+        a.push(libp2p::multiaddr::Protocol::P2p(target));
+        if !out.contains(&a) {
+            out.push(a);
+        }
+    }
+    out
+}
+
+fn expand_dial_addrs(
+    peer_id: PeerId,
+    addrs: Vec<Multiaddr>,
+    bootstrap_addrs: &[Multiaddr],
+) -> Vec<Multiaddr> {
+    let mut expanded: Vec<Multiaddr> = addrs
+        .into_iter()
+        .filter(|a| !is_junk_addr(a))
+        .collect();
+    for relay_ma in bootstrap_addrs {
+        for circuit in relay_circuit_dial_addrs(std::slice::from_ref(relay_ma), peer_id) {
+            if !expanded.contains(&circuit) {
+                expanded.push(circuit);
+            }
+        }
+    }
+    expanded
 }
 
 fn dial_peer_best_effort(
     swarm: &mut libp2p::Swarm<ChatBehaviour>,
     peer_id: PeerId,
     addrs: Vec<Multiaddr>,
+    bootstrap_addrs: &[Multiaddr],
 ) {
-    let clean: Vec<Multiaddr> = addrs
-        .into_iter()
-        .filter(|a| !is_junk_addr(a))
-        .collect();
+    let clean = expand_dial_addrs(peer_id, addrs, bootstrap_addrs);
     let opts = if clean.is_empty() {
         DialOpts::peer_id(peer_id)
             .condition(libp2p::swarm::dial_opts::PeerCondition::DisconnectedAndNotDialing)
@@ -968,15 +1018,10 @@ pub async fn run_chat_network(
             debug!("⚠️ QUIC не поднят ни на одном порту");
         }
 
-        // Слушаем через Relay для работы за NAT
-        match "/p2p-circuit".parse::<Multiaddr>() {
-            Ok(ma) => {
-                if let Err(e) = swarm.listen_on(ma) {
-                    warn!("⚠️ relay listen /p2p-circuit: {:?}", e);
-                }
-            }
-            Err(e) => warn!("⚠️ parse /p2p-circuit: {:?}", e),
-        }
+        let bootstrap_peer_ids: HashSet<PeerId> = void_bootstraps
+            .iter()
+            .filter_map(|ma| peer_id_from_multiaddr(ma))
+            .collect();
 
         let startup_status = if void_bootstraps.is_empty() {
             let lan = if std::env::var("VOID_DISABLE_MDNS").is_ok() {
@@ -1021,7 +1066,7 @@ pub async fn run_chat_network(
                     &pid.to_string()[..8],
                     addrs.len()
                 );
-                dial_peer_best_effort(&mut swarm, *pid, addrs.clone());
+                dial_peer_best_effort(&mut swarm, *pid, addrs.clone(), &void_bootstraps);
             }
         }
 
@@ -1040,7 +1085,7 @@ pub async fn run_chat_network(
                     &pid.to_string()[..8],
                     addrs.len()
                 );
-                dial_peer_best_effort(&mut swarm, pid, addrs);
+                dial_peer_best_effort(&mut swarm, pid, addrs, &void_bootstraps);
             }
         }
 
@@ -1145,7 +1190,7 @@ pub async fn run_chat_network(
                             clean.len(),
                             attempt
                         );
-                        dial_peer_best_effort(&mut swarm, pid, clean);
+                        dial_peer_best_effort(&mut swarm, pid, clean, &void_bootstraps);
                     }
                 }
                 // ─── Tick: переобъявление себя в DHT (каждые 10 мин) ───────
@@ -1310,10 +1355,11 @@ pub async fn run_chat_network(
                                  let short = &peer_id.to_string()[..16];
                                  // Выкидываем loopback и виртуальные интерфейсы — чтобы
                                  // не тратить время на заведомо пустой dial.
-                                 let addrs: Vec<Multiaddr> = addrs
-                                     .into_iter()
-                                     .filter(|addr| !is_junk_addr(addr))
-                                     .collect();
+                                 let addrs: Vec<Multiaddr> = expand_dial_addrs(
+                                     peer_id,
+                                     addrs,
+                                     &void_bootstraps,
+                                 );
                                  debug!("🔌 UI_COMMAND: DialPeer {} ({} addresses)", short, addrs.len());
 
                                  for addr in &addrs {
@@ -2478,6 +2524,7 @@ pub async fn run_chat_network(
                                                 &mut swarm,
                                                 peer,
                                                 addrs.clone(),
+                                                &void_bootstraps,
                                             );
                                         }
                                         swarm
@@ -2545,9 +2592,35 @@ pub async fn run_chat_network(
                             }
 
                              if peer_id != local_peer_id {
-                                 // Сразу шлём Hello любому подключённому пиру без E2EE-сессии
-                                 // (mDNS, vault, DHT-dial) — иначе оба ждут первого сообщения.
-                                 let needs_handshake = !sessions.contains_key(&peer_id);
+                                 // Резервируем слот на bootstrap-relay, чтобы другие пиры
+                                 // могли дозвониться через NAT (circuit relay v2).
+                                 if bootstrap_peer_ids.contains(&peer_id) {
+                                     let relay_src: Vec<Multiaddr> = reconnect_targets
+                                         .get(&peer_id)
+                                         .cloned()
+                                         .unwrap_or_else(|| {
+                                             void_bootstraps
+                                                 .iter()
+                                                 .filter(|ma| {
+                                                     peer_id_from_multiaddr(ma) == Some(peer_id)
+                                                 })
+                                                 .cloned()
+                                                 .collect()
+                                         });
+                                     for ma in relay_circuit_listen_addrs(&relay_src) {
+                                         if let Err(e) = swarm.listen_on(ma.clone()) {
+                                             debug!(
+                                                 "relay circuit listen {}: {:?}",
+                                                 ma, e
+                                             );
+                                         } else {
+                                             debug!("📡 relay circuit listen: {}", ma);
+                                         }
+                                     }
+                                 }
+                                 // E2EE только с VOID-чат пирами, не с bootstrap/DHT-узлами.
+                                 let needs_handshake = !sessions.contains_key(&peer_id)
+                                     && !bootstrap_peer_ids.contains(&peer_id);
                                  if needs_handshake {
                                      let now_hs = chrono::Local::now().format("%H:%M:%S").to_string();
                                      let _ = ensure_e2ee_handshake_started(
@@ -2709,7 +2782,8 @@ pub async fn run_chat_network(
                         SwarmEvent::Behaviour(ChatBehaviourEvent::Identify(identify::Event::Received { peer_id, info, .. })) => {
                             let now = chrono::Local::now().format("%H:%M:%S").to_string();
                             let has_chat = peer_advertises_void_chat(&info);
-                            let is_void = peer_is_void_messenger(&info);
+                            let is_bootstrap = bootstrap_peer_ids.contains(&peer_id)
+                                || peer_is_bootstrap_agent(&info);
                             debug!(
                                 "[{}] 🆔 Identify: {} — {} listen, {} протоколов{}",
                                 now,
@@ -2718,18 +2792,19 @@ pub async fn run_chat_network(
                                 info.protocols.len(),
                                 if has_chat {
                                     ""
-                                } else if is_void {
-                                    "  (VOID, список протоколов ещё неполный)"
+                                } else if is_bootstrap {
+                                    "  (bootstrap/relay)"
+                                } else if info.protocol_version == VOID_IDENTIFY_PROTOCOL {
+                                    "  (VOID-клиент, список протоколов ещё неполный)"
                                 } else {
-                                    "  ⚠️ БЕЗ /void/chat/1.0.0 (bootstrap/чужая версия)"
+                                    "  ⚠️ БЕЗ /void/chat/1.0.0 (чужая версия)"
                                 }
                             );
-                            // Первый identify на свежем коннекте часто приходит ДО того, как
-                            // libp2p успевает зарегистрировать /void/chat/1.0.0. Не удаляем
-                            // собеседника по пустому или неполному списку — только явные
-                            // bootstrap/чужие узлы (protocol_version != /void/v1).
+                            // Первый identify часто приходит до регистрации /void/chat/1.0.0.
+                            // Не удаляем VOID-клиентов и bootstrap из контактов ошибочно.
                             if !has_chat
-                                && !is_void
+                                && !is_bootstrap
+                                && info.protocol_version != VOID_IDENTIFY_PROTOCOL
                                 && !info.protocols.is_empty()
                                 && peer_id != local_peer_id
                             {
@@ -2737,7 +2812,7 @@ pub async fn run_chat_network(
                                     .send(NetworkEvent::PeerIsNotVoidChat(peer_id))
                                     .await;
                             }
-                            if is_void
+                            if has_chat
                                 && !sessions.contains_key(&peer_id)
                                 && swarm.is_connected(&peer_id)
                                 && peer_id != local_peer_id
@@ -2782,7 +2857,7 @@ pub async fn run_chat_network(
                                 // Если это настоящий VOID-клиент — сохраним его
                                 // listen-адрес в контактной книге, чтобы связь поднялась
                                 // после рестарта без ручного ПОДКЛЮЧИТЬ.
-                                if (has_chat || is_void) && peer_id != local_peer_id {
+                                if has_chat && peer_id != local_peer_id {
                                     let _ = event_tx
                                         .send(NetworkEvent::PeerAddress(peer_id, a))
                                         .await;
@@ -2817,6 +2892,39 @@ pub async fn run_chat_network(
                             }
                         }
 
+                        SwarmEvent::Behaviour(ChatBehaviourEvent::Relay(
+                            relay::client::Event::ReservationReqAccepted {
+                                relay_peer_id,
+                                renewal,
+                                ..
+                            },
+                        )) => {
+                            debug!(
+                                "📡 Relay: резервация на {} (renewal={renewal})",
+                                &relay_peer_id.to_string()[..8]
+                            );
+                            publish_self_in_dht(
+                                &mut swarm.behaviour_mut().kad,
+                                local_peer_id,
+                            );
+                        }
+                        SwarmEvent::Behaviour(ChatBehaviourEvent::Relay(
+                            relay::client::Event::InboundCircuitEstablished { src_peer_id, .. },
+                        )) => {
+                            debug!(
+                                "📡 Relay: входящий circuit от {}",
+                                &src_peer_id.to_string()[..8]
+                            );
+                        }
+                        SwarmEvent::Behaviour(ChatBehaviourEvent::Relay(
+                            relay::client::Event::OutboundCircuitEstablished { relay_peer_id, .. },
+                        )) => {
+                            debug!(
+                                "📡 Relay: исходящий circuit через {}",
+                                &relay_peer_id.to_string()[..8]
+                            );
+                        }
+
                         SwarmEvent::Behaviour(ChatBehaviourEvent::Kad(kad::Event::OutboundQueryProgressed { result, .. })) => {
                             match result {
                                 libp2p::kad::QueryResult::GetProviders(Ok(ok)) => {
@@ -2843,7 +2951,12 @@ pub async fn run_chat_network(
                                                             UICommand::DialPeer(wanted, addrs),
                                                         );
                                                     } else {
-                                                        dial_peer_best_effort(&mut swarm, wanted, vec![]);
+                                                        dial_peer_best_effort(
+                                                            &mut swarm,
+                                                            wanted,
+                                                            vec![],
+                                                            &void_bootstraps,
+                                                        );
                                                         let _ = event_tx
                                                             .send(NetworkEvent::Status(format!(
                                                                 "📍 DHT: {} зарегистрирован — набор…",
