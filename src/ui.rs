@@ -359,7 +359,6 @@ impl App {
                     }
                     let peer_str = peer_id.to_string();
                     let is_selected = self.selected_chat == peer_str;
-                    let is_online = self.connected_peer_ids.contains(peer_id);
 
                     let (preview, time_str) = {
                         let msgs = self.messages.lock();
@@ -413,14 +412,6 @@ impl App {
                                             egui::vec2(name_w, 18.0),
                                             egui::Layout::left_to_right(egui::Align::Center),
                                             |ui| {
-                                                ui.add(
-                                                    egui::Label::new(
-                                                        egui::RichText::new(if is_online { "●" } else { "○" })
-                                                            .size(12.0)
-                                                            .color(if is_online { palette::ONLINE } else { palette::TEXT_MUTED }),
-                                                    ),
-                                                );
-                                                ui.add_space(6.0);
                                                 ui.add(
                                                     egui::Label::new(
                                                         egui::RichText::new(name)
@@ -1579,16 +1570,8 @@ impl eframe::App for App {
                 NetworkEvent::MdnsExpired(peer) => {
                     self.add_status(format!("⏳ Оффлайн (MDNS): {}", &peer.to_string()[..8]));
                 }
-                NetworkEvent::InitialConnectedPeers(peers) => {
-                    self.add_status(format!("📋 Начальные пиры: {}", peers.len()));
-                    for peer in peers {
-                        self.connected_peer_ids.insert(peer);
-                        self.connected_peers = self.connected_peer_ids.len();
-                    }
-                }
                 NetworkEvent::Connected(peer) => {
                     self.connected_peers += 1;
-                    self.connected_peer_ids.insert(peer);
                     self.add_status(format!("✅ Подключено: {}...", &peer.to_string()[..8]));
                     if peer != self.local_peer_id {
                         self.select_peer_if_no_chat(peer);
@@ -2206,27 +2189,15 @@ impl eframe::App for App {
                                 let n = self.selected_chat.len().min(8);
                                 format!("Peer {}", &self.selected_chat[..n])
                             });
-                        let is_online = self.selected_chat.parse::<PeerId>()
-                            .ok()
-                            .map(|pid| self.connected_peer_ids.contains(&pid))
-                            .unwrap_or(false);
                         draw_avatar(ui, &self.selected_chat, &display_name, 40.0, None);
                         ui.add_space(12.0);
                         let contact_header = ui.vertical(|ui| {
-                            ui.horizontal(|ui| {
-                                ui.label(
-                                    egui::RichText::new(&display_name)
-                                        .strong()
-                                        .size(16.0)
-                                        .color(palette::TEXT),
-                                );
-                                ui.add_space(8.0);
-                                ui.label(
-                                    egui::RichText::new(if is_online { "●" } else { "○" })
-                                        .size(14.0)
-                                        .color(if is_online { palette::ONLINE } else { palette::TEXT_MUTED }),
-                                );
-                            });
+                            ui.label(
+                                egui::RichText::new(&display_name)
+                                    .strong()
+                                    .size(16.0)
+                                    .color(palette::TEXT),
+                            );
                             let id_short = {
                                 let n = self.selected_chat.len().min(20);
                                 format!("{}…", &self.selected_chat[..n])
