@@ -154,6 +154,7 @@ pub(crate) struct App {
     pub(crate) local_nickname: String,
     pub(crate) listen_addrs: Vec<String>,
     pub(crate) connected_peers: usize,
+    pub(crate) connected_peer_ids: HashSet<PeerId>,
     pub(crate) dial_address: String,
     pub(crate) chat_input: String,
     pub(crate) messages: SharedChatMessages,
@@ -212,6 +213,7 @@ pub(crate) struct App {
     pub(crate) vault_master_key: Option<Zeroizing<[u8; 32]>>,
 }
 
+// ─── Функции создания и инициализации ──────────────────────────────────────
 impl App {
     pub(crate) fn new(
         cc: &eframe::CreationContext<'_>,
@@ -234,6 +236,7 @@ impl App {
             local_nickname,
             listen_addrs: Vec::new(),
             connected_peers: 0,
+            connected_peer_ids: HashSet::new(),
             dial_address: String::new(),
             chat_input: String::new(),
             messages: chat_messages,
@@ -276,6 +279,8 @@ impl App {
             vault_master_key,
         }
     }
+
+    // ─── Основные экраны приложения ──────────────────────────────────────────
 
     /// Экран разблокировки vault. Возвращает `true`, пока нужно блокировать основной UI.
     pub(crate) fn vault_unlock_gate(&mut self, ctx: &egui::Context) -> bool {
@@ -357,6 +362,7 @@ impl App {
         true
     }
 
+    // ─── Действия по событиям ──────────────────────────────────────────────────
     fn submit_vault_unlock(&mut self, ctx: &egui::Context) {
         let Some(mut pending) = self.pending_unlock.take() else {
             return;
@@ -561,6 +567,7 @@ impl App {
         }
     }
 
+    // ─── Действия по разблокировке vault ──────────────────────────────────────
     fn apply_unlock_success(
         &mut self,
         ctx: &egui::Context,

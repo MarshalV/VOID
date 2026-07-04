@@ -392,7 +392,8 @@ impl App {
                         .show(ui, |ui| {
                             ui.set_width(ui.available_width());
                             ui.horizontal(|ui| {
-                                draw_avatar(ui, &peer_str, name, 42.0, None);
+                                let is_online = self.connected_peer_ids.contains(peer_id);
+                                draw_avatar(ui, &peer_str, name, 42.0, Some(is_online));
                                 ui.add_space(10.0);
                                 ui.vertical(|ui| {
                                     let inner_w = ui.available_width();
@@ -1572,6 +1573,7 @@ impl eframe::App for App {
                 }
                 NetworkEvent::Connected(peer) => {
                     self.connected_peers += 1;
+                    self.connected_peer_ids.insert(peer);
                     self.add_status(format!("✅ Подключено: {}...", &peer.to_string()[..8]));
                     if peer != self.local_peer_id {
                         self.select_peer_if_no_chat(peer);
@@ -1634,6 +1636,7 @@ impl eframe::App for App {
                 }
                 NetworkEvent::Disconnected(peer) => {
                     self.connected_peers = self.connected_peers.saturating_sub(1);
+                    self.connected_peer_ids.remove(&peer);
                     self.add_status(format!("❌ Отключено: {}...", &peer.to_string()[..8]));
                     // Пир офлайн — снимаем блокировку E2EE-ожидания и ускоряем ретрай.
                     for p in self
@@ -2188,7 +2191,11 @@ impl eframe::App for App {
                                 let n = self.selected_chat.len().min(8);
                                 format!("Peer {}", &self.selected_chat[..n])
                             });
-                        draw_avatar(ui, &self.selected_chat, &display_name, 40.0, None);
+                        let is_online = self.selected_chat.parse::<PeerId>()
+                            .ok()
+                            .map(|pid| self.connected_peer_ids.contains(&pid))
+                            .unwrap_or(false);
+                        draw_avatar(ui, &self.selected_chat, &display_name, 40.0, Some(is_online));
                         ui.add_space(12.0);
                         let contact_header = ui.vertical(|ui| {
                             ui.label(
