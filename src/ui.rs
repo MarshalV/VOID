@@ -1579,6 +1579,12 @@ impl eframe::App for App {
                 NetworkEvent::MdnsExpired(peer) => {
                     self.add_status(format!("⏳ Оффлайн (MDNS): {}", &peer.to_string()[..8]));
                 }
+                NetworkEvent::InitialConnectedPeers(peers) => {
+                    for peer in peers {
+                        self.connected_peer_ids.insert(peer);
+                        self.connected_peers = self.connected_peer_ids.len();
+                    }
+                }
                 NetworkEvent::Connected(peer) => {
                     self.connected_peers += 1;
                     self.connected_peer_ids.insert(peer);

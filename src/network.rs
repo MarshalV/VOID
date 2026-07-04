@@ -167,6 +167,8 @@ pub(crate) enum NetworkEvent {
     MdnsExpired(PeerId),
     Connected(PeerId),
     Disconnected(PeerId),
+    /// Начальный список подключенных пиров при старте
+    InitialConnectedPeers(Vec<PeerId>),
     ChatMessage(ChatMessage),
     Status(String),
     PublicIpConfirmed(String),
@@ -987,6 +989,10 @@ pub async fn run_chat_network(
             )
         };
         let _ = event_tx.send(NetworkEvent::Status(startup_status)).await;
+
+        // Отправляем начальный список подключенных пиров в UI
+        let initial_connected: Vec<PeerId> = swarm.connected_peers().copied().collect();
+        let _ = event_tx.send(NetworkEvent::InitialConnectedPeers(initial_connected)).await;
 
         // Сразу пробуем дозвониться до сохранённых контактов: если они онлайн и
         // их адрес не сменился — связь появится в первые же секунды без
