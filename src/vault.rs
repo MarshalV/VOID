@@ -34,6 +34,9 @@ pub(crate) struct StorageData {
     pub(crate) static_secret_bytes: [u8; 32],
     #[serde(default)]
     pub(crate) address_book: Vec<AddressBookEntry>,
+    /// Известные VOID bootstrap-ноды (полные multiaddr с `/p2p/`). Обмениваются с участниками сети.
+    #[serde(default)]
+    pub(crate) void_bootstraps: Vec<String>,
 }
 
 fn storage_format_v1() -> u32 {
@@ -51,6 +54,8 @@ impl Storage {
     const VAULT_ENTRY_NAME_MAX: usize = 256;
     const VAULT_ENTRY_ADDRS_MAX: usize = 128;
     const VAULT_ENTRY_ONE_ADDR_MAX: usize = 1024;
+    const VAULT_BOOTSTRAPS_MAX: usize = 64;
+    const VAULT_BOOTSTRAP_ONE_ADDR_MAX: usize = 1024;
 
     pub(crate) const FILE: &'static str = "vault.bin";
     const FILE_TMP: &'static str = "vault.bin.tmp";
@@ -142,6 +147,7 @@ impl Storage {
         keypair: Option<&libp2p::identity::Keypair>,
         static_secret: Option<&crypto::StaticSecret>,
         address_book: Option<&[AddressBookEntry]>,
+        void_bootstraps: Option<&[String]>,
     ) -> Result<(), Box<dyn Error>> {
         let current_load = Self::load(master_key);
 
@@ -178,12 +184,22 @@ impl Storage {
                 .unwrap_or_default()
         };
 
+        let void_bootstraps_vec: Vec<String> = if let Some(bs) = void_bootstraps {
+            bs.to_vec()
+        } else {
+            current_load
+                .as_ref()
+                .map(|c| c.void_bootstraps.clone())
+                .unwrap_or_default()
+        };
+
         let data = StorageData {
             format_version: 1,
             nickname: nickname.to_string(),
             keypair_bytes,
             static_secret_bytes,
             address_book: address_book_vec,
+            void_bootstraps: void_bootstraps_vec,
         };
         let plaintext = serde_json::to_vec(&data)?;
 
@@ -265,6 +281,22 @@ impl Storage {
                     )
                     .into());
                 }
+            }
+        }
+        if s.void_bootstraps.len() > Self::VAULT_BOOTSTRAPS_MAX {
+            return Err(format!(
+                "vault: void_bootstraps больше {} записей",
+                Self::VAULT_BOOTSTRAPS_MAX
+            )
+            .into());
+        }
+        for (i, a) in s.void_bootstraps.iter().enumerate() {
+            if a.len() > Self::VAULT_BOOTSTRAP_ONE_ADDR_MAX {
+                return Err(format!(
+                    "vault: void_bootstraps[{}] — строка multiaddr слишком длинная",
+                    i
+                )
+                .into());
             }
         }
         Ok(())

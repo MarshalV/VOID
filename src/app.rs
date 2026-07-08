@@ -1,7 +1,6 @@
 //! Состояние приложения, vault unlock и логика повторной отправки.
 
 use std::collections::{HashMap, HashSet};
-use std::path::Path;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
@@ -14,6 +13,9 @@ use tokio::sync::mpsc;
 use tracing::{info, warn};
 use zeroize::{Zeroize, Zeroizing};
 
+use crate::bootstrap::{
+    merge_bootstrap_string_lists, migrate_void_bootstrap_txt, void_bootstrap_multiaddrs,
+};
 use crate::chat_store::ChatJournal;
 use crate::crypto;
 use crate::file_transfer;
@@ -96,7 +98,6 @@ pub(crate) struct DeferredNetworkSpawn {
     pub event_tx: mpsc::Sender<NetworkEvent>,
     pub command_rx: mpsc::Receiver<UICommand>,
     pub command_tx_for_mdns: mpsc::Sender<UICommand>,
-    pub void_bootstraps: Vec<Multiaddr>,
     pub chat_messages: SharedChatMessages,
 }
 
@@ -172,6 +173,8 @@ pub(crate) struct App {
     pub(crate) add_contact_name: String,
     pub(crate) peer_name_edits: HashMap<PeerId, String>,
     pub(crate) void_bootstrap_draft: String,
+    /// Bootstrap-ноды VOID из vault.bin (полные multiaddr).
+    pub(crate) void_bootstrap_strings: Vec<String>,
     pub(crate) dht_routing_lines: Vec<String>,
     pub(crate) dht_routing_total: usize,
     pub(crate) command_tx: mpsc::Sender<UICommand>,
@@ -214,6 +217,34 @@ pub(crate) struct App {
 }
 
 // ─── Функции создания и инициализации ──────────────────────────────────────
+
+fn resolve_vault_bootstraps(
+    storage: &crate::vault::StorageData,
+    master_arr: &[u8; 32],
+    nickname: &str,
+) -> Vec<String> {
+    let mut bootstraps = storage.void_bootstraps.clone();
+    if bootstraps.is_empty() {
+        let migrated = migrate_void_bootstrap_txt();
+        if !migrated.is_empty() {
+            bootstraps = migrated;
+            if let Err(e) = Storage::save(
+                master_arr,
+                nickname,
+                None,
+                None,
+                None,
+                Some(&bootstraps),
+            ) {
+                warn!("VOID: импорт void-bootstrap.txt → vault: {}", e);
+            } else {
+                info!("VOID: bootstrap из void-bootstrap.txt перенесены в vault.bin");
+            }
+        }
+    }
+    bootstraps
+}
+
 impl App {
     pub(crate) fn new(
         cc: &eframe::CreationContext<'_>,
@@ -251,8 +282,8 @@ impl App {
             add_contact_peer: String::new(),
             add_contact_name: String::new(),
             peer_name_edits: HashMap::new(),
-            void_bootstrap_draft: std::fs::read_to_string(Path::new("void-bootstrap.txt"))
-                .unwrap_or_default(),
+            void_bootstrap_draft: String::new(),
+            void_bootstrap_strings: Vec::new(),
             dht_routing_lines: Vec::new(),
             dht_routing_total: 0,
             command_tx,
@@ -476,6 +507,10 @@ impl App {
                 };
                 let static_secret = crypto::StaticSecret::from(storage.static_secret_bytes);
                 let my_id = PeerId::from(local_key.public());
+                let void_bootstrap_strings =
+                    resolve_vault_bootstraps(&storage, &master_arr, &storage.nickname);
+                let network_bootstraps = void_bootstrap_multiaddrs(&void_bootstrap_strings);
+                self.void_bootstrap_strings = void_bootstrap_strings;
                 let mut book = HashMap::new();
                 let mut addrs_map: HashMap<PeerId, Vec<Multiaddr>> = HashMap::new();
                 for entry in storage.address_book {
@@ -503,7 +538,7 @@ impl App {
                     dn_sp.command_tx_for_mdns,
                     local_key.clone(),
                     static_secret.clone(),
-                    dn_sp.void_bootstraps,
+                    network_bootstraps,
                     contact_addrs_flat,
                     dn_sp.chat_messages.clone(),
                 ));
@@ -531,6 +566,7 @@ impl App {
                     Some(&local_key),
                     Some(&static_secret),
                     None,
+                    None,
                 ) {
                     let _ = std::fs::remove_file(Storage::KEY_FILE);
                     self.pending_unlock = Some(VaultUnlockState {
@@ -543,13 +579,14 @@ impl App {
                     return;
                 }
 
+                self.void_bootstrap_strings = Vec::new();
                 tokio::spawn(run_chat_network(
                     dn_sp.command_rx,
                     dn_sp.event_tx,
                     dn_sp.command_tx_for_mdns,
                     local_key.clone(),
                     static_secret.clone(),
-                    dn_sp.void_bootstraps,
+                    Vec::new(),
                     Vec::new(),
                     dn_sp.chat_messages.clone(),
                 ));
@@ -1176,6 +1213,32 @@ impl App {
         self.mark_chat_journal_dirty();
     }
 
+    pub(crate) fn merge_learned_bootstraps(&mut self, learned: Vec<String>) {
+        let before = self.void_bootstrap_strings.len();
+        let merged = merge_bootstrap_string_lists(&self.void_bootstrap_strings, &learned);
+        if merged.len() != before {
+            self.void_bootstrap_strings = merged;
+            self.persist_vault();
+            self.add_status(format!(
+                "🌐 Vault: {} bootstrap-узл(ов) (+{})",
+                self.void_bootstrap_strings.len(),
+                self.void_bootstrap_strings.len().saturating_sub(before)
+            ));
+        }
+    }
+
+    pub(crate) fn reload_bootstraps_from_vault(&mut self) {
+        let parsed = void_bootstrap_multiaddrs(&self.void_bootstrap_strings);
+        let _ = self
+            .command_tx
+            .try_send(UICommand::ReloadBootstraps(self.void_bootstrap_strings.clone()));
+        if parsed.is_empty() && self.void_bootstrap_strings.is_empty() {
+            self.add_status(
+                "Нет bootstrap в vault — войдите в сеть через IP другой ноды.".into(),
+            );
+        }
+    }
+
     /// Сохраняет ник и записную книгу в `vault.bin` (AES-GCM под мастер-ключом).
     pub(crate) fn persist_vault(&self) {
         let Some(ref vault_master_key) = self.vault_master_key else {
@@ -1209,6 +1272,7 @@ impl App {
             None,
             None,
             Some(&entries),
+            Some(&self.void_bootstrap_strings),
         ) {
             warn!("VOID: не удалось сохранить vault (записная книга): {}", e);
         }

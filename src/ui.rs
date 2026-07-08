@@ -676,9 +676,20 @@ impl App {
                                     .color(palette::ACCENT_2),
                             );
                         });
+                        ui.horizontal(|ui| {
+                            ui.label(
+                                egui::RichText::new("Bootstrap в vault:")
+                                    .color(palette::TEXT_MUTED)
+                                    .size(12.0),
+                            );
+                            ui.label(
+                                egui::RichText::new(format!("{} узл.", self.void_bootstrap_strings.len()))
+                                    .color(palette::ACCENT_2),
+                            );
+                        });
                         ui.add_space(8.0);
                         ui.label(
-                            egui::RichText::new("Войти в сеть через IP")
+                            egui::RichText::new("Войти в сеть через IP (сохранится в vault)")
                                 .color(palette::TEXT_MUTED)
                                 .size(11.5),
                         );
@@ -712,13 +723,11 @@ impl App {
                         ui.add_space(4.0);
                         if ui
                             .button(
-                                egui::RichText::new("Переподключить seed").color(palette::TEXT),
+                                egui::RichText::new("Переподключить bootstrap").color(palette::TEXT),
                             )
                             .clicked()
                         {
-                            let _ = self
-                                .command_tx
-                                .try_send(UICommand::ReloadBootstrapFromSources);
+                            self.reload_bootstraps_from_vault();
                         }
                         if ui
                             .button(egui::RichText::new("Снимок DHT").color(palette::TEXT))
@@ -1818,7 +1827,7 @@ impl eframe::App for App {
                 NetworkEvent::PeerIsNotVoidChat(peer) => {
                     // Identify показал, что у пира нет /void/chat/1.0.0.
                     // Подчищаем его из контактов заранее, не дожидаясь попытки
-                    // отправки. Чаще всего это bootstrap из void-bootstrap.txt.
+                    // отправки. Bootstrap-ноды хранятся в vault, не в контактах.
                     if self.known_peers.remove(&peer).is_some() {
                         self.contact_addrs.remove(&peer);
                         self.messages.lock().remove(&peer.to_string());
@@ -1967,6 +1976,9 @@ impl eframe::App for App {
                         ToastKind::Error,
                         TOAST_TTL_LONG,
                     );
+                }
+                NetworkEvent::BootstrapsLearned(addrs) => {
+                    self.merge_learned_bootstraps(addrs);
                 }
                 NetworkEvent::PeerAddress(peer, ma) => {
                     // Пир засветился с рабочим адресом: если он уже контакт —

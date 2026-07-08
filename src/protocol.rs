@@ -6,6 +6,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::crypto;
 use crate::file_transfer;
+use crate::bootstrap::peer_id_from_multiaddr;
 
 /// Статус доставки исходящего сообщения (галочки в UI).
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, Default)]
@@ -348,6 +349,36 @@ pub(crate) fn parse_decrypted_chat_json(plaintext: &[u8]) -> Option<ChatMessage>
     Some(msg)
 }
 
+const MAX_BOOTSTRAP_GOSSIP_ADDRS: usize = 32;
+const MAX_BOOTSTRAP_ADDR_LEN: usize = 512;
+
+/// Проверяет список bootstrap multiaddr из gossip-обмена между участниками.
+pub(crate) fn validate_bootstrap_gossip_addrs(addrs: &[String]) -> Option<Vec<String>> {
+    if addrs.is_empty() || addrs.len() > MAX_BOOTSTRAP_GOSSIP_ADDRS {
+        return None;
+    }
+    let mut out = Vec::new();
+    for s in addrs {
+        let t = s.trim();
+        if t.is_empty() || t.len() > MAX_BOOTSTRAP_ADDR_LEN {
+            continue;
+        }
+        if let Ok(ma) = t.parse::<libp2p::Multiaddr>() {
+            if peer_id_from_multiaddr(&ma).is_some() {
+                let normalized = ma.to_string();
+                if !out.contains(&normalized) {
+                    out.push(normalized);
+                }
+            }
+        }
+    }
+    if out.is_empty() {
+        None
+    } else {
+        Some(out)
+    }
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub(crate) enum V1Packet {
     Hello {
@@ -359,6 +390,10 @@ pub(crate) enum V1Packet {
         /// Если PeerId не identity-multihash: protobuf `PublicKey` для проверки подписи.
         #[serde(default)]
         transport_pubkey_pb: Vec<u8>,
+    },
+    /// Обмен известными VOID bootstrap-нодами между участниками (публичные multiaddr).
+    BootstrapGossip {
+        addrs: Vec<String>,
     },
     Encrypted {
         header: crypto::MessageHeader,

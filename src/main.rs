@@ -25,9 +25,8 @@ use libp2p::PeerId;
 use tokio::sync::mpsc;
 use tracing::info;
 
-use bootstrap::void_bootstrap_multiaddrs;
-use network::env_flag_true;
 use app::DeferredNetworkSpawn;
+use network::env_flag_true;
 use vault::{detect_vault_unlock_kind, VaultUnlockState};
 
 #[tokio::main]
@@ -165,17 +164,7 @@ async fn main() -> Result<(), Box<dyn Error>> {
     let vault_unlock_kind =
         detect_vault_unlock_kind().map_err(|m| Box::<dyn Error>::from(m))?;
 
-    let void_bootstraps = void_bootstrap_multiaddrs();
-    if void_bootstraps.is_empty() {
-        info!(
-            "🌐 Глобально: нет seed для DHT — задайте BUILTIN_VOID_BOOTSTRAP / VOID_BOOTSTRAP_PUBLIC_LIST_URL в коде, VOID_BOOTSTRAP_URL, VOID_BOOTSTRAP, void-bootstrap.txt, либо полный multiaddr собеседника. LAN: mDNS (отключить: VOID_DISABLE_MDNS)."
-        );
-    } else {
-        info!(
-            "🌐 VOID bootstrap: {} multiaddr → заполнение DHT /void/kad/1.0.0 (без IPFS).",
-            void_bootstraps.len()
-        );
-    }
+    info!("🌐 VOID bootstrap: загрузка из vault.bin после разблокировки.");
 
     let (event_tx, event_rx) = mpsc::channel(256);
     let (command_tx, command_rx) = mpsc::channel(256);
@@ -187,7 +176,6 @@ async fn main() -> Result<(), Box<dyn Error>> {
         event_tx: event_tx.clone(),
         command_rx,
         command_tx_for_mdns,
-        void_bootstraps,
         chat_messages: chat_messages.clone(),
     };
 

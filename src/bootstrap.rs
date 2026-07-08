@@ -1,4 +1,4 @@
-//! Bootstrap-адреса VOID DHT: встроенные seed, HTTP(S), файл, env, Ed25519-подписи.
+//! Bootstrap-адреса VOID DHT: vault, встроенные seed, HTTP(S), env, Ed25519-подписи.
 
 use std::collections::HashSet;
 use std::io::Read;
@@ -33,14 +33,10 @@ const VOID_BOOTSTRAP_PUBLIC_LIST_URL: &str = "";
 /// Узлы для заполнения **отдельного** VOID DHT (не IPFS): сообщения по-прежнему идут напрямую между пирами.
 ///
 /// Источники (все опциональны, объединяются и дедуплицируются):
+/// - `void_bootstraps` в `vault.bin` (основное хранилище, обмен с участниками);
 /// - `BUILTIN_VOID_BOOTSTRAP` и сборка с `VOID_BUILTIN_BOOTSTRAP=/ip4/.../p2p/...,...` (вшито в exe);
-/// - HTTP(S): `VOID_BOOTSTRAP_URL` и/или `VOID_BOOTSTRAP_PUBLIC_LIST_URL` (если не пустой и не задан `VOID_SKIP_PUBLIC_BOOTSTRAP_LIST`);
-///   Тело ответа ограничено (~256 KiB). Опционально: `VOID_BOOTSTRAP_TRUSTED_HOSTS=host1,host2` — только эти хосты для URL-загрузки;
-///   Для HTTPS: `VOID_BOOTSTRAP_TLS_LEAF_SHA256` — через запятую SHA-256 DER листового сертификата (64 hex), дополнительно к проверке CA;
+/// - HTTP(S): `VOID_BOOTSTRAP_URL` и/или `VOID_BOOTSTRAP_PUBLIC_LIST_URL`;
 /// - переменная `VOID_BOOTSTRAP`: multiaddr через запятую;
-/// - файл `void-bootstrap.txt`: одна multiaddr на строку;
-/// - опционально Ed25519: `VOID_BOOTSTRAP_SIGNING_PUB_HEX` + `void-bootstrap.sig` (64 B) для файла;
-///   для HTTP — ещё `VOID_BOOTSTRAP_URL_SIG_HEX` (128 hex);
 /// - `VOID_DISABLE_MDNS` — отключить mDNS в LAN;
 /// - `VOID_APPLY_FIREWALL_RULE=1` — разрешить автоматическую настройку файрвола (Windows/macOS).
 ///
@@ -65,10 +61,68 @@ fn append_bootstraps_from_comma_separated(out: &mut Vec<Multiaddr>, s: &str, sou
             continue;
         }
         match t.parse::<Multiaddr>() {
-            Ok(ma) => out.push(ma),
+            Ok(ma) => {
+                if peer_id_from_multiaddr(&ma).is_some() {
+                    out.push(ma);
+                } else {
+                    warn!("{}: нет /p2p/ в конце, пропуск: {}", source, t);
+                }
+            }
             Err(_) => warn!("{}: пропуск неверной multiaddr: {}", source, t),
         }
     }
+}
+
+/// Однократный импорт из устаревшего `void-bootstrap.txt` в vault при первом запуске.
+pub(crate) fn migrate_void_bootstrap_txt() -> Vec<String> {
+    let path = Path::new("void-bootstrap.txt");
+    if !path.exists() {
+        return Vec::new();
+    }
+    let Ok(txt) = std::fs::read_to_string(path) else {
+        return Vec::new();
+    };
+    let mut out = Vec::new();
+    for line in txt.lines() {
+        let t = line.split('#').next().unwrap_or("").trim();
+        if t.is_empty() {
+            continue;
+        }
+        if let Ok(ma) = t.parse::<Multiaddr>() {
+            if peer_id_from_multiaddr(&ma).is_some() {
+                let s = ma.to_string();
+                if !out.contains(&s) {
+                    out.push(s);
+                }
+            }
+        }
+    }
+    out
+}
+
+/// Объединяет списки bootstrap multiaddr (строки), оставляя только валидные с `/p2p/`.
+pub(crate) fn merge_bootstrap_string_lists(
+    existing: &[String],
+    incoming: &[String],
+) -> Vec<String> {
+    let mut out: Vec<String> = existing.to_vec();
+    for s in incoming {
+        let t = s.trim();
+        if t.is_empty() {
+            continue;
+        }
+        if let Ok(ma) = t.parse::<Multiaddr>() {
+            if peer_id_from_multiaddr(&ma).is_some() {
+                let normalized = ma.to_string();
+                if !out.contains(&normalized) {
+                    out.push(normalized);
+                }
+            }
+        }
+    }
+    out.sort();
+    out.dedup();
+    out
 }
 
 /// Макс. размер тела ответа bootstrap-списка (защита от DoS по памяти).
@@ -371,9 +425,39 @@ fn verify_void_bootstrap_http_body(body: &str, source: &str) -> Result<bool, Str
     Ok(true)
 }
 
-pub fn void_bootstrap_multiaddrs() -> Vec<Multiaddr> {
+/// Собирает полный список bootstrap: сначала из vault, затем встроенные/URL/env.
+pub fn void_bootstrap_multiaddrs(vault_bootstraps: &[String]) -> Vec<Multiaddr> {
     let mut out = Vec::new();
 
+    for s in vault_bootstraps {
+        let t = s.trim();
+        if t.is_empty() {
+            continue;
+        }
+        match t.parse::<Multiaddr>() {
+            Ok(ma) => {
+                if peer_id_from_multiaddr(&ma).is_some() {
+                    out.push(ma);
+                } else {
+                    warn!("vault bootstrap: нет /p2p/, пропуск: {}", t);
+                }
+            }
+            Err(_) => warn!("vault bootstrap: пропуск: {}", t),
+        }
+    }
+
+    append_global_bootstraps(&mut out);
+
+    out.sort_by(|a, b| a.to_string().cmp(&b.to_string()));
+    out.dedup_by(|a, b| a == b);
+    out
+}
+
+fn append_global_bootstraps(out: &mut Vec<Multiaddr>) {
+    append_global_bootstraps_body(out);
+}
+
+fn append_global_bootstraps_body(out: &mut Vec<Multiaddr>) {
     for s in BUILTIN_VOID_BOOTSTRAP {
         let t = s.trim();
         if t.is_empty() {
@@ -386,7 +470,7 @@ pub fn void_bootstrap_multiaddrs() -> Vec<Multiaddr> {
     }
 
     if let Some(s) = option_env!("VOID_BUILTIN_BOOTSTRAP") {
-        append_bootstraps_from_comma_separated(&mut out, s, "VOID_BUILTIN_BOOTSTRAP (сборка)");
+        append_bootstraps_from_comma_separated(out, s, "VOID_BUILTIN_BOOTSTRAP (сборка)");
     }
 
     let mut urls: Vec<String> = Vec::new();
@@ -408,28 +492,14 @@ pub fn void_bootstrap_multiaddrs() -> Vec<Multiaddr> {
         if let Some(body) = fetch_void_bootstrap_list(&url) {
             let src = format!("GET {}", url);
             match verify_void_bootstrap_http_body(&body, &src) {
-                Ok(true) => append_bootstraps_from_lines(&mut out, &body, &src),
+                Ok(true) => append_bootstraps_from_lines(out, &body, &src),
                 Ok(false) => {}
                 Err(e) => warn!("{}", e),
             }
         }
     }
 
-    let path = Path::new("void-bootstrap.txt");
-    if path.exists() {
-        if let Ok(txt) = std::fs::read_to_string(path) {
-            match verify_void_bootstrap_file(path, &txt) {
-                Ok(()) => append_bootstraps_from_lines(&mut out, &txt, "void-bootstrap.txt"),
-                Err(e) => warn!("{}", e),
-            }
-        }
-    }
-
     if let Ok(s) = std::env::var("VOID_BOOTSTRAP") {
-        append_bootstraps_from_comma_separated(&mut out, &s, "VOID_BOOTSTRAP");
+        append_bootstraps_from_comma_separated(out, &s, "VOID_BOOTSTRAP");
     }
-
-    out.sort_by(|a, b| a.to_string().cmp(&b.to_string()));
-    out.dedup_by(|a, b| a == b);
-    out
 }

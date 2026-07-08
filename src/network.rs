@@ -24,7 +24,8 @@ use crate::protocol::{
     build_delete_ack_json, build_v1_hello,
     chat_message_id_from_json,     delete_command_message_ids, is_delete_command_json,
     is_read_command_json, new_message_id, parse_decrypted_chat_frame,
-    read_command_message_ids, verify_hello_transport_binding, transfer_id_to_hex, ChatMessage,
+    read_command_message_ids, verify_hello_transport_binding, validate_bootstrap_gossip_addrs,
+    transfer_id_to_hex, ChatMessage,
     DecryptedChatFrame, OutgoingDeliveryStatus, VoiceMeta, V1Packet,
 };
 
@@ -182,6 +183,81 @@ fn relay_circuit_dial_addrs(relay_addrs: &[Multiaddr], target: PeerId) -> Vec<Mu
     out
 }
 
+fn bootstrap_peer_ids_from(void_bootstraps: &[Multiaddr]) -> HashSet<PeerId> {
+    void_bootstraps
+        .iter()
+        .filter_map(|ma| peer_id_from_multiaddr(ma))
+        .collect()
+}
+
+fn merge_bootstraps_into_swarm(
+    swarm: &mut libp2p::Swarm<ChatBehaviour>,
+    void_bootstraps: &mut Vec<Multiaddr>,
+    bootstrap_peer_ids: &mut HashSet<PeerId>,
+    new_addrs: &[Multiaddr],
+) -> usize {
+    let mut added = 0usize;
+    for ma in new_addrs {
+        if !void_bootstraps.contains(ma) {
+            if let Some(pid) = peer_id_from_multiaddr(ma) {
+                void_bootstraps.push(ma.clone());
+                swarm.behaviour_mut().kad.add_address(&pid, ma.clone());
+                added += 1;
+            }
+        }
+    }
+    if added > 0 {
+        void_bootstraps.sort_by(|a, b| a.to_string().cmp(&b.to_string()));
+        void_bootstraps.dedup_by(|a, b| a == b);
+        *bootstrap_peer_ids = bootstrap_peer_ids_from(void_bootstraps);
+        let mut grouped: HashMap<PeerId, Vec<Multiaddr>> = HashMap::new();
+        for ma in new_addrs {
+            if let Some(pid) = peer_id_from_multiaddr(ma) {
+                grouped.entry(pid).or_default().push(ma.clone());
+            }
+        }
+        for (pid, addrs) in grouped {
+            dial_peer_best_effort(swarm, pid, addrs, void_bootstraps);
+        }
+        let _ = swarm.behaviour_mut().kad.bootstrap();
+    }
+    added
+}
+
+fn bootstrap_gossip_strings(void_bootstraps: &[Multiaddr]) -> Vec<String> {
+    void_bootstraps.iter().map(|a| a.to_string()).collect()
+}
+
+/// Эпидемический обмен bootstrap-нодами: рассылаем список всем подключённым VOID-клиентам.
+fn fanout_bootstrap_gossip(
+    swarm: &mut libp2p::Swarm<ChatBehaviour>,
+    local_peer_id: PeerId,
+    bootstrap_peer_ids: &HashSet<PeerId>,
+    addrs: Vec<String>,
+    exclude: Option<PeerId>,
+) {
+    if addrs.is_empty() {
+        return;
+    }
+    let targets: Vec<PeerId> = swarm
+        .connected_peers()
+        .copied()
+        .filter(|p| {
+            *p != local_peer_id
+                && exclude != Some(*p)
+                && !bootstrap_peer_ids.contains(p)
+        })
+        .collect();
+    for peer in targets {
+        let _ = swarm.behaviour_mut().request_response.send_request(
+            &peer,
+            V1Packet::BootstrapGossip {
+                addrs: addrs.clone(),
+            },
+        );
+    }
+}
+
 fn expand_dial_addrs(
     peer_id: PeerId,
     addrs: Vec<Multiaddr>,
@@ -249,6 +325,8 @@ pub(crate) enum NetworkEvent {
     /// / входящего коннекта). UI сохранит его в `contact_addrs` — тогда после
     /// рестарта связь с этим контактом поднимется сама.
     PeerAddress(PeerId, Multiaddr),
+    /// Новые bootstrap-ноды узнаны из сети — сохранить в vault.
+    BootstrapsLearned(Vec<String>),
     /// Получен Response (Ack) на ранее отправленное сообщение — доставка подтверждена.
     MessageDelivered { peer: PeerId, message_id: String },
     /// Собеседник прочитал наши сообщения.
@@ -413,8 +491,8 @@ pub(crate) enum UICommand {
     Dial(String),
     DialPeer(PeerId, Vec<Multiaddr>),
     SearchPeer(PeerId),
-    /// Перечитать `VOID_BOOTSTRAP` / файл / встроенные / URL и снова подать в Kad (как при старте).
-    ReloadBootstrapFromSources,
+    /// Перечитать bootstrap из vault + глобальные источники и переподключиться.
+    ReloadBootstraps(Vec<String>),
     /// Войти в сеть через один узел: IP, IP:PORT или полный multiaddr; после коннекта — kad.bootstrap.
     JoinViaNode(String),
     /// Собрать PeerId из kbuckets и отправить в UI.
@@ -923,6 +1001,7 @@ pub async fn run_chat_network(
     contact_seed_addrs: Vec<(PeerId, Multiaddr)>,
     chat_messages: SharedChatMessages,
 ) {
+        let mut void_bootstraps = void_bootstraps;
         let mut sessions: HashMap<PeerId, crypto::SecureSession> = HashMap::new();
         let mut pending_handshakes: HashMap<PeerId, crypto::StaticSecret> = HashMap::new();
         let mut pending_messages: HashMap<PeerId, Vec<Vec<u8>>> = HashMap::new();
@@ -1018,10 +1097,7 @@ pub async fn run_chat_network(
             debug!("⚠️ QUIC не поднят ни на одном порту");
         }
 
-        let bootstrap_peer_ids: HashSet<PeerId> = void_bootstraps
-            .iter()
-            .filter_map(|ma| peer_id_from_multiaddr(ma))
-            .collect();
+        let mut bootstrap_peer_ids = bootstrap_peer_ids_from(&void_bootstraps);
 
         let startup_status = if void_bootstraps.is_empty() {
             let lan = if std::env::var("VOID_DISABLE_MDNS").is_ok() {
@@ -1030,7 +1106,7 @@ pub async fn run_chat_network(
                 "LAN: mDNS."
             };
             format!(
-                "🚀 Запущен. Интернет: полный multiaddr контакта или встроенный/URL seed (см. код), VOID_BOOTSTRAP, void-bootstrap.txt. {}",
+                "🚀 Запущен. Войдите в сеть через IP или добавьте bootstrap в vault. {}",
                 lan
             )
         } else {
@@ -1157,9 +1233,22 @@ pub async fn run_chat_network(
         reconnect_tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
         let mut provider_tick = tokio::time::interval(Duration::from_secs(10 * 60));
         provider_tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+        let mut gossip_tick = tokio::time::interval(Duration::from_secs(2 * 60));
+        gossip_tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
 
         loop {
             tokio::select! {
+                // ─── Tick: эпидемический обмен bootstrap-нодами (2 мин) ─────
+                _ = gossip_tick.tick() => {
+                    let addrs = bootstrap_gossip_strings(&void_bootstraps);
+                    fanout_bootstrap_gossip(
+                        &mut swarm,
+                        local_peer_id,
+                        &bootstrap_peer_ids,
+                        addrs,
+                        None,
+                    );
+                }
                 // ─── Tick: переподключение к контактам (5 с) ────────────────
                 _ = reconnect_tick.tick() => {
                     let now = Instant::now();
@@ -1443,27 +1532,27 @@ pub async fn run_chat_network(
                                     }
                                 }
                             }
-                            UICommand::ReloadBootstrapFromSources => {
-                                let addrs = void_bootstrap_multiaddrs();
-                                if addrs.is_empty() {
+                            UICommand::ReloadBootstraps(vault_bootstraps) => {
+                                let merged = void_bootstrap_multiaddrs(&vault_bootstraps);
+                                if merged.is_empty() {
                                     let _ = event_tx
                                         .send(NetworkEvent::Status(
-                                            "Нет seed: задайте BUILTIN/URL в коде, VOID_BOOTSTRAP или void-bootstrap.txt."
+                                            "Нет bootstrap: добавьте ноду в vault (вход в сеть) или задайте VOID_BOOTSTRAP."
                                                 .into(),
                                         ))
                                         .await;
                                 } else {
-                                    for ma in &addrs {
-                                        if let Some(pid) = peer_id_from_multiaddr(ma) {
-                                            swarm.behaviour_mut().kad.add_address(&pid, ma.clone());
-                                            let _ = swarm.dial(ma.clone());
-                                        }
-                                    }
-                                    let _ = swarm.behaviour_mut().kad.bootstrap();
+                                    let added = merge_bootstraps_into_swarm(
+                                        &mut swarm,
+                                        &mut void_bootstraps,
+                                        &mut bootstrap_peer_ids,
+                                        &merged,
+                                    );
                                     let _ = event_tx
                                         .send(NetworkEvent::Status(format!(
-                                            "🌐 VOID: переподключение к {} seed (источники как при старте).",
-                                            addrs.len()
+                                            "🌐 VOID: {} bootstrap-узл(ов) из vault ({} новых).",
+                                            merged.len(),
+                                            added
                                         )))
                                         .await;
                                 }
@@ -2012,6 +2101,58 @@ pub async fn run_chat_network(
                             match message {
                                 libp2p::request_response::Message::Request { request, channel, .. } => {
                                     match request {
+                                        V1Packet::BootstrapGossip { addrs } => {
+                                            let their_set: HashSet<&str> =
+                                                addrs.iter().map(|s| s.as_str()).collect();
+                                            if let Some(valid) =
+                                                validate_bootstrap_gossip_addrs(&addrs)
+                                            {
+                                                let parsed: Vec<Multiaddr> = valid
+                                                    .iter()
+                                                    .filter_map(|s| s.parse().ok())
+                                                    .collect();
+                                                let added = merge_bootstraps_into_swarm(
+                                                    &mut swarm,
+                                                    &mut void_bootstraps,
+                                                    &mut bootstrap_peer_ids,
+                                                    &parsed,
+                                                );
+                                                if added > 0 {
+                                                    fanout_bootstrap_gossip(
+                                                        &mut swarm,
+                                                        local_peer_id,
+                                                        &bootstrap_peer_ids,
+                                                        valid.clone(),
+                                                        Some(peer),
+                                                    );
+                                                    let _ = event_tx
+                                                        .send(NetworkEvent::BootstrapsLearned(
+                                                            valid,
+                                                        ))
+                                                        .await;
+                                                }
+                                            }
+                                            let our_extra: Vec<String> = void_bootstraps
+                                                .iter()
+                                                .map(|a| a.to_string())
+                                                .filter(|s| !their_set.contains(s.as_str()))
+                                                .collect();
+                                            if !our_extra.is_empty() {
+                                                let _ = swarm
+                                                    .behaviour_mut()
+                                                    .request_response
+                                                    .send_request(
+                                                        &peer,
+                                                        V1Packet::BootstrapGossip {
+                                                            addrs: our_extra,
+                                                        },
+                                                    );
+                                            }
+                                            let _ = swarm
+                                                .behaviour_mut()
+                                                .request_response
+                                                .send_response(channel, V1Packet::Ack);
+                                        }
                                         V1Packet::Hello {
                                             public_key,
                                             ephemeral_key,
@@ -2485,6 +2626,7 @@ pub async fn run_chat_network(
                                                 }
                                             }
                                         }
+                                        V1Packet::BootstrapGossip { .. } => {}
                                     }
                                 }
                             }
@@ -2638,6 +2780,16 @@ pub async fn run_chat_network(
                                  }
                                  let _ = event_tx.send(NetworkEvent::Connected(peer_id)).await;
                                  let _ = event_tx.send(NetworkEvent::Status(format!("✅ СОЕДИНЕНО: {}", &peer_id.to_string()[..8]))).await;
+                                 // Сразу делимся bootstrap-нодами с любым подключённым VOID-клиентом.
+                                 if !bootstrap_peer_ids.contains(&peer_id) {
+                                     let gossip = bootstrap_gossip_strings(&void_bootstraps);
+                                     if !gossip.is_empty() {
+                                         let _ = swarm.behaviour_mut().request_response.send_request(
+                                             &peer_id,
+                                             V1Packet::BootstrapGossip { addrs: gossip },
+                                         );
+                                     }
+                                 }
                                  // Передаём рабочий multiaddr в UI: для Dialer — кого набирали,
                                  // для Listener — кто пришёл (send_back_addr + /p2p/peer_id).
                                  // UI сохранит его в контактную книгу.
@@ -2676,8 +2828,30 @@ pub async fn run_chat_network(
                                     libp2p::core::ConnectedPoint::Dialer { ref address, .. } => Some(address.clone()),
                                     _ => None,
                                 };
-                                if let Some(addr) = addr {
-                                    swarm.behaviour_mut().kad.add_address(&peer_id, addr);
+                                if let Some(mut addr) = addr {
+                                    swarm.behaviour_mut().kad.add_address(&peer_id, addr.clone());
+                                    if peer_id_from_multiaddr(&addr).is_none() {
+                                        addr.push(libp2p::multiaddr::Protocol::P2p(peer_id));
+                                    }
+                                    let added = merge_bootstraps_into_swarm(
+                                        &mut swarm,
+                                        &mut void_bootstraps,
+                                        &mut bootstrap_peer_ids,
+                                        &[addr.clone()],
+                                    );
+                                    if added > 0 {
+                                        let learned = vec![addr.to_string()];
+                                        fanout_bootstrap_gossip(
+                                            &mut swarm,
+                                            local_peer_id,
+                                            &bootstrap_peer_ids,
+                                            learned.clone(),
+                                            None,
+                                        );
+                                        let _ = event_tx
+                                            .send(NetworkEvent::BootstrapsLearned(learned))
+                                            .await;
+                                    }
                                 }
                                 pending_seed_bare = false;
                                 pending_seed_peers.remove(&peer_id);
@@ -2830,6 +3004,7 @@ pub async fn run_chat_network(
                                 )
                                 .await;
                             }
+                            let mut bootstrap_learned: Vec<String> = Vec::new();
                             for addr in info.listen_addrs {
                                 // Не тащим к себе заведомо-невалидные адреса пира
                                 // (VirtualBox/Docker/link-local). Они только
@@ -2854,12 +3029,40 @@ pub async fn run_chat_network(
                                     }
                                 }
 
+                                if is_bootstrap && peer_id != local_peer_id {
+                                    bootstrap_learned.push(a.to_string());
+                                }
+
                                 // Если это настоящий VOID-клиент — сохраним его
                                 // listen-адрес в контактной книге, чтобы связь поднялась
                                 // после рестарта без ручного ПОДКЛЮЧИТЬ.
                                 if has_chat && peer_id != local_peer_id {
                                     let _ = event_tx
                                         .send(NetworkEvent::PeerAddress(peer_id, a))
+                                        .await;
+                                }
+                            }
+                            if !bootstrap_learned.is_empty() {
+                                let parsed: Vec<Multiaddr> = bootstrap_learned
+                                    .iter()
+                                    .filter_map(|s| s.parse().ok())
+                                    .collect();
+                                let added = merge_bootstraps_into_swarm(
+                                    &mut swarm,
+                                    &mut void_bootstraps,
+                                    &mut bootstrap_peer_ids,
+                                    &parsed,
+                                );
+                                if added > 0 {
+                                    fanout_bootstrap_gossip(
+                                        &mut swarm,
+                                        local_peer_id,
+                                        &bootstrap_peer_ids,
+                                        bootstrap_learned.clone(),
+                                        None,
+                                    );
+                                    let _ = event_tx
+                                        .send(NetworkEvent::BootstrapsLearned(bootstrap_learned))
                                         .await;
                                 }
                             }
