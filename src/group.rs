@@ -78,6 +78,25 @@ pub(crate) fn validate_group_chat(g: &GroupChat) -> bool {
         })
 }
 
+/// Извлекает все invite-ссылки из текста сообщения.
+pub(crate) fn extract_invite_links(text: &str) -> Vec<String> {
+    let mut links = Vec::new();
+    let mut search_from = 0usize;
+    while let Some(rel) = text[search_from..].find("void://group/") {
+        let start = search_from + rel;
+        let tail = &text[start..];
+        let end = tail
+            .find(|c: char| c.is_whitespace())
+            .unwrap_or(tail.len());
+        links.push(tail[..end].to_string());
+        search_from = start + end;
+        if search_from >= text.len() {
+            break;
+        }
+    }
+    links
+}
+
 /// `void://group/{id}?name=…&m=peer1,peer2,…&creator=…`
 pub(crate) fn build_invite_link(group: &GroupChat) -> String {
     let name_enc = url_encode(&group.name);

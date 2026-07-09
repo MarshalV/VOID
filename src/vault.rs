@@ -433,23 +433,63 @@ impl VaultUnlockState {
 
 const KEYRING_SERVICE: &str = "VOID P2P Messenger";
 const KEYRING_USER: &str = "vault_password";
+const SESSION_PWD_FILE: &str = "void.pwd";
+
+#[cfg(windows)]
+fn session_file_save(password: &str) -> Result<(), Box<dyn Error>> {
+    use windows_dpapi::{encrypt_data, Scope};
+    let encrypted = encrypt_data(password.as_bytes(), Scope::User)
+        .map_err(|e| format!("dpapi encrypt: {e}"))?;
+    std::fs::write(SESSION_PWD_FILE, encrypted)?;
+    Ok(())
+}
+
+#[cfg(windows)]
+fn session_file_load() -> Option<String> {
+    use windows_dpapi::{decrypt_data, Scope};
+    let data = std::fs::read(SESSION_PWD_FILE).ok()?;
+    let plain = decrypt_data(&data, Scope::User).ok()?;
+    String::from_utf8(plain).ok().filter(|s| !s.is_empty())
+}
+
+#[cfg(windows)]
+fn session_file_clear() {
+    let _ = std::fs::remove_file(SESSION_PWD_FILE);
+}
 
 fn keyring_entry() -> Result<keyring::Entry, Box<dyn Error>> {
     keyring::Entry::new(KEYRING_SERVICE, KEYRING_USER).map_err(|e| e.into())
 }
 
-/// Сохраняет пароль vault в системном хранилище учётных данных.
+/// Сохраняет пароль vault в системном хранилище учётных данных (+ DPAPI-файл на Windows).
 pub(crate) fn save_remembered_password(password: &str) -> Result<(), Box<dyn Error>> {
-    keyring_entry()?.set_password(password).map_err(|e| e.into())
+    let keyring_err = keyring_entry()
+        .and_then(|entry| entry.set_password(password).map_err(|e| e.into()));
+    #[cfg(windows)]
+    {
+        session_file_save(password)?;
+        return keyring_err.or(Ok(()));
+    }
+    #[cfg(not(windows))]
+    keyring_err
 }
 
 /// Загружает сохранённый пароль vault (если есть).
 pub(crate) fn load_remembered_password() -> Option<String> {
-    keyring_entry()
-        .ok()?
-        .get_password()
-        .ok()
-        .filter(|p| !p.is_empty())
+    if let Ok(entry) = keyring_entry() {
+        if let Ok(pwd) = entry.get_password() {
+            if !pwd.is_empty() {
+                return Some(pwd);
+            }
+        }
+    }
+    #[cfg(windows)]
+    {
+        if let Some(pwd) = session_file_load() {
+            return Some(pwd);
+        }
+    }
+    None
 }
 
 /// Удаляет сохранённый пароль vault.
@@ -457,6 +497,8 @@ pub(crate) fn clear_remembered_password() {
     if let Ok(entry) = keyring_entry() {
         let _ = entry.delete_credential();
     }
+    #[cfg(windows)]
+    session_file_clear();
 }
 
 /// Определяет сценарий разблокировки по наличию `vault.bin` и формату `void.key`.

@@ -1838,6 +1838,7 @@ impl eframe::App for App {
                             is_retry: true,
                         });
                     }
+                    self.dispatch_outbox_for_peer(peer);
                     self.sync_groups_to_peer(peer);
                     self.retry_pending_group_sends_for_peer(peer);
                 }
@@ -1874,6 +1875,9 @@ impl eframe::App for App {
                     }
 
                     self.ingest_chat_message(msg.clone());
+                    if !msg.text.is_empty() {
+                        self.try_join_groups_from_invite_text(&msg.text);
+                    }
                     if let Some(ref voice) = msg.voice {
                         if let Some(path) = self.resolve_voice_path(&voice.transfer_id) {
                             self.register_voice_path(

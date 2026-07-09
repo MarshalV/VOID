@@ -20,8 +20,8 @@ use crate::chat_store::ChatJournal;
 use crate::crypto;
 use crate::file_transfer;
 use crate::group::{
-    self, build_invite_link, group_thread_key, is_group_thread, parse_group_thread_key,
-    parse_invite_link, GroupChat, GroupMember,
+    self, build_invite_link, extract_invite_links, group_thread_key, is_group_thread,
+    parse_group_thread_key, parse_invite_link, GroupChat, GroupMember,
 };
 use crate::network::{run_chat_network, NetworkEvent, UICommand};
 use crate::outbox::{Outbox, OutboxEntry};
@@ -1014,9 +1014,7 @@ impl App {
                     members,
                     recipient,
                 } => {
-                    if self.left_groups.contains(&group_id)
-                        || !self.is_active_group_member(&group_id)
-                    {
+                    if self.left_groups.contains(&group_id) {
                         continue;
                     }
                     let Ok(pid) = recipient.parse::<PeerId>() else {
@@ -1824,7 +1822,66 @@ impl App {
         self.persist_vault();
         self.broadcast_group_sync(&group);
         self.dial_group_members(&group);
+        for pid in group.member_peer_ids() {
+            if pid != self.local_peer_id {
+                self.send_group_invite_dm(pid, &group);
+            }
+        }
         Some(id)
+    }
+
+    /// Автоматически вступает в группу, если в тексте есть invite-ссылка.
+    pub(crate) fn try_join_groups_from_invite_text(&mut self, text: &str) {
+        for link in extract_invite_links(text) {
+            let Some(parsed) = parse_invite_link(&link) else {
+                continue;
+            };
+            if self.groups.contains_key(&parsed.id) && !self.left_groups.contains(&parsed.id) {
+                continue;
+            }
+            if self.join_group_from_invite(&link).is_ok() {
+                info!("Группа «{}» добавлена из invite в сообщении", parsed.name);
+            }
+        }
+    }
+
+    fn send_group_invite_dm(&mut self, peer: PeerId, group: &GroupChat) {
+        let link = build_invite_link(group);
+        let text = format!(
+            "📎 Приглашение в группу «{}»:\n{}",
+            group.name, link
+        );
+        let message_id = new_message_id();
+        self.stage_outgoing_message(ChatMessage {
+            id: message_id.clone(),
+            sender_id: self.local_peer_id.to_string(),
+            sender_name: self.local_nickname.clone(),
+            recipient_id: Some(peer.to_string()),
+            text: text.clone(),
+            timestamp: chrono::Local::now().format("%H:%M").to_string(),
+            delivery: OutgoingDeliveryStatus::Pending,
+            voice: None,
+            group_id: None,
+        });
+        self.outbox_track_direct(peer, message_id.clone(), text.clone());
+        self.pending_sends.push(PendingSend {
+            peer,
+            text: text.clone(),
+            message_id: message_id.clone(),
+            last_send_at: Instant::now(),
+            dht_kicked: false,
+            dht_kicked_at: None,
+            attempts: 0,
+            awaiting_session: false,
+        });
+        let _ = self.command_tx.try_send(UICommand::SendMessage {
+            sender_name: self.local_nickname.clone(),
+            text,
+            recipient: Some(peer),
+            message_id: Some(message_id),
+            is_retry: false,
+        });
+        let _ = self.command_tx.try_send(UICommand::SearchPeer(peer));
     }
 
     pub(crate) fn join_group_from_invite(&mut self, link: &str) -> Result<(), &'static str> {
@@ -1836,6 +1893,7 @@ impl App {
         self.selected_chat = thread.clone();
         self.messages.lock().entry(thread).or_default();
         self.dial_group_members(&group);
+        self.broadcast_group_sync(&group);
         self.persist_vault();
         Ok(())
     }
@@ -1864,6 +1922,7 @@ impl App {
         let group = group.clone();
         self.persist_vault();
         self.broadcast_group_sync(&group);
+        self.send_group_invite_dm(peer, &group);
         let _ = self.command_tx.try_send(UICommand::SearchPeer(peer));
         Ok(())
     }
@@ -2089,12 +2148,9 @@ impl App {
         });
     }
 
-    /// Отправляет group_sync пиру при первом подключении в этой сессии.
+    /// Отправляет group_sync пиру при подключении (повторяет при каждом reconnect).
     pub(crate) fn sync_groups_to_peer(&mut self, peer: PeerId) {
         if peer == self.local_peer_id {
-            return;
-        }
-        if !self.group_synced_peers.insert(peer) {
             return;
         }
         let peer_str = peer.to_string();
@@ -2108,9 +2164,10 @@ impl App {
             .map(|g| g.id.clone())
             .collect();
         for gid in group_ids {
-            let Some(group) = self.groups.get(&gid) else {
+            let Some(group) = self.groups.get(&gid).cloned() else {
                 continue;
             };
+            self.queue_outbox_group_sync(&group, peer);
             let _ = self.command_tx.try_send(UICommand::SendGroupSync {
                 group_id: group.id.clone(),
                 group_name: group.name.clone(),
@@ -2118,7 +2175,64 @@ impl App {
                 members: group.members.clone(),
                 recipients: vec![peer],
             });
-            self.remove_outbox_group_sync(&gid, &peer_str);
+        }
+    }
+
+    /// Повторно отправляет outbox-записи конкретному пиру после подключения.
+    pub(crate) fn dispatch_outbox_for_peer(&mut self, peer: PeerId) {
+        let peer_str = peer.to_string();
+        let entries = self.outbox_entries.clone();
+        for entry in entries {
+            match entry {
+                OutboxEntry::DirectMessage {
+                    peer: p,
+                    message_id,
+                    text,
+                } if p == peer_str => {
+                    if !self
+                        .pending_sends
+                        .iter()
+                        .any(|x| x.message_id == message_id)
+                    {
+                        self.pending_sends.push(PendingSend {
+                            peer,
+                            text: text.clone(),
+                            message_id: message_id.clone(),
+                            last_send_at: Instant::now(),
+                            dht_kicked: false,
+                            dht_kicked_at: None,
+                            attempts: 0,
+                            awaiting_session: false,
+                        });
+                    }
+                    let _ = self.command_tx.try_send(UICommand::SendMessage {
+                        sender_name: self.local_nickname.clone(),
+                        text,
+                        recipient: Some(peer),
+                        message_id: Some(message_id),
+                        is_retry: true,
+                    });
+                }
+                OutboxEntry::GroupSync {
+                    group_id,
+                    group_name,
+                    creator_id,
+                    members,
+                    recipient,
+                } if recipient == peer_str => {
+                    if self.left_groups.contains(&group_id) {
+                        continue;
+                    }
+                    let _ = self.command_tx.try_send(UICommand::SendGroupSync {
+                        group_id,
+                        group_name,
+                        creator_id,
+                        members,
+                        recipients: vec![peer],
+                    });
+                }
+                _ => {}
+            }
         }
     }
 
