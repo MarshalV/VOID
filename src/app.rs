@@ -150,6 +150,8 @@ pub(crate) struct PendingGroupSend {
     pub(crate) message_id: String,
     pub(crate) last_send_at: Instant,
     pub(crate) attempts: u32,
+    /// Подтверждённые доставки (по одному на каждого участника, кроме себя).
+    pub(crate) delivered_to: HashSet<PeerId>,
 }
 
 pub(crate) const RESEND_GRACE: Duration = Duration::from_secs(1);
@@ -681,6 +683,7 @@ impl App {
         }
 
         self.restore_pending_outgoing();
+        self.restore_group_syncs();
 
         info!("=== VOID P2P Chat ===");
         info!("Ваш Peer ID: {}", self.local_peer_id);
@@ -726,6 +729,12 @@ impl App {
         if self.messages.take_dirty() {
             self.persist_chat_journal();
         }
+    }
+
+    /// Сохраняет исходящее сообщение в журнал сразу (до подтверждения сети).
+    pub(crate) fn stage_outgoing_message(&mut self, msg: ChatMessage) {
+        self.ingest_chat_message(msg);
+        self.persist_chat_journal();
     }
 
     pub(crate) fn ingest_chat_message(&mut self, mut msg: ChatMessage) {
@@ -865,6 +874,25 @@ impl App {
             out
         };
 
+        let group_snapshot: Vec<(String, ChatMessage)> = {
+            let messages = self.messages.lock();
+            let mut out = Vec::new();
+            for (thread_key, msgs) in messages.iter() {
+                let Some(gid) = parse_group_thread_key(thread_key) else {
+                    continue;
+                };
+                for msg in msgs {
+                    if msg.sender_id == me
+                        && msg.delivery == OutgoingDeliveryStatus::Pending
+                        && !msg.text.is_empty()
+                    {
+                        out.push((gid.to_string(), msg.clone()));
+                    }
+                }
+            }
+            out
+        };
+
         for (peer, msg) in snapshot {
             if let Some(voice) = msg.voice.clone() {
                 let Some(transfer_id) = transfer_id_from_hex(&voice.transfer_id) else {
@@ -924,6 +952,107 @@ impl App {
                 text: msg.text,
                 recipient: Some(peer),
                 message_id: Some(msg.id),
+                is_retry: true,
+            });
+        }
+
+        for (gid, msg) in group_snapshot {
+            if self
+                .pending_group_sends
+                .iter()
+                .any(|p| p.message_id == msg.id)
+            {
+                continue;
+            }
+            let members = self
+                .groups
+                .get(&gid)
+                .map(|g| g.member_peer_ids())
+                .unwrap_or_default();
+            let targets: Vec<PeerId> = members
+                .iter()
+                .copied()
+                .filter(|p| *p != self.local_peer_id)
+                .collect();
+            if targets.is_empty() {
+                continue;
+            }
+            self.pending_group_sends.push(PendingGroupSend {
+                group_id: gid.clone(),
+                members,
+                text: msg.text.clone(),
+                message_id: msg.id.clone(),
+                last_send_at: Instant::now(),
+                attempts: 0,
+                delivered_to: HashSet::new(),
+            });
+            let _ = self.command_tx.try_send(UICommand::SendGroupMessage {
+                sender_name: self.local_nickname.clone(),
+                text: msg.text,
+                group_id: gid,
+                members: targets,
+                message_id: Some(msg.id),
+                is_retry: true,
+            });
+        }
+    }
+
+    /// Повторно рассылает состав всех групп после рестарта.
+    pub(crate) fn restore_group_syncs(&mut self) {
+        let groups: Vec<GroupChat> = self.groups.values().cloned().collect();
+        for group in groups {
+            self.broadcast_group_sync(&group);
+            self.dial_group_members(&group);
+        }
+    }
+
+    /// Отправляет group_sync пиру для всех общих групп (при подключении).
+    pub(crate) fn sync_groups_to_peer(&mut self, peer: PeerId) {
+        if peer == self.local_peer_id {
+            return;
+        }
+        let peer_str = peer.to_string();
+        for group in self.groups.values() {
+            if !group.members.iter().any(|m| m.peer_id == peer_str) {
+                continue;
+            }
+            let _ = self.command_tx.try_send(UICommand::SendGroupSync {
+                group_id: group.id.clone(),
+                group_name: group.name.clone(),
+                creator_id: group.creator_id.clone(),
+                members: group.members.clone(),
+                recipients: vec![peer],
+            });
+        }
+    }
+
+    /// Повторяет недоставленные групповые сообщения при появлении пира в сети.
+    pub(crate) fn retry_pending_group_sends_for_peer(&mut self, peer: PeerId) {
+        if peer == self.local_peer_id {
+            return;
+        }
+        let due: Vec<PendingGroupSend> = self
+            .pending_group_sends
+            .iter()
+            .filter(|p| p.members.contains(&peer) && !p.delivered_to.contains(&peer))
+            .cloned()
+            .collect();
+        for item in due {
+            let targets: Vec<PeerId> = item
+                .members
+                .iter()
+                .copied()
+                .filter(|m| *m != self.local_peer_id && !item.delivered_to.contains(m))
+                .collect();
+            if targets.is_empty() {
+                continue;
+            }
+            let _ = self.command_tx.try_send(UICommand::SendGroupMessage {
+                sender_name: self.local_nickname.clone(),
+                text: item.text.clone(),
+                group_id: item.group_id.clone(),
+                members: targets,
+                message_id: Some(item.message_id.clone()),
                 is_retry: true,
             });
         }
@@ -1388,9 +1517,10 @@ impl App {
             .lock()
             .entry(self.selected_chat.clone())
             .or_default();
+        self.persist_vault();
+        self.persist_chat_journal();
         self.broadcast_group_sync(&group);
         self.dial_group_members(&group);
-        self.persist_vault();
         Some(id)
     }
 
@@ -1428,9 +1558,9 @@ impl App {
             display_name,
         });
         let group = group.clone();
+        self.persist_vault();
         self.broadcast_group_sync(&group);
         let _ = self.command_tx.try_send(UICommand::SearchPeer(peer));
-        self.persist_vault();
         Ok(())
     }
 
@@ -1547,9 +1677,32 @@ impl App {
         Some(build_invite_link(group))
     }
 
-    pub(crate) fn complete_pending_group_send(&mut self, message_id: &str) {
-        self.pending_group_sends
-            .retain(|p| p.message_id != message_id);
+    pub(crate) fn mark_group_message_delivered(&mut self, peer: PeerId, message_id: &str) {
+        self.set_outgoing_delivery(
+            peer,
+            message_id,
+            OutgoingDeliveryStatus::Delivered,
+        );
+        let me = self.local_peer_id;
+        let mut remove = false;
+        if let Some(idx) = self
+            .pending_group_sends
+            .iter()
+            .position(|p| p.message_id == message_id)
+        {
+            self.pending_group_sends[idx].delivered_to.insert(peer);
+            let needed: HashSet<PeerId> = self.pending_group_sends[idx]
+                .members
+                .iter()
+                .copied()
+                .filter(|p| *p != me)
+                .collect();
+            remove = needed.is_subset(&self.pending_group_sends[idx].delivered_to);
+        }
+        if remove {
+            self.pending_group_sends
+                .retain(|p| p.message_id != message_id);
+        }
     }
 
     pub(crate) fn tick_pending_group_sends(&mut self) {
@@ -1561,6 +1714,15 @@ impl App {
             .cloned()
             .collect();
         for item in due {
+            let targets: Vec<PeerId> = item
+                .members
+                .iter()
+                .copied()
+                .filter(|m| *m != self.local_peer_id && !item.delivered_to.contains(m))
+                .collect();
+            if targets.is_empty() {
+                continue;
+            }
             if let Some(slot) = self
                 .pending_group_sends
                 .iter_mut()
@@ -1573,7 +1735,7 @@ impl App {
                 sender_name: self.local_nickname.clone(),
                 text: item.text.clone(),
                 group_id: item.group_id.clone(),
-                members: item.members.clone(),
+                members: targets,
                 message_id: Some(item.message_id.clone()),
                 is_retry: true,
             });

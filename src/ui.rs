@@ -17,6 +17,7 @@ use crate::{
     RESEND_GRACE,
 };
 use crate::group::{group_thread_key, is_group_thread, GroupChat};
+use crate::protocol::ChatMessage;
 use crate::voice;
 
 #[derive(Clone, Copy)]
@@ -1822,6 +1823,8 @@ impl eframe::App for App {
                             is_retry: true,
                         });
                     }
+                    self.sync_groups_to_peer(peer);
+                    self.retry_pending_group_sends_for_peer(peer);
                 }
                 NetworkEvent::Disconnected(peer) => {
                     self.connected_peers = self.connected_peers.saturating_sub(1);
@@ -1899,7 +1902,7 @@ impl eframe::App for App {
                         OutgoingDeliveryStatus::Delivered,
                     );
                     self.complete_pending_send(peer, &message_id);
-                    self.complete_pending_group_send(&message_id);
+                    self.mark_group_message_delivered(peer, &message_id);
                 }
                 NetworkEvent::MessageRead { peer, message_ids } => {
                     self.mark_outgoing_read(peer, &message_ids);
@@ -3201,11 +3204,29 @@ impl eframe::App for App {
                                     if members.is_empty() {
                                         self.add_status("⚠ Группа не найдена".into());
                                     } else {
+                                        let targets: Vec<PeerId> = members
+                                            .iter()
+                                            .copied()
+                                            .filter(|p| *p != self.local_peer_id)
+                                            .collect();
+                                        self.stage_outgoing_message(ChatMessage {
+                                            id: message_id.clone(),
+                                            sender_id: self.local_peer_id.to_string(),
+                                            sender_name: self.local_nickname.clone(),
+                                            recipient_id: None,
+                                            text: text_to_send.clone(),
+                                            timestamp: chrono::Local::now()
+                                                .format("%H:%M")
+                                                .to_string(),
+                                            delivery: OutgoingDeliveryStatus::Pending,
+                                            voice: None,
+                                            group_id: Some(gid.clone()),
+                                        });
                                         match self.command_tx.try_send(UICommand::SendGroupMessage {
                                             sender_name: self.local_nickname.clone(),
                                             text: text_to_send.clone(),
                                             group_id: gid.clone(),
-                                            members: members.clone(),
+                                            members: targets.clone(),
                                             message_id: Some(message_id.clone()),
                                             is_retry: false,
                                         }) {
@@ -3218,6 +3239,7 @@ impl eframe::App for App {
                                                     message_id,
                                                     last_send_at: Instant::now(),
                                                     attempts: 0,
+                                                    delivered_to: std::collections::HashSet::new(),
                                                 });
                                             }
                                             Err(_) => self.add_status(
@@ -3229,6 +3251,19 @@ impl eframe::App for App {
                                 } else if let Some(peer_id) = self.selected_chat.parse::<PeerId>().ok() {
                                     let text_to_send = self.chat_input.clone();
                                     let message_id = new_message_id();
+                                    self.stage_outgoing_message(ChatMessage {
+                                        id: message_id.clone(),
+                                        sender_id: self.local_peer_id.to_string(),
+                                        sender_name: self.local_nickname.clone(),
+                                        recipient_id: Some(peer_id.to_string()),
+                                        text: text_to_send.clone(),
+                                        timestamp: chrono::Local::now()
+                                            .format("%H:%M")
+                                            .to_string(),
+                                        delivery: OutgoingDeliveryStatus::Pending,
+                                        voice: None,
+                                        group_id: None,
+                                    });
                                     match self.command_tx.try_send(UICommand::SendMessage {
                                         sender_name: self.local_nickname.clone(),
                                         text: text_to_send.clone(),
