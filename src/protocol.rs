@@ -111,6 +111,19 @@ struct GroupSyncCommand {
     members: Vec<GroupMember>,
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct GroupLeaveCommand {
+    kind: String,
+    group_id: String,
+    peer_id: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct GroupDeleteCommand {
+    kind: String,
+    group_id: String,
+}
+
 pub(crate) enum DecryptedChatFrame {
     Message(ChatMessage),
     Delete { message_ids: Vec<String> },
@@ -121,6 +134,13 @@ pub(crate) enum DecryptedChatFrame {
         group_name: String,
         creator_id: String,
         members: Vec<GroupMember>,
+    },
+    GroupLeave {
+        group_id: String,
+        peer_id: String,
+    },
+    GroupDelete {
+        group_id: String,
     },
 }
 
@@ -328,7 +348,49 @@ pub(crate) fn parse_decrypted_chat_frame(plaintext: &[u8]) -> Option<DecryptedCh
             });
         }
     }
+    if let Ok(cmd) = serde_json::from_slice::<GroupLeaveCommand>(plaintext) {
+        if cmd.kind == "group_leave"
+            && group::validate_group_id(&cmd.group_id)
+            && !cmd.peer_id.is_empty()
+            && cmd.peer_id.len() <= MAX_CHAT_SENDER_ID_BYTES
+        {
+            return Some(DecryptedChatFrame::GroupLeave {
+                group_id: cmd.group_id,
+                peer_id: cmd.peer_id,
+            });
+        }
+    }
+    if let Ok(cmd) = serde_json::from_slice::<GroupDeleteCommand>(plaintext) {
+        if cmd.kind == "group_delete" && group::validate_group_id(&cmd.group_id) {
+            return Some(DecryptedChatFrame::GroupDelete {
+                group_id: cmd.group_id,
+            });
+        }
+    }
     parse_decrypted_chat_json(plaintext).map(DecryptedChatFrame::Message)
+}
+
+pub(crate) fn build_group_leave_json(group_id: &str, peer_id: &str) -> Option<Vec<u8>> {
+    if !group::validate_group_id(group_id) || peer_id.is_empty() || peer_id.len() > 512 {
+        return None;
+    }
+    let cmd = GroupLeaveCommand {
+        kind: "group_leave".into(),
+        group_id: group_id.to_string(),
+        peer_id: peer_id.to_string(),
+    };
+    serde_json::to_vec(&cmd).ok()
+}
+
+pub(crate) fn build_group_delete_json(group_id: &str) -> Option<Vec<u8>> {
+    if !group::validate_group_id(group_id) {
+        return None;
+    }
+    let cmd = GroupDeleteCommand {
+        kind: "group_delete".into(),
+        group_id: group_id.to_string(),
+    };
+    serde_json::to_vec(&cmd).ok()
 }
 
 pub(crate) fn build_group_sync_json(

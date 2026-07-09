@@ -1,4 +1,5 @@
 mod group;
+mod outbox;
 mod chat_store;
 mod crypto;
 mod file_transfer;
@@ -18,7 +19,7 @@ pub(crate) use protocol::{new_message_id, OutgoingDeliveryStatus};
 pub(crate) use network::{NetworkEvent, UICommand};
 pub(crate) use protocol::FileTransferProgress;
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::error::Error;
 
 use eframe::egui;
@@ -28,7 +29,7 @@ use tracing::info;
 
 use app::DeferredNetworkSpawn;
 use network::env_flag_true;
-use vault::{detect_vault_unlock_kind, VaultUnlockState};
+use vault::{detect_vault_unlock_kind, load_remembered_password, VaultUnlockKind, VaultUnlockState};
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn Error>> {
@@ -180,12 +181,15 @@ async fn main() -> Result<(), Box<dyn Error>> {
         chat_messages: chat_messages.clone(),
     };
 
-    let pending_unlock_state = VaultUnlockState {
-        kind: vault_unlock_kind,
-        password: String::new(),
-        password_confirm: String::new(),
-        error: None,
-    };
+    let mut pending_unlock_state = VaultUnlockState::new(vault_unlock_kind.clone());
+    if matches!(vault_unlock_kind, VaultUnlockKind::OpenWrappedKey) {
+        if let Some(saved) = load_remembered_password() {
+            pending_unlock_state.password = saved;
+            pending_unlock_state.remember_password = true;
+            pending_unlock_state.try_auto_unlock = true;
+        }
+    }
+    pending_unlock_state.kind = vault_unlock_kind;
 
     let placeholder_kp = libp2p::identity::Keypair::generate_ed25519();
     let placeholder_peer_id = PeerId::from(placeholder_kp.public());
@@ -215,6 +219,7 @@ async fn main() -> Result<(), Box<dyn Error>> {
                 HashMap::new(),
                 HashMap::new(),
                 HashMap::new(),
+                HashSet::new(),
                 command_tx,
                 event_rx,
                 chat_messages,

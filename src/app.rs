@@ -24,12 +24,16 @@ use crate::group::{
     parse_invite_link, GroupChat, GroupMember,
 };
 use crate::network::{run_chat_network, NetworkEvent, UICommand};
+use crate::outbox::{Outbox, OutboxEntry};
 use crate::protocol::{
     new_message_id, transfer_id_from_hex, transfer_id_to_hex, ChatMessage, FileTransferProgress,
     OutgoingDeliveryStatus, VoiceMeta,
 };
 use crate::ui::{setup_custom_style, Toast, ToastKind, TOAST_TTL_LONG, TOAST_TTL_SHORT};
-use crate::vault::{AddressBookEntry, Storage, VaultUnlockKind, VaultUnlockState};
+use crate::vault::{
+    clear_remembered_password, save_remembered_password, AddressBookEntry, Storage,
+    VaultUnlockKind, VaultUnlockState,
+};
 use crate::voice::{VoicePlayer, VoiceRecorder};
 
 /// Переписки, доступные и UI, и сетевому таску (входящее удаление без roundtrip через egui).
@@ -160,6 +164,8 @@ pub(crate) const RESEND_DELAY_BASE: Duration = Duration::from_secs(2);
 pub(crate) const RESEND_DELAY_MAX: Duration = Duration::from_secs(300);
 /// Сколько ждём E2EE-хендшейк, прежде чем снова разрешить DHT-ретрай.
 pub(crate) const SESSION_WAIT_TIMEOUT: Duration = Duration::from_secs(20);
+/// Журнал переписок пишем на диск не чаще этого интервала (не блокируем отправку).
+pub(crate) const JOURNAL_PERSIST_DEBOUNCE: Duration = Duration::from_secs(2);
 
 pub(crate) fn resend_delay_for_attempt(attempts: u32) -> Duration {
     let exp = attempts.min(6);
@@ -223,12 +229,19 @@ pub(crate) struct App {
     pub(crate) pending_group_sends: Vec<PendingGroupSend>,
     /// Групповые чаты (id → метаданные).
     pub(crate) groups: HashMap<String, GroupChat>,
+    /// Группы, из которых вышли — не показывать и не принимать новые сообщения.
+    pub(crate) left_groups: HashSet<String>,
     pub(crate) show_create_group: bool,
     pub(crate) create_group_name: String,
     pub(crate) create_group_pick: HashSet<PeerId>,
     pub(crate) join_group_link: String,
     pub(crate) show_group_panel: bool,
     pub(crate) add_group_member_peer: String,
+    /// Недоставленное: быстрый `outbox.bin` (переживает выход из приложения).
+    pub(crate) outbox_entries: Vec<OutboxEntry>,
+    /// Пиры, которым уже отправили group_sync в этой сессии (до disconnect).
+    pub(crate) group_synced_peers: HashSet<PeerId>,
+    journal_persist_after: Option<Instant>,
     /// Ожидаемый результат выбора папки сохранения: `(rx, transfer_id, from_peer)`.
     /// Поллим `try_recv()` каждый кадр; `None` = выбор не идёт.
     pub(crate) pending_accept: Option<(
@@ -262,6 +275,7 @@ fn resolve_vault_bootstraps(
                 None,
                 Some(&bootstraps),
                 None,
+                None,
             ) {
                 warn!("VOID: импорт void-bootstrap.txt → vault: {}", e);
             } else {
@@ -284,6 +298,7 @@ impl App {
         initial_address_book: HashMap<PeerId, String>,
         initial_contact_addrs: HashMap<PeerId, Vec<Multiaddr>>,
         initial_groups: HashMap<String, GroupChat>,
+        initial_left_groups: HashSet<String>,
         command_tx: mpsc::Sender<UICommand>,
         event_rx: mpsc::Receiver<NetworkEvent>,
         chat_messages: SharedChatMessages,
@@ -334,12 +349,16 @@ impl App {
             pending_voice_sends: Vec::new(),
             pending_group_sends: Vec::new(),
             groups: initial_groups,
+            left_groups: initial_left_groups,
             show_create_group: false,
             create_group_name: String::new(),
             create_group_pick: HashSet::new(),
             join_group_link: String::new(),
             show_group_panel: false,
             add_group_member_peer: String::new(),
+            outbox_entries: Vec::new(),
+            group_synced_peers: HashSet::new(),
+            journal_persist_after: None,
             pending_accept: None,
             pending_unlock,
             deferred_network_spawn,
@@ -351,6 +370,16 @@ impl App {
 
     /// Экран разблокировки vault. Возвращает `true`, пока нужно блокировать основной UI.
     pub(crate) fn vault_unlock_gate(&mut self, ctx: &egui::Context) -> bool {
+        if self
+            .pending_unlock
+            .as_ref()
+            .is_some_and(|p| p.try_auto_unlock && !p.password.is_empty())
+        {
+            self.pending_unlock.as_mut().unwrap().try_auto_unlock = false;
+            self.submit_vault_unlock(ctx);
+            return true;
+        }
+
         let kind = match self.pending_unlock.as_ref() {
             Some(p) => p.kind.clone(),
             None => return false,
@@ -402,6 +431,16 @@ impl App {
                         );
                     }
 
+                    ui.add_space(8.0);
+                    ui.checkbox(
+                        &mut p.remember_password,
+                        "Запомнить пароль на этом устройстве",
+                    )
+                    .on_hover_text(
+                        "Пароль сохраняется в системном хранилище (Windows / macOS / Linux) \
+                         и подставляется при следующем запуске.",
+                    );
+
                     if let Some(err) = &p.error {
                         ui.add_space(8.0);
                         ui.colored_label(egui::Color32::from_rgb(220, 100, 100), err);
@@ -435,7 +474,9 @@ impl App {
             return;
         };
         pending.error = None;
-        let pwd = pending.password.trim();
+        let remember_password = pending.remember_password;
+        let pwd_owned = pending.password.clone();
+        let pwd = pwd_owned.trim();
         let pwd2 = pending.password_confirm.trim();
         let require_confirm = matches!(
             pending.kind,
@@ -444,11 +485,13 @@ impl App {
 
         if pwd.len() < 8 {
             pending.error = Some("Укажите пароль не короче 8 символов.".into());
+            pending.try_auto_unlock = false;
             self.pending_unlock = Some(pending);
             return;
         }
         if require_confirm && pwd != pwd2 {
             pending.error = Some("Пароли не совпадают.".into());
+            pending.try_auto_unlock = false;
             self.pending_unlock = Some(pending);
             return;
         }
@@ -465,9 +508,12 @@ impl App {
             VaultUnlockKind::OpenWrappedKey => match Storage::unwrap_master_key_file(pwd) {
                 Ok(m) => Zeroizing::new(m),
                 Err(e) => {
+                    clear_remembered_password();
                     pending.password.zeroize();
                     pending.password_confirm.zeroize();
-                    pending.error = Some(format!("{}", e));
+                    pending.try_auto_unlock = false;
+                    pending.remember_password = false;
+                    pending.error = Some(format!("{e}"));
                     self.pending_unlock = Some(pending);
                     return;
                 }
@@ -497,6 +543,14 @@ impl App {
             }
         };
 
+        if remember_password {
+            if let Err(e) = save_remembered_password(pwd) {
+                warn!("VOID: не удалось сохранить пароль в системном хранилище: {}", e);
+            }
+        } else {
+            clear_remembered_password();
+        }
+
         pending.password.zeroize();
         pending.password_confirm.zeroize();
         drop(pending);
@@ -507,6 +561,8 @@ impl App {
                 password: String::new(),
                 password_confirm: String::new(),
                 error: Some("Внутренняя ошибка: параметры сети недоступны.".into()),
+                remember_password,
+                try_auto_unlock: false,
             });
             return;
         };
@@ -521,6 +577,8 @@ impl App {
                             password: String::new(),
                             password_confirm: String::new(),
                             error: Some(format!("Не удалось прочитать vault.bin: {}", e)),
+                            remember_password,
+                            try_auto_unlock: false,
                         });
                         self.deferred_network_spawn = Some(dn_sp);
                         return;
@@ -536,6 +594,8 @@ impl App {
                             password: String::new(),
                             password_confirm: String::new(),
                             error: Some(format!("Не удалось восстановить ключи: {}", e)),
+                            remember_password,
+                            try_auto_unlock: false,
                         });
                         self.deferred_network_spawn = Some(dn_sp);
                         return;
@@ -569,8 +629,12 @@ impl App {
                     .flat_map(|(pid, addrs)| addrs.iter().cloned().map(move |a| (*pid, a)))
                     .collect();
                 let mut groups_map: HashMap<String, GroupChat> = HashMap::new();
+                let left_groups: HashSet<String> =
+                    storage.left_groups.into_iter().collect();
                 for g in storage.groups {
-                    groups_map.insert(g.id.clone(), g);
+                    if !left_groups.contains(&g.id) {
+                        groups_map.insert(g.id.clone(), g);
+                    }
                 }
                 tokio::spawn(run_chat_network(
                     dn_sp.command_rx,
@@ -590,6 +654,7 @@ impl App {
                     book,
                     addrs_map,
                     groups_map,
+                    left_groups,
                     master_arr,
                 );
             }
@@ -609,6 +674,7 @@ impl App {
                     None,
                     None,
                     None,
+                    None,
                 ) {
                     let _ = std::fs::remove_file(Storage::KEY_FILE);
                     self.pending_unlock = Some(VaultUnlockState {
@@ -616,6 +682,8 @@ impl App {
                         password: String::new(),
                         password_confirm: String::new(),
                         error: Some(format!("Не удалось создать vault: {}", e)),
+                        remember_password,
+                        try_auto_unlock: false,
                     });
                     self.deferred_network_spawn = Some(dn_sp);
                     return;
@@ -641,6 +709,7 @@ impl App {
                     HashMap::new(),
                     HashMap::new(),
                     HashMap::new(),
+                    HashSet::new(),
                     master_arr,
                 );
             }
@@ -657,6 +726,7 @@ impl App {
         book: HashMap<PeerId, String>,
         addrs_map: HashMap<PeerId, Vec<Multiaddr>>,
         groups: HashMap<String, GroupChat>,
+        left_groups: HashSet<String>,
         master_arr: Zeroizing<[u8; 32]>,
     ) {
         self.local_peer_id = PeerId::from(local_key.public());
@@ -664,6 +734,7 @@ impl App {
         self.known_peers = book;
         self.contact_addrs = addrs_map;
         self.groups = groups;
+        self.left_groups = left_groups;
         self._local_static = static_secret;
         self.pending_unlock = None;
         self.vault_master_key = Some(master_arr.clone());
@@ -682,8 +753,15 @@ impl App {
             }
         }
 
+        match Outbox::load(&master_arr) {
+            Ok(entries) => {
+                self.outbox_entries = entries;
+                info!("Загружено {} записей из outbox.bin", self.outbox_entries.len());
+            }
+            Err(e) => warn!("VOID: не удалось загрузить outbox.bin: {}", e),
+        }
         self.restore_pending_outgoing();
-        self.restore_group_syncs();
+        self.dispatch_outbox();
 
         info!("=== VOID P2P Chat ===");
         info!("Ваш Peer ID: {}", self.local_peer_id);
@@ -731,10 +809,236 @@ impl App {
         }
     }
 
-    /// Сохраняет исходящее сообщение в журнал сразу (до подтверждения сети).
+    /// Сохраняет исходящее в память + outbox (быстро), журнал — с debounce.
     pub(crate) fn stage_outgoing_message(&mut self, msg: ChatMessage) {
         self.ingest_chat_message(msg);
+        self.schedule_journal_persist();
+    }
+
+    pub(crate) fn schedule_journal_persist(&mut self) {
+        self.journal_persist_after =
+            Some(Instant::now() + JOURNAL_PERSIST_DEBOUNCE);
+    }
+
+    pub(crate) fn tick_journal_persist(&mut self) {
+        if let Some(deadline) = self.journal_persist_after {
+            if Instant::now() >= deadline {
+                self.journal_persist_after = None;
+                self.persist_chat_journal();
+            }
+        }
+    }
+
+    pub(crate) fn persist_all_before_exit(&self) {
         self.persist_chat_journal();
+        self.persist_outbox();
+    }
+
+    fn persist_outbox(&self) {
+        let Some(ref key) = self.vault_master_key else {
+            return;
+        };
+        if let Err(e) = Outbox::save(key, &self.outbox_entries) {
+            warn!("VOID: не удалось сохранить outbox.bin: {}", e);
+        }
+    }
+
+    fn push_outbox(&mut self, entry: OutboxEntry) {
+        self.outbox_entries.retain(|e| !outbox_same_slot(e, &entry));
+        self.outbox_entries.push(entry);
+        self.persist_outbox();
+    }
+
+    fn remove_outbox_direct(&mut self, peer: &str, message_id: &str) {
+        let before = self.outbox_entries.len();
+        self.outbox_entries.retain(|e| {
+            !matches!(
+                e,
+                OutboxEntry::DirectMessage { peer: p, message_id: id, .. }
+                    if p == peer && id == message_id
+            )
+        });
+        if self.outbox_entries.len() != before {
+            self.persist_outbox();
+        }
+    }
+
+    fn remove_outbox_group_message(&mut self, message_id: &str) {
+        let before = self.outbox_entries.len();
+        self.outbox_entries.retain(|e| {
+            !matches!(
+                e,
+                OutboxEntry::GroupMessage { message_id: id, .. } if id == message_id
+            )
+        });
+        if self.outbox_entries.len() != before {
+            self.persist_outbox();
+        }
+    }
+
+    fn remove_outbox_group_sync(&mut self, group_id: &str, recipient: &str) {
+        let before = self.outbox_entries.len();
+        self.outbox_entries.retain(|e| {
+            !matches!(
+                e,
+                OutboxEntry::GroupSync { group_id: g, recipient: r, .. }
+                    if g == group_id && r == recipient
+            )
+        });
+        if self.outbox_entries.len() != before {
+            self.persist_outbox();
+        }
+    }
+
+    pub(crate) fn outbox_track_direct(&mut self, peer: PeerId, message_id: String, text: String) {
+        self.push_outbox(OutboxEntry::DirectMessage {
+            peer: peer.to_string(),
+            message_id,
+            text,
+        });
+    }
+
+    pub(crate) fn outbox_track_group_message(
+        &mut self,
+        group_id: String,
+        message_id: String,
+        text: String,
+        members: Vec<PeerId>,
+    ) {
+        self.push_outbox(OutboxEntry::GroupMessage {
+            group_id,
+            message_id,
+            text,
+            members: members.iter().map(|p| p.to_string()).collect(),
+        });
+    }
+
+    fn queue_outbox_group_sync(&mut self, group: &GroupChat, recipient: PeerId) {
+        self.push_outbox(OutboxEntry::GroupSync {
+            group_id: group.id.clone(),
+            group_name: group.name.clone(),
+            creator_id: group.creator_id.clone(),
+            members: group.members.clone(),
+            recipient: recipient.to_string(),
+        });
+    }
+
+    /// Отправляет всё из outbox после старта (пережившее выход из приложения).
+    pub(crate) fn dispatch_outbox(&mut self) {
+        let entries = self.outbox_entries.clone();
+        for entry in entries {
+            match entry {
+                OutboxEntry::DirectMessage {
+                    peer,
+                    message_id,
+                    text,
+                } => {
+                    let Ok(pid) = peer.parse::<PeerId>() else {
+                        continue;
+                    };
+                    if !self
+                        .pending_sends
+                        .iter()
+                        .any(|p| p.message_id == message_id)
+                    {
+                        self.pending_sends.push(PendingSend {
+                            peer: pid,
+                            text: text.clone(),
+                            message_id: message_id.clone(),
+                            last_send_at: Instant::now(),
+                            dht_kicked: false,
+                            dht_kicked_at: None,
+                            attempts: 0,
+                            awaiting_session: false,
+                        });
+                    }
+                    let _ = self.command_tx.try_send(UICommand::SendMessage {
+                        sender_name: self.local_nickname.clone(),
+                        text,
+                        recipient: Some(pid),
+                        message_id: Some(message_id),
+                        is_retry: true,
+                    });
+                }
+                OutboxEntry::GroupMessage {
+                    group_id,
+                    message_id,
+                    text,
+                    members,
+                } => {
+                    if self.left_groups.contains(&group_id)
+                        || !self.is_active_group_member(&group_id)
+                    {
+                        continue;
+                    }
+                    let member_pids: Vec<PeerId> = members
+                        .iter()
+                        .filter_map(|s| s.parse().ok())
+                        .collect();
+                    let targets: Vec<PeerId> = member_pids
+                        .iter()
+                        .copied()
+                        .filter(|p| *p != self.local_peer_id)
+                        .collect();
+                    if targets.is_empty() {
+                        continue;
+                    }
+                    if !self
+                        .pending_group_sends
+                        .iter()
+                        .any(|p| p.message_id == message_id)
+                    {
+                        self.pending_group_sends.push(PendingGroupSend {
+                            group_id: group_id.clone(),
+                            members: member_pids,
+                            text: text.clone(),
+                            message_id: message_id.clone(),
+                            last_send_at: Instant::now(),
+                            attempts: 0,
+                            delivered_to: HashSet::new(),
+                        });
+                    }
+                    let _ = self.command_tx.try_send(UICommand::SendGroupMessage {
+                        sender_name: self.local_nickname.clone(),
+                        text,
+                        group_id,
+                        members: targets,
+                        message_id: Some(message_id),
+                        is_retry: true,
+                    });
+                }
+                OutboxEntry::GroupSync {
+                    group_id,
+                    group_name,
+                    creator_id,
+                    members,
+                    recipient,
+                } => {
+                    if self.left_groups.contains(&group_id)
+                        || !self.is_active_group_member(&group_id)
+                    {
+                        continue;
+                    }
+                    let Ok(pid) = recipient.parse::<PeerId>() else {
+                        continue;
+                    };
+                    if pid == self.local_peer_id {
+                        continue;
+                    }
+                    let _ = self.command_tx.try_send(UICommand::SendGroupSync {
+                        group_id,
+                        group_name,
+                        creator_id,
+                        members,
+                        recipients: vec![pid],
+                    });
+                }
+            }
+        }
+        let groups: Vec<GroupChat> = self.groups.values().cloned().collect();
+        for group in groups {
+            self.dial_group_members(&group);
+        }
     }
 
     pub(crate) fn ingest_chat_message(&mut self, mut msg: ChatMessage) {
@@ -745,7 +1049,7 @@ impl App {
         let voice_tid = msg.voice.as_ref().map(|v| v.transfer_id.clone());
 
         let bucket = if let Some(ref gid) = msg.group_id {
-            if group::validate_group_id(gid) {
+            if group::validate_group_id(gid) && self.is_active_group_member(gid) {
                 Some(group_thread_key(gid))
             } else {
                 None
@@ -853,11 +1157,21 @@ impl App {
     pub(crate) fn complete_pending_send(&mut self, peer: PeerId, message_id: &str) {
         self.pending_sends
             .retain(|p| !(p.peer == peer && p.message_id == message_id));
+        self.remove_outbox_direct(&peer.to_string(), message_id);
     }
 
     /// Восстанавливает очередь недоставленных исходящих из журнала после рестарта.
     pub(crate) fn restore_pending_outgoing(&mut self) {
         let me = self.local_peer_id.to_string();
+        let outbox_msg_ids: HashSet<String> = self
+            .outbox_entries
+            .iter()
+            .filter_map(|e| match e {
+                OutboxEntry::DirectMessage { message_id, .. }
+                | OutboxEntry::GroupMessage { message_id, .. } => Some(message_id.clone()),
+                _ => None,
+            })
+            .collect();
         let snapshot: Vec<(PeerId, ChatMessage)> = {
             let messages = self.messages.lock();
             let mut out = Vec::new();
@@ -867,6 +1181,9 @@ impl App {
                 };
                 for msg in msgs {
                     if msg.sender_id == me && msg.delivery == OutgoingDeliveryStatus::Pending {
+                        if outbox_msg_ids.contains(&msg.id) {
+                            continue;
+                        }
                         out.push((peer, msg.clone()));
                     }
                 }
@@ -885,6 +1202,7 @@ impl App {
                     if msg.sender_id == me
                         && msg.delivery == OutgoingDeliveryStatus::Pending
                         && !msg.text.is_empty()
+                        && !outbox_msg_ids.contains(&msg.id)
                     {
                         out.push((gid.to_string(), msg.clone()));
                     }
@@ -993,35 +1311,6 @@ impl App {
                 members: targets,
                 message_id: Some(msg.id),
                 is_retry: true,
-            });
-        }
-    }
-
-    /// Повторно рассылает состав всех групп после рестарта.
-    pub(crate) fn restore_group_syncs(&mut self) {
-        let groups: Vec<GroupChat> = self.groups.values().cloned().collect();
-        for group in groups {
-            self.broadcast_group_sync(&group);
-            self.dial_group_members(&group);
-        }
-    }
-
-    /// Отправляет group_sync пиру для всех общих групп (при подключении).
-    pub(crate) fn sync_groups_to_peer(&mut self, peer: PeerId) {
-        if peer == self.local_peer_id {
-            return;
-        }
-        let peer_str = peer.to_string();
-        for group in self.groups.values() {
-            if !group.members.iter().any(|m| m.peer_id == peer_str) {
-                continue;
-            }
-            let _ = self.command_tx.try_send(UICommand::SendGroupSync {
-                group_id: group.id.clone(),
-                group_name: group.name.clone(),
-                creator_id: group.creator_id.clone(),
-                members: group.members.clone(),
-                recipients: vec![peer],
             });
         }
     }
@@ -1461,6 +1750,7 @@ impl App {
             Some(&entries),
             Some(&self.void_bootstrap_strings),
             Some(&self.groups_vec()),
+            Some(&self.left_groups_vec()),
         ) {
             warn!("VOID: не удалось сохранить vault (записная книга): {}", e);
         }
@@ -1470,6 +1760,20 @@ impl App {
         let mut v: Vec<GroupChat> = self.groups.values().cloned().collect();
         v.sort_by(|a, b| a.name.to_lowercase().cmp(&b.name.to_lowercase()));
         v
+    }
+
+    fn left_groups_vec(&self) -> Vec<String> {
+        let mut v: Vec<String> = self.left_groups.iter().cloned().collect();
+        v.sort();
+        v
+    }
+
+    pub(crate) fn is_active_group_member(&self, group_id: &str) -> bool {
+        !self.left_groups.contains(group_id)
+            && self
+                .groups
+                .get(group_id)
+                .is_some_and(|g| g.includes_peer(&self.local_peer_id))
     }
 
     pub(crate) fn selected_group_id(&self) -> Option<&str> {
@@ -1518,7 +1822,6 @@ impl App {
             .entry(self.selected_chat.clone())
             .or_default();
         self.persist_vault();
-        self.persist_chat_journal();
         self.broadcast_group_sync(&group);
         self.dial_group_members(&group);
         Some(id)
@@ -1526,6 +1829,7 @@ impl App {
 
     pub(crate) fn join_group_from_invite(&mut self, link: &str) -> Result<(), &'static str> {
         let mut group = parse_invite_link(link).ok_or("Некорректная invite-ссылка")?;
+        self.left_groups.remove(&group.id);
         self.ensure_self_in_group(&mut group);
         let thread = group_thread_key(&group.id);
         self.groups.insert(group.id.clone(), group.clone());
@@ -1568,18 +1872,141 @@ impl App {
         let Some(gid) = self.selected_group_id().map(str::to_string) else {
             return;
         };
+        self.leave_group(&gid, true);
+    }
+
+    pub(crate) fn delete_selected_group(&mut self) {
+        let Some(gid) = self.selected_group_id().map(str::to_string) else {
+            return;
+        };
         let me = self.local_peer_id.to_string();
-        if let Some(group) = self.groups.get_mut(&gid) {
-            group.members.retain(|m| m.peer_id != me);
-            if group.members.is_empty() {
-                self.groups.remove(&gid);
-            } else {
-                let g = group.clone();
-                self.broadcast_group_sync(&g);
-            }
+        let is_creator = self
+            .groups
+            .get(&gid)
+            .map(|g| g.creator_id == me)
+            .unwrap_or(false);
+        if is_creator {
+            self.dissolve_group(&gid);
+        } else {
+            self.leave_group(&gid, true);
         }
-        self.messages.lock().remove(&self.selected_chat);
-        self.selected_chat.clear();
+    }
+
+    fn leave_group(&mut self, gid: &str, clear_chat: bool) {
+        let Some(group) = self.groups.get(gid).cloned() else {
+            return;
+        };
+        let me = self.local_peer_id.to_string();
+        let notify: Vec<PeerId> = group
+            .member_peer_ids()
+            .into_iter()
+            .filter(|p| *p != self.local_peer_id)
+            .collect();
+
+        let mut updated = group.clone();
+        updated.members.retain(|m| m.peer_id != me);
+
+        let _ = self.command_tx.try_send(UICommand::SendGroupLeave {
+            group_id: gid.to_string(),
+            peer_id: me.clone(),
+            recipients: notify.clone(),
+        });
+        if !updated.members.is_empty() {
+            self.broadcast_group_sync(&updated);
+        }
+
+        self.left_groups.insert(gid.to_string());
+        self.groups.remove(gid);
+        self.group_synced_peers.clear();
+        self.purge_group_outbox(gid);
+        self.pending_group_sends
+            .retain(|p| p.group_id != gid);
+
+        if clear_chat {
+            self.messages.lock().remove(&group_thread_key(gid));
+            self.mark_chat_journal_dirty();
+        }
+        if self.selected_chat == group_thread_key(gid) {
+            self.selected_chat.clear();
+        }
+        self.persist_vault();
+    }
+
+    fn dissolve_group(&mut self, gid: &str) {
+        let Some(group) = self.groups.get(gid).cloned() else {
+            return;
+        };
+        let notify: Vec<PeerId> = group
+            .member_peer_ids()
+            .into_iter()
+            .filter(|p| *p != self.local_peer_id)
+            .collect();
+        let _ = self.command_tx.try_send(UICommand::SendGroupDelete {
+            group_id: gid.to_string(),
+            recipients: notify,
+        });
+
+        self.left_groups.insert(gid.to_string());
+        self.groups.remove(gid);
+        self.group_synced_peers.clear();
+        self.purge_group_outbox(gid);
+        self.pending_group_sends
+            .retain(|p| p.group_id != gid);
+        self.messages.lock().remove(&group_thread_key(gid));
+        self.mark_chat_journal_dirty();
+        if self.selected_chat == group_thread_key(gid) {
+            self.selected_chat.clear();
+        }
+        self.persist_vault();
+    }
+
+    fn purge_group_outbox(&mut self, gid: &str) {
+        let before = self.outbox_entries.len();
+        self.outbox_entries.retain(|e| match e {
+            OutboxEntry::GroupMessage { group_id, .. }
+            | OutboxEntry::GroupSync { group_id, .. } => group_id != gid,
+            _ => true,
+        });
+        if self.outbox_entries.len() != before {
+            self.persist_outbox();
+        }
+    }
+
+    pub(crate) fn handle_incoming_group_leave(&mut self, group_id: String, peer_id: String) {
+        if self.left_groups.contains(&group_id) {
+            return;
+        }
+        let me = self.local_peer_id.to_string();
+        if peer_id == me {
+            self.left_groups.insert(group_id.clone());
+            self.groups.remove(&group_id);
+            self.purge_group_outbox(&group_id);
+            self.pending_group_sends
+                .retain(|p| p.group_id != group_id);
+            if self.selected_chat == group_thread_key(&group_id) {
+                self.selected_chat.clear();
+            }
+            self.persist_vault();
+            return;
+        }
+        if let Some(group) = self.groups.get_mut(&group_id) {
+            group.members.retain(|m| m.peer_id != peer_id);
+            if group.members.is_empty() {
+                self.groups.remove(&group_id);
+            }
+            self.persist_vault();
+        }
+    }
+
+    pub(crate) fn handle_incoming_group_delete(&mut self, group_id: String) {
+        self.left_groups.insert(group_id.clone());
+        self.groups.remove(&group_id);
+        self.purge_group_outbox(&group_id);
+        self.pending_group_sends
+            .retain(|p| p.group_id != group_id);
+        if self.selected_chat == group_thread_key(&group_id) {
+            self.selected_chat.clear();
+        }
         self.persist_vault();
         self.mark_chat_journal_dirty();
     }
@@ -1592,42 +2019,36 @@ impl App {
         creator_id: String,
         members: Vec<GroupMember>,
     ) {
-        let from_str = from.to_string();
+        if self.left_groups.contains(&group_id) {
+            return;
+        }
+        let me = self.local_peer_id.to_string();
+        if !members.iter().any(|m| m.peer_id == me) {
+            self.groups.remove(&group_id);
+            if self.selected_chat == group_thread_key(&group_id) {
+                self.selected_chat.clear();
+            }
+            self.left_groups.insert(group_id);
+            self.persist_vault();
+            return;
+        }
         let creator_id = if creator_id.is_empty() {
-            from_str.clone()
+            from.to_string()
         } else {
             creator_id
         };
-        let mut members = members;
-        if !members.iter().any(|m| m.peer_id == from_str) {
-            let display_name = self
-                .known_peers
-                .get(&from)
-                .cloned()
-                .unwrap_or_else(|| {
-                    format!("Peer {}", &from_str[..8.min(from_str.len())])
-                });
-            members.push(GroupMember {
-                peer_id: from_str.clone(),
-                display_name,
-            });
-        }
-        let mut group = GroupChat {
+        let created_at = self
+            .groups
+            .get(&group_id)
+            .map(|g| g.created_at.clone())
+            .unwrap_or_else(|| chrono::Local::now().format("%Y-%m-%d %H:%M").to_string());
+        let group = GroupChat {
             id: group_id.clone(),
             name: group_name,
             creator_id,
             members,
-            created_at: chrono::Local::now().format("%Y-%m-%d %H:%M").to_string(),
+            created_at,
         };
-        self.ensure_self_in_group(&mut group);
-        if let Some(existing) = self.groups.get(&group_id) {
-            group.created_at = existing.created_at.clone();
-            for m in &existing.members {
-                if !group.members.iter().any(|x| x.peer_id == m.peer_id) {
-                    group.members.push(m.clone());
-                }
-            }
-        }
         if group::validate_group_chat(&group) {
             self.groups.insert(group_id, group);
             self.persist_vault();
@@ -1645,6 +2066,9 @@ impl App {
     }
 
     fn broadcast_group_sync(&mut self, group: &GroupChat) {
+        if self.left_groups.contains(&group.id) {
+            return;
+        }
         let recipients: Vec<PeerId> = group
             .member_peer_ids()
             .into_iter()
@@ -1653,6 +2077,9 @@ impl App {
         if recipients.is_empty() {
             return;
         }
+        for pid in &recipients {
+            self.queue_outbox_group_sync(group, *pid);
+        }
         let _ = self.command_tx.try_send(UICommand::SendGroupSync {
             group_id: group.id.clone(),
             group_name: group.name.clone(),
@@ -1660,6 +2087,43 @@ impl App {
             members: group.members.clone(),
             recipients,
         });
+    }
+
+    /// Отправляет group_sync пиру при первом подключении в этой сессии.
+    pub(crate) fn sync_groups_to_peer(&mut self, peer: PeerId) {
+        if peer == self.local_peer_id {
+            return;
+        }
+        if !self.group_synced_peers.insert(peer) {
+            return;
+        }
+        let peer_str = peer.to_string();
+        let group_ids: Vec<String> = self
+            .groups
+            .values()
+            .filter(|g| {
+                !self.left_groups.contains(&g.id)
+                    && g.members.iter().any(|m| m.peer_id == peer_str)
+            })
+            .map(|g| g.id.clone())
+            .collect();
+        for gid in group_ids {
+            let Some(group) = self.groups.get(&gid) else {
+                continue;
+            };
+            let _ = self.command_tx.try_send(UICommand::SendGroupSync {
+                group_id: group.id.clone(),
+                group_name: group.name.clone(),
+                creator_id: group.creator_id.clone(),
+                members: group.members.clone(),
+                recipients: vec![peer],
+            });
+            self.remove_outbox_group_sync(&gid, &peer_str);
+        }
+    }
+
+    pub(crate) fn on_peer_disconnected(&mut self, peer: PeerId) {
+        self.group_synced_peers.remove(&peer);
     }
 
     fn dial_group_members(&mut self, group: &GroupChat) {
@@ -1702,6 +2166,7 @@ impl App {
         if remove {
             self.pending_group_sends
                 .retain(|p| p.message_id != message_id);
+            self.remove_outbox_group_message(message_id);
         }
     }
 
@@ -1710,7 +2175,10 @@ impl App {
         let due: Vec<PendingGroupSend> = self
             .pending_group_sends
             .iter()
-            .filter(|p| now.duration_since(p.last_send_at) >= RESEND_GRACE)
+            .filter(|p| {
+                now.duration_since(p.last_send_at)
+                    >= resend_delay_for_attempt(p.attempts)
+            })
             .cloned()
             .collect();
         for item in due {
@@ -1837,4 +2305,42 @@ impl App {
         ));
     }
 
+}
+
+fn outbox_same_slot(a: &OutboxEntry, b: &OutboxEntry) -> bool {
+    match (a, b) {
+        (
+            OutboxEntry::DirectMessage {
+                peer: p1,
+                message_id: id1,
+                ..
+            },
+            OutboxEntry::DirectMessage {
+                peer: p2,
+                message_id: id2,
+                ..
+            },
+        ) => p1 == p2 && id1 == id2,
+        (
+            OutboxEntry::GroupMessage {
+                message_id: id1, ..
+            },
+            OutboxEntry::GroupMessage {
+                message_id: id2, ..
+            },
+        ) => id1 == id2,
+        (
+            OutboxEntry::GroupSync {
+                group_id: g1,
+                recipient: r1,
+                ..
+            },
+            OutboxEntry::GroupSync {
+                group_id: g2,
+                recipient: r2,
+                ..
+            },
+        ) => g1 == g2 && r1 == r2,
+        _ => false,
+    }
 }

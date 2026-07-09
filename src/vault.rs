@@ -41,6 +41,9 @@ pub(crate) struct StorageData {
     /// Групповые чаты (format_version >= 2).
     #[serde(default)]
     pub(crate) groups: Vec<GroupChat>,
+    /// Группы, из которых пользователь вышел (не показывать и не принимать сообщения).
+    #[serde(default)]
+    pub(crate) left_groups: Vec<String>,
 }
 
 fn storage_format_v2() -> u32 {
@@ -61,6 +64,7 @@ impl Storage {
     const VAULT_BOOTSTRAPS_MAX: usize = 64;
     const VAULT_BOOTSTRAP_ONE_ADDR_MAX: usize = 1024;
     const VAULT_GROUPS_MAX: usize = 512;
+    const VAULT_LEFT_GROUPS_MAX: usize = 512;
 
     pub(crate) const FILE: &'static str = "vault.bin";
     const FILE_TMP: &'static str = "vault.bin.tmp";
@@ -154,6 +158,7 @@ impl Storage {
         address_book: Option<&[AddressBookEntry]>,
         void_bootstraps: Option<&[String]>,
         groups: Option<&[GroupChat]>,
+        left_groups: Option<&[String]>,
     ) -> Result<(), Box<dyn Error>> {
         let current_load = Self::load(master_key);
 
@@ -208,6 +213,15 @@ impl Storage {
                 .unwrap_or_default()
         };
 
+        let left_groups_vec: Vec<String> = if let Some(lg) = left_groups {
+            lg.to_vec()
+        } else {
+            current_load
+                .as_ref()
+                .map(|c| c.left_groups.clone())
+                .unwrap_or_default()
+        };
+
         let data = StorageData {
             format_version: 2,
             nickname: nickname.to_string(),
@@ -216,6 +230,7 @@ impl Storage {
             address_book: address_book_vec,
             void_bootstraps: void_bootstraps_vec,
             groups: groups_vec,
+            left_groups: left_groups_vec,
         };
         let plaintext = serde_json::to_vec(&data)?;
 
@@ -327,6 +342,18 @@ impl Storage {
                 return Err(format!("vault: groups[{}] — некорректные данные", i).into());
             }
         }
+        if s.left_groups.len() > Self::VAULT_LEFT_GROUPS_MAX {
+            return Err(format!(
+                "vault: left_groups больше {} записей",
+                Self::VAULT_LEFT_GROUPS_MAX
+            )
+            .into());
+        }
+        for (i, gid) in s.left_groups.iter().enumerate() {
+            if !crate::group::validate_group_id(gid) {
+                return Err(format!("vault: left_groups[{}] — некорректный id", i).into());
+            }
+        }
         Ok(())
     }
 
@@ -385,6 +412,51 @@ pub(crate) struct VaultUnlockState {
     pub password: String,
     pub password_confirm: String,
     pub error: Option<String>,
+    /// Сохранить пароль в системном хранилище (Windows Credential Manager / macOS Keychain).
+    pub remember_password: bool,
+    /// Автоматически разблокировать при старте (пароль подставлен из хранилища).
+    pub try_auto_unlock: bool,
+}
+
+impl VaultUnlockState {
+    pub(crate) fn new(kind: VaultUnlockKind) -> Self {
+        Self {
+            kind,
+            password: String::new(),
+            password_confirm: String::new(),
+            error: None,
+            remember_password: true,
+            try_auto_unlock: false,
+        }
+    }
+}
+
+const KEYRING_SERVICE: &str = "VOID P2P Messenger";
+const KEYRING_USER: &str = "vault_password";
+
+fn keyring_entry() -> Result<keyring::Entry, Box<dyn Error>> {
+    keyring::Entry::new(KEYRING_SERVICE, KEYRING_USER).map_err(|e| e.into())
+}
+
+/// Сохраняет пароль vault в системном хранилище учётных данных.
+pub(crate) fn save_remembered_password(password: &str) -> Result<(), Box<dyn Error>> {
+    keyring_entry()?.set_password(password).map_err(|e| e.into())
+}
+
+/// Загружает сохранённый пароль vault (если есть).
+pub(crate) fn load_remembered_password() -> Option<String> {
+    keyring_entry()
+        .ok()?
+        .get_password()
+        .ok()
+        .filter(|p| !p.is_empty())
+}
+
+/// Удаляет сохранённый пароль vault.
+pub(crate) fn clear_remembered_password() {
+    if let Ok(entry) = keyring_entry() {
+        let _ = entry.delete_credential();
+    }
 }
 
 /// Определяет сценарий разблокировки по наличию `vault.bin` и формату `void.key`.

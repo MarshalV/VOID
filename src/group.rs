@@ -30,6 +30,11 @@ impl GroupChat {
             .filter_map(|m| m.peer_id.parse().ok())
             .collect()
     }
+
+    pub(crate) fn includes_peer(&self, peer_id: &libp2p::PeerId) -> bool {
+        let s = peer_id.to_string();
+        self.members.iter().any(|m| m.peer_id == s)
+    }
 }
 
 pub(crate) fn new_group_id() -> String {

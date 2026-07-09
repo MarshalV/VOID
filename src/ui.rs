@@ -568,6 +568,7 @@ impl App {
                 groups.sort_by(|a, b| a.1.name.to_lowercase().cmp(&b.1.name.to_lowercase()));
 
                 let mut to_leave_group: Option<String> = None;
+                let mut to_delete_group: Option<String> = None;
                 let mut to_clear_group: Vec<String> = Vec::new();
 
                 for (gid, group) in &groups {
@@ -660,7 +661,12 @@ impl App {
                             to_clear_group.push(gid.clone());
                             ui.close_menu();
                         }
-                        if ui.button("🚪 Покинуть группу").clicked() {
+                        if group.creator_id == me_str {
+                            if ui.button("🗑 Удалить группу").clicked() {
+                                to_delete_group = Some(gid.clone());
+                                ui.close_menu();
+                            }
+                        } else if ui.button("🚪 Покинуть группу").clicked() {
                             to_leave_group = Some(gid.clone());
                             ui.close_menu();
                         }
@@ -677,6 +683,15 @@ impl App {
                     self.leave_selected_group();
                     self.push_toast(
                         "Вы покинули группу".into(),
+                        ToastKind::Info,
+                        TOAST_TTL_SHORT,
+                    );
+                }
+                if let Some(gid) = to_delete_group {
+                    self.selected_chat = group_thread_key(&gid);
+                    self.delete_selected_group();
+                    self.push_toast(
+                        "Группа удалена".into(),
                         ToastKind::Info,
                         TOAST_TTL_SHORT,
                     );
@@ -1829,6 +1844,7 @@ impl eframe::App for App {
                 NetworkEvent::Disconnected(peer) => {
                     self.connected_peers = self.connected_peers.saturating_sub(1);
                     self.connected_peer_ids.remove(&peer);
+                    self.on_peer_disconnected(peer);
                     self.add_status(format!("❌ Отключено: {}...", &peer.to_string()[..8]));
                     // Пир офлайн — снимаем блокировку E2EE-ожидания и ускоряем ретрай.
                     for p in self
@@ -1883,6 +1899,30 @@ impl eframe::App for App {
                     );
                     self.push_toast(
                         "Обновлён состав группы".into(),
+                        ToastKind::Info,
+                        TOAST_TTL_SHORT,
+                    );
+                }
+                NetworkEvent::GroupLeave {
+                    group_id,
+                    peer_id,
+                    ..
+                } => {
+                    let me = self.local_peer_id.to_string();
+                    let is_self = peer_id == me;
+                    self.handle_incoming_group_leave(group_id, peer_id);
+                    if !is_self {
+                        self.push_toast(
+                            "Участник покинул группу".into(),
+                            ToastKind::Info,
+                            TOAST_TTL_SHORT,
+                        );
+                    }
+                }
+                NetworkEvent::GroupDelete { group_id, .. } => {
+                    self.handle_incoming_group_delete(group_id);
+                    self.push_toast(
+                        "Группа удалена".into(),
                         ToastKind::Info,
                         TOAST_TTL_SHORT,
                     );
@@ -2218,6 +2258,7 @@ impl eframe::App for App {
         // ===== Tick: повторные отправки + истечение toast'ов =====
         self.tick_pending_sends();
         self.tick_pending_group_sends();
+        self.tick_journal_persist();
         self.tick_pending_file_sends();
         self.tick_pending_voice_sends();
         self.voice_poll_tick();
@@ -2542,6 +2583,9 @@ impl eframe::App for App {
                                 .map(|g| g.name.as_str())
                                 .unwrap_or("Группа");
                             let member_count = group.map(|g| g.members.len()).unwrap_or(0);
+                            let is_creator = group
+                                .map(|g| g.creator_id == self.local_peer_id.to_string())
+                                .unwrap_or(false);
                             ui.label(egui::RichText::new("👥").size(32.0));
                             ui.add_space(12.0);
                             let group_header = ui.vertical(|ui| {
@@ -2573,8 +2617,24 @@ impl eframe::App for App {
                                     chat_clear_action = Some(ConversationClearAction::AllLocal);
                                     ui.close_menu();
                                 }
-                                if ui.button("🚪 Покинуть группу").clicked() {
+                                let is_creator = is_creator;
+                                if is_creator {
+                                    if ui.button("🗑 Удалить группу").clicked() {
+                                        self.delete_selected_group();
+                                        self.push_toast(
+                                            "Группа удалена".into(),
+                                            ToastKind::Info,
+                                            TOAST_TTL_SHORT,
+                                        );
+                                        ui.close_menu();
+                                    }
+                                } else if ui.button("🚪 Покинуть группу").clicked() {
                                     self.leave_selected_group();
+                                    self.push_toast(
+                                        "Вы покинули группу".into(),
+                                        ToastKind::Info,
+                                        TOAST_TTL_SHORT,
+                                    );
                                     ui.close_menu();
                                 }
                             });
@@ -3222,6 +3282,12 @@ impl eframe::App for App {
                                             voice: None,
                                             group_id: Some(gid.clone()),
                                         });
+                                        self.outbox_track_group_message(
+                                            gid.clone(),
+                                            message_id.clone(),
+                                            text_to_send.clone(),
+                                            members.clone(),
+                                        );
                                         match self.command_tx.try_send(UICommand::SendGroupMessage {
                                             sender_name: self.local_nickname.clone(),
                                             text: text_to_send.clone(),
@@ -3264,6 +3330,11 @@ impl eframe::App for App {
                                         voice: None,
                                         group_id: None,
                                     });
+                                    self.outbox_track_direct(
+                                        peer_id,
+                                        message_id.clone(),
+                                        text_to_send.clone(),
+                                    );
                                     match self.command_tx.try_send(UICommand::SendMessage {
                                         sender_name: self.local_nickname.clone(),
                                         text: text_to_send.clone(),
@@ -3641,6 +3712,10 @@ impl eframe::App for App {
             }
         }
 
+        if ctx.input(|i| i.viewport().close_requested()) {
+            self.persist_all_before_exit();
+        }
+
         self.flush_chat_journal_if_dirty();
 
         self.voice_player.poll();
@@ -3655,5 +3730,9 @@ impl eframe::App for App {
         } else {
             ctx.request_repaint_after(Duration::from_millis(100));
         }
+    }
+
+    fn on_exit(&mut self, _gl: Option<&eframe::glow::Context>) {
+        self.persist_all_before_exit();
     }
 }

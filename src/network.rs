@@ -25,7 +25,8 @@ use crate::protocol::{
     chat_message_id_from_json,     delete_command_message_ids, is_delete_command_json,
     is_read_command_json, new_message_id, parse_decrypted_chat_frame,
     read_command_message_ids, verify_hello_transport_binding, validate_bootstrap_gossip_addrs,
-    build_group_sync_json, transfer_id_to_hex, ChatMessage,
+    build_group_sync_json, build_group_leave_json, build_group_delete_json,
+    transfer_id_to_hex, ChatMessage,
     DecryptedChatFrame, OutgoingDeliveryStatus, VoiceMeta, V1Packet,
 };
 
@@ -316,6 +317,15 @@ pub(crate) enum NetworkEvent {
         creator_id: String,
         members: Vec<crate::group::GroupMember>,
     },
+    GroupLeave {
+        from: PeerId,
+        group_id: String,
+        peer_id: String,
+    },
+    GroupDelete {
+        from: PeerId,
+        group_id: String,
+    },
     Status(String),
     PublicIpConfirmed(String),
     /// Снимок PeerId в локальной таблице Kademlia (для UI «узлы сети»).
@@ -527,6 +537,15 @@ pub(crate) enum UICommand {
         group_name: String,
         creator_id: String,
         members: Vec<crate::group::GroupMember>,
+        recipients: Vec<PeerId>,
+    },
+    SendGroupLeave {
+        group_id: String,
+        peer_id: String,
+        recipients: Vec<PeerId>,
+    },
+    SendGroupDelete {
+        group_id: String,
         recipients: Vec<PeerId>,
     },
     /// Уведомить собеседника, что мы прочитали его сообщения.
@@ -1869,6 +1888,75 @@ pub async fn run_chat_network(
                                     }
                                 }
                             }
+                            UICommand::SendGroupLeave {
+                                group_id,
+                                peer_id,
+                                recipients,
+                            } => {
+                                let now = chrono::Local::now().format("%H:%M:%S").to_string();
+                                let Some(json_data) =
+                                    build_group_leave_json(&group_id, &peer_id)
+                                else {
+                                    continue;
+                                };
+                                for peer_id in recipients {
+                                    if peer_id == local_peer_id {
+                                        continue;
+                                    }
+                                    if sessions.contains_key(&peer_id) {
+                                        let _ = send_encrypted_chat_payload(
+                                            &mut swarm,
+                                            &mut sessions,
+                                            &mut outbound_msg_requests,
+                                            &mut outbound_delete_requests,
+                                            &event_tx,
+                                            peer_id,
+                                            json_data.clone(),
+                                            None,
+                                            &now,
+                                        )
+                                        .await;
+                                    } else {
+                                        pending_messages
+                                            .entry(peer_id)
+                                            .or_default()
+                                            .push(json_data.clone());
+                                    }
+                                }
+                            }
+                            UICommand::SendGroupDelete {
+                                group_id,
+                                recipients,
+                            } => {
+                                let now = chrono::Local::now().format("%H:%M:%S").to_string();
+                                let Some(json_data) = build_group_delete_json(&group_id) else {
+                                    continue;
+                                };
+                                for peer_id in recipients {
+                                    if peer_id == local_peer_id {
+                                        continue;
+                                    }
+                                    if sessions.contains_key(&peer_id) {
+                                        let _ = send_encrypted_chat_payload(
+                                            &mut swarm,
+                                            &mut sessions,
+                                            &mut outbound_msg_requests,
+                                            &mut outbound_delete_requests,
+                                            &event_tx,
+                                            peer_id,
+                                            json_data.clone(),
+                                            None,
+                                            &now,
+                                        )
+                                        .await;
+                                    } else {
+                                        pending_messages
+                                            .entry(peer_id)
+                                            .or_default()
+                                            .push(json_data.clone());
+                                    }
+                                }
+                            }
                             UICommand::SendReadReceipt { peer, message_ids } => {
                                 let now = chrono::Local::now().format("%H:%M:%S").to_string();
                                 if message_ids.is_empty() {
@@ -2592,6 +2680,30 @@ pub async fn run_chat_network(
                                                                         .await;
                                                                     send_ack = true;
                                                                 }
+                                                                DecryptedChatFrame::GroupLeave {
+                                                                    group_id,
+                                                                    peer_id,
+                                                                } => {
+                                                                    let _ = event_tx
+                                                                        .send(NetworkEvent::GroupLeave {
+                                                                            from: peer,
+                                                                            group_id,
+                                                                            peer_id,
+                                                                        })
+                                                                        .await;
+                                                                    send_ack = true;
+                                                                }
+                                                                DecryptedChatFrame::GroupDelete {
+                                                                    group_id,
+                                                                } => {
+                                                                    let _ = event_tx
+                                                                        .send(NetworkEvent::GroupDelete {
+                                                                            from: peer,
+                                                                            group_id,
+                                                                        })
+                                                                        .await;
+                                                                    send_ack = true;
+                                                                }
                                                             }
                                                         }
                                                     }
@@ -2817,6 +2929,28 @@ pub async fn run_chat_network(
                                                                         group_name,
                                                                         creator_id,
                                                                         members,
+                                                                    })
+                                                                    .await;
+                                                            }
+                                                            DecryptedChatFrame::GroupLeave {
+                                                                group_id,
+                                                                peer_id,
+                                                            } => {
+                                                                let _ = event_tx
+                                                                    .send(NetworkEvent::GroupLeave {
+                                                                        from: peer,
+                                                                        group_id,
+                                                                        peer_id,
+                                                                    })
+                                                                    .await;
+                                                            }
+                                                            DecryptedChatFrame::GroupDelete {
+                                                                group_id,
+                                                            } => {
+                                                                let _ = event_tx
+                                                                    .send(NetworkEvent::GroupDelete {
+                                                                        from: peer,
+                                                                        group_id,
                                                                     })
                                                                     .await;
                                                             }
