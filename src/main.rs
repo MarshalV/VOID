@@ -1,3 +1,4 @@
+mod group;
 mod chat_store;
 mod crypto;
 mod file_transfer;
@@ -11,7 +12,7 @@ mod network;
 mod protocol;
 mod vault;
 
-pub(crate) use app::{App, PendingSend, RESEND_GRACE, SharedChatMessages};
+pub(crate) use app::{App, PendingGroupSend, PendingSend, RESEND_GRACE, SharedChatMessages};
 pub(crate) use bootstrap::parse_seed_input;
 pub(crate) use protocol::{new_message_id, OutgoingDeliveryStatus};
 pub(crate) use network::{NetworkEvent, UICommand};
@@ -211,6 +212,7 @@ async fn main() -> Result<(), Box<dyn Error>> {
                 placeholder_peer_id,
                 "Разблокировка…".into(),
                 placeholder_static_secret,
+                HashMap::new(),
                 HashMap::new(),
                 HashMap::new(),
                 command_tx,

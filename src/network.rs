@@ -25,7 +25,7 @@ use crate::protocol::{
     chat_message_id_from_json,     delete_command_message_ids, is_delete_command_json,
     is_read_command_json, new_message_id, parse_decrypted_chat_frame,
     read_command_message_ids, verify_hello_transport_binding, validate_bootstrap_gossip_addrs,
-    transfer_id_to_hex, ChatMessage,
+    build_group_sync_json, transfer_id_to_hex, ChatMessage,
     DecryptedChatFrame, OutgoingDeliveryStatus, VoiceMeta, V1Packet,
 };
 
@@ -308,6 +308,14 @@ pub(crate) enum NetworkEvent {
     Connected(PeerId),
     Disconnected(PeerId),
     ChatMessage(ChatMessage),
+    /// Входящая синхронизация группы от участника.
+    GroupSync {
+        from: PeerId,
+        group_id: String,
+        group_name: String,
+        creator_id: String,
+        members: Vec<crate::group::GroupMember>,
+    },
     Status(String),
     PublicIpConfirmed(String),
     /// Снимок PeerId в локальной таблице Kademlia (для UI «узлы сети»).
@@ -503,6 +511,23 @@ pub(crate) enum UICommand {
         recipient: Option<PeerId>,
         message_id: Option<String>,
         is_retry: bool,
+    },
+    /// Сообщение в групповой чат: fan-out каждому участнику (кроме себя).
+    SendGroupMessage {
+        sender_name: String,
+        text: String,
+        group_id: String,
+        members: Vec<PeerId>,
+        message_id: Option<String>,
+        is_retry: bool,
+    },
+    /// Синхронизация состава группы (pairwise E2EE).
+    SendGroupSync {
+        group_id: String,
+        group_name: String,
+        creator_id: String,
+        members: Vec<crate::group::GroupMember>,
+        recipients: Vec<PeerId>,
     },
     /// Уведомить собеседника, что мы прочитали его сообщения.
     SendReadReceipt {
@@ -1595,6 +1620,7 @@ pub async fn run_chat_network(
                                     timestamp: chrono::Local::now().format("%H:%M").to_string(),
                                     delivery: OutgoingDeliveryStatus::Pending,
                                     voice: None,
+                                    group_id: None,
                                 };
 
                                 let json_data = match serde_json::to_vec(&msg) {
@@ -1702,6 +1728,145 @@ pub async fn run_chat_network(
                                 }
                                 if !is_retry {
                                     let _ = event_tx.send(NetworkEvent::ChatMessage(msg)).await;
+                                }
+                            }
+                            UICommand::SendGroupMessage {
+                                sender_name,
+                                text,
+                                group_id,
+                                members,
+                                message_id,
+                                is_retry,
+                            } => {
+                                let now = chrono::Local::now().format("%H:%M:%S").to_string();
+                                let msg_id = message_id.unwrap_or_else(new_message_id);
+                                let me = local_peer_id.to_string();
+                                let msg = ChatMessage {
+                                    id: msg_id.clone(),
+                                    sender_id: me.clone(),
+                                    sender_name: sender_name.clone(),
+                                    recipient_id: None,
+                                    text: text.clone(),
+                                    timestamp: chrono::Local::now().format("%H:%M").to_string(),
+                                    delivery: OutgoingDeliveryStatus::Pending,
+                                    voice: None,
+                                    group_id: Some(group_id.clone()),
+                                };
+                                for peer_id in members {
+                                    if peer_id == local_peer_id {
+                                        continue;
+                                    }
+                                    let mut per_peer_msg = msg.clone();
+                                    per_peer_msg.recipient_id = Some(peer_id.to_string());
+                                    let per_json = match serde_json::to_vec(&per_peer_msg) {
+                                        Ok(v) => v,
+                                        Err(_) => continue,
+                                    };
+                                    if sessions.contains_key(&peer_id) {
+                                        let _ = send_encrypted_chat_payload(
+                                            &mut swarm,
+                                            &mut sessions,
+                                            &mut outbound_msg_requests,
+                                            &mut outbound_delete_requests,
+                                            &event_tx,
+                                            peer_id,
+                                            per_json,
+                                            None,
+                                            &now,
+                                        )
+                                        .await;
+                                    } else {
+                                        let force_hs = pending_handshakes.contains_key(&peer_id)
+                                            && swarm.is_connected(&peer_id);
+                                        let _ = ensure_e2ee_handshake_started(
+                                            &mut swarm,
+                                            &local_key,
+                                            local_peer_id,
+                                            my_public_key,
+                                            peer_id,
+                                            &sessions,
+                                            &mut pending_handshakes,
+                                            &now,
+                                            force_hs,
+                                        )
+                                        .await;
+                                        let queue =
+                                            pending_messages.entry(peer_id).or_default();
+                                        if let Some(ref mid) =
+                                            chat_message_id_from_json(per_json.as_slice())
+                                        {
+                                            if !queue.iter().any(|b| {
+                                                chat_message_id_from_json(b.as_slice())
+                                                    .as_deref()
+                                                    == Some(mid.as_str())
+                                            }) {
+                                                queue.push(per_json);
+                                            }
+                                        } else {
+                                            queue.push(per_json);
+                                        }
+                                        let _ = event_tx
+                                            .send(NetworkEvent::MessageAwaitingSession(peer_id))
+                                            .await;
+                                    }
+                                }
+                                if !is_retry {
+                                    let _ = event_tx.send(NetworkEvent::ChatMessage(msg)).await;
+                                }
+                            }
+                            UICommand::SendGroupSync {
+                                group_id,
+                                group_name,
+                                creator_id,
+                                members,
+                                recipients,
+                            } => {
+                                let now = chrono::Local::now().format("%H:%M:%S").to_string();
+                                let Some(json_data) = build_group_sync_json(
+                                    &group_id,
+                                    &group_name,
+                                    &creator_id,
+                                    &members,
+                                ) else {
+                                    continue;
+                                };
+                                for peer_id in recipients {
+                                    if peer_id == local_peer_id {
+                                        continue;
+                                    }
+                                    if sessions.contains_key(&peer_id) {
+                                        let _ = send_encrypted_chat_payload(
+                                            &mut swarm,
+                                            &mut sessions,
+                                            &mut outbound_msg_requests,
+                                            &mut outbound_delete_requests,
+                                            &event_tx,
+                                            peer_id,
+                                            json_data.clone(),
+                                            None,
+                                            &now,
+                                        )
+                                        .await;
+                                    } else {
+                                        let force_hs = pending_handshakes.contains_key(&peer_id)
+                                            && swarm.is_connected(&peer_id);
+                                        let _ = ensure_e2ee_handshake_started(
+                                            &mut swarm,
+                                            &local_key,
+                                            local_peer_id,
+                                            my_public_key,
+                                            peer_id,
+                                            &sessions,
+                                            &mut pending_handshakes,
+                                            &now,
+                                            force_hs,
+                                        )
+                                        .await;
+                                        pending_messages
+                                            .entry(peer_id)
+                                            .or_default()
+                                            .push(json_data.clone());
+                                    }
                                 }
                             }
                             UICommand::SendReadReceipt { peer, message_ids } => {
@@ -1865,6 +2030,7 @@ pub async fn run_chat_network(
                                         transfer_id: transfer_id_to_hex(&transfer_id),
                                         duration_secs,
                                     }),
+                                    group_id: None,
                                 };
 
                                 let json_data = match serde_json::to_vec(&msg) {
@@ -2409,6 +2575,23 @@ pub async fn run_chat_network(
                                                                         .await;
                                                                     send_ack = true;
                                                                 }
+                                                                DecryptedChatFrame::GroupSync {
+                                                                    group_id,
+                                                                    group_name,
+                                                                    creator_id,
+                                                                    members,
+                                                                } => {
+                                                                    let _ = event_tx
+                                                                        .send(NetworkEvent::GroupSync {
+                                                                            from: peer,
+                                                                            group_id,
+                                                                            group_name,
+                                                                            creator_id,
+                                                                            members,
+                                                                        })
+                                                                        .await;
+                                                                    send_ack = true;
+                                                                }
                                                             }
                                                         }
                                                     }
@@ -2618,6 +2801,22 @@ pub async fn run_chat_network(
                                                                     .send(NetworkEvent::MessageRead {
                                                                         peer,
                                                                         message_ids,
+                                                                    })
+                                                                    .await;
+                                                            }
+                                                            DecryptedChatFrame::GroupSync {
+                                                                group_id,
+                                                                group_name,
+                                                                creator_id,
+                                                                members,
+                                                            } => {
+                                                                let _ = event_tx
+                                                                    .send(NetworkEvent::GroupSync {
+                                                                        from: peer,
+                                                                        group_id,
+                                                                        group_name,
+                                                                        creator_id,
+                                                                        members,
                                                                     })
                                                                     .await;
                                                             }

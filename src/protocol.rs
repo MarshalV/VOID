@@ -7,6 +7,7 @@ use serde::{Deserialize, Serialize};
 use crate::crypto;
 use crate::file_transfer;
 use crate::bootstrap::peer_id_from_multiaddr;
+use crate::group::{self, GroupMember};
 
 /// Статус доставки исходящего сообщения (галочки в UI).
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, Default)]
@@ -68,6 +69,9 @@ pub(crate) struct ChatMessage {
     /// Голосовое сообщение: аудио по `transfer_id` в file sub-протоколе.
     #[serde(default)]
     pub(crate) voice: Option<VoiceMeta>,
+    /// Групповой чат: 32 hex-символа id группы.
+    #[serde(default)]
+    pub(crate) group_id: Option<String>,
 }
 
 pub(crate) fn new_message_id() -> String {
@@ -98,11 +102,26 @@ struct ChatReadCommand {
     message_ids: Vec<String>,
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct GroupSyncCommand {
+    kind: String,
+    group_id: String,
+    group_name: String,
+    creator_id: String,
+    members: Vec<GroupMember>,
+}
+
 pub(crate) enum DecryptedChatFrame {
     Message(ChatMessage),
     Delete { message_ids: Vec<String> },
     DeleteAck,
     Read { message_ids: Vec<String> },
+    GroupSync {
+        group_id: String,
+        group_name: String,
+        creator_id: String,
+        members: Vec<GroupMember>,
+    },
 }
 
 /// Лимиты JSON чата после `decrypt_payload` (защита от DoS по памяти).
@@ -293,7 +312,48 @@ pub(crate) fn parse_decrypted_chat_frame(plaintext: &[u8]) -> Option<DecryptedCh
             });
         }
     }
+    if let Ok(cmd) = serde_json::from_slice::<GroupSyncCommand>(plaintext) {
+        if cmd.kind == "group_sync"
+            && group::validate_group_id(&cmd.group_id)
+            && !cmd.group_name.is_empty()
+            && cmd.group_name.len() <= 128
+            && !cmd.creator_id.is_empty()
+            && cmd.members.len() <= 256
+        {
+            return Some(DecryptedChatFrame::GroupSync {
+                group_id: cmd.group_id,
+                group_name: cmd.group_name,
+                creator_id: cmd.creator_id,
+                members: cmd.members,
+            });
+        }
+    }
     parse_decrypted_chat_json(plaintext).map(DecryptedChatFrame::Message)
+}
+
+pub(crate) fn build_group_sync_json(
+    group_id: &str,
+    group_name: &str,
+    creator_id: &str,
+    members: &[GroupMember],
+) -> Option<Vec<u8>> {
+    if !group::validate_group_id(group_id)
+        || group_name.is_empty()
+        || group_name.len() > 128
+        || creator_id.is_empty()
+        || members.is_empty()
+        || members.len() > 256
+    {
+        return None;
+    }
+    let cmd = GroupSyncCommand {
+        kind: "group_sync".into(),
+        group_id: group_id.to_string(),
+        group_name: group_name.to_string(),
+        creator_id: creator_id.to_string(),
+        members: members.to_vec(),
+    };
+    serde_json::to_vec(&cmd).ok()
 }
 
 pub(crate) fn build_delete_ack_json(
@@ -343,6 +403,11 @@ pub(crate) fn parse_decrypted_chat_json(plaintext: &[u8]) -> Option<ChatMessage>
     }
     if let Some(ref r) = msg.recipient_id {
         if r.len() > MAX_CHAT_SENDER_ID_BYTES {
+            return None;
+        }
+    }
+    if let Some(ref gid) = msg.group_id {
+        if !group::validate_group_id(gid) {
             return None;
         }
     }

@@ -82,6 +82,10 @@ pub(crate) fn migrate_void_bootstrap_txt() -> Vec<String> {
     let Ok(txt) = std::fs::read_to_string(path) else {
         return Vec::new();
     };
+    if let Err(e) = verify_void_bootstrap_file(path, &txt) {
+        tracing::warn!("VOID: migrate void-bootstrap.txt: {}", e);
+        return Vec::new();
+    }
     let mut out = Vec::new();
     for line in txt.lines() {
         let t = line.split('#').next().unwrap_or("").trim();

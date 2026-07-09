@@ -19,6 +19,10 @@ use crate::bootstrap::{
 use crate::chat_store::ChatJournal;
 use crate::crypto;
 use crate::file_transfer;
+use crate::group::{
+    self, build_invite_link, group_thread_key, is_group_thread, parse_group_thread_key,
+    parse_invite_link, GroupChat, GroupMember,
+};
 use crate::network::{run_chat_network, NetworkEvent, UICommand};
 use crate::protocol::{
     new_message_id, transfer_id_from_hex, transfer_id_to_hex, ChatMessage, FileTransferProgress,
@@ -137,6 +141,17 @@ pub(crate) struct PendingVoiceSend {
     pub(crate) last_attempt: Instant,
 }
 
+/// Сообщение группового чата в очереди повторной отправки.
+#[derive(Clone)]
+pub(crate) struct PendingGroupSend {
+    pub(crate) group_id: String,
+    pub(crate) members: Vec<PeerId>,
+    pub(crate) text: String,
+    pub(crate) message_id: String,
+    pub(crate) last_send_at: Instant,
+    pub(crate) attempts: u32,
+}
+
 pub(crate) const RESEND_GRACE: Duration = Duration::from_secs(1);
 /// Базовая задержка перед повтором после DHT-поиска (растёт с числом попыток).
 pub(crate) const RESEND_DELAY_BASE: Duration = Duration::from_secs(2);
@@ -203,6 +218,15 @@ pub(crate) struct App {
     /// Локальные пути WAV по transfer_id (hex).
     pub(crate) voice_audio_paths: HashMap<String, String>,
     pub(crate) pending_voice_sends: Vec<PendingVoiceSend>,
+    pub(crate) pending_group_sends: Vec<PendingGroupSend>,
+    /// Групповые чаты (id → метаданные).
+    pub(crate) groups: HashMap<String, GroupChat>,
+    pub(crate) show_create_group: bool,
+    pub(crate) create_group_name: String,
+    pub(crate) create_group_pick: HashSet<PeerId>,
+    pub(crate) join_group_link: String,
+    pub(crate) show_group_panel: bool,
+    pub(crate) add_group_member_peer: String,
     /// Ожидаемый результат выбора папки сохранения: `(rx, transfer_id, from_peer)`.
     /// Поллим `try_recv()` каждый кадр; `None` = выбор не идёт.
     pub(crate) pending_accept: Option<(
@@ -235,6 +259,7 @@ fn resolve_vault_bootstraps(
                 None,
                 None,
                 Some(&bootstraps),
+                None,
             ) {
                 warn!("VOID: импорт void-bootstrap.txt → vault: {}", e);
             } else {
@@ -256,6 +281,7 @@ impl App {
         local_static: crypto::StaticSecret,
         initial_address_book: HashMap<PeerId, String>,
         initial_contact_addrs: HashMap<PeerId, Vec<Multiaddr>>,
+        initial_groups: HashMap<String, GroupChat>,
         command_tx: mpsc::Sender<UICommand>,
         event_rx: mpsc::Receiver<NetworkEvent>,
         chat_messages: SharedChatMessages,
@@ -304,6 +330,14 @@ impl App {
             voice_player: VoicePlayer::new(),
             voice_audio_paths: HashMap::new(),
             pending_voice_sends: Vec::new(),
+            pending_group_sends: Vec::new(),
+            groups: initial_groups,
+            show_create_group: false,
+            create_group_name: String::new(),
+            create_group_pick: HashSet::new(),
+            join_group_link: String::new(),
+            show_group_panel: false,
+            add_group_member_peer: String::new(),
             pending_accept: None,
             pending_unlock,
             deferred_network_spawn,
@@ -532,6 +566,10 @@ impl App {
                     .iter()
                     .flat_map(|(pid, addrs)| addrs.iter().cloned().map(move |a| (*pid, a)))
                     .collect();
+                let mut groups_map: HashMap<String, GroupChat> = HashMap::new();
+                for g in storage.groups {
+                    groups_map.insert(g.id.clone(), g);
+                }
                 tokio::spawn(run_chat_network(
                     dn_sp.command_rx,
                     dn_sp.event_tx,
@@ -549,6 +587,7 @@ impl App {
                     static_secret,
                     book,
                     addrs_map,
+                    groups_map,
                     master_arr,
                 );
             }
@@ -565,6 +604,7 @@ impl App {
                     &nickname,
                     Some(&local_key),
                     Some(&static_secret),
+                    None,
                     None,
                     None,
                 ) {
@@ -598,6 +638,7 @@ impl App {
                     static_secret,
                     HashMap::new(),
                     HashMap::new(),
+                    HashMap::new(),
                     master_arr,
                 );
             }
@@ -613,12 +654,14 @@ impl App {
         static_secret: crypto::StaticSecret,
         book: HashMap<PeerId, String>,
         addrs_map: HashMap<PeerId, Vec<Multiaddr>>,
+        groups: HashMap<String, GroupChat>,
         master_arr: Zeroizing<[u8; 32]>,
     ) {
         self.local_peer_id = PeerId::from(local_key.public());
         self.local_nickname = nickname;
         self.known_peers = book;
         self.contact_addrs = addrs_map;
+        self.groups = groups;
         self._local_static = static_secret;
         self.pending_unlock = None;
         self.vault_master_key = Some(master_arr.clone());
@@ -692,7 +735,13 @@ impl App {
 
         let voice_tid = msg.voice.as_ref().map(|v| v.transfer_id.clone());
 
-        let bucket = if let Some(ref target) = msg.recipient_id {
+        let bucket = if let Some(ref gid) = msg.group_id {
+            if group::validate_group_id(gid) {
+                Some(group_thread_key(gid))
+            } else {
+                None
+            }
+        } else if let Some(ref target) = msg.recipient_id {
             if target == &self.local_peer_id.to_string() {
                 Some(msg.sender_id.clone())
             } else if msg.sender_id == self.local_peer_id.to_string() {
@@ -745,15 +794,23 @@ impl App {
         let peer_str = peer.to_string();
         let me = self.local_peer_id.to_string();
         let mut changed = false;
-        if let Some(msgs) = self.messages.lock().get_mut(&peer_str) {
-            for msg in msgs.iter_mut() {
-                if msg.id == message_id && msg.sender_id == me {
-                    if status == OutgoingDeliveryStatus::Read
-                        || (status == OutgoingDeliveryStatus::Delivered
-                            && msg.delivery != OutgoingDeliveryStatus::Read)
-                    {
-                        msg.delivery = status;
-                        changed = true;
+        {
+            let mut messages = self.messages.lock();
+            for (thread_key, msgs) in messages.iter_mut() {
+                let is_direct = thread_key == &peer_str;
+                let is_group = is_group_thread(thread_key);
+                if !is_direct && !is_group {
+                    continue;
+                }
+                for msg in msgs.iter_mut() {
+                    if msg.id == message_id && msg.sender_id == me {
+                        if status == OutgoingDeliveryStatus::Read
+                            || (status == OutgoingDeliveryStatus::Delivered
+                                && msg.delivery != OutgoingDeliveryStatus::Read)
+                        {
+                            msg.delivery = status;
+                            changed = true;
+                        }
                     }
                 }
             }
@@ -1125,6 +1182,7 @@ impl App {
                 transfer_id: transfer_hex.clone(),
                 duration_secs,
             }),
+            group_id: None,
         });
         match self.command_tx.try_send(UICommand::SendVoiceMessage {
             sender_name: self.local_nickname.clone(),
@@ -1273,8 +1331,252 @@ impl App {
             None,
             Some(&entries),
             Some(&self.void_bootstrap_strings),
+            Some(&self.groups_vec()),
         ) {
             warn!("VOID: не удалось сохранить vault (записная книга): {}", e);
+        }
+    }
+
+    fn groups_vec(&self) -> Vec<GroupChat> {
+        let mut v: Vec<GroupChat> = self.groups.values().cloned().collect();
+        v.sort_by(|a, b| a.name.to_lowercase().cmp(&b.name.to_lowercase()));
+        v
+    }
+
+    pub(crate) fn selected_group_id(&self) -> Option<&str> {
+        parse_group_thread_key(&self.selected_chat)
+    }
+
+    pub(crate) fn create_group(&mut self, name: String, member_pids: Vec<PeerId>) -> Option<String> {
+        let name = name.trim().to_string();
+        if name.is_empty() {
+            return None;
+        }
+        let id = group::new_group_id();
+        let me = self.local_peer_id.to_string();
+        let mut members = vec![GroupMember {
+            peer_id: me.clone(),
+            display_name: self.local_nickname.clone(),
+        }];
+        for pid in member_pids {
+            if pid == self.local_peer_id {
+                continue;
+            }
+            let display_name = self
+                .known_peers
+                .get(&pid)
+                .cloned()
+                .unwrap_or_else(|| format!("Peer {}", &pid.to_string()[..8.min(pid.to_string().len())]));
+            members.push(GroupMember {
+                peer_id: pid.to_string(),
+                display_name,
+            });
+        }
+        let group = GroupChat {
+            id: id.clone(),
+            name,
+            creator_id: me,
+            members,
+            created_at: chrono::Local::now().format("%Y-%m-%d %H:%M").to_string(),
+        };
+        if !group::validate_group_chat(&group) {
+            return None;
+        }
+        self.groups.insert(id.clone(), group.clone());
+        self.selected_chat = group_thread_key(&id);
+        self.messages
+            .lock()
+            .entry(self.selected_chat.clone())
+            .or_default();
+        self.broadcast_group_sync(&group);
+        self.dial_group_members(&group);
+        self.persist_vault();
+        Some(id)
+    }
+
+    pub(crate) fn join_group_from_invite(&mut self, link: &str) -> Result<(), &'static str> {
+        let mut group = parse_invite_link(link).ok_or("Некорректная invite-ссылка")?;
+        self.ensure_self_in_group(&mut group);
+        let thread = group_thread_key(&group.id);
+        self.groups.insert(group.id.clone(), group.clone());
+        self.selected_chat = thread.clone();
+        self.messages.lock().entry(thread).or_default();
+        self.dial_group_members(&group);
+        self.persist_vault();
+        Ok(())
+    }
+
+    pub(crate) fn add_member_to_selected_group(&mut self, peer: PeerId) -> Result<(), &'static str> {
+        if peer == self.local_peer_id {
+            return Err("Нельзя добавить себя");
+        }
+        let group_id = self
+            .selected_group_id()
+            .ok_or("Выберите групповой чат")?
+            .to_string();
+        let display_name = self
+            .known_peers
+            .get(&peer)
+            .cloned()
+            .unwrap_or_else(|| format!("Peer {}", &peer.to_string()[..8.min(peer.to_string().len())]));
+        let group = self.groups.get_mut(&group_id).ok_or("Группа не найдена")?;
+        if group.members.iter().any(|m| m.peer_id == peer.to_string()) {
+            return Err("Участник уже в группе");
+        }
+        group.members.push(GroupMember {
+            peer_id: peer.to_string(),
+            display_name,
+        });
+        let group = group.clone();
+        self.broadcast_group_sync(&group);
+        let _ = self.command_tx.try_send(UICommand::SearchPeer(peer));
+        self.persist_vault();
+        Ok(())
+    }
+
+    pub(crate) fn leave_selected_group(&mut self) {
+        let Some(gid) = self.selected_group_id().map(str::to_string) else {
+            return;
+        };
+        let me = self.local_peer_id.to_string();
+        if let Some(group) = self.groups.get_mut(&gid) {
+            group.members.retain(|m| m.peer_id != me);
+            if group.members.is_empty() {
+                self.groups.remove(&gid);
+            } else {
+                let g = group.clone();
+                self.broadcast_group_sync(&g);
+            }
+        }
+        self.messages.lock().remove(&self.selected_chat);
+        self.selected_chat.clear();
+        self.persist_vault();
+        self.mark_chat_journal_dirty();
+    }
+
+    pub(crate) fn merge_incoming_group_sync(
+        &mut self,
+        from: PeerId,
+        group_id: String,
+        group_name: String,
+        creator_id: String,
+        members: Vec<GroupMember>,
+    ) {
+        let from_str = from.to_string();
+        let creator_id = if creator_id.is_empty() {
+            from_str.clone()
+        } else {
+            creator_id
+        };
+        let mut members = members;
+        if !members.iter().any(|m| m.peer_id == from_str) {
+            let display_name = self
+                .known_peers
+                .get(&from)
+                .cloned()
+                .unwrap_or_else(|| {
+                    format!("Peer {}", &from_str[..8.min(from_str.len())])
+                });
+            members.push(GroupMember {
+                peer_id: from_str.clone(),
+                display_name,
+            });
+        }
+        let mut group = GroupChat {
+            id: group_id.clone(),
+            name: group_name,
+            creator_id,
+            members,
+            created_at: chrono::Local::now().format("%Y-%m-%d %H:%M").to_string(),
+        };
+        self.ensure_self_in_group(&mut group);
+        if let Some(existing) = self.groups.get(&group_id) {
+            group.created_at = existing.created_at.clone();
+            for m in &existing.members {
+                if !group.members.iter().any(|x| x.peer_id == m.peer_id) {
+                    group.members.push(m.clone());
+                }
+            }
+        }
+        if group::validate_group_chat(&group) {
+            self.groups.insert(group_id, group);
+            self.persist_vault();
+        }
+    }
+
+    fn ensure_self_in_group(&self, group: &mut GroupChat) {
+        let me = self.local_peer_id.to_string();
+        if !group.members.iter().any(|m| m.peer_id == me) {
+            group.members.push(GroupMember {
+                peer_id: me,
+                display_name: self.local_nickname.clone(),
+            });
+        }
+    }
+
+    fn broadcast_group_sync(&mut self, group: &GroupChat) {
+        let recipients: Vec<PeerId> = group
+            .member_peer_ids()
+            .into_iter()
+            .filter(|p| *p != self.local_peer_id)
+            .collect();
+        if recipients.is_empty() {
+            return;
+        }
+        let _ = self.command_tx.try_send(UICommand::SendGroupSync {
+            group_id: group.id.clone(),
+            group_name: group.name.clone(),
+            creator_id: group.creator_id.clone(),
+            members: group.members.clone(),
+            recipients,
+        });
+    }
+
+    fn dial_group_members(&mut self, group: &GroupChat) {
+        for pid in group.member_peer_ids() {
+            if pid == self.local_peer_id {
+                continue;
+            }
+            let _ = self.command_tx.try_send(UICommand::SearchPeer(pid));
+        }
+    }
+
+    pub(crate) fn invite_link_for_selected_group(&self) -> Option<String> {
+        let gid = self.selected_group_id()?;
+        let group = self.groups.get(gid)?;
+        Some(build_invite_link(group))
+    }
+
+    pub(crate) fn complete_pending_group_send(&mut self, message_id: &str) {
+        self.pending_group_sends
+            .retain(|p| p.message_id != message_id);
+    }
+
+    pub(crate) fn tick_pending_group_sends(&mut self) {
+        let now = Instant::now();
+        let due: Vec<PendingGroupSend> = self
+            .pending_group_sends
+            .iter()
+            .filter(|p| now.duration_since(p.last_send_at) >= RESEND_GRACE)
+            .cloned()
+            .collect();
+        for item in due {
+            if let Some(slot) = self
+                .pending_group_sends
+                .iter_mut()
+                .find(|p| p.message_id == item.message_id)
+            {
+                slot.last_send_at = now;
+                slot.attempts = slot.attempts.saturating_add(1);
+            }
+            let _ = self.command_tx.try_send(UICommand::SendGroupMessage {
+                sender_name: self.local_nickname.clone(),
+                text: item.text.clone(),
+                group_id: item.group_id.clone(),
+                members: item.members.clone(),
+                message_id: Some(item.message_id.clone()),
+                is_retry: true,
+            });
         }
     }
 

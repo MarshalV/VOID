@@ -13,9 +13,10 @@ use tracing::warn;
 
 use crate::{
     file_transfer, parse_seed_input, new_message_id, App,
-    FileTransferProgress, NetworkEvent, OutgoingDeliveryStatus, PendingSend, UICommand,
+    FileTransferProgress, NetworkEvent, OutgoingDeliveryStatus, PendingGroupSend, PendingSend, UICommand,
     RESEND_GRACE,
 };
+use crate::group::{group_thread_key, is_group_thread, GroupChat};
 use crate::voice;
 
 #[derive(Clone, Copy)]
@@ -536,6 +537,185 @@ impl App {
                     self.persist_vault();
                     self.mark_chat_journal_dirty();
                 }
+
+                ui.add_space(14.0);
+                ui.separator();
+                ui.add_space(8.0);
+
+                // -------- Групповые чаты --------
+                let groups_label = ui.add(
+                    egui::Label::new(
+                        egui::RichText::new("👥  Группы")
+                            .color(palette::ACCENT_2)
+                            .strong(),
+                    )
+                    .sense(egui::Sense::click()),
+                );
+                if groups_label.clicked() {
+                    self.show_create_group = true;
+                    self.create_group_name.clear();
+                    self.create_group_pick.clear();
+                }
+                groups_label.on_hover_text("Создать группу");
+                ui.add_space(4.0);
+
+                let mut groups: Vec<(String, GroupChat)> = self
+                    .groups
+                    .iter()
+                    .map(|(id, g)| (id.clone(), g.clone()))
+                    .collect();
+                groups.sort_by(|a, b| a.1.name.to_lowercase().cmp(&b.1.name.to_lowercase()));
+
+                let mut to_leave_group: Option<String> = None;
+                let mut to_clear_group: Vec<String> = Vec::new();
+
+                for (gid, group) in &groups {
+                    if !search.is_empty()
+                        && !group.name.to_lowercase().contains(&search)
+                        && !gid.to_lowercase().contains(&search)
+                    {
+                        continue;
+                    }
+                    let thread_key = group_thread_key(gid);
+                    let is_selected = self.selected_chat == thread_key;
+                    let (preview, time_str) = {
+                        let msgs = self.messages.lock();
+                        let last_msg = msgs.get(&thread_key).and_then(|v| v.last());
+                        let preview = match last_msg {
+                            Some(m) if m.sender_id == me_str => format!("Вы: {}", m.text),
+                            Some(m) => format!("{}: {}", m.sender_name, m.text),
+                            None => "Групповой чат".to_string(),
+                        };
+                        let time_str = last_msg
+                            .map(|m| short_time(&m.timestamp))
+                            .unwrap_or_default();
+                        (preview, time_str)
+                    };
+                    let bg = if is_selected {
+                        palette::BG_SELECTED
+                    } else {
+                        egui::Color32::TRANSPARENT
+                    };
+                    let inner = egui::Frame::none()
+                        .fill(bg)
+                        .rounding(10.0)
+                        .inner_margin(egui::Margin {
+                            left: 10.0,
+                            right: 14.0,
+                            top: 8.0,
+                            bottom: 8.0,
+                        })
+                        .show(ui, |ui| {
+                            ui.set_width(ui.available_width());
+                            ui.horizontal(|ui| {
+                                ui.label(egui::RichText::new("👥").size(28.0));
+                                ui.add_space(8.0);
+                                ui.vertical(|ui| {
+                                    ui.label(
+                                        egui::RichText::new(&group.name)
+                                            .strong()
+                                            .color(palette::TEXT)
+                                            .size(14.5),
+                                    );
+                                    ui.label(
+                                        egui::RichText::new(format!(
+                                            "{} участн. · {}",
+                                            group.members.len(),
+                                            truncate_text(&preview, 32)
+                                        ))
+                                        .color(palette::TEXT_MUTED)
+                                        .size(12.0),
+                                    );
+                                });
+                                ui.with_layout(
+                                    egui::Layout::right_to_left(egui::Align::Center),
+                                    |ui| {
+                                        if !time_str.is_empty() {
+                                            ui.label(
+                                                egui::RichText::new(&time_str)
+                                                    .size(10.5)
+                                                    .color(palette::TEXT_MUTED),
+                                            );
+                                        }
+                                    },
+                                );
+                            });
+                        })
+                        .response;
+                    let click = inner.interact(egui::Sense::click());
+                    if click.clicked() {
+                        self.selected_chat = thread_key.clone();
+                        self.messages.lock().entry(thread_key).or_default();
+                    }
+                    click.context_menu(|ui| {
+                        if ui.button("📋 Копировать invite-ссылку").clicked() {
+                            self.selected_chat = group_thread_key(gid);
+                            if let Some(link) = self.invite_link_for_selected_group() {
+                                ui.output_mut(|o| o.copied_text = link);
+                            }
+                            ui.close_menu();
+                        }
+                        if ui.button("Очистить чат").clicked() {
+                            to_clear_group.push(gid.clone());
+                            ui.close_menu();
+                        }
+                        if ui.button("🚪 Покинуть группу").clicked() {
+                            to_leave_group = Some(gid.clone());
+                            ui.close_menu();
+                        }
+                    });
+                }
+
+                for gid in to_clear_group {
+                    let key = group_thread_key(&gid);
+                    self.messages.lock().remove(&key);
+                    self.mark_chat_journal_dirty();
+                }
+                if let Some(gid) = to_leave_group {
+                    self.selected_chat = group_thread_key(&gid);
+                    self.leave_selected_group();
+                    self.push_toast(
+                        "Вы покинули группу".into(),
+                        ToastKind::Info,
+                        TOAST_TTL_SHORT,
+                    );
+                }
+
+                ui.add_space(8.0);
+                ui.collapsing(
+                    egui::RichText::new("🔗  Войти по invite-ссылке")
+                        .color(palette::ACCENT)
+                        .strong(),
+                    |ui| {
+                        ui.add(
+                            egui::TextEdit::multiline(&mut self.join_group_link)
+                                .hint_text("void://group/…")
+                                .desired_width(f32::INFINITY)
+                                .desired_rows(2)
+                                .font(egui::TextStyle::Monospace),
+                        );
+                        if ui
+                            .add_sized(
+                                [ui.available_width(), 32.0],
+                                egui::Button::new("Войти в группу").fill(palette::ACCENT),
+                            )
+                            .clicked()
+                        {
+                            let link = self.join_group_link.trim().to_string();
+                            match self.join_group_from_invite(&link) {
+                                Ok(()) => {
+                                    self.push_toast(
+                                        "Группа добавлена".into(),
+                                        ToastKind::Info,
+                                        TOAST_TTL_SHORT,
+                                    );
+                                    self.join_group_link.clear();
+                                }
+                                Err(e) => self.add_status(format!("⚠ {e}")),
+                            }
+                        }
+                    },
+                );
 
                 ui.add_space(14.0);
                 ui.separator();
@@ -1684,6 +1864,26 @@ impl eframe::App for App {
                         }
                     }
                 }
+                NetworkEvent::GroupSync {
+                    from,
+                    group_id,
+                    group_name,
+                    creator_id,
+                    members,
+                } => {
+                    self.merge_incoming_group_sync(
+                        from,
+                        group_id,
+                        group_name,
+                        creator_id,
+                        members,
+                    );
+                    self.push_toast(
+                        "Обновлён состав группы".into(),
+                        ToastKind::Info,
+                        TOAST_TTL_SHORT,
+                    );
+                }
                 NetworkEvent::Status(msg) => {
                     self.add_status(msg);
                 }
@@ -1699,6 +1899,7 @@ impl eframe::App for App {
                         OutgoingDeliveryStatus::Delivered,
                     );
                     self.complete_pending_send(peer, &message_id);
+                    self.complete_pending_group_send(&message_id);
                 }
                 NetworkEvent::MessageRead { peer, message_ids } => {
                     self.mark_outgoing_read(peer, &message_ids);
@@ -2013,6 +2214,7 @@ impl eframe::App for App {
 
         // ===== Tick: повторные отправки + истечение toast'ов =====
         self.tick_pending_sends();
+        self.tick_pending_group_sends();
         self.tick_pending_file_sends();
         self.tick_pending_voice_sends();
         self.voice_poll_tick();
@@ -2031,6 +2233,7 @@ impl eframe::App for App {
 
         // Чтобы фоновые таймеры (retry/toast) тикали без активности пользователя.
         if !self.pending_sends.is_empty()
+            || !self.pending_group_sends.is_empty()
             || !self.pending_file_sends.is_empty()
             || !self.pending_voice_sends.is_empty()
             || self.voice_recorder.on_air()
@@ -2097,6 +2300,142 @@ impl eframe::App for App {
                             }
                         });
                 });
+        }
+
+        if self.show_create_group {
+            let mut do_create = false;
+            let mut create_name = self.create_group_name.clone();
+            let mut create_pick = self.create_group_pick.clone();
+            let mut open_create = self.show_create_group;
+            let mut close_create = false;
+            egui::Window::new("Создать группу")
+                .open(&mut open_create)
+                .collapsible(false)
+                .resizable(false)
+                .default_width(360.0)
+                .show(ctx, |ui| {
+                    ui.label("Название группы");
+                    ui.add(
+                        egui::TextEdit::singleline(&mut create_name)
+                            .hint_text("Например: Команда VOID")
+                            .desired_width(f32::INFINITY),
+                    );
+                    ui.add_space(8.0);
+                    ui.label("Участники из контактов");
+                    egui::ScrollArea::vertical()
+                        .max_height(200.0)
+                        .show(ui, |ui| {
+                            let mut peers: Vec<(PeerId, String)> = self
+                                .known_peers
+                                .iter()
+                                .map(|(p, n)| (*p, n.clone()))
+                                .collect();
+                            peers.sort_by(|a, b| a.1.to_lowercase().cmp(&b.1.to_lowercase()));
+                            for (pid, name) in peers {
+                                let mut checked = create_pick.contains(&pid);
+                                if ui.checkbox(&mut checked, &name).changed() {
+                                    if checked {
+                                        create_pick.insert(pid);
+                                    } else {
+                                        create_pick.remove(&pid);
+                                    }
+                                }
+                            }
+                        });
+                    ui.add_space(12.0);
+                    ui.horizontal(|ui| {
+                        if ui.button("Отмена").clicked() {
+                            close_create = true;
+                        }
+                        if ui
+                            .add_enabled(
+                                !create_name.trim().is_empty(),
+                                egui::Button::new("Создать").fill(palette::ACCENT),
+                            )
+                            .clicked()
+                        {
+                            do_create = true;
+                        }
+                    });
+                });
+            if close_create {
+                open_create = false;
+            }
+            self.show_create_group = open_create;
+            self.create_group_name = create_name;
+            self.create_group_pick = create_pick;
+            if do_create {
+                let name = self.create_group_name.trim().to_string();
+                let members: Vec<PeerId> = self.create_group_pick.iter().copied().collect();
+                if self.create_group(name, members).is_some() {
+                    self.show_create_group = false;
+                    self.push_toast(
+                        "Группа создана".into(),
+                        ToastKind::Info,
+                        TOAST_TTL_SHORT,
+                    );
+                }
+            }
+        }
+
+        if self.show_group_panel {
+            let mut do_add = false;
+            let mut member_peer = self.add_group_member_peer.clone();
+            let mut open_panel = self.show_group_panel;
+            egui::Window::new("Добавить в группу")
+                .open(&mut open_panel)
+                .collapsible(false)
+                .resizable(false)
+                .default_width(340.0)
+                .show(ctx, |ui| {
+                    ui.label("PeerId или контакт из записной книги");
+                    ui.add(
+                        egui::TextEdit::singleline(&mut member_peer)
+                            .hint_text("12D3Koo…")
+                            .desired_width(f32::INFINITY)
+                            .font(egui::TextStyle::Monospace),
+                    );
+                    ui.add_space(8.0);
+                    ui.label(
+                        egui::RichText::new("Быстрый выбор")
+                            .color(palette::TEXT_MUTED)
+                            .size(11.0),
+                    );
+                    let mut pick: Option<PeerId> = None;
+                    for (pid, name) in &self.known_peers {
+                        if ui.small_button(name).clicked() {
+                            pick = Some(*pid);
+                        }
+                    }
+                    if let Some(pid) = pick {
+                        member_peer = pid.to_string();
+                    }
+                    ui.add_space(8.0);
+                    if ui.button("Добавить").clicked() {
+                        do_add = true;
+                    }
+                });
+            self.show_group_panel = open_panel;
+            self.add_group_member_peer = member_peer;
+            if do_add {
+                let input = self.add_group_member_peer.trim();
+                if let Ok(pid) = input.parse::<PeerId>() {
+                    match self.add_member_to_selected_group(pid) {
+                        Ok(()) => {
+                            self.show_group_panel = false;
+                            self.add_group_member_peer.clear();
+                            self.push_toast(
+                                "Участник добавлен".into(),
+                                ToastKind::Info,
+                                TOAST_TTL_SHORT,
+                            );
+                        }
+                        Err(e) => self.add_status(format!("⚠ {e}")),
+                    }
+                } else {
+                    self.add_status("⚠ Некорректный PeerId".into());
+                }
+            }
         }
 
         // ===== Левая панель: контакты (Telegram-стиль) =====
@@ -2194,6 +2533,49 @@ impl eframe::App for App {
                     ui.add_space(8.0);
 
                     if !self.selected_chat.is_empty() {
+                        if let Some(gid) = self.selected_group_id() {
+                            let group = self.groups.get(gid);
+                            let display_name = group
+                                .map(|g| g.name.as_str())
+                                .unwrap_or("Группа");
+                            let member_count = group.map(|g| g.members.len()).unwrap_or(0);
+                            ui.label(egui::RichText::new("👥").size(32.0));
+                            ui.add_space(12.0);
+                            let group_header = ui.vertical(|ui| {
+                                ui.label(
+                                    egui::RichText::new(display_name)
+                                        .strong()
+                                        .size(16.0)
+                                        .color(palette::TEXT),
+                                );
+                                ui.label(
+                                    egui::RichText::new(format!("{member_count} участников"))
+                                        .size(11.0)
+                                        .color(palette::TEXT_MUTED),
+                                );
+                            });
+                            group_header.response.context_menu(|ui| {
+                                if ui.button("📋 Копировать invite-ссылку").clicked() {
+                                    if let Some(link) = self.invite_link_for_selected_group() {
+                                        ui.output_mut(|o| o.copied_text = link);
+                                    }
+                                    ui.close_menu();
+                                }
+                                if ui.button("👤 Добавить участника").clicked() {
+                                    self.show_group_panel = true;
+                                    ui.close_menu();
+                                }
+                                ui.separator();
+                                if ui.button("Очистить чат").clicked() {
+                                    chat_clear_action = Some(ConversationClearAction::AllLocal);
+                                    ui.close_menu();
+                                }
+                                if ui.button("🚪 Покинуть группу").clicked() {
+                                    self.leave_selected_group();
+                                    ui.close_menu();
+                                }
+                            });
+                        } else {
                         let display_name = self
                             .selected_chat
                             .parse::<PeerId>()
@@ -2239,6 +2621,7 @@ impl eframe::App for App {
                                 ui.close_menu();
                             }
                         });
+                        }
                     } else {
                         ui.horizontal(|ui| {
                             self.star_icon(ui, 20.0, palette::ACCENT);
@@ -2271,10 +2654,22 @@ impl eframe::App for App {
             });
 
         if let Some(action) = chat_clear_action {
-            if let Ok(peer) = self.selected_chat.parse::<PeerId>() {
-                if matches!(action, ConversationClearAction::AllLocal) {
+            if matches!(action, ConversationClearAction::AllLocal) {
+                if is_group_thread(&self.selected_chat) {
+                    self.messages.lock().remove(&self.selected_chat);
+                    self.mark_chat_journal_dirty();
+                    self.push_toast(
+                        "Переписка удалена у вас".into(),
+                        ToastKind::Info,
+                        TOAST_TTL_SHORT,
+                    );
+                } else if let Ok(peer) = self.selected_chat.parse::<PeerId>() {
                     self.clear_conversation(peer);
-                    self.push_toast("Переписка удалена у вас".into(), ToastKind::Info, TOAST_TTL_SHORT);
+                    self.push_toast(
+                        "Переписка удалена у вас".into(),
+                        ToastKind::Info,
+                        TOAST_TTL_SHORT,
+                    );
                 }
             }
         }
@@ -2790,18 +3185,48 @@ impl eframe::App for App {
                                 }
                             }
 
-                            let recipient = if self.selected_chat.is_empty() {
-                                None
-                            } else {
-                                self.selected_chat.parse::<PeerId>().ok()
-                            };
-
                             let send_text = (send_clicked || enter_pressed)
                                 && !self.chat_input.is_empty()
                                 && !voice_mode;
 
                             if send_text {
-                                if let Some(peer_id) = recipient {
+                                if let Some(gid) = self.selected_group_id().map(str::to_string) {
+                                    let text_to_send = self.chat_input.clone();
+                                    let message_id = new_message_id();
+                                    let members = self
+                                        .groups
+                                        .get(&gid)
+                                        .map(|g| g.member_peer_ids())
+                                        .unwrap_or_default();
+                                    if members.is_empty() {
+                                        self.add_status("⚠ Группа не найдена".into());
+                                    } else {
+                                        match self.command_tx.try_send(UICommand::SendGroupMessage {
+                                            sender_name: self.local_nickname.clone(),
+                                            text: text_to_send.clone(),
+                                            group_id: gid.clone(),
+                                            members: members.clone(),
+                                            message_id: Some(message_id.clone()),
+                                            is_retry: false,
+                                        }) {
+                                            Ok(()) => {
+                                                self.chat_input.clear();
+                                                self.pending_group_sends.push(PendingGroupSend {
+                                                    group_id: gid,
+                                                    members,
+                                                    text: text_to_send,
+                                                    message_id,
+                                                    last_send_at: Instant::now(),
+                                                    attempts: 0,
+                                                });
+                                            }
+                                            Err(_) => self.add_status(
+                                                "⚠ Очередь к сети переполнена, повторите отправку."
+                                                    .into(),
+                                            ),
+                                        }
+                                    }
+                                } else if let Some(peer_id) = self.selected_chat.parse::<PeerId>().ok() {
                                     let text_to_send = self.chat_input.clone();
                                     let message_id = new_message_id();
                                     match self.command_tx.try_send(UICommand::SendMessage {
@@ -2831,8 +3256,7 @@ impl eframe::App for App {
                                     }
                                 } else if self.selected_chat.is_empty() {
                                     self.add_status(
-                                        "⚠ Выберите контакт слева, чтобы отправить сообщение."
-                                            .into(),
+                                        "⚠ Выберите контакт или группу слева.".into(),
                                     );
                                 } else {
                                     self.add_status(

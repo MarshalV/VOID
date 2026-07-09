@@ -13,6 +13,7 @@ use serde::{Deserialize, Serialize};
 use zeroize::Zeroizing;
 
 use crate::crypto;
+use crate::group::GroupChat;
 
 #[derive(Serialize, Deserialize, Clone, Default)]
 pub(crate) struct AddressBookEntry {
@@ -27,7 +28,7 @@ pub(crate) struct AddressBookEntry {
 
 #[derive(Serialize, Deserialize)]
 pub(crate) struct StorageData {
-    #[serde(default = "storage_format_v1")]
+    #[serde(default = "storage_format_v2")]
     format_version: u32,
     pub(crate) nickname: String,
     pub(crate) keypair_bytes: Vec<u8>,
@@ -37,10 +38,13 @@ pub(crate) struct StorageData {
     /// Известные VOID bootstrap-ноды (полные multiaddr с `/p2p/`). Обмениваются с участниками сети.
     #[serde(default)]
     pub(crate) void_bootstraps: Vec<String>,
+    /// Групповые чаты (format_version >= 2).
+    #[serde(default)]
+    pub(crate) groups: Vec<GroupChat>,
 }
 
-fn storage_format_v1() -> u32 {
-    1
+fn storage_format_v2() -> u32 {
+    2
 }
 
 pub(crate) struct Storage;
@@ -56,6 +60,7 @@ impl Storage {
     const VAULT_ENTRY_ONE_ADDR_MAX: usize = 1024;
     const VAULT_BOOTSTRAPS_MAX: usize = 64;
     const VAULT_BOOTSTRAP_ONE_ADDR_MAX: usize = 1024;
+    const VAULT_GROUPS_MAX: usize = 512;
 
     pub(crate) const FILE: &'static str = "vault.bin";
     const FILE_TMP: &'static str = "vault.bin.tmp";
@@ -148,6 +153,7 @@ impl Storage {
         static_secret: Option<&crypto::StaticSecret>,
         address_book: Option<&[AddressBookEntry]>,
         void_bootstraps: Option<&[String]>,
+        groups: Option<&[GroupChat]>,
     ) -> Result<(), Box<dyn Error>> {
         let current_load = Self::load(master_key);
 
@@ -193,13 +199,23 @@ impl Storage {
                 .unwrap_or_default()
         };
 
+        let groups_vec: Vec<GroupChat> = if let Some(gs) = groups {
+            gs.to_vec()
+        } else {
+            current_load
+                .as_ref()
+                .map(|c| c.groups.clone())
+                .unwrap_or_default()
+        };
+
         let data = StorageData {
-            format_version: 1,
+            format_version: 2,
             nickname: nickname.to_string(),
             keypair_bytes,
             static_secret_bytes,
             address_book: address_book_vec,
             void_bootstraps: void_bootstraps_vec,
+            groups: groups_vec,
         };
         let plaintext = serde_json::to_vec(&data)?;
 
@@ -299,6 +315,18 @@ impl Storage {
                 .into());
             }
         }
+        if s.groups.len() > Self::VAULT_GROUPS_MAX {
+            return Err(format!(
+                "vault: groups больше {} записей",
+                Self::VAULT_GROUPS_MAX
+            )
+            .into());
+        }
+        for (i, g) in s.groups.iter().enumerate() {
+            if !crate::group::validate_group_chat(g) {
+                return Err(format!("vault: groups[{}] — некорректные данные", i).into());
+            }
+        }
         Ok(())
     }
 
@@ -330,7 +358,7 @@ impl Storage {
 
         let storage: StorageData = serde_json::from_slice(&plaintext)?;
         Self::validate_plain_storage(&storage)?;
-        if storage.format_version != 1 {
+        if storage.format_version != 1 && storage.format_version != 2 {
             return Err(format!(
                 "vault: неподдерживаемая format_version {}",
                 storage.format_version

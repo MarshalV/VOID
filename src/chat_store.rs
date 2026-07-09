@@ -36,7 +36,7 @@ impl ChatJournal {
     const MAX_THREADS: usize = 4096;
     const MAX_MESSAGES_PER_THREAD: usize = 5000;
     const MAX_TOTAL_MESSAGES: usize = 50_000;
-    const MAX_PEER_ID_BYTES: usize = 256;
+    const MAX_THREAD_KEY_BYTES: usize = 320;
 
     pub(crate) fn save(
         master_key: &[u8; 32],
@@ -173,8 +173,8 @@ impl ChatJournal {
         }
         let mut total = 0usize;
         for (peer, msgs) in &data.threads {
-            if peer.len() > Self::MAX_PEER_ID_BYTES {
-                return Err("chat journal: peer_id слишком длинный".into());
+            if peer.len() > Self::MAX_THREAD_KEY_BYTES {
+                return Err("chat journal: ключ потока слишком длинный".into());
             }
             if msgs.len() > Self::MAX_MESSAGES_PER_THREAD {
                 return Err(format!(
