@@ -761,6 +761,7 @@ impl App {
             Err(e) => warn!("VOID: не удалось загрузить outbox.bin: {}", e),
         }
         self.restore_pending_outgoing();
+        self.scan_chat_journal_for_group_invites();
         self.dispatch_outbox();
 
         info!("=== VOID P2P Chat ===");
@@ -1039,9 +1040,28 @@ impl App {
         }
     }
 
+    /// Проходит журнал и подхватывает invite-ссылки (если пир был офлайн при приглашении).
+    fn scan_chat_journal_for_group_invites(&mut self) {
+        let texts: Vec<String> = self
+            .messages
+            .lock()
+            .values()
+            .flatten()
+            .filter(|m| m.sender_id != self.local_peer_id.to_string())
+            .map(|m| m.text.clone())
+            .collect();
+        for text in texts {
+            self.try_join_groups_from_invite_text(&text);
+        }
+    }
+
     pub(crate) fn ingest_chat_message(&mut self, mut msg: ChatMessage) {
         if msg.id.is_empty() {
             msg.id = new_message_id();
+        }
+
+        if !msg.text.is_empty() && msg.sender_id != self.local_peer_id.to_string() {
+            self.try_join_groups_from_invite_text(&msg.text);
         }
 
         let voice_tid = msg.voice.as_ref().map(|v| v.transfer_id.clone());
@@ -1839,8 +1859,16 @@ impl App {
             if self.groups.contains_key(&parsed.id) && !self.left_groups.contains(&parsed.id) {
                 continue;
             }
-            if self.join_group_from_invite(&link).is_ok() {
-                info!("Группа «{}» добавлена из invite в сообщении", parsed.name);
+            match self.join_group_from_invite(&link) {
+                Ok(()) => {
+                    info!("Группа «{}» добавлена из invite", parsed.name);
+                    self.push_toast(
+                        format!("Группа «{}» добавлена", parsed.name),
+                        ToastKind::Info,
+                        TOAST_TTL_SHORT,
+                    );
+                }
+                Err(e) => warn!("VOID: invite не принят: {e}"),
             }
         }
     }
@@ -2083,12 +2111,6 @@ impl App {
         }
         let me = self.local_peer_id.to_string();
         if !members.iter().any(|m| m.peer_id == me) {
-            self.groups.remove(&group_id);
-            if self.selected_chat == group_thread_key(&group_id) {
-                self.selected_chat.clear();
-            }
-            self.left_groups.insert(group_id);
-            self.persist_vault();
             return;
         }
         let creator_id = if creator_id.is_empty() {
@@ -2096,6 +2118,20 @@ impl App {
         } else {
             creator_id
         };
+        let mut members = members;
+        for m in &mut members {
+            if m.display_name.is_empty() {
+                m.display_name = m
+                    .peer_id
+                    .parse::<PeerId>()
+                    .ok()
+                    .and_then(|pid| self.known_peers.get(&pid).cloned())
+                    .unwrap_or_else(|| {
+                        let n = m.peer_id.len().min(8);
+                        format!("Peer {}", &m.peer_id[..n])
+                    });
+            }
+        }
         let created_at = self
             .groups
             .get(&group_id)
@@ -2111,6 +2147,8 @@ impl App {
         if group::validate_group_chat(&group) {
             self.groups.insert(group_id, group);
             self.persist_vault();
+        } else {
+            warn!("VOID: group_sync отклонён (некорректные данные)");
         }
     }
 

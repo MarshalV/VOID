@@ -11,6 +11,7 @@ mod app;
 mod bootstrap;
 mod network;
 mod protocol;
+mod paths;
 mod vault;
 
 pub(crate) use app::{App, PendingGroupSend, PendingSend, RESEND_GRACE, SharedChatMessages};
@@ -29,6 +30,7 @@ use tracing::info;
 
 use app::DeferredNetworkSpawn;
 use network::env_flag_true;
+use paths::init_storage_paths;
 use vault::{detect_vault_unlock_kind, load_remembered_password, VaultUnlockKind, VaultUnlockState};
 
 #[tokio::main]
@@ -44,6 +46,10 @@ async fn main() -> Result<(), Box<dyn Error>> {
             }),
         )
         .try_init();
+
+    if let Err(e) = init_storage_paths() {
+        eprintln!("VOID: не удалось инициализировать каталог данных: {e}");
+    }
 
     // === Правила файрвола: только по явному согласию (VOID_APPLY_FIREWALL_RULE=1) ===
     #[allow(unused_variables)]

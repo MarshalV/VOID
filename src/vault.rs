@@ -8,6 +8,7 @@ use aes_gcm::{
     Aes256Gcm, Key, Nonce,
 };
 use argon2::{Algorithm, Argon2, Params, Version};
+use blake2::{Blake2b512, Digest};
 use rand::RngCore;
 use serde::{Deserialize, Serialize};
 use zeroize::Zeroizing;
@@ -431,12 +432,13 @@ impl VaultUnlockState {
     }
 }
 
-const KEYRING_SERVICE: &str = "VOID P2P Messenger";
-const KEYRING_USER: &str = "vault_password";
+const KEYRING_SERVICE: &str = "void-p2p-messenger";
+const KEYRING_USER: &str = "vault";
 const SESSION_PWD_FILE: &str = "void.pwd";
+const SESSION_PWD_MAGIC: &[u8; 8] = b"VOIDPWD1";
 
 #[cfg(windows)]
-fn session_file_save(password: &str) -> Result<(), Box<dyn Error>> {
+fn session_file_save_dpapi(password: &str) -> Result<(), Box<dyn Error>> {
     use windows_dpapi::{encrypt_data, Scope};
     let encrypted = encrypt_data(password.as_bytes(), Scope::User)
         .map_err(|e| format!("dpapi encrypt: {e}"))?;
@@ -445,14 +447,86 @@ fn session_file_save(password: &str) -> Result<(), Box<dyn Error>> {
 }
 
 #[cfg(windows)]
-fn session_file_load() -> Option<String> {
+fn session_file_load_dpapi() -> Option<String> {
     use windows_dpapi::{decrypt_data, Scope};
     let data = std::fs::read(SESSION_PWD_FILE).ok()?;
+    if data.starts_with(SESSION_PWD_MAGIC) {
+        return None;
+    }
     let plain = decrypt_data(&data, Scope::User).ok()?;
     String::from_utf8(plain).ok().filter(|s| !s.is_empty())
 }
 
-#[cfg(windows)]
+fn session_file_key() -> [u8; 32] {
+    let user = std::env::var("USER")
+        .or_else(|_| std::env::var("USERNAME"))
+        .unwrap_or_default();
+    let mut hasher = Blake2b512::new();
+    hasher.update(b"void-session-v1");
+    hasher.update(user.as_bytes());
+    if let Ok(exe) = std::env::current_exe() {
+        hasher.update(exe.to_string_lossy().as_bytes());
+    }
+    let hash = hasher.finalize();
+    let mut key = [0u8; 32];
+    key.copy_from_slice(&hash[..32]);
+    key
+}
+
+fn session_file_save_aes(password: &str) -> Result<(), Box<dyn Error>> {
+    let key = session_file_key();
+    let cipher = Aes256Gcm::new(Key::<Aes256Gcm>::from_slice(&key));
+    let mut nonce = [0u8; 12];
+    rand::thread_rng().fill_bytes(&mut nonce);
+    let ct = cipher
+        .encrypt(Nonce::from_slice(&nonce), password.as_bytes())
+        .map_err(|e| format!("session encrypt: {e}"))?;
+    let mut blob = Vec::with_capacity(SESSION_PWD_MAGIC.len() + nonce.len() + ct.len());
+    blob.extend_from_slice(SESSION_PWD_MAGIC);
+    blob.extend_from_slice(&nonce);
+    blob.extend_from_slice(&ct);
+    std::fs::write(SESSION_PWD_FILE, &blob)?;
+    Ok(())
+}
+
+fn session_file_load_aes() -> Option<String> {
+    let data = std::fs::read(SESSION_PWD_FILE).ok()?;
+    if data.len() < SESSION_PWD_MAGIC.len() + 12 + 16 {
+        return None;
+    }
+    if &data[..SESSION_PWD_MAGIC.len()] != SESSION_PWD_MAGIC {
+        return None;
+    }
+    let rest = &data[SESSION_PWD_MAGIC.len()..];
+    let (nonce, ct) = rest.split_at(12);
+    let key = session_file_key();
+    let cipher = Aes256Gcm::new(Key::<Aes256Gcm>::from_slice(&key));
+    let plain = cipher
+        .decrypt(Nonce::from_slice(nonce), ct.as_ref())
+        .ok()?;
+    String::from_utf8(plain).ok().filter(|s| !s.is_empty())
+}
+
+fn session_file_save(password: &str) -> Result<(), Box<dyn Error>> {
+    #[cfg(windows)]
+    {
+        if session_file_save_dpapi(password).is_ok() {
+            return Ok(());
+        }
+    }
+    session_file_save_aes(password)
+}
+
+fn session_file_load() -> Option<String> {
+    #[cfg(windows)]
+    {
+        if let Some(pwd) = session_file_load_dpapi() {
+            return Some(pwd);
+        }
+    }
+    session_file_load_aes()
+}
+
 fn session_file_clear() {
     let _ = std::fs::remove_file(SESSION_PWD_FILE);
 }
@@ -461,17 +535,12 @@ fn keyring_entry() -> Result<keyring::Entry, Box<dyn Error>> {
     keyring::Entry::new(KEYRING_SERVICE, KEYRING_USER).map_err(|e| e.into())
 }
 
-/// Сохраняет пароль vault в системном хранилище учётных данных (+ DPAPI-файл на Windows).
+/// Сохраняет пароль vault (Keychain / Credential Manager + локальный void.pwd).
 pub(crate) fn save_remembered_password(password: &str) -> Result<(), Box<dyn Error>> {
     let keyring_err = keyring_entry()
         .and_then(|entry| entry.set_password(password).map_err(|e| e.into()));
-    #[cfg(windows)]
-    {
-        session_file_save(password)?;
-        return keyring_err.or(Ok(()));
-    }
-    #[cfg(not(windows))]
-    keyring_err
+    session_file_save(password)?;
+    keyring_err.or(Ok(()))
 }
 
 /// Загружает сохранённый пароль vault (если есть).
@@ -483,13 +552,7 @@ pub(crate) fn load_remembered_password() -> Option<String> {
             }
         }
     }
-    #[cfg(windows)]
-    {
-        if let Some(pwd) = session_file_load() {
-            return Some(pwd);
-        }
-    }
-    None
+    session_file_load()
 }
 
 /// Удаляет сохранённый пароль vault.
@@ -497,7 +560,6 @@ pub(crate) fn clear_remembered_password() {
     if let Ok(entry) = keyring_entry() {
         let _ = entry.delete_credential();
     }
-    #[cfg(windows)]
     session_file_clear();
 }
 
