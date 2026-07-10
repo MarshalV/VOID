@@ -64,6 +64,14 @@ pub(crate) fn parse_group_thread_key(key: &str) -> Option<&str> {
     }
 }
 
+pub(crate) fn dedupe_members(members: Vec<GroupMember>) -> Vec<GroupMember> {
+    let mut seen = std::collections::HashSet::new();
+    members
+        .into_iter()
+        .filter(|m| seen.insert(m.peer_id.clone()))
+        .collect()
+}
+
 pub(crate) fn validate_group_chat(g: &GroupChat) -> bool {
     validate_group_id(&g.id)
         && !g.name.is_empty()

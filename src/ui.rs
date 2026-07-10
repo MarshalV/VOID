@@ -1876,7 +1876,7 @@ impl eframe::App for App {
 
                     self.ingest_chat_message(msg.clone());
                     if !msg.text.is_empty() {
-                        self.try_join_groups_from_invite_text(&msg.text);
+                        self.try_process_invite_message(&msg.id, &msg.text);
                     }
                     if let Some(ref voice) = msg.voice {
                         if let Some(path) = self.resolve_voice_path(&voice.transfer_id) {
