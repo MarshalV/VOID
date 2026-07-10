@@ -767,6 +767,7 @@ impl App {
             Err(e) => warn!("VOID: не удалось загрузить outbox.bin: {}", e),
         }
         self.restore_pending_outgoing();
+        self.prune_auto_discovered_contacts();
         self.refresh_outbox_group_sync_snapshots();
         self.scan_chat_journal_for_group_invites();
         self.dispatch_outbox();
@@ -1037,7 +1038,7 @@ impl App {
                         continue;
                     };
                     let members = self.members_for_sync(group);
-                    if members.len() < 2 {
+                    if members.is_empty() {
                         continue;
                     }
                     let _ = self.command_tx.try_send(UICommand::SendGroupSync {
@@ -1070,9 +1071,21 @@ impl App {
             if self.invite_join_processed.contains(&id) {
                 continue;
             }
-            let _ = self.try_join_groups_from_invite_text(&text, &id);
-            self.invite_join_processed.insert(id);
+            let joined = self.try_join_groups_from_invite_text(&text, &id);
+            if joined || self.invite_links_handled(&text) {
+                self.invite_join_processed.insert(id);
+            }
         }
+    }
+
+    fn invite_links_handled(&self, text: &str) -> bool {
+        let links = extract_invite_links(text);
+        links.is_empty()
+            || links.iter().all(|link| {
+                parse_invite_link(link).is_some_and(|g| {
+                    self.left_groups.contains(&g.id) || self.is_active_group_member(&g.id)
+                })
+            })
     }
 
     pub(crate) fn ingest_chat_message(&mut self, mut msg: ChatMessage) {
@@ -1915,7 +1928,17 @@ impl App {
 
     fn install_group(&mut self, mut group: GroupChat, select: bool) -> Result<(), &'static str> {
         group.members = dedupe_members(group.members);
+        if group.creator_id.is_empty() {
+            group.creator_id = group
+                .members
+                .first()
+                .map(|m| m.peer_id.clone())
+                .unwrap_or_else(|| self.local_peer_id.to_string());
+        }
         self.ensure_self_in_group(&mut group);
+        if !group::validate_group_chat(&group) {
+            return Err("некорректные данные группы");
+        }
         let was_active = self.is_active_group_member(&group.id);
         let thread = group_thread_key(&group.id);
         self.groups.insert(group.id.clone(), group.clone());
@@ -2004,13 +2027,15 @@ impl App {
         )
     }
 
-    /// Обрабатывает invite в входящем сообщении (один раз на message id).
+    /// Обрабатывает invite в входящем сообщении (повторяет, пока не вступит).
     pub(crate) fn try_process_invite_message(&mut self, message_id: &str, text: &str) {
         if self.invite_join_processed.contains(message_id) {
             return;
         }
-        let _ = self.try_join_groups_from_invite_text(text, message_id);
-        self.invite_join_processed.insert(message_id.to_string());
+        let joined = self.try_join_groups_from_invite_text(text, message_id);
+        if joined || self.invite_links_handled(text) {
+            self.invite_join_processed.insert(message_id.to_string());
+        }
     }
 
     fn refresh_outbox_group_sync_snapshots(&mut self) {
@@ -2026,7 +2051,7 @@ impl App {
                 }
                 let group = self.groups.get(group_id)?;
                 let members = self.members_for_sync(group);
-                if members.len() < 2 {
+                if members.is_empty() {
                     return None;
                 }
                 Some((
@@ -2326,7 +2351,7 @@ impl App {
             return;
         }
         let members = self.members_for_sync(group);
-        if members.len() < 2 {
+        if members.is_empty() {
             return;
         }
         let mut sync_group = group.clone();
@@ -2371,7 +2396,7 @@ impl App {
                 continue;
             };
             let members = self.members_for_sync(&group);
-            if members.len() < 2 {
+            if members.is_empty() {
                 continue;
             }
             let mut sync_group = group.clone();
@@ -2438,7 +2463,7 @@ impl App {
                         continue;
                     };
                     let members = self.members_for_sync(group);
-                    if members.len() < 2 {
+                    if members.is_empty() {
                         continue;
                     }
                     let _ = self.command_tx.try_send(UICommand::SendGroupSync {
@@ -2623,9 +2648,54 @@ impl App {
         }
     }
 
-    /// Личный чат не выбран, пока пользователь не нажмёт 💬. Если чат пуст — открываем первого пира (mDNS / входящее).
+    /// Убирает из контактов автоматически обнаруженные DHT/mDNS-узлы без переписки.
+    fn prune_auto_discovered_contacts(&mut self) {
+        let me = self.local_peer_id.to_string();
+        let msgs = self.messages.lock();
+        let to_remove: Vec<PeerId> = self
+            .known_peers
+            .iter()
+            .filter_map(|(pid, name)| {
+                if *pid == self.local_peer_id {
+                    return Some(*pid);
+                }
+                let pid_str = pid.to_string();
+                let auto_name = format!("Peer_{}", &pid_str[..8.min(pid_str.len())]);
+                if name != &auto_name {
+                    return None;
+                }
+                if msgs.contains_key(&pid_str) && msgs.get(&pid_str).is_some_and(|v| !v.is_empty()) {
+                    return None;
+                }
+                let in_group = self.groups.values().any(|g| {
+                    g.members.iter().any(|m| m.peer_id == pid_str)
+                });
+                if in_group {
+                    return None;
+                }
+                Some(*pid)
+            })
+            .collect();
+        drop(msgs);
+        if to_remove.is_empty() {
+            return;
+        }
+        for pid in to_remove {
+            if pid.to_string() == me {
+                continue;
+            }
+            self.known_peers.remove(&pid);
+            self.contact_addrs.remove(&pid);
+        }
+        self.persist_vault();
+    }
+
+    /// Личный чат не выбран — открываем только существующий контакт.
     pub(crate) fn select_peer_if_no_chat(&mut self, peer_id: PeerId) {
         if !self.selected_chat.is_empty() {
+            return;
+        }
+        if !self.known_peers.contains_key(&peer_id) {
             return;
         }
         let s = peer_id.to_string();

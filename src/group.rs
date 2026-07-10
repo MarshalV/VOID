@@ -177,6 +177,14 @@ pub(crate) fn parse_invite_link(input: &str) -> Option<GroupChat> {
             .collect()
     };
 
+    let mut creator_id = creator_id;
+    if creator_id.is_empty() {
+        creator_id = members
+            .first()
+            .map(|m| m.peer_id.clone())
+            .unwrap_or_default();
+    }
+
     let group = GroupChat {
         id: id_part.to_string(),
         name,

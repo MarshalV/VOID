@@ -7,7 +7,6 @@
 
 use eframe::egui;
 use libp2p::PeerId;
-use std::collections::hash_map::Entry;
 use std::time::{Duration, Instant};
 use tracing::warn;
 
@@ -1765,13 +1764,6 @@ impl eframe::App for App {
                         &peer.to_string()[..8],
                         addr
                     ));
-                    if peer != self.local_peer_id {
-                        if let Entry::Vacant(e) = self.known_peers.entry(peer) {
-                            e.insert(format!("Peer_{}", &peer.to_string()[..8]));
-                            self.persist_vault();
-                        }
-                        self.select_peer_if_no_chat(peer);
-                    }
                 }
                 NetworkEvent::MdnsExpired(peer) => {
                     self.add_status(format!("⏳ Оффлайн (MDNS): {}", &peer.to_string()[..8]));
@@ -2229,31 +2221,22 @@ impl eframe::App for App {
                     self.merge_learned_bootstraps(addrs);
                 }
                 NetworkEvent::PeerAddress(peer, ma) => {
-                    // Пир засветился с рабочим адресом: если он уже контакт —
-                    // обновляем запись; если нет, но это явно реальный VOID-
-                    // клиент (Identify/Connected), добавляем как Peer_XXXX.
                     if peer == self.local_peer_id {
+                        continue;
+                    }
+                    // Адреса сохраняем только для контактов из записной книги.
+                    if !self.known_peers.contains_key(&peer) {
                         continue;
                     }
                     let entry = self.contact_addrs.entry(peer).or_default();
                     let is_new = !entry.iter().any(|a| a == &ma);
                     if is_new {
                         entry.push(ma);
-                        // Ограничиваем 4 последними адресами на контакта.
                         if entry.len() > 4 {
                             let excess = entry.len() - 4;
                             entry.drain(0..excess);
                         }
-                        let mut changed = true;
-                        if let Entry::Vacant(e) = self.known_peers.entry(peer) {
-                            e.insert(format!("Peer_{}", &peer.to_string()[..8]));
-                        } else {
-                            // Обновили только адреса — всё равно persist.
-                            changed = true;
-                        }
-                        if changed {
-                            self.persist_vault();
-                        }
+                        self.persist_vault();
                     }
                 }
             }
