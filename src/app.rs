@@ -253,6 +253,8 @@ pub(crate) struct App {
     /// Сообщения, по которым уже обработан auto-join по invite (не повторять).
     invite_join_processed: HashSet<String>,
     journal_persist_after: Option<Instant>,
+    /// Выход уже обработан (не повторять сохранение / flush).
+    exit_prepared: bool,
     /// Ожидаемый результат выбора папки сохранения: `(rx, transfer_id, from_peer)`.
     /// Поллим `try_recv()` каждый кадр; `None` = выбор не идёт.
     pub(crate) pending_accept: Option<(
@@ -375,6 +377,7 @@ impl App {
             group_departed_peers: HashMap::new(),
             invite_join_processed: HashSet::new(),
             journal_persist_after: None,
+            exit_prepared: false,
             pending_accept: None,
             pending_unlock,
             deferred_network_spawn,
@@ -855,6 +858,10 @@ impl App {
     }
 
     pub(crate) fn persist_all_before_exit(&mut self) {
+        if self.exit_prepared {
+            return;
+        }
+        self.exit_prepared = true;
         self.persist_chat_journal();
         self.persist_outbox();
         self.flush_outbox_to_dht_on_exit();
@@ -916,15 +923,16 @@ impl App {
         });
     }
 
-    /// При выходе: ждём DHT-публикацию в отдельном std-потоке (нельзя blocking_send из tokio runtime).
+    /// При выходе: best-effort публикация outbox (не блокируем UI — outbox уже на диске).
     fn flush_outbox_to_dht_on_exit(&self) {
         let items = self.build_offline_publish_items();
         if items.is_empty() {
             return;
         }
         let command_tx = self.command_tx.clone();
-        std::thread::scope(|scope| {
-            scope.spawn(|| {
+        let _ = std::thread::Builder::new()
+            .name("void-exit-flush".into())
+            .spawn(move || {
                 let (ack_tx, ack_rx) = std::sync::mpsc::channel();
                 if command_tx
                     .blocking_send(UICommand::PublishOfflineOutbox {
@@ -933,10 +941,9 @@ impl App {
                     })
                     .is_ok()
                 {
-                    let _ = ack_rx.recv_timeout(Duration::from_secs(10));
+                    let _ = ack_rx.recv_timeout(Duration::from_secs(2));
                 }
             });
-        });
     }
 
     fn build_offline_publish_items(&self) -> Vec<OfflineOutboxItem> {
@@ -1040,13 +1047,17 @@ impl App {
             return;
         }
         let mut any = false;
+        let mut decrypt_failed = 0u32;
         for env in envelopes {
             if self.offline_mail_processed.contains(&env.message_id) {
                 continue;
             }
             let plaintext = match open_envelope(&self._local_static, &env) {
                 Ok(p) => p,
-                Err(_) => continue,
+                Err(_) => {
+                    decrypt_failed += 1;
+                    continue;
+                }
             };
             match env.kind.as_str() {
                 "dm" => {
@@ -1088,6 +1099,10 @@ impl App {
             self.mark_chat_journal_dirty();
             let _ = self.command_tx.try_send(UICommand::ClearOfflineMailbox);
             self.add_status("📬 Получена офлайн-почта".into());
+        } else if decrypt_failed > 0 {
+            self.add_status(format!(
+                "⚠ {decrypt_failed} офлайн-конвертов не удалось расшифровать"
+            ));
         }
     }
 

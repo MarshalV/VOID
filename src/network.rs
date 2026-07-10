@@ -3578,6 +3578,21 @@ pub async fn run_chat_network(
                                  let _ = event_tx.send(NetworkEvent::Status(format!("✅ СОЕДИНЕНО: {}", &peer_id.to_string()[..8]))).await;
                                  // Запрашиваем офлайн-почту у всех пиров (включая bootstrap-relay).
                                  query_relay_mailbox(&mut swarm, local_peer_id);
+                                 if bootstrap_peer_ids.contains(&peer_id) {
+                                     let qid = swarm
+                                         .behaviour_mut()
+                                         .kad
+                                         .get_record(mailbox_record_key(local_peer_id));
+                                     pending_kad_mail.insert(
+                                         qid,
+                                         MailboxKadOp::FetchInbox { record_bytes: None },
+                                     );
+                                     let _ = event_tx
+                                         .send(NetworkEvent::Status(
+                                             "📬 Запрос офлайн-почты у bootstrap".into(),
+                                         ))
+                                         .await;
+                                 }
                                  // Сразу делимся bootstrap-нодами с любым подключённым VOID-клиентом.
                                  if !bootstrap_peer_ids.contains(&peer_id) {
                                      let gossip = bootstrap_gossip_strings(&void_bootstraps);

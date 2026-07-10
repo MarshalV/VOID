@@ -1833,6 +1833,7 @@ impl eframe::App for App {
                     self.dispatch_outbox_for_peer(peer);
                     self.sync_groups_to_peer(peer);
                     self.retry_pending_group_sends_for_peer(peer);
+                    let _ = self.command_tx.try_send(UICommand::FetchOfflineMailbox);
                 }
                 NetworkEvent::Disconnected(peer) => {
                     self.connected_peers = self.connected_peers.saturating_sub(1);
