@@ -522,6 +522,19 @@ pub(crate) enum V1Packet {
     BootstrapGossip {
         addrs: Vec<String>,
     },
+    /// Store-and-forward: сохранить офлайн-почту для получателя (E2EE-конверты).
+    OfflineMailboxStore {
+        recipient: String,
+        envelopes: Vec<crate::offline_mail::OfflineEnvelope>,
+    },
+    /// Запросить офлайн-почту для peer_id.
+    OfflineMailboxQuery {
+        recipient: String,
+    },
+    /// Ответ на OfflineMailboxQuery.
+    OfflineMailboxDeliver {
+        envelopes: Vec<crate::offline_mail::OfflineEnvelope>,
+    },
     Encrypted {
         header: crypto::MessageHeader,
         ciphertext: Vec<u8>,

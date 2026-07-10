@@ -1,4 +1,4 @@
-//! Offline mail via DHT.
+//! Offline mail via DHT and peer relay.
 
 use anyhow::{anyhow, Result};
 use chacha20poly1305::{

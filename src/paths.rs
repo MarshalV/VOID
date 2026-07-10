@@ -12,6 +12,7 @@ const LEGACY_BLOBS: &[&str] = &[
     "void.pwd",
     "outbox.bin",
     "chat_journal.bin",
+    "relay_mailbox.bin",
 ];
 
 /// Переключает cwd на каталог данных и мигрирует файлы из старых мест (cwd, рядом с .exe).

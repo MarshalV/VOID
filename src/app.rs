@@ -168,7 +168,7 @@ pub(crate) const RESEND_DELAY_MAX: Duration = Duration::from_secs(300);
 pub(crate) const SESSION_WAIT_TIMEOUT: Duration = Duration::from_secs(20);
 /// Журнал переписок пишем на диск не чаще этого интервала (не блокируем отправку).
 pub(crate) const JOURNAL_PERSIST_DEBOUNCE: Duration = Duration::from_secs(2);
-pub(crate) const OFFLINE_DHT_PUBLISH_DEBOUNCE: Duration = Duration::from_secs(20);
+pub(crate) const OFFLINE_DHT_PUBLISH_DEBOUNCE: Duration = Duration::from_secs(1);
 
 pub(crate) fn resend_delay_for_attempt(attempts: u32) -> Duration {
     let exp = attempts.min(6);
@@ -877,6 +877,7 @@ impl App {
         if self.peer_prekeys.get(&peer) != Some(&public_key) {
             self.peer_prekeys.insert(peer, public_key);
             self.persist_vault();
+            self.accelerate_offline_dht_publish();
         }
     }
 
@@ -932,7 +933,7 @@ impl App {
                     })
                     .is_ok()
                 {
-                    let _ = ack_rx.recv_timeout(Duration::from_secs(3));
+                    let _ = ack_rx.recv_timeout(Duration::from_secs(10));
                 }
             });
         });
@@ -1086,7 +1087,7 @@ impl App {
             self.persist_vault();
             self.mark_chat_journal_dirty();
             let _ = self.command_tx.try_send(UICommand::ClearOfflineMailbox);
-            self.add_status("📬 Получена офлайн-почта из DHT".into());
+            self.add_status("📬 Получена офлайн-почта".into());
         }
     }
 
@@ -1103,7 +1104,7 @@ impl App {
         self.outbox_entries.retain(|e| !outbox_same_slot(e, &entry));
         self.outbox_entries.push(entry);
         self.persist_outbox();
-        self.schedule_offline_dht_publish();
+        self.accelerate_offline_dht_publish();
     }
 
     fn remove_outbox_direct(&mut self, peer: &str, message_id: &str) {

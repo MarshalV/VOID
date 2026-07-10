@@ -1,7 +1,8 @@
 //! libp2p swarm, сетевой цикл и события UI ↔ сеть.
 
 use std::collections::{HashMap, HashSet};
-use std::sync::mpsc as std_mpsc;
+use std::sync::{mpsc as std_mpsc, Arc};
+use std::sync::atomic::{AtomicU32, Ordering};
 use std::time::{Duration, Instant};
 
 use futures::StreamExt;
@@ -25,6 +26,7 @@ use crate::offline_mail::{
     decode_mailbox, encode_mailbox, mailbox_record_key, prekey_record_key, seal_for_recipient,
     OfflineEnvelope, MAILBOX_TTL_SECS,
 };
+use crate::relay_mailbox::RelayMailbox;
 use crate::protocol::{
     build_delete_ack_json, build_v1_hello,
     chat_message_id_from_json,     delete_command_message_ids, is_delete_command_json,
@@ -623,15 +625,35 @@ enum MailboxKadOp {
     MergePut {
         recipient: PeerId,
         new_envelopes: Vec<OfflineEnvelope>,
-        ack_sync: Option<std_mpsc::Sender<()>>,
+        done: Option<PublishDone>,
         record_bytes: Option<Vec<u8>>,
     },
     PrekeyForPublish {
         recipient: PeerId,
         items: Vec<OfflineOutboxItem>,
-        ack_sync: Option<std_mpsc::Sender<()>>,
+        done: Option<PublishDone>,
         prekey_bytes: Option<Vec<u8>>,
     },
+    AwaitPut {
+        done: Option<PublishDone>,
+    },
+}
+
+type PublishDone = Arc<dyn Fn() + Send + Sync>;
+
+fn publish_done_token(tx: std_mpsc::Sender<()>, total: u32) -> PublishDone {
+    let left = Arc::new(AtomicU32::new(total));
+    Arc::new(move || {
+        if left.fetch_sub(1, Ordering::SeqCst) == 1 {
+            let _ = tx.send(());
+        }
+    })
+}
+
+fn signal_publish_done(done: &Option<PublishDone>) {
+    if let Some(d) = done {
+        d();
+    }
 }
 
 fn publish_self_prekey(
@@ -656,7 +678,7 @@ fn start_mailbox_merge_put(
     pending_kad_mail: &mut HashMap<kad::QueryId, MailboxKadOp>,
     recipient: PeerId,
     new_envelopes: Vec<OfflineEnvelope>,
-    ack_sync: Option<std_mpsc::Sender<()>>,
+    done: Option<PublishDone>,
 ) {
     let qid = swarm
         .behaviour_mut()
@@ -667,7 +689,7 @@ fn start_mailbox_merge_put(
         MailboxKadOp::MergePut {
             recipient,
             new_envelopes,
-            ack_sync,
+            done,
             record_bytes: None,
         },
     );
@@ -689,11 +711,14 @@ fn merge_envelopes(
 
 fn put_mailbox_envelopes(
     swarm: &mut libp2p::Swarm<ChatBehaviour>,
+    pending_kad_mail: &mut HashMap<kad::QueryId, MailboxKadOp>,
     local_peer_id: PeerId,
     recipient: PeerId,
     envelopes: &[OfflineEnvelope],
+    done: Option<PublishDone>,
 ) {
     let Ok(value) = encode_mailbox(envelopes) else {
+        signal_publish_done(&done);
         return;
     };
     let record = kad::Record {
@@ -702,10 +727,117 @@ fn put_mailbox_envelopes(
         publisher: Some(local_peer_id),
         expires: Some(Instant::now() + Duration::from_secs(MAILBOX_TTL_SECS)),
     };
-    let _ = swarm
+    match swarm
         .behaviour_mut()
         .kad
-        .put_record(record, kad::Quorum::One);
+        .put_record(record, kad::Quorum::One)
+    {
+        Ok(qid) => {
+            if done.is_some() {
+                pending_kad_mail.insert(qid, MailboxKadOp::AwaitPut { done });
+            }
+        }
+        Err(_) => signal_publish_done(&done),
+    }
+}
+
+fn fanout_relay_mail(
+    swarm: &mut libp2p::Swarm<ChatBehaviour>,
+    local_peer_id: PeerId,
+    recipient: PeerId,
+    envelopes: &[OfflineEnvelope],
+) {
+    if envelopes.is_empty() {
+        return;
+    }
+    let packet = V1Packet::OfflineMailboxStore {
+        recipient: recipient.to_string(),
+        envelopes: envelopes.to_vec(),
+    };
+    for peer in swarm.connected_peers().copied().collect::<Vec<_>>() {
+        if peer == local_peer_id || peer == recipient {
+            continue;
+        }
+        let _ = swarm
+            .behaviour_mut()
+            .request_response
+            .send_request(&peer, packet.clone());
+    }
+}
+
+/// Разослать офлайн-почту всем bootstrap-нодам (даже если ещё не в connected_peers — dial).
+fn fanout_relay_to_bootstraps(
+    swarm: &mut libp2p::Swarm<ChatBehaviour>,
+    bootstrap_peer_ids: &HashSet<PeerId>,
+    void_bootstraps: &[Multiaddr],
+    local_peer_id: PeerId,
+    recipient: PeerId,
+    envelopes: &[OfflineEnvelope],
+) {
+    if envelopes.is_empty() {
+        return;
+    }
+    let packet = V1Packet::OfflineMailboxStore {
+        recipient: recipient.to_string(),
+        envelopes: envelopes.to_vec(),
+    };
+    for pid in bootstrap_peer_ids {
+        if *pid == local_peer_id || *pid == recipient {
+            continue;
+        }
+        if swarm.is_connected(pid) {
+            let _ = swarm
+                .behaviour_mut()
+                .request_response
+                .send_request(pid, packet.clone());
+        } else {
+            let addrs: Vec<Multiaddr> = void_bootstraps
+                .iter()
+                .filter(|ma| peer_id_from_multiaddr(ma) == Some(*pid))
+                .cloned()
+                .collect();
+            if !addrs.is_empty() {
+                dial_peer_best_effort(swarm, *pid, addrs, void_bootstraps);
+            }
+        }
+    }
+}
+
+fn publish_relay_mail(
+    swarm: &mut libp2p::Swarm<ChatBehaviour>,
+    bootstrap_peer_ids: &HashSet<PeerId>,
+    void_bootstraps: &[Multiaddr],
+    local_peer_id: PeerId,
+    recipient: PeerId,
+    envelopes: &[OfflineEnvelope],
+) {
+    fanout_relay_mail(swarm, local_peer_id, recipient, envelopes);
+    fanout_relay_to_bootstraps(
+        swarm,
+        bootstrap_peer_ids,
+        void_bootstraps,
+        local_peer_id,
+        recipient,
+        envelopes,
+    );
+}
+
+fn query_relay_mailbox(
+    swarm: &mut libp2p::Swarm<ChatBehaviour>,
+    local_peer_id: PeerId,
+) {
+    let packet = V1Packet::OfflineMailboxQuery {
+        recipient: local_peer_id.to_string(),
+    };
+    for peer in swarm.connected_peers().copied().collect::<Vec<_>>() {
+        if peer == local_peer_id {
+            continue;
+        }
+        let _ = swarm
+            .behaviour_mut()
+            .request_response
+            .send_request(&peer, packet.clone());
+    }
 }
 
 async fn remember_peer_prekey(
@@ -1195,7 +1327,10 @@ pub async fn run_chat_network(
         let local_peer_id = local_key.public().to_peer_id();
         let mut peer_prekeys: HashMap<PeerId, [u8; 32]> = HashMap::new();
         let mut pending_kad_mail: HashMap<kad::QueryId, MailboxKadOp> = HashMap::new();
-        let mut fetch_mailbox_after = Some(Instant::now() + Duration::from_secs(8));
+        let mut relay_mail_store = RelayMailbox::load();
+        let mut fetch_mailbox_after = Some(Instant::now() + Duration::from_secs(5));
+        let mut mailbox_fetch_attempts: u32 = 0;
+        const MAX_MAILBOX_FETCH_ATTEMPTS: u32 = 30;
 
         let mut swarm = match build_void_swarm(
             local_key.clone(),
@@ -1430,12 +1565,19 @@ pub async fn run_chat_network(
                 _ = mailbox_tick.tick() => {
                     if let Some(deadline) = fetch_mailbox_after {
                         if Instant::now() >= deadline {
-                            fetch_mailbox_after = None;
+                            mailbox_fetch_attempts = mailbox_fetch_attempts.saturating_add(1);
+                            query_relay_mailbox(&mut swarm, local_peer_id);
                             let qid = swarm
                                 .behaviour_mut()
                                 .kad
                                 .get_record(mailbox_record_key(local_peer_id));
                             pending_kad_mail.insert(qid, MailboxKadOp::FetchInbox { record_bytes: None });
+                            if mailbox_fetch_attempts < MAX_MAILBOX_FETCH_ATTEMPTS {
+                                fetch_mailbox_after =
+                                    Some(Instant::now() + Duration::from_secs(10));
+                            } else {
+                                fetch_mailbox_after = None;
+                            }
                         }
                     }
                 }
@@ -2426,6 +2568,7 @@ pub async fn run_chat_network(
                                 }
                             }
                             UICommand::FetchOfflineMailbox => {
+                                query_relay_mailbox(&mut swarm, local_peer_id);
                                 let qid = swarm
                                     .behaviour_mut()
                                     .kad
@@ -2435,13 +2578,14 @@ pub async fn run_chat_network(
                             UICommand::ClearOfflineMailbox => {
                                 put_mailbox_envelopes(
                                     &mut swarm,
+                                    &mut pending_kad_mail,
                                     local_peer_id,
                                     local_peer_id,
                                     &[],
+                                    None,
                                 );
                             }
                             UICommand::PublishOfflineOutbox { items, ack } => {
-                                let ack_sync = ack;
                                 let mut by_recipient: HashMap<PeerId, Vec<OfflineOutboxItem>> =
                                     HashMap::new();
                                 for item in items {
@@ -2450,6 +2594,8 @@ pub async fn run_chat_network(
                                         .or_default()
                                         .push(item);
                                 }
+                                let work_count = by_recipient.len() as u32;
+                                let done_gate = ack.map(|tx| publish_done_token(tx, work_count.max(1)));
                                 let mut work_queued = false;
                                 for (recipient, batch) in by_recipient {
                                     let mut sealed: Vec<OfflineEnvelope> = Vec::new();
@@ -2474,12 +2620,27 @@ pub async fn run_chat_network(
                                     }
                                     if !sealed.is_empty() {
                                         work_queued = true;
+                                        if RelayMailbox::merge(
+                                            &mut relay_mail_store,
+                                            &recipient.to_string(),
+                                            sealed.clone(),
+                                        ) {
+                                            let _ = RelayMailbox::save(&relay_mail_store);
+                                        }
+                                        publish_relay_mail(
+                                            &mut swarm,
+                                            &bootstrap_peer_ids,
+                                            &void_bootstraps,
+                                            local_peer_id,
+                                            recipient,
+                                            &sealed,
+                                        );
                                         start_mailbox_merge_put(
                                             &mut swarm,
                                             &mut pending_kad_mail,
                                             recipient,
                                             sealed,
-                                            ack_sync.clone(),
+                                            done_gate.clone(),
                                         );
                                     }
                                     if !need_prekey.is_empty() {
@@ -2493,16 +2654,14 @@ pub async fn run_chat_network(
                                             MailboxKadOp::PrekeyForPublish {
                                                 recipient,
                                                 items: need_prekey,
-                                                ack_sync: ack_sync.clone(),
+                                                done: done_gate.clone(),
                                                 prekey_bytes: None,
                                             },
                                         );
                                     }
                                 }
                                 if !work_queued {
-                                    if let Some(tx) = ack_sync {
-                                        let _ = tx.send(());
-                                    }
+                                    signal_publish_done(&done_gate);
                                 }
                             }
                         }
@@ -2645,6 +2804,44 @@ pub async fn run_chat_network(
                                                         },
                                                     );
                                             }
+                                            let _ = swarm
+                                                .behaviour_mut()
+                                                .request_response
+                                                .send_response(channel, V1Packet::Ack);
+                                        }
+                                        V1Packet::OfflineMailboxStore {
+                                            recipient,
+                                            envelopes,
+                                        } => {
+                                            if RelayMailbox::merge(
+                                                &mut relay_mail_store,
+                                                &recipient,
+                                                envelopes,
+                                            ) {
+                                                let _ = RelayMailbox::save(&relay_mail_store);
+                                            }
+                                            let _ = swarm
+                                                .behaviour_mut()
+                                                .request_response
+                                                .send_response(channel, V1Packet::Ack);
+                                        }
+                                        V1Packet::OfflineMailboxQuery { recipient } => {
+                                            let envs =
+                                                RelayMailbox::take_for(&mut relay_mail_store, &recipient);
+                                            if !envs.is_empty() {
+                                                let _ = RelayMailbox::save(&relay_mail_store);
+                                            }
+                                            let response = if envs.is_empty() {
+                                                V1Packet::Ack
+                                            } else {
+                                                V1Packet::OfflineMailboxDeliver { envelopes: envs }
+                                            };
+                                            let _ = swarm
+                                                .behaviour_mut()
+                                                .request_response
+                                                .send_response(channel, response);
+                                        }
+                                        V1Packet::OfflineMailboxDeliver { .. } => {
                                             let _ = swarm
                                                 .behaviour_mut()
                                                 .request_response
@@ -3033,6 +3230,13 @@ pub async fn run_chat_network(
                                                 );
                                             }
                                         }
+                                        V1Packet::OfflineMailboxDeliver { envelopes } => {
+                                            if !envelopes.is_empty() {
+                                                let _ = event_tx
+                                                    .send(NetworkEvent::OfflineMailbox(envelopes))
+                                                    .await;
+                                            }
+                                        }
                                         V1Packet::Hello {
                                             public_key,
                                             ephemeral_key,
@@ -3217,6 +3421,8 @@ pub async fn run_chat_network(
                                             }
                                         }
                                         V1Packet::BootstrapGossip { .. } => {}
+                                        V1Packet::OfflineMailboxStore { .. }
+                                        | V1Packet::OfflineMailboxQuery { .. } => {}
                                     }
                                 }
                             }
@@ -3370,6 +3576,8 @@ pub async fn run_chat_network(
                                  }
                                  let _ = event_tx.send(NetworkEvent::Connected(peer_id)).await;
                                  let _ = event_tx.send(NetworkEvent::Status(format!("✅ СОЕДИНЕНО: {}", &peer_id.to_string()[..8]))).await;
+                                 // Запрашиваем офлайн-почту у всех пиров (включая bootstrap-relay).
+                                 query_relay_mailbox(&mut swarm, local_peer_id);
                                  // Сразу делимся bootstrap-нодами с любым подключённым VOID-клиентом.
                                  if !bootstrap_peer_ids.contains(&peer_id) {
                                      let gossip = bootstrap_gossip_strings(&void_bootstraps);
@@ -3720,6 +3928,17 @@ pub async fn run_chat_network(
 
                         SwarmEvent::Behaviour(ChatBehaviourEvent::Kad(kad::Event::OutboundQueryProgressed { id, result, .. })) => {
                             match &result {
+                                libp2p::kad::QueryResult::PutRecord(Ok(_))
+                                | libp2p::kad::QueryResult::PutRecord(Err(_)) => {
+                                    if let Some(MailboxKadOp::AwaitPut { done }) =
+                                        pending_kad_mail.remove(&id)
+                                    {
+                                        let _ = event_tx
+                                            .send(NetworkEvent::OfflineMailboxPublished)
+                                            .await;
+                                        signal_publish_done(&done);
+                                    }
+                                }
                                 libp2p::kad::QueryResult::GetRecord(Ok(
                                     kad::GetRecordOk::FoundRecord(peer_record),
                                 )) => {
@@ -3739,6 +3958,7 @@ pub async fn run_chat_network(
                                                 *prekey_bytes =
                                                     Some(peer_record.record.value.clone());
                                             }
+                                            MailboxKadOp::AwaitPut { .. } => {}
                                         }
                                     }
                                 }
@@ -3763,7 +3983,7 @@ pub async fn run_chat_network(
                                             MailboxKadOp::MergePut {
                                                 recipient,
                                                 new_envelopes,
-                                                ack_sync,
+                                                done,
                                                 record_bytes,
                                             } => {
                                                 let existing = record_bytes
@@ -3774,21 +3994,17 @@ pub async fn run_chat_network(
                                                     merge_envelopes(&existing, &new_envelopes);
                                                 put_mailbox_envelopes(
                                                     &mut swarm,
+                                                    &mut pending_kad_mail,
                                                     local_peer_id,
                                                     recipient,
                                                     &merged,
+                                                    done,
                                                 );
-                                                let _ = event_tx
-                                                    .send(NetworkEvent::OfflineMailboxPublished)
-                                                    .await;
-                                                if let Some(tx) = ack_sync {
-                                                    let _ = tx.send(());
-                                                }
                                             }
                                             MailboxKadOp::PrekeyForPublish {
                                                 recipient,
                                                 items,
-                                                ack_sync,
+                                                done,
                                                 prekey_bytes,
                                             } => {
                                                 let pk_bytes =
@@ -3823,20 +4039,43 @@ pub async fn run_chat_network(
                                                         }
                                                     }
                                                     if !sealed.is_empty() {
+                                                        if RelayMailbox::merge(
+                                                            &mut relay_mail_store,
+                                                            &recipient.to_string(),
+                                                            sealed.clone(),
+                                                        ) {
+                                                            let _ =
+                                                                RelayMailbox::save(&relay_mail_store);
+                                                        }
+                                                        publish_relay_mail(
+                                                            &mut swarm,
+                                                            &bootstrap_peer_ids,
+                                                            &void_bootstraps,
+                                                            local_peer_id,
+                                                            recipient,
+                                                            &sealed,
+                                                        );
                                                         start_mailbox_merge_put(
                                                             &mut swarm,
                                                             &mut pending_kad_mail,
                                                             recipient,
                                                             sealed,
-                                                            ack_sync,
+                                                            done,
                                                         );
-                                                    } else if let Some(tx) = ack_sync {
-                                                        let _ = tx.send(());
+                                                    } else {
+                                                        signal_publish_done(&done);
                                                     }
-                                                } else if let Some(tx) = ack_sync {
-                                                    let _ = tx.send(());
+                                                } else {
+                                                    signal_publish_done(&done);
+                                                    let _ = event_tx
+                                                        .send(NetworkEvent::Status(format!(
+                                                            "⚠ Нет prekey {} — офлайн-почта не отправлена",
+                                                            &recipient.to_string()[..8.min(recipient.to_string().len())]
+                                                        )))
+                                                        .await;
                                                 }
                                             }
+                                            MailboxKadOp::AwaitPut { .. } => {}
                                         }
                                     }
                                 }
@@ -3846,28 +4085,23 @@ pub async fn run_chat_network(
                                             MailboxKadOp::MergePut {
                                                 recipient,
                                                 new_envelopes,
-                                                ack_sync,
+                                                done,
                                                 ..
                                             } => {
                                                 put_mailbox_envelopes(
                                                     &mut swarm,
+                                                    &mut pending_kad_mail,
                                                     local_peer_id,
                                                     recipient,
                                                     &new_envelopes,
+                                                    done,
                                                 );
-                                                let _ = event_tx
-                                                    .send(NetworkEvent::OfflineMailboxPublished)
-                                                    .await;
-                                                if let Some(tx) = ack_sync {
-                                                    let _ = tx.send(());
-                                                }
                                             }
-                                            MailboxKadOp::PrekeyForPublish { ack_sync, .. } => {
-                                                if let Some(tx) = ack_sync {
-                                                    let _ = tx.send(());
-                                                }
+                                            MailboxKadOp::PrekeyForPublish { done, .. } => {
+                                                signal_publish_done(&done);
                                             }
-                                            _ => {}
+                                            MailboxKadOp::FetchInbox { .. }
+                                            | MailboxKadOp::AwaitPut { .. } => {}
                                         }
                                     }
                                 }
