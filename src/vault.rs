@@ -534,20 +534,30 @@ fn session_file_clear() {
     let _ = std::fs::remove_file(SESSION_PWD_FILE);
 }
 
+#[cfg(not(target_os = "linux"))]
 fn keyring_entry() -> Result<keyring::Entry, Box<dyn Error>> {
     keyring::Entry::new(KEYRING_SERVICE, KEYRING_USER).map_err(|e| e.into())
 }
 
 /// Сохраняет пароль vault (Keychain / Credential Manager + локальный void.pwd).
 pub(crate) fn save_remembered_password(password: &str) -> Result<(), Box<dyn Error>> {
+    #[cfg(not(target_os = "linux"))]
     let keyring_err = keyring_entry()
         .and_then(|entry| entry.set_password(password).map_err(|e| e.into()));
     session_file_save(password)?;
-    keyring_err.or(Ok(()))
+    #[cfg(not(target_os = "linux"))]
+    {
+        keyring_err.or(Ok(()))
+    }
+    #[cfg(target_os = "linux")]
+    {
+        Ok(())
+    }
 }
 
 /// Загружает сохранённый пароль vault (если есть).
 pub(crate) fn load_remembered_password() -> Option<String> {
+    #[cfg(not(target_os = "linux"))]
     if let Ok(entry) = keyring_entry() {
         if let Ok(pwd) = entry.get_password() {
             if !pwd.is_empty() {
@@ -560,6 +570,7 @@ pub(crate) fn load_remembered_password() -> Option<String> {
 
 /// Удаляет сохранённый пароль vault.
 pub(crate) fn clear_remembered_password() {
+    #[cfg(not(target_os = "linux"))]
     if let Ok(entry) = keyring_entry() {
         let _ = entry.delete_credential();
     }
