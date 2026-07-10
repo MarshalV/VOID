@@ -857,7 +857,7 @@ impl App {
     pub(crate) fn persist_all_before_exit(&mut self) {
         self.persist_chat_journal();
         self.persist_outbox();
-        self.publish_outbox_to_dht(true);
+        self.flush_outbox_to_dht_on_exit();
     }
 
     fn bootstrap_offline_mail(&mut self) {
@@ -898,9 +898,44 @@ impl App {
         if let Some(deadline) = self.offline_dht_publish_after {
             if Instant::now() >= deadline {
                 self.offline_dht_publish_after = None;
-                self.publish_outbox_to_dht(false);
+                self.publish_outbox_to_dht();
             }
         }
+    }
+
+    /// Неблокирующая публикация outbox в DHT (из UI/tokio-потока).
+    pub(crate) fn publish_outbox_to_dht(&self) {
+        let items = self.build_offline_publish_items();
+        if items.is_empty() {
+            return;
+        }
+        let _ = self.command_tx.try_send(UICommand::PublishOfflineOutbox {
+            items,
+            ack: None,
+        });
+    }
+
+    /// При выходе: ждём DHT-публикацию в отдельном std-потоке (нельзя blocking_send из tokio runtime).
+    fn flush_outbox_to_dht_on_exit(&self) {
+        let items = self.build_offline_publish_items();
+        if items.is_empty() {
+            return;
+        }
+        let command_tx = self.command_tx.clone();
+        std::thread::scope(|scope| {
+            scope.spawn(|| {
+                let (ack_tx, ack_rx) = std::sync::mpsc::channel();
+                if command_tx
+                    .blocking_send(UICommand::PublishOfflineOutbox {
+                        items,
+                        ack: Some(ack_tx),
+                    })
+                    .is_ok()
+                {
+                    let _ = ack_rx.recv_timeout(Duration::from_secs(3));
+                }
+            });
+        });
     }
 
     fn build_offline_publish_items(&self) -> Vec<OfflineOutboxItem> {
@@ -999,31 +1034,6 @@ impl App {
         items
     }
 
-    pub(crate) fn publish_outbox_to_dht(&self, blocking: bool) {
-        let items = self.build_offline_publish_items();
-        if items.is_empty() {
-            return;
-        }
-        if blocking {
-            let (tx, rx) = std::sync::mpsc::channel();
-            if self
-                .command_tx
-                .blocking_send(UICommand::PublishOfflineOutbox {
-                    items,
-                    ack: Some(tx),
-                })
-                .is_ok()
-            {
-                let _ = rx.recv_timeout(Duration::from_secs(4));
-            }
-        } else {
-            let _ = self.command_tx.try_send(UICommand::PublishOfflineOutbox {
-                items,
-                ack: None,
-            });
-        }
-    }
-
     pub(crate) fn ingest_offline_mailbox(&mut self, envelopes: Vec<OfflineEnvelope>) {
         if envelopes.is_empty() {
             return;
@@ -1116,20 +1126,6 @@ impl App {
             !matches!(
                 e,
                 OutboxEntry::GroupMessage { message_id: id, .. } if id == message_id
-            )
-        });
-        if self.outbox_entries.len() != before {
-            self.persist_outbox();
-        }
-    }
-
-    fn remove_outbox_group_sync(&mut self, group_id: &str, recipient: &str) {
-        let before = self.outbox_entries.len();
-        self.outbox_entries.retain(|e| {
-            !matches!(
-                e,
-                OutboxEntry::GroupSync { group_id: g, recipient: r, .. }
-                    if g == group_id && r == recipient
             )
         });
         if self.outbox_entries.len() != before {
