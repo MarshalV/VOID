@@ -23,10 +23,12 @@ use crate::group::{
     self, build_invite_link, dedupe_members, extract_invite_links, group_thread_key,
     is_group_thread, parse_group_thread_key, parse_invite_link, GroupChat, GroupMember,
 };
-use crate::network::{run_chat_network, NetworkEvent, UICommand};
+use crate::network::{run_chat_network, NetworkEvent, OfflineOutboxItem, UICommand};
+use crate::offline_mail::{open_envelope, OfflineEnvelope};
 use crate::outbox::{Outbox, OutboxEntry};
 use crate::protocol::{
-    new_message_id, transfer_id_from_hex, transfer_id_to_hex, ChatMessage, FileTransferProgress,
+    build_group_sync_json, new_message_id, parse_decrypted_chat_frame, transfer_id_from_hex,
+    transfer_id_to_hex, ChatMessage, DecryptedChatFrame, FileTransferProgress,
     OutgoingDeliveryStatus, VoiceMeta,
 };
 use crate::ui::{setup_custom_style, Toast, ToastKind, TOAST_TTL_LONG, TOAST_TTL_SHORT};
@@ -166,6 +168,7 @@ pub(crate) const RESEND_DELAY_MAX: Duration = Duration::from_secs(300);
 pub(crate) const SESSION_WAIT_TIMEOUT: Duration = Duration::from_secs(20);
 /// Журнал переписок пишем на диск не чаще этого интервала (не блокируем отправку).
 pub(crate) const JOURNAL_PERSIST_DEBOUNCE: Duration = Duration::from_secs(2);
+pub(crate) const OFFLINE_DHT_PUBLISH_DEBOUNCE: Duration = Duration::from_secs(20);
 
 pub(crate) fn resend_delay_for_attempt(attempts: u32) -> Duration {
     let exp = attempts.min(6);
@@ -239,6 +242,10 @@ pub(crate) struct App {
     pub(crate) add_group_member_peer: String,
     /// Недоставленное: быстрый `outbox.bin` (переживает выход из приложения).
     pub(crate) outbox_entries: Vec<OutboxEntry>,
+    /// X25519 prekey контактов (для DHT офлайн-почты).
+    pub(crate) peer_prekeys: HashMap<PeerId, [u8; 32]>,
+    offline_dht_publish_after: Option<Instant>,
+    offline_mail_processed: HashSet<String>,
     /// Пиры, которым уже отправили group_sync в этой сессии (до disconnect).
     pub(crate) group_synced_peers: HashSet<PeerId>,
     /// Пиры, покинувшие группу (не возвращать через устаревший group_sync).
@@ -361,6 +368,9 @@ impl App {
             show_group_panel: false,
             add_group_member_peer: String::new(),
             outbox_entries: Vec::new(),
+            peer_prekeys: HashMap::new(),
+            offline_dht_publish_after: None,
+            offline_mail_processed: HashSet::new(),
             group_synced_peers: HashSet::new(),
             group_departed_peers: HashMap::new(),
             invite_join_processed: HashSet::new(),
@@ -615,10 +625,14 @@ impl App {
                 self.void_bootstrap_strings = void_bootstrap_strings;
                 let mut book = HashMap::new();
                 let mut addrs_map: HashMap<PeerId, Vec<Multiaddr>> = HashMap::new();
+                let mut peer_prekeys = HashMap::new();
                 for entry in storage.address_book {
                     if let Ok(pid) = entry.peer_id.parse::<PeerId>() {
                         if pid != my_id {
                             book.insert(pid, entry.display_name);
+                            if let Some(pk) = entry.x25519_public {
+                                peer_prekeys.insert(pid, pk);
+                            }
                             let mut parsed: Vec<Multiaddr> = entry
                                 .addrs
                                 .iter()
@@ -652,6 +666,7 @@ impl App {
                     contact_addrs_flat,
                     dn_sp.chat_messages.clone(),
                 ));
+                self.peer_prekeys = peer_prekeys;
                 self.apply_unlock_success(
                     ctx,
                     local_key,
@@ -771,6 +786,7 @@ impl App {
         self.refresh_outbox_group_sync_snapshots();
         self.scan_chat_journal_for_group_invites();
         self.dispatch_outbox();
+        self.bootstrap_offline_mail();
 
         info!("=== VOID P2P Chat ===");
         info!("Ваш Peer ID: {}", self.local_peer_id);
@@ -838,9 +854,230 @@ impl App {
         }
     }
 
-    pub(crate) fn persist_all_before_exit(&self) {
+    pub(crate) fn persist_all_before_exit(&mut self) {
         self.persist_chat_journal();
         self.persist_outbox();
+        self.publish_outbox_to_dht(true);
+    }
+
+    fn bootstrap_offline_mail(&mut self) {
+        let keys: Vec<(PeerId, [u8; 32])> = self
+            .peer_prekeys
+            .iter()
+            .map(|(p, k)| (*p, *k))
+            .collect();
+        if !keys.is_empty() {
+            let _ = self.command_tx.try_send(UICommand::CachePeerPrekeys(keys));
+        }
+        self.schedule_offline_dht_publish();
+        let _ = self.command_tx.try_send(UICommand::FetchOfflineMailbox);
+    }
+
+    pub(crate) fn cache_peer_prekey(&mut self, peer: PeerId, public_key: [u8; 32]) {
+        if self.peer_prekeys.get(&peer) != Some(&public_key) {
+            self.peer_prekeys.insert(peer, public_key);
+            self.persist_vault();
+        }
+    }
+
+    fn schedule_offline_dht_publish(&mut self) {
+        if self.outbox_entries.is_empty() {
+            return;
+        }
+        self.offline_dht_publish_after =
+            Some(Instant::now() + OFFLINE_DHT_PUBLISH_DEBOUNCE);
+    }
+
+    pub(crate) fn accelerate_offline_dht_publish(&mut self) {
+        if !self.outbox_entries.is_empty() {
+            self.offline_dht_publish_after = Some(Instant::now());
+        }
+    }
+
+    pub(crate) fn tick_offline_dht_publish(&mut self) {
+        if let Some(deadline) = self.offline_dht_publish_after {
+            if Instant::now() >= deadline {
+                self.offline_dht_publish_after = None;
+                self.publish_outbox_to_dht(false);
+            }
+        }
+    }
+
+    fn build_offline_publish_items(&self) -> Vec<OfflineOutboxItem> {
+        let me = self.local_peer_id;
+        let mut items = Vec::new();
+        for entry in &self.outbox_entries {
+            match entry {
+                OutboxEntry::DirectMessage {
+                    peer,
+                    message_id,
+                    text,
+                } => {
+                    let Ok(recipient) = peer.parse::<PeerId>() else {
+                        continue;
+                    };
+                    let msg = ChatMessage {
+                        id: message_id.clone(),
+                        sender_id: me.to_string(),
+                        sender_name: self.local_nickname.clone(),
+                        recipient_id: Some(peer.clone()),
+                        text: text.clone(),
+                        timestamp: chrono::Local::now().format("%H:%M").to_string(),
+                        delivery: OutgoingDeliveryStatus::Pending,
+                        voice: None,
+                        group_id: None,
+                    };
+                    if let Ok(payload) = serde_json::to_vec(&msg) {
+                        items.push(OfflineOutboxItem {
+                            recipient,
+                            message_id: message_id.clone(),
+                            kind: "dm".into(),
+                            payload,
+                        });
+                    }
+                }
+                OutboxEntry::GroupMessage {
+                    group_id,
+                    message_id,
+                    text,
+                    members,
+                } => {
+                    for peer_str in members {
+                        let Ok(recipient) = peer_str.parse::<PeerId>() else {
+                            continue;
+                        };
+                        if recipient == me {
+                            continue;
+                        }
+                        let msg = ChatMessage {
+                            id: message_id.clone(),
+                            sender_id: me.to_string(),
+                            sender_name: self.local_nickname.clone(),
+                            recipient_id: Some(peer_str.clone()),
+                            text: text.clone(),
+                            timestamp: chrono::Local::now().format("%H:%M").to_string(),
+                            delivery: OutgoingDeliveryStatus::Pending,
+                            voice: None,
+                            group_id: Some(group_id.clone()),
+                        };
+                        if let Ok(payload) = serde_json::to_vec(&msg) {
+                            items.push(OfflineOutboxItem {
+                                recipient,
+                                message_id: format!("{}:{}", message_id, peer_str),
+                                kind: "dm".into(),
+                                payload,
+                            });
+                        }
+                    }
+                }
+                OutboxEntry::GroupSync {
+                    group_id,
+                    group_name,
+                    creator_id,
+                    members,
+                    recipient,
+                } => {
+                    let Ok(pid) = recipient.parse::<PeerId>() else {
+                        continue;
+                    };
+                    if let Some(payload) = build_group_sync_json(
+                        group_id,
+                        group_name,
+                        creator_id,
+                        members,
+                    ) {
+                        items.push(OfflineOutboxItem {
+                            recipient: pid,
+                            message_id: format!("gsync:{}:{}", group_id, recipient),
+                            kind: "group_sync".into(),
+                            payload,
+                        });
+                    }
+                }
+            }
+        }
+        items
+    }
+
+    pub(crate) fn publish_outbox_to_dht(&self, blocking: bool) {
+        let items = self.build_offline_publish_items();
+        if items.is_empty() {
+            return;
+        }
+        if blocking {
+            let (tx, rx) = std::sync::mpsc::channel();
+            if self
+                .command_tx
+                .blocking_send(UICommand::PublishOfflineOutbox {
+                    items,
+                    ack: Some(tx),
+                })
+                .is_ok()
+            {
+                let _ = rx.recv_timeout(Duration::from_secs(4));
+            }
+        } else {
+            let _ = self.command_tx.try_send(UICommand::PublishOfflineOutbox {
+                items,
+                ack: None,
+            });
+        }
+    }
+
+    pub(crate) fn ingest_offline_mailbox(&mut self, envelopes: Vec<OfflineEnvelope>) {
+        if envelopes.is_empty() {
+            return;
+        }
+        let mut any = false;
+        for env in envelopes {
+            if self.offline_mail_processed.contains(&env.message_id) {
+                continue;
+            }
+            let plaintext = match open_envelope(&self._local_static, &env) {
+                Ok(p) => p,
+                Err(_) => continue,
+            };
+            match env.kind.as_str() {
+                "dm" => {
+                    if let Ok(msg) = serde_json::from_slice::<ChatMessage>(&plaintext) {
+                        self.ingest_chat_message(msg.clone());
+                        if !msg.text.is_empty() {
+                            self.try_process_invite_message(&msg.id, &msg.text);
+                        }
+                        self.offline_mail_processed.insert(env.message_id.clone());
+                        any = true;
+                    }
+                }
+                "group_sync" => {
+                    if let Some(DecryptedChatFrame::GroupSync {
+                        group_id,
+                        group_name,
+                        creator_id,
+                        members,
+                    }) = parse_decrypted_chat_frame(&plaintext)
+                    {
+                        if let Some(from) = env.sender.parse::<PeerId>().ok() {
+                            self.merge_incoming_group_sync(
+                                from,
+                                group_id,
+                                group_name,
+                                creator_id,
+                                members,
+                            );
+                        }
+                        self.offline_mail_processed.insert(env.message_id.clone());
+                        any = true;
+                    }
+                }
+                _ => {}
+            }
+        }
+        if any {
+            self.persist_vault();
+            self.mark_chat_journal_dirty();
+            let _ = self.command_tx.try_send(UICommand::ClearOfflineMailbox);
+            self.add_status("📬 Получена офлайн-почта из DHT".into());
+        }
     }
 
     fn persist_outbox(&self) {
@@ -856,6 +1093,7 @@ impl App {
         self.outbox_entries.retain(|e| !outbox_same_slot(e, &entry));
         self.outbox_entries.push(entry);
         self.persist_outbox();
+        self.schedule_offline_dht_publish();
     }
 
     fn remove_outbox_direct(&mut self, peer: &str, message_id: &str) {
@@ -1781,6 +2019,7 @@ impl App {
                     peer_id: pid.to_string(),
                     display_name: name.clone(),
                     addrs,
+                    x25519_public: self.peer_prekeys.get(pid).copied(),
                 }
             })
             .collect();

@@ -1,6 +1,7 @@
 //! libp2p swarm, сетевой цикл и события UI ↔ сеть.
 
 use std::collections::{HashMap, HashSet};
+use std::sync::mpsc as std_mpsc;
 use std::time::{Duration, Instant};
 
 use futures::StreamExt;
@@ -20,6 +21,10 @@ use crate::bootstrap::{parse_seed_input, peer_id_from_multiaddr, void_bootstrap_
 use crate::app::SharedChatMessages;
 use crate::crypto;
 use crate::file_transfer;
+use crate::offline_mail::{
+    decode_mailbox, encode_mailbox, mailbox_record_key, prekey_record_key, seal_for_recipient,
+    OfflineEnvelope, MAILBOX_TTL_SECS,
+};
 use crate::protocol::{
     build_delete_ack_json, build_v1_hello,
     chat_message_id_from_json,     delete_command_message_ids, is_delete_command_json,
@@ -355,6 +360,12 @@ pub(crate) enum NetworkEvent {
     MessageAwaitingSession(PeerId),
     /// Зашифрованный пакет чата реально ушёл в сеть (не только в буфер).
     MessageOnWire { peer: PeerId, message_id: String },
+    /// Офлайн-почта из DHT (зашифрованные конверты для локальной расшифровки).
+    OfflineMailbox(Vec<OfflineEnvelope>),
+    /// Публичный X25519 ключ пира (Hello / DHT prekey).
+    PeerPrekey { peer: PeerId, public_key: [u8; 32] },
+    /// Офлайн-почта опубликована в DHT.
+    OfflineMailboxPublished,
     /// Отправка файла отложена — нет E2EE-сессии с пиром.
     FileSendDeferred {
         recipient: PeerId,
@@ -583,6 +594,133 @@ pub(crate) enum UICommand {
         from: PeerId,
         reason: String,
     },
+    /// Кэш X25519 prekey контактов (из vault).
+    CachePeerPrekeys(Vec<(PeerId, [u8; 32])>),
+    /// Опубликовать недоставленное в DHT-почтовые ящики получателей.
+    PublishOfflineOutbox {
+        items: Vec<OfflineOutboxItem>,
+        ack: Option<std_mpsc::Sender<()>>,
+    },
+    /// Забрать свой почтовый ящик из DHT.
+    FetchOfflineMailbox,
+    /// Очистить свой почтовый ящик в DHT после успешной обработки.
+    ClearOfflineMailbox,
+}
+
+/// Элемент очереди для публикации в DHT-почту.
+#[derive(Clone)]
+pub(crate) struct OfflineOutboxItem {
+    pub recipient: PeerId,
+    pub message_id: String,
+    pub kind: String,
+    pub payload: Vec<u8>,
+}
+
+enum MailboxKadOp {
+    FetchInbox {
+        record_bytes: Option<Vec<u8>>,
+    },
+    MergePut {
+        recipient: PeerId,
+        new_envelopes: Vec<OfflineEnvelope>,
+        ack_sync: Option<std_mpsc::Sender<()>>,
+        record_bytes: Option<Vec<u8>>,
+    },
+    PrekeyForPublish {
+        recipient: PeerId,
+        items: Vec<OfflineOutboxItem>,
+        ack_sync: Option<std_mpsc::Sender<()>>,
+        prekey_bytes: Option<Vec<u8>>,
+    },
+}
+
+fn publish_self_prekey(
+    swarm: &mut libp2p::Swarm<ChatBehaviour>,
+    local_peer_id: PeerId,
+    public_key: &[u8; 32],
+) {
+    let record = kad::Record {
+        key: prekey_record_key(local_peer_id),
+        value: public_key.to_vec(),
+        publisher: Some(local_peer_id),
+        expires: Some(Instant::now() + Duration::from_secs(MAILBOX_TTL_SECS)),
+    };
+    let _ = swarm
+        .behaviour_mut()
+        .kad
+        .put_record(record, kad::Quorum::One);
+}
+
+fn start_mailbox_merge_put(
+    swarm: &mut libp2p::Swarm<ChatBehaviour>,
+    pending_kad_mail: &mut HashMap<kad::QueryId, MailboxKadOp>,
+    recipient: PeerId,
+    new_envelopes: Vec<OfflineEnvelope>,
+    ack_sync: Option<std_mpsc::Sender<()>>,
+) {
+    let qid = swarm
+        .behaviour_mut()
+        .kad
+        .get_record(mailbox_record_key(recipient));
+    pending_kad_mail.insert(
+        qid,
+        MailboxKadOp::MergePut {
+            recipient,
+            new_envelopes,
+            ack_sync,
+            record_bytes: None,
+        },
+    );
+}
+
+fn merge_envelopes(
+    existing: &[OfflineEnvelope],
+    new_envelopes: &[OfflineEnvelope],
+) -> Vec<OfflineEnvelope> {
+    let mut out: Vec<OfflineEnvelope> = existing.to_vec();
+    for env in new_envelopes {
+        if out.iter().any(|e| e.message_id == env.message_id) {
+            continue;
+        }
+        out.push(env.clone());
+    }
+    out
+}
+
+fn put_mailbox_envelopes(
+    swarm: &mut libp2p::Swarm<ChatBehaviour>,
+    local_peer_id: PeerId,
+    recipient: PeerId,
+    envelopes: &[OfflineEnvelope],
+) {
+    let Ok(value) = encode_mailbox(envelopes) else {
+        return;
+    };
+    let record = kad::Record {
+        key: mailbox_record_key(recipient),
+        value,
+        publisher: Some(local_peer_id),
+        expires: Some(Instant::now() + Duration::from_secs(MAILBOX_TTL_SECS)),
+    };
+    let _ = swarm
+        .behaviour_mut()
+        .kad
+        .put_record(record, kad::Quorum::One);
+}
+
+async fn remember_peer_prekey(
+    peer_prekeys: &mut HashMap<PeerId, [u8; 32]>,
+    event_tx: &mpsc::Sender<NetworkEvent>,
+    peer: PeerId,
+    public_key: [u8; 32],
+) {
+    let changed = peer_prekeys.get(&peer) != Some(&public_key);
+    peer_prekeys.insert(peer, public_key);
+    if changed {
+        let _ = event_tx
+            .send(NetworkEvent::PeerPrekey { peer, public_key })
+            .await;
+    }
 }
 
 #[derive(NetworkBehaviour)]
@@ -1053,7 +1191,11 @@ pub async fn run_chat_network(
             HashMap::new();
         let mut pending_read_receipts: HashMap<PeerId, Vec<Vec<String>>> = HashMap::new();
         let my_public_key = crypto::PublicKey::from(&local_static);
+        let my_public_key_bytes = my_public_key.to_bytes();
         let local_peer_id = local_key.public().to_peer_id();
+        let mut peer_prekeys: HashMap<PeerId, [u8; 32]> = HashMap::new();
+        let mut pending_kad_mail: HashMap<kad::QueryId, MailboxKadOp> = HashMap::new();
+        let mut fetch_mailbox_after = Some(Instant::now() + Duration::from_secs(8));
 
         let mut swarm = match build_void_swarm(
             local_key.clone(),
@@ -1210,6 +1352,7 @@ pub async fn run_chat_network(
         }
 
         publish_self_in_dht(&mut swarm.behaviour_mut().kad, local_peer_id);
+        publish_self_prekey(&mut swarm, local_peer_id, &my_public_key_bytes);
         if !void_bootstraps.is_empty() {
             let _ = swarm.behaviour_mut().kad.bootstrap();
         }
@@ -1279,9 +1422,23 @@ pub async fn run_chat_network(
         provider_tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
         let mut gossip_tick = tokio::time::interval(Duration::from_secs(2 * 60));
         gossip_tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+        let mut mailbox_tick = tokio::time::interval(Duration::from_secs(2));
+        mailbox_tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
 
         loop {
             tokio::select! {
+                _ = mailbox_tick.tick() => {
+                    if let Some(deadline) = fetch_mailbox_after {
+                        if Instant::now() >= deadline {
+                            fetch_mailbox_after = None;
+                            let qid = swarm
+                                .behaviour_mut()
+                                .kad
+                                .get_record(mailbox_record_key(local_peer_id));
+                            pending_kad_mail.insert(qid, MailboxKadOp::FetchInbox { record_bytes: None });
+                        }
+                    }
+                }
                 // ─── Tick: эпидемический обмен bootstrap-нодами (2 мин) ─────
                 _ = gossip_tick.tick() => {
                     let addrs = bootstrap_gossip_strings(&void_bootstraps);
@@ -1329,6 +1486,7 @@ pub async fn run_chat_network(
                 // ─── Tick: переобъявление себя в DHT (каждые 10 мин) ───────
                 _ = provider_tick.tick() => {
                     publish_self_in_dht(&mut swarm.behaviour_mut().kad, local_peer_id);
+                    publish_self_prekey(&mut swarm, local_peer_id, &my_public_key_bytes);
                 }
                 // ─── Tick: отправка очередных чанков с rate-limit ───────────
                 _ = chunk_tick.tick() => {
@@ -2262,6 +2420,91 @@ pub async fn run_chat_network(
                                     reason
                                 );
                             }
+                            UICommand::CachePeerPrekeys(keys) => {
+                                for (peer, pk) in keys {
+                                    peer_prekeys.insert(peer, pk);
+                                }
+                            }
+                            UICommand::FetchOfflineMailbox => {
+                                let qid = swarm
+                                    .behaviour_mut()
+                                    .kad
+                                    .get_record(mailbox_record_key(local_peer_id));
+                                pending_kad_mail.insert(qid, MailboxKadOp::FetchInbox { record_bytes: None });
+                            }
+                            UICommand::ClearOfflineMailbox => {
+                                put_mailbox_envelopes(
+                                    &mut swarm,
+                                    local_peer_id,
+                                    local_peer_id,
+                                    &[],
+                                );
+                            }
+                            UICommand::PublishOfflineOutbox { items, ack } => {
+                                let ack_sync = ack;
+                                let mut by_recipient: HashMap<PeerId, Vec<OfflineOutboxItem>> =
+                                    HashMap::new();
+                                for item in items {
+                                    by_recipient
+                                        .entry(item.recipient)
+                                        .or_default()
+                                        .push(item);
+                                }
+                                let mut work_queued = false;
+                                for (recipient, batch) in by_recipient {
+                                    let mut sealed: Vec<OfflineEnvelope> = Vec::new();
+                                    let mut need_prekey: Vec<OfflineOutboxItem> = Vec::new();
+                                    if let Some(pk_bytes) = peer_prekeys.get(&recipient) {
+                                        let pk = crypto::PublicKey::from(*pk_bytes);
+                                        for item in batch {
+                                            match seal_for_recipient(
+                                                &pk,
+                                                &local_peer_id,
+                                                &my_public_key_bytes,
+                                                &item.message_id,
+                                                &item.kind,
+                                                &item.payload,
+                                            ) {
+                                                Ok(env) => sealed.push(env),
+                                                Err(e) => debug!("offline seal: {e}"),
+                                            }
+                                        }
+                                    } else {
+                                        need_prekey = batch;
+                                    }
+                                    if !sealed.is_empty() {
+                                        work_queued = true;
+                                        start_mailbox_merge_put(
+                                            &mut swarm,
+                                            &mut pending_kad_mail,
+                                            recipient,
+                                            sealed,
+                                            ack_sync.clone(),
+                                        );
+                                    }
+                                    if !need_prekey.is_empty() {
+                                        work_queued = true;
+                                        let qid = swarm
+                                            .behaviour_mut()
+                                            .kad
+                                            .get_record(prekey_record_key(recipient));
+                                        pending_kad_mail.insert(
+                                            qid,
+                                            MailboxKadOp::PrekeyForPublish {
+                                                recipient,
+                                                items: need_prekey,
+                                                ack_sync: ack_sync.clone(),
+                                                prekey_bytes: None,
+                                            },
+                                        );
+                                    }
+                                }
+                                if !work_queued {
+                                    if let Some(tx) = ack_sync {
+                                        let _ = tx.send(());
+                                    }
+                                }
+                            }
                         }
                     }
                 }
@@ -2450,6 +2693,13 @@ pub async fn run_chat_network(
                                                 let took_outgoing = pending_handshakes.remove(&peer);
 
                                                 let remote_static_pub = crypto::PublicKey::from(public_key);
+                                                remember_peer_prekey(
+                                                    &mut peer_prekeys,
+                                                    &event_tx,
+                                                    peer,
+                                                    public_key,
+                                                )
+                                                .await;
                                                 let remote_ephem_pub = crypto::PublicKey::from(ephemeral_key);
 
                                                 if is_initiator {
@@ -2830,6 +3080,13 @@ pub async fn run_chat_network(
                                                 // написавший первым, никогда не создавал сессию по Hello в ответе.
                                                 if !session_exists {
                                                     let remote_static_pub = crypto::PublicKey::from(public_key);
+                                                    remember_peer_prekey(
+                                                        &mut peer_prekeys,
+                                                        &event_tx,
+                                                        peer,
+                                                        public_key,
+                                                    )
+                                                    .await;
                                                     let remote_ephem_pub = crypto::PublicKey::from(ephemeral_key);
                                                     if let Some(local_ephem_secret) = pending_handshakes.remove(&peer) {
                                                         let session = crypto::SecureSession::new_initiator(&local_static, &remote_static_pub, local_ephem_secret, &remote_ephem_pub);
@@ -3461,7 +3718,161 @@ pub async fn run_chat_network(
                             );
                         }
 
-                        SwarmEvent::Behaviour(ChatBehaviourEvent::Kad(kad::Event::OutboundQueryProgressed { result, .. })) => {
+                        SwarmEvent::Behaviour(ChatBehaviourEvent::Kad(kad::Event::OutboundQueryProgressed { id, result, .. })) => {
+                            match &result {
+                                libp2p::kad::QueryResult::GetRecord(Ok(
+                                    kad::GetRecordOk::FoundRecord(peer_record),
+                                )) => {
+                                    if let Some(op) = pending_kad_mail.get_mut(&id) {
+                                        match op {
+                                            MailboxKadOp::FetchInbox { record_bytes } => {
+                                                *record_bytes =
+                                                    Some(peer_record.record.value.clone());
+                                            }
+                                            MailboxKadOp::MergePut { record_bytes, .. } => {
+                                                *record_bytes =
+                                                    Some(peer_record.record.value.clone());
+                                            }
+                                            MailboxKadOp::PrekeyForPublish {
+                                                prekey_bytes, ..
+                                            } => {
+                                                *prekey_bytes =
+                                                    Some(peer_record.record.value.clone());
+                                            }
+                                        }
+                                    }
+                                }
+                                libp2p::kad::QueryResult::GetRecord(Ok(
+                                    kad::GetRecordOk::FinishedWithNoAdditionalRecord { .. },
+                                )) => {
+                                    if let Some(op) = pending_kad_mail.remove(&id) {
+                                        match op {
+                                            MailboxKadOp::FetchInbox { record_bytes } => {
+                                                let envelopes = record_bytes
+                                                    .as_deref()
+                                                    .and_then(|b| decode_mailbox(b).ok())
+                                                    .unwrap_or_default();
+                                                if !envelopes.is_empty() {
+                                                    let _ = event_tx
+                                                        .send(NetworkEvent::OfflineMailbox(
+                                                            envelopes,
+                                                        ))
+                                                        .await;
+                                                }
+                                            }
+                                            MailboxKadOp::MergePut {
+                                                recipient,
+                                                new_envelopes,
+                                                ack_sync,
+                                                record_bytes,
+                                            } => {
+                                                let existing = record_bytes
+                                                    .as_deref()
+                                                    .and_then(|b| decode_mailbox(b).ok())
+                                                    .unwrap_or_default();
+                                                let merged =
+                                                    merge_envelopes(&existing, &new_envelopes);
+                                                put_mailbox_envelopes(
+                                                    &mut swarm,
+                                                    local_peer_id,
+                                                    recipient,
+                                                    &merged,
+                                                );
+                                                let _ = event_tx
+                                                    .send(NetworkEvent::OfflineMailboxPublished)
+                                                    .await;
+                                                if let Some(tx) = ack_sync {
+                                                    let _ = tx.send(());
+                                                }
+                                            }
+                                            MailboxKadOp::PrekeyForPublish {
+                                                recipient,
+                                                items,
+                                                ack_sync,
+                                                prekey_bytes,
+                                            } => {
+                                                let pk_bytes =
+                                                    prekey_bytes.and_then(|bytes| {
+                                                        bytes.get(..32).map(|s| {
+                                                            let mut arr = [0u8; 32];
+                                                            arr.copy_from_slice(s);
+                                                            arr
+                                                        })
+                                                    });
+                                                if let Some(pk_bytes) = pk_bytes {
+                                                    peer_prekeys.insert(recipient, pk_bytes);
+                                                    let _ = event_tx
+                                                        .send(NetworkEvent::PeerPrekey {
+                                                            peer: recipient,
+                                                            public_key: pk_bytes,
+                                                        })
+                                                        .await;
+                                                    let pk =
+                                                        crypto::PublicKey::from(pk_bytes);
+                                                    let mut sealed = Vec::new();
+                                                    for item in items {
+                                                        if let Ok(env) = seal_for_recipient(
+                                                            &pk,
+                                                            &local_peer_id,
+                                                            &my_public_key_bytes,
+                                                            &item.message_id,
+                                                            &item.kind,
+                                                            &item.payload,
+                                                        ) {
+                                                            sealed.push(env);
+                                                        }
+                                                    }
+                                                    if !sealed.is_empty() {
+                                                        start_mailbox_merge_put(
+                                                            &mut swarm,
+                                                            &mut pending_kad_mail,
+                                                            recipient,
+                                                            sealed,
+                                                            ack_sync,
+                                                        );
+                                                    } else if let Some(tx) = ack_sync {
+                                                        let _ = tx.send(());
+                                                    }
+                                                } else if let Some(tx) = ack_sync {
+                                                    let _ = tx.send(());
+                                                }
+                                            }
+                                        }
+                                    }
+                                }
+                                libp2p::kad::QueryResult::GetRecord(Err(_)) => {
+                                    if let Some(op) = pending_kad_mail.remove(&id) {
+                                        match op {
+                                            MailboxKadOp::MergePut {
+                                                recipient,
+                                                new_envelopes,
+                                                ack_sync,
+                                                ..
+                                            } => {
+                                                put_mailbox_envelopes(
+                                                    &mut swarm,
+                                                    local_peer_id,
+                                                    recipient,
+                                                    &new_envelopes,
+                                                );
+                                                let _ = event_tx
+                                                    .send(NetworkEvent::OfflineMailboxPublished)
+                                                    .await;
+                                                if let Some(tx) = ack_sync {
+                                                    let _ = tx.send(());
+                                                }
+                                            }
+                                            MailboxKadOp::PrekeyForPublish { ack_sync, .. } => {
+                                                if let Some(tx) = ack_sync {
+                                                    let _ = tx.send(());
+                                                }
+                                            }
+                                            _ => {}
+                                        }
+                                    }
+                                }
+                                _ => {}
+                            }
                             match result {
                                 libp2p::kad::QueryResult::GetProviders(Ok(ok)) => {
                                     match ok {

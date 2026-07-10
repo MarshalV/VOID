@@ -25,6 +25,9 @@ pub(crate) struct AddressBookEntry {
     /// дозвона. Старые vault'ы без этого поля читаются нормально.
     #[serde(default)]
     pub(crate) addrs: Vec<String>,
+    /// X25519 static public key для офлайн-почты через DHT.
+    #[serde(default)]
+    pub(crate) x25519_public: Option<[u8; 32]>,
 }
 
 #[derive(Serialize, Deserialize)]

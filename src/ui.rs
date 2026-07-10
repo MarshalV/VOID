@@ -1931,6 +1931,13 @@ impl eframe::App for App {
                     self.dht_routing_lines = lines;
                     self.add_status(format!("DHT: в таблице маршрутов {} узл.", total));
                 }
+                NetworkEvent::OfflineMailbox(envelopes) => {
+                    self.ingest_offline_mailbox(envelopes);
+                }
+                NetworkEvent::PeerPrekey { peer, public_key } => {
+                    self.cache_peer_prekey(peer, public_key);
+                }
+                NetworkEvent::OfflineMailboxPublished => {}
                 NetworkEvent::MessageDelivered { peer, message_id } => {
                     self.set_outgoing_delivery(
                         peer,
@@ -2014,6 +2021,7 @@ impl eframe::App for App {
                     }
                 }
                 NetworkEvent::SendFailedDial(peer) => {
+                    self.accelerate_offline_dht_publish();
                     // Подталкиваем все ожидающие сообщения этому пиру к DHT-lookup.
                     for p in self
                         .pending_sends
@@ -2246,6 +2254,7 @@ impl eframe::App for App {
         self.tick_pending_sends();
         self.tick_pending_group_sends();
         self.tick_journal_persist();
+        self.tick_offline_dht_publish();
         self.tick_pending_file_sends();
         self.tick_pending_voice_sends();
         self.voice_poll_tick();
