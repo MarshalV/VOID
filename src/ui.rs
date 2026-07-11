@@ -3524,6 +3524,7 @@ impl eframe::App for App {
                                                 );
                                             }
                                             if let Some(ref voice) = msg.voice {
+                                                self.link_voice_file_if_present(&voice.transfer_id);
                                                 let has_audio =
                                                     self.resolve_voice_path(&voice.transfer_id)
                                                         .is_some();

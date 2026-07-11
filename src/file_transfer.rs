@@ -445,10 +445,9 @@ pub fn unique_download_path(filename: &str) -> std::path::PathBuf {
 
 /// Формирует уникальный путь к файлу в указанной директории.
 /// Создаёт директорию при необходимости.
-pub fn unique_download_path_in(dir: &str, filename: &str) -> std::path::PathBuf {
-    let dir_path = std::path::Path::new(dir);
-    let _ = std::fs::create_dir_all(dir_path);
-    let path = dir_path.join(filename);
+pub fn unique_download_path_in_path(dir: &std::path::Path, filename: &str) -> std::path::PathBuf {
+    let _ = std::fs::create_dir_all(dir);
+    let path = dir.join(filename);
     if !path.exists() {
         return path;
     }
@@ -462,15 +461,46 @@ pub fn unique_download_path_in(dir: &str, filename: &str) -> std::path::PathBuf 
         .unwrap_or("");
     for i in 1u32.. {
         let candidate = if ext.is_empty() {
-            dir_path.join(format!("{}_({i})", stem))
+            dir.join(format!("{}_({i})", stem))
         } else {
-            dir_path.join(format!("{}_({i}).{}", stem, ext))
+            dir.join(format!("{}_({i}).{}", stem, ext))
         };
         if !candidate.exists() {
             return candidate;
         }
     }
     unreachable!()
+}
+
+/// Формирует уникальный путь к файлу в указанной директории (строковый путь).
+/// Создаёт директорию при необходимости.
+pub fn unique_download_path_in(dir: &str, filename: &str) -> std::path::PathBuf {
+    unique_download_path_in_path(std::path::Path::new(dir), filename)
+}
+
+/// Копирует записанный WAV в каталог голосовых с именем по transfer_id.
+pub fn stage_voice_wav(
+    src: &std::path::Path,
+    transfer_id: &[u8; 16],
+) -> Result<std::path::PathBuf, String> {
+    if !src.is_file() {
+        return Err(format!("исходный файл не найден: {}", src.display()));
+    }
+    let voice_name = voice_filename(transfer_id);
+    let dir = voice_dir_absolute();
+    std::fs::create_dir_all(&dir)
+        .map_err(|e| format!("не удалось создать {}: {e}", dir.display()))?;
+    let dest = unique_download_path_in_path(&dir, &voice_name);
+    if std::fs::copy(src, &dest).is_err() {
+        let data = std::fs::read(src)
+            .map_err(|e| format!("не удалось прочитать {}: {e}", src.display()))?;
+        std::fs::write(&dest, &data)
+            .map_err(|e| format!("не удалось записать {}: {e}", dest.display()))?;
+    }
+    if !dest.is_file() {
+        return Err(format!("файл не создан: {}", dest.display()));
+    }
+    Ok(dest)
 }
 
 /// Форматирует размер в байтах в читаемую строку (КБ/МБ/ГБ).

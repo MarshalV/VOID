@@ -1769,6 +1769,11 @@ impl App {
             p = abs;
         }
         if !p.is_file() {
+            crate::voice::voice_log(&format!(
+                "register miss {} -> {} (файл не найден)",
+                transfer_id_hex.to_ascii_lowercase(),
+                p.display()
+            ));
             return;
         }
         self.voice_audio_paths
@@ -1896,7 +1901,30 @@ impl App {
                 return Some(path);
             }
         }
-        self.lookup_voice_file_on_disk(&tid)
+        if let Some(path) = self.lookup_voice_file_on_disk(&tid) {
+            return Some(path);
+        }
+        for pending in &self.pending_voice_sends {
+            if transfer_id_to_hex(&pending.transfer_id) == tid {
+                let path = std::path::PathBuf::from(&pending.path);
+                if path.is_file() {
+                    return Some(path);
+                }
+            }
+        }
+        for pending in &self.pending_group_sends {
+            if let Some(vtid) = pending.voice_transfer_id {
+                if transfer_id_to_hex(&vtid) == tid {
+                    if let Some(ref p) = pending.voice_path {
+                        let path = std::path::PathBuf::from(p);
+                        if path.is_file() {
+                            return Some(path);
+                        }
+                    }
+                }
+            }
+        }
+        None
     }
 
     pub(crate) fn send_voice_message(
@@ -1910,17 +1938,17 @@ impl App {
         rand::thread_rng().fill_bytes(&mut tid);
         let message_id = new_message_id();
         let transfer_hex = transfer_id_to_hex(&tid);
-        let voice_name = file_transfer::voice_filename(&tid);
-        let local_copy = file_transfer::unique_download_path_in(
-            file_transfer::voice_dir_absolute()
-                .to_str()
-                .unwrap_or(file_transfer::VOICE_DIR),
-            &voice_name,
-        );
-        let path_str = if std::fs::copy(&path, &local_copy).is_ok() {
-            local_copy.display().to_string()
-        } else {
-            path.display().to_string()
+        let path_str = match file_transfer::stage_voice_wav(&path, &tid) {
+            Ok(dest) => dest.display().to_string(),
+            Err(e) => {
+                crate::voice::voice_log(&format!("stage voice {transfer_hex}: {e}"));
+                if path.is_file() {
+                    path.display().to_string()
+                } else {
+                    self.add_status(format!("⚠ Не удалось сохранить голосовое: {e}"));
+                    return Err("Не удалось сохранить голосовое");
+                }
+            }
         };
         self.register_voice_path(&transfer_hex, path_str.clone());
         self.ingest_chat_message(ChatMessage {
@@ -1982,17 +2010,17 @@ impl App {
         rand::thread_rng().fill_bytes(&mut tid);
         let message_id = new_message_id();
         let transfer_hex = transfer_id_to_hex(&tid);
-        let voice_name = file_transfer::voice_filename(&tid);
-        let local_copy = file_transfer::unique_download_path_in(
-            file_transfer::voice_dir_absolute()
-                .to_str()
-                .unwrap_or(file_transfer::VOICE_DIR),
-            &voice_name,
-        );
-        let path_str = if std::fs::copy(&path, &local_copy).is_ok() {
-            local_copy.display().to_string()
-        } else {
-            path.display().to_string()
+        let path_str = match file_transfer::stage_voice_wav(&path, &tid) {
+            Ok(dest) => dest.display().to_string(),
+            Err(e) => {
+                crate::voice::voice_log(&format!("stage group voice {transfer_hex}: {e}"));
+                if path.is_file() {
+                    path.display().to_string()
+                } else {
+                    self.add_status(format!("⚠ Не удалось сохранить голосовое: {e}"));
+                    return Err("Не удалось сохранить голосовое");
+                }
+            }
         };
         self.register_voice_path(&transfer_hex, path_str.clone());
         self.stage_outgoing_message(ChatMessage {

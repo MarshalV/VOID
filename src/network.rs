@@ -476,10 +476,8 @@ async fn apply_incoming_file_chunk(
                     {
                         file_transfer::unique_download_path_in(dir, &fname)
                     } else if file_transfer::is_voice_filename(&fname) {
-                        file_transfer::unique_download_path_in(
-                            file_transfer::voice_dir_absolute()
-                                .to_str()
-                                .unwrap_or(file_transfer::VOICE_DIR),
+                        file_transfer::unique_download_path_in_path(
+                            &file_transfer::voice_dir_absolute(),
                             &fname,
                         )
                     } else {
@@ -4424,8 +4422,8 @@ pub async fn run_chat_network(
                                                 {
                                                     inc.save_dir = Some(
                                                         file_transfer::voice_dir_absolute()
-                                                            .to_string_lossy()
-                                                            .into_owned(),
+                                                            .display()
+                                                            .to_string(),
                                                     );
                                                 }
                                                 let accept =
