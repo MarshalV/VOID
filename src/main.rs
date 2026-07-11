@@ -31,6 +31,7 @@ use tokio::sync::mpsc;
 use tracing::info;
 
 use app::DeferredNetworkSpawn;
+#[cfg(any(target_os = "windows", target_os = "macos"))]
 use network::env_flag_true;
 use paths::init_storage_paths;
 use vault::{detect_vault_unlock_kind, load_remembered_password, VaultUnlockKind, VaultUnlockState};

@@ -2,7 +2,9 @@
 
 use std::io::Write;
 use std::path::{Path, PathBuf};
-use std::process::{Child, Command, Stdio};
+use std::process::Child;
+#[cfg(not(target_os = "linux"))]
+use std::process::{Command, Stdio};
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::mpsc::{self, Receiver, SyncSender, TrySendError};
 use std::sync::Arc;
@@ -454,13 +456,16 @@ fn audio_host() -> cpal::Host {
     #[cfg(target_os = "linux")]
     {
         use cpal::traits::{DeviceTrait, HostTrait};
-        for id in [cpal::HostId::Alsa, cpal::HostId::Jack] {
-            if let Ok(host) = cpal::host_from_id(id) {
-                if host.default_input_device().is_some() || host.default_output_device().is_some()
-                {
-                    voice_log(&format!("audio host: {:?}", id));
-                    return host;
-                }
+        if let Ok(host) = cpal::host_from_id(cpal::HostId::Alsa) {
+            if host.default_input_device().is_some() || host.default_output_device().is_some() {
+                voice_log("audio host: Alsa");
+                return host;
+            }
+        }
+        for host in cpal::hosts() {
+            if host.default_input_device().is_some() || host.default_output_device().is_some() {
+                voice_log(&format!("audio host: {}", host.id().name()));
+                return host;
             }
         }
     }
