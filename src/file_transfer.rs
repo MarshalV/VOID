@@ -138,14 +138,29 @@ pub fn voice_transfer_hex_from_filename(name: &str) -> Option<String> {
     }
 }
 
-/// Абсолютный путь к каталогу голосовых (рядом с exe, иначе cwd).
+/// Абсолютный путь к каталогу голосовых (в каталоге данных VOID).
 pub fn voice_dir_absolute() -> std::path::PathBuf {
-    let dir = std::env::current_exe()
-        .ok()
-        .and_then(|exe| exe.parent().map(|p| p.join(VOICE_DIR)))
-        .unwrap_or_else(|| std::path::PathBuf::from(VOICE_DIR));
+    let dir = crate::paths::data_dir().join(VOICE_DIR);
     let _ = std::fs::create_dir_all(&dir);
     dir
+}
+
+/// Все каталоги, где могут лежать WAV (текущий + устаревший рядом с exe).
+pub(crate) fn voice_search_dirs() -> Vec<std::path::PathBuf> {
+    let mut dirs = vec![voice_dir_absolute()];
+    if let Ok(exe) = std::env::current_exe() {
+        if let Some(parent) = exe.parent() {
+            let legacy = parent.join(VOICE_DIR);
+            if !dirs.iter().any(|d| d == &legacy) {
+                dirs.push(legacy);
+            }
+        }
+    }
+    let cwd_voice = std::path::PathBuf::from(VOICE_DIR);
+    if !dirs.iter().any(|d| d == &cwd_voice) {
+        dirs.push(cwd_voice);
+    }
+    dirs
 }
 
 /// Префикс открытого текста перед Double Ratchet: не начинается с `{`, чтобы отличаться от JSON чата.

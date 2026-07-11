@@ -15,6 +15,8 @@ const LEGACY_BLOBS: &[&str] = &[
     "relay_mailbox.bin",
 ];
 
+const LEGACY_DIRS: &[&str] = &["void_downloads"];
+
 /// Переключает cwd на каталог данных и мигрирует файлы из старых мест (cwd, рядом с .exe).
 pub(crate) fn init_storage_paths() -> Result<(), String> {
     let dir = resolve_data_dir();
@@ -24,6 +26,14 @@ pub(crate) fn init_storage_paths() -> Result<(), String> {
     std::env::set_current_dir(&dir).map_err(|e| format!("set_current_dir: {e}"))?;
     info!("VOID: каталог данных — {}", dir.display());
     Ok(())
+}
+
+/// Каталог данных VOID (после `init_storage_paths` совпадает с cwd).
+pub(crate) fn data_dir() -> PathBuf {
+    if let Ok(p) = std::env::var("VOID_DATA_DIR") {
+        return PathBuf::from(p);
+    }
+    std::env::current_dir().unwrap_or_else(|_| resolve_data_dir())
 }
 
 fn resolve_data_dir() -> PathBuf {
@@ -59,6 +69,42 @@ fn migrate_legacy_files(dest_dir: &Path) -> Result<(), String> {
         migrate_one_file(dest_dir, &legacy_roots, name)?;
         for suffix in [".tmp", ".bak"] {
             migrate_one_file(dest_dir, &legacy_roots, &format!("{name}{suffix}"))?;
+        }
+    }
+    for name in LEGACY_DIRS {
+        migrate_one_dir(dest_dir, &legacy_roots, name)?;
+    }
+    Ok(())
+}
+
+fn migrate_one_dir(dest_dir: &Path, legacy_roots: &[PathBuf], name: &str) -> Result<(), String> {
+    let dest = dest_dir.join(name);
+    if dest.exists() {
+        return Ok(());
+    }
+    for root in legacy_roots {
+        let src = root.join(name);
+        if !src.is_dir() {
+            continue;
+        }
+        copy_dir_recursive(&src, &dest)
+            .map_err(|e| format!("миграция каталога {}: {e}", src.display()))?;
+        info!("VOID: перенесён каталог {} → {}", src.display(), dest.display());
+        break;
+    }
+    Ok(())
+}
+
+fn copy_dir_recursive(src: &Path, dest: &Path) -> std::io::Result<()> {
+    std::fs::create_dir_all(dest)?;
+    for entry in std::fs::read_dir(src)? {
+        let entry = entry?;
+        let ty = entry.file_type()?;
+        let dest_path = dest.join(entry.file_name());
+        if ty.is_dir() {
+            copy_dir_recursive(&entry.path(), &dest_path)?;
+        } else if ty.is_file() {
+            std::fs::copy(entry.path(), dest_path)?;
         }
     }
     Ok(())

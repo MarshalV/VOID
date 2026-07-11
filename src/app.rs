@@ -1796,17 +1796,18 @@ impl App {
 
     fn lookup_voice_file_on_disk(&self, tid: &str) -> Option<std::path::PathBuf> {
         let name = format!("{}{}.wav", file_transfer::VOICE_FILENAME_PREFIX, tid);
-        let direct = file_transfer::voice_dir_absolute().join(&name);
-        if direct.is_file() {
-            return Some(direct);
-        }
-        let dir = file_transfer::voice_dir_absolute();
-        if let Ok(entries) = std::fs::read_dir(&dir) {
-            let prefix = format!("{}{}", file_transfer::VOICE_FILENAME_PREFIX, tid);
-            for entry in entries.flatten() {
-                let fname = entry.file_name().to_string_lossy().into_owned();
-                if fname.starts_with(&prefix) && fname.ends_with(".wav") {
-                    return Some(entry.path());
+        let prefix = format!("{}{}", file_transfer::VOICE_FILENAME_PREFIX, tid);
+        for dir in file_transfer::voice_search_dirs() {
+            let direct = dir.join(&name);
+            if direct.is_file() {
+                return Some(direct);
+            }
+            if let Ok(entries) = std::fs::read_dir(&dir) {
+                for entry in entries.flatten() {
+                    let fname = entry.file_name().to_string_lossy().into_owned();
+                    if fname.starts_with(&prefix) && fname.ends_with(".wav") {
+                        return Some(entry.path());
+                    }
                 }
             }
         }
