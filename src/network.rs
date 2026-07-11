@@ -2102,7 +2102,6 @@ pub async fn run_chat_network(
                                         base_tid
                                     };
                                     let mut per_peer_msg = msg.clone();
-                                    per_peer_msg.recipient_id = Some(peer_id.to_string());
                                     if has_voice {
                                         per_peer_msg.voice = Some(VoiceMeta {
                                             transfer_id: transfer_id_to_hex(&peer_tid),
@@ -2116,11 +2115,12 @@ pub async fn run_chat_network(
                                     if sessions.contains_key(&peer_id) {
                                         let msg_id_for_send =
                                             chat_message_id_from_json(per_json.as_slice());
-                                        let in_flight = msg_id_for_send.as_ref().is_some_and(|mid| {
-                                            outbound_msg_requests.values().any(|(p, id)| {
-                                                *p == peer_id && id == mid
-                                            })
-                                        });
+                                        let in_flight = !is_retry
+                                            && msg_id_for_send.as_ref().is_some_and(|mid| {
+                                                outbound_msg_requests.values().any(|(p, id)| {
+                                                    *p == peer_id && id == mid
+                                                })
+                                            });
                                         if !in_flight {
                                             let _ = send_encrypted_chat_payload(
                                                 &mut swarm,

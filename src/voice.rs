@@ -836,9 +836,9 @@ fn play_wav_file(
 
     #[cfg(target_os = "linux")]
     if start_ratio <= 0.001 {
-        match play_wav_linux_external(&path, stop_flag) {
+        match play_wav_linux(&path, stop_flag) {
             Ok(()) => return Ok(()),
-            Err(e) => voice_log(&format!("linux external miss: {e}")),
+            Err(e) => voice_log(&format!("linux play miss: {e}")),
         }
     }
 
@@ -863,7 +863,7 @@ fn play_wav_file(
             }
             #[cfg(target_os = "linux")]
             {
-                play_wav_linux_external(&path, stop_flag)
+                play_wav_linux(&path, stop_flag)
                     .map_err(|ext| format!("cpal: {cpal_err}; {ext}"))
             }
             #[cfg(all(not(target_os = "windows"), not(target_os = "linux")))]
@@ -875,45 +875,197 @@ fn play_wav_file(
 }
 
 #[cfg(target_os = "linux")]
-fn play_wav_linux_external(path: &Path, stop_flag: &AtomicBool) -> Result<(), String> {
-    for (cmd, extra_args) in [("paplay", &[][..]), ("aplay", &["-q"][..])] {
-        let mut command = Command::new(cmd);
-        for arg in extra_args {
-            command.arg(arg);
+fn linux_pulse_servers() -> Vec<String> {
+    if let Ok(existing) = std::env::var("PULSE_SERVER") {
+        if !existing.trim().is_empty() {
+            return vec![existing];
         }
-        let mut child = match command
-            .arg(path)
-            .stdin(Stdio::null())
-            .stdout(Stdio::null())
-            .stderr(Stdio::null())
-            .spawn()
-        {
-            Ok(c) => c,
-            Err(_) => continue,
-        };
-        voice_log(&format!("play via {cmd}: {}", path.display()));
-        loop {
-            if stop_flag.load(Ordering::Relaxed) {
-                let _ = child.kill();
-                let _ = child.wait();
-                voice_log(&format!("play stopped ({cmd})"));
-                return Ok(());
+    }
+    let mut servers = Vec::new();
+    let mut push = |path: &Path| {
+        if path.exists() {
+            let s = format!("unix:{}", path.display());
+            if !servers.iter().any(|x| x == &s) {
+                servers.push(s);
             }
-            match child.try_wait() {
-                Ok(Some(status)) if status.success() => {
-                    voice_log(&format!("play done ({cmd})"));
-                    return Ok(());
+        }
+    };
+    if let Ok(uid) = std::env::var("SUDO_UID") {
+        push(&PathBuf::from(format!("/run/user/{uid}/pulse/native")));
+    }
+    if let Ok(uid) = std::env::var("UID") {
+        push(&PathBuf::from(format!("/run/user/{uid}/pulse/native")));
+    }
+    if let Ok(xdg) = std::env::var("XDG_RUNTIME_DIR") {
+        push(&PathBuf::from(xdg).join("pulse/native"));
+    }
+    if let Ok(entries) = std::fs::read_dir("/run/user") {
+        let mut uids: Vec<_> = entries.flatten().collect();
+        uids.sort_by_key(|e| e.file_name());
+        for entry in uids {
+            push(&entry.path().join("pulse/native"));
+        }
+    }
+    servers
+}
+
+#[cfg(target_os = "linux")]
+fn linux_aplay_devices() -> Vec<String> {
+    let mut devices = vec![
+        "default".into(),
+        "pipewire".into(),
+        "pulse".into(),
+        "plughw:0,0".into(),
+        "hw:0,0".into(),
+    ];
+    if let Ok(out) = Command::new("aplay").arg("-L").output() {
+        if out.status.success() {
+            let text = String::from_utf8_lossy(&out.stdout);
+            for line in text.lines() {
+                let name = line.trim();
+                if name.is_empty() || name.starts_with(' ') || name.starts_with('\t') {
+                    continue;
                 }
-                Ok(Some(status)) => {
-                    voice_log(&format!("play {cmd} exit: {status}"));
-                    break;
+                if name.contains(':') || name.starts_with("hw:") || name.starts_with("plughw:") {
+                    if !devices.iter().any(|d| d == name) {
+                        devices.push(name.to_string());
+                    }
                 }
-                Ok(None) => std::thread::sleep(Duration::from_millis(40)),
-                Err(e) => return Err(format!("{cmd}: {e}")),
             }
         }
     }
-    Err("paplay/aplay не найдены (sudo apt install pulseaudio-utils alsa-utils)".into())
+    devices
+}
+
+#[cfg(target_os = "linux")]
+fn linux_env_sets() -> Vec<Vec<(String, String)>> {
+    let mut sets = vec![Vec::new()];
+    for server in linux_pulse_servers() {
+        let mut env = vec![("PULSE_SERVER".into(), server.clone())];
+        if let Some(runtime) = server.strip_prefix("unix:/run/user/") {
+            if let Some(uid_dir) = runtime.strip_suffix("/pulse/native") {
+                env.push(("XDG_RUNTIME_DIR".into(), format!("/run/user/{uid_dir}")));
+            }
+        }
+        sets.push(env);
+    }
+    sets
+}
+
+#[cfg(target_os = "linux")]
+fn linux_wait_player(
+    child: &mut Child,
+    stop_flag: &AtomicBool,
+    expect_secs: f32,
+    label: &str,
+) -> Result<(), String> {
+    let started = Instant::now();
+    let min_alive = if expect_secs > 0.4 {
+        (expect_secs * 0.35).min(expect_secs - 0.15).max(0.08)
+    } else {
+        0.04
+    };
+    loop {
+        if stop_flag.load(Ordering::Relaxed) {
+            let _ = child.kill();
+            let _ = child.wait();
+            voice_log(&format!("play stopped ({label})"));
+            return Ok(());
+        }
+        match child.try_wait() {
+            Ok(Some(status)) if status.success() => {
+                let elapsed = started.elapsed().as_secs_f32();
+                if elapsed + 0.05 >= min_alive {
+                    voice_log(&format!("play done ({label}, {elapsed:.2}s)"));
+                    return Ok(());
+                }
+                return Err(format!(
+                    "{label}: мгновенный выход ({elapsed:.3}s, ожидали >= {min_alive:.2}s)"
+                ));
+            }
+            Ok(Some(status)) => {
+                let mut err_text = String::new();
+                if let Some(mut stderr) = child.stderr.take() {
+                    use std::io::Read;
+                    let _ = stderr.read_to_string(&mut err_text);
+                }
+                return Err(format!("{label} exit {status}: {}", err_text.trim()));
+            }
+            Ok(None) => std::thread::sleep(Duration::from_millis(35)),
+            Err(e) => return Err(format!("{label}: {e}")),
+        }
+    }
+}
+
+#[cfg(target_os = "linux")]
+fn linux_spawn_player(
+    cmd: &str,
+    args: &[&str],
+    path: &Path,
+    env: &[(String, String)],
+) -> Result<Child, String> {
+    let mut command = Command::new(cmd);
+    for arg in args {
+        command.arg(arg);
+    }
+    for (k, v) in env {
+        command.env(k, v);
+    }
+    command
+        .arg(path)
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::piped())
+        .spawn()
+        .map_err(|e| format!("{cmd}: {e}"))
+}
+
+#[cfg(target_os = "linux")]
+fn play_wav_linux(path: &Path, stop_flag: &AtomicBool) -> Result<(), String> {
+    let duration = wav_duration(path).unwrap_or(0.5);
+    let env_sets = linux_env_sets();
+    let aplay_devices = linux_aplay_devices();
+    let mut last_err = String::from("нет доступных аудиоплееров");
+
+    for env in &env_sets {
+        if let Ok(mut child) = linux_spawn_player("paplay", &[], path, env) {
+            let tag = format!(
+                "paplay{}",
+                env.iter()
+                    .find(|(k, _)| k == "PULSE_SERVER")
+                    .map(|(_, v)| format!("@{v}"))
+                    .unwrap_or_default()
+            );
+            voice_log(&format!("try {tag}: {}", path.display()));
+            match linux_wait_player(&mut child, stop_flag, duration, &tag) {
+                Ok(()) => return Ok(()),
+                Err(e) => {
+                    last_err = e;
+                    voice_log(&last_err);
+                }
+            }
+        }
+    }
+
+    for device in &aplay_devices {
+        for env in &env_sets {
+            let args = ["-q", "-D", device.as_str()];
+            let Ok(mut child) = linux_spawn_player("aplay", &args, path, env) else {
+                continue;
+            };
+            let tag = format!("aplay -D {device}");
+            voice_log(&format!("try {tag}: {}", path.display()));
+            match linux_wait_player(&mut child, stop_flag, duration, &tag) {
+                Ok(()) => return Ok(()),
+                Err(e) => {
+                    last_err = e;
+                    voice_log(&last_err);
+                }
+            }
+        }
+    }
+
+    Err(format!("{last_err} (sudo apt install pulseaudio-utils alsa-utils)"))
 }
 
 fn normalize_playback_path(path: &Path) -> PathBuf {
@@ -971,7 +1123,7 @@ fn play_wav_cpal(
     start_ratio: f32,
     frame_pos: Arc<AtomicUsize>,
 ) -> Result<(), String> {
-    use cpal::traits::{DeviceTrait, HostTrait, StreamTrait};
+    use cpal::traits::{DeviceTrait, HostTrait};
 
     let (mono, src_rate) = read_wav_mono_f32(path)?;
     let mono = if src_rate == VOICE_SAMPLE_RATE {
@@ -981,9 +1133,57 @@ fn play_wav_cpal(
     };
 
     let host = audio_host();
-    let device = host
-        .default_output_device()
-        .ok_or_else(|| "Устройство воспроизведения не найдено".to_string())?;
+    let mut devices: Vec<cpal::Device> = Vec::new();
+    if let Some(default) = host.default_output_device() {
+        devices.push(default);
+    }
+    if let Ok(all) = host.devices() {
+        for dev in all {
+            if dev.default_output_config().is_ok()
+                && !devices
+                    .iter()
+                    .any(|d| d.name().ok().as_deref() == dev.name().ok().as_deref())
+            {
+                devices.push(dev);
+            }
+        }
+    }
+    if devices.is_empty() {
+        return Err("Устройство воспроизведения не найдено".into());
+    }
+
+    let mut last_err = String::from("cpal: нет рабочего выхода");
+    for device in devices {
+        let name = device.name().unwrap_or_else(|_| "?".into());
+        match play_wav_cpal_device(
+            &device,
+            &mono,
+            stop_flag,
+            start_ratio,
+            frame_pos.clone(),
+        ) {
+            Ok(()) => {
+                voice_log(&format!("play done (cpal/{name})"));
+                return Ok(());
+            }
+            Err(e) => {
+                last_err = format!("cpal/{name}: {e}");
+                voice_log(&last_err);
+            }
+        }
+    }
+    Err(last_err)
+}
+
+fn play_wav_cpal_device(
+    device: &cpal::Device,
+    mono: &[f32],
+    stop_flag: &AtomicBool,
+    start_ratio: f32,
+    frame_pos: Arc<AtomicUsize>,
+) -> Result<(), String> {
+    use cpal::traits::StreamTrait;
+
     let config = device
         .default_output_config()
         .map_err(|e| format!("Выход аудио: {e}"))?;
@@ -991,17 +1191,31 @@ fn play_wav_cpal(
     let out_ch = config.channels() as usize;
     let out_rate = config.sample_rate().0;
     let pcm = Arc::new(if out_rate == VOICE_SAMPLE_RATE {
-        mono
+        mono.to_vec()
     } else {
-        resample_linear(&mono, VOICE_SAMPLE_RATE, out_rate)
+        resample_linear(mono, VOICE_SAMPLE_RATE, out_rate)
     });
     let total_frames = pcm.len();
-    let start_frame = ((start_ratio.clamp(0.0, 1.0) * total_frames as f32) as usize).min(total_frames);
+    let start_frame =
+        ((start_ratio.clamp(0.0, 1.0) * total_frames as f32) as usize).min(total_frames);
     frame_pos.store(start_frame, Ordering::Relaxed);
-    let stream = build_output_stream(&device, &config, pcm, frame_pos.clone(), out_ch)?;
+    let stream = build_output_stream(device, &config, pcm, frame_pos.clone(), out_ch)?;
     stream
         .play()
         .map_err(|e| format!("Не удалось начать воспроизведение: {e}"))?;
+
+    let warmup = Instant::now();
+    while frame_pos.load(Ordering::Relaxed) <= start_frame
+        && warmup.elapsed() < Duration::from_millis(350)
+    {
+        if stop_flag.load(Ordering::Relaxed) {
+            return Ok(());
+        }
+        std::thread::sleep(Duration::from_millis(10));
+    }
+    if frame_pos.load(Ordering::Relaxed) <= start_frame && total_frames > start_frame.saturating_add(1) {
+        return Err("поток не воспроизводит (тишина)".into());
+    }
 
     while frame_pos.load(Ordering::Relaxed) < total_frames {
         if stop_flag.load(Ordering::Relaxed) {

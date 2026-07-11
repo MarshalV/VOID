@@ -1002,7 +1002,7 @@ impl App {
                             id: message_id.clone(),
                             sender_id: me.to_string(),
                             sender_name: self.local_nickname.clone(),
-                            recipient_id: Some(peer_str.clone()),
+                            recipient_id: None,
                             text: text.clone(),
                             timestamp: chrono::Local::now().format("%H:%M").to_string(),
                             delivery: OutgoingDeliveryStatus::Pending,
@@ -1013,7 +1013,7 @@ impl App {
                             items.push(OfflineOutboxItem {
                                 recipient,
                                 message_id: format!("{}:{}", message_id, peer_str),
-                                kind: "dm".into(),
+                                kind: "group".into(),
                                 payload,
                             });
                         }
@@ -1071,6 +1071,16 @@ impl App {
                         self.ingest_chat_message(msg.clone());
                         if !msg.text.is_empty() {
                             self.try_process_invite_message(&msg.id, &msg.text);
+                        }
+                        self.offline_mail_processed.insert(env.message_id.clone());
+                        any = true;
+                    }
+                }
+                "group" => {
+                    if let Ok(msg) = serde_json::from_slice::<ChatMessage>(&plaintext) {
+                        self.ingest_chat_message(msg.clone());
+                        if let Some(ref voice) = msg.voice {
+                            self.link_voice_file_if_present(&voice.transfer_id);
                         }
                         self.offline_mail_processed.insert(env.message_id.clone());
                         any = true;
@@ -2903,6 +2913,59 @@ impl App {
                         creator_id: group.creator_id.clone(),
                         members,
                         recipients: vec![peer],
+                    });
+                }
+                OutboxEntry::GroupMessage {
+                    group_id,
+                    message_id,
+                    text,
+                    members,
+                } if members.iter().any(|m| m == &peer_str) => {
+                    if self.left_groups.contains(&group_id)
+                        || !self.is_active_group_member(&group_id)
+                    {
+                        continue;
+                    }
+                    let member_pids: Vec<PeerId> = members
+                        .iter()
+                        .filter_map(|s| s.parse().ok())
+                        .collect();
+                    let targets: Vec<PeerId> = member_pids
+                        .iter()
+                        .copied()
+                        .filter(|p| *p != self.local_peer_id && *p == peer)
+                        .collect();
+                    if targets.is_empty() {
+                        continue;
+                    }
+                    if !self
+                        .pending_group_sends
+                        .iter()
+                        .any(|p| p.message_id == message_id)
+                    {
+                        self.pending_group_sends.push(PendingGroupSend {
+                            group_id: group_id.clone(),
+                            members: member_pids,
+                            text: text.clone(),
+                            message_id: message_id.clone(),
+                            last_send_at: Instant::now(),
+                            attempts: 0,
+                            delivered_to: HashSet::new(),
+                            voice_path: None,
+                            voice_duration_secs: 0.0,
+                            voice_transfer_id: None,
+                        });
+                    }
+                    let _ = self.command_tx.try_send(UICommand::SendGroupMessage {
+                        sender_name: self.local_nickname.clone(),
+                        text,
+                        group_id,
+                        members: targets,
+                        message_id: Some(message_id),
+                        is_retry: true,
+                        voice_path: None,
+                        voice_duration_secs: 0.0,
+                        voice_transfer_id: None,
                     });
                 }
                 _ => {}
