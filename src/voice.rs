@@ -462,12 +462,6 @@ fn audio_host() -> cpal::Host {
                 return host;
             }
         }
-        for host in cpal::hosts() {
-            if host.default_input_device().is_some() || host.default_output_device().is_some() {
-                voice_log(&format!("audio host: {}", host.id().name()));
-                return host;
-            }
-        }
     }
     cpal::default_host()
 }
