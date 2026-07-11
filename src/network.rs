@@ -33,7 +33,7 @@ use crate::protocol::{
     is_read_command_json, new_message_id, parse_decrypted_chat_frame,
     read_command_message_ids, verify_hello_transport_binding, validate_bootstrap_gossip_addrs,
     build_group_sync_json, build_group_leave_json, build_group_delete_json,
-    transfer_id_to_hex, ChatMessage,
+    transfer_id_to_hex, per_peer_voice_transfer_id, ChatMessage,
     DecryptedChatFrame, OutgoingDeliveryStatus, VoiceMeta, V1Packet,
 };
 
@@ -543,6 +543,9 @@ pub(crate) enum UICommand {
         members: Vec<PeerId>,
         message_id: Option<String>,
         is_retry: bool,
+        voice_path: Option<String>,
+        voice_duration_secs: f32,
+        voice_transfer_id: Option<[u8; 16]>,
     },
     /// Синхронизация состава группы (pairwise E2EE).
     SendGroupSync {
@@ -2056,44 +2059,96 @@ pub async fn run_chat_network(
                                 members,
                                 message_id,
                                 is_retry,
+                                voice_path,
+                                voice_duration_secs,
+                                voice_transfer_id,
                             } => {
                                 let now = chrono::Local::now().format("%H:%M:%S").to_string();
                                 let msg_id = message_id.unwrap_or_else(new_message_id);
                                 let me = local_peer_id.to_string();
+                                let has_voice = voice_path
+                                    .as_ref()
+                                    .is_some_and(|p| !p.is_empty())
+                                    && voice_transfer_id.is_some();
+                                let base_tid = voice_transfer_id.unwrap_or([0u8; 16]);
+                                let voice_path = voice_path.unwrap_or_default();
                                 let msg = ChatMessage {
                                     id: msg_id.clone(),
                                     sender_id: me.clone(),
                                     sender_name: sender_name.clone(),
                                     recipient_id: None,
-                                    text: text.clone(),
+                                    text: if has_voice {
+                                        String::new()
+                                    } else {
+                                        text.clone()
+                                    },
                                     timestamp: chrono::Local::now().format("%H:%M").to_string(),
                                     delivery: OutgoingDeliveryStatus::Pending,
-                                    voice: None,
+                                    voice: if has_voice {
+                                        Some(VoiceMeta {
+                                            transfer_id: transfer_id_to_hex(&base_tid),
+                                            duration_secs: voice_duration_secs,
+                                        })
+                                    } else {
+                                        None
+                                    },
                                     group_id: Some(group_id.clone()),
                                 };
                                 for peer_id in members {
                                     if peer_id == local_peer_id {
                                         continue;
                                     }
+                                    let peer_tid = if has_voice {
+                                        per_peer_voice_transfer_id(&base_tid, peer_id)
+                                    } else {
+                                        base_tid
+                                    };
                                     let mut per_peer_msg = msg.clone();
                                     per_peer_msg.recipient_id = Some(peer_id.to_string());
+                                    if has_voice {
+                                        per_peer_msg.voice = Some(VoiceMeta {
+                                            transfer_id: transfer_id_to_hex(&peer_tid),
+                                            duration_secs: voice_duration_secs,
+                                        });
+                                    }
                                     let per_json = match serde_json::to_vec(&per_peer_msg) {
                                         Ok(v) => v,
                                         Err(_) => continue,
                                     };
                                     if sessions.contains_key(&peer_id) {
-                                        let _ = send_encrypted_chat_payload(
-                                            &mut swarm,
-                                            &mut sessions,
-                                            &mut outbound_msg_requests,
-                                            &mut outbound_delete_requests,
-                                            &event_tx,
-                                            peer_id,
-                                            per_json,
-                                            None,
-                                            &now,
-                                        )
-                                        .await;
+                                        let msg_id_for_send =
+                                            chat_message_id_from_json(per_json.as_slice());
+                                        let in_flight = msg_id_for_send.as_ref().is_some_and(|mid| {
+                                            outbound_msg_requests.values().any(|(p, id)| {
+                                                *p == peer_id && id == mid
+                                            })
+                                        });
+                                        if !in_flight {
+                                            let _ = send_encrypted_chat_payload(
+                                                &mut swarm,
+                                                &mut sessions,
+                                                &mut outbound_msg_requests,
+                                                &mut outbound_delete_requests,
+                                                &event_tx,
+                                                peer_id,
+                                                per_json,
+                                                None,
+                                                &now,
+                                            )
+                                            .await;
+                                        }
+                                        if has_voice {
+                                            start_voice_file_transfer(
+                                                &mut swarm,
+                                                &mut outgoing_transfers,
+                                                &relay_peers,
+                                                &event_tx,
+                                                peer_id,
+                                                &voice_path,
+                                                peer_tid,
+                                            )
+                                            .await;
+                                        }
                                     } else {
                                         let force_hs = pending_handshakes.contains_key(&peer_id)
                                             && swarm.is_connected(&peer_id);
@@ -2123,6 +2178,25 @@ pub async fn run_chat_network(
                                             }
                                         } else {
                                             queue.push(per_json);
+                                        }
+                                        if has_voice {
+                                            let vq =
+                                                pending_voice_transfers.entry(peer_id).or_default();
+                                            if !vq.iter().any(|v| v.transfer_id == peer_tid) {
+                                                vq.push(PendingVoiceTransfer {
+                                                    path: voice_path.clone(),
+                                                    transfer_id: peer_tid,
+                                                });
+                                            }
+                                            let _ = event_tx
+                                                .send(NetworkEvent::VoiceSendDeferred {
+                                                    recipient: peer_id,
+                                                    path: voice_path.clone(),
+                                                    duration_secs: voice_duration_secs,
+                                                    message_id: msg_id.clone(),
+                                                    transfer_id: peer_tid,
+                                                })
+                                                .await;
                                         }
                                         let _ = event_tx
                                             .send(NetworkEvent::MessageAwaitingSession(peer_id))

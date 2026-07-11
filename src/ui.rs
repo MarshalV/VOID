@@ -2002,10 +2002,15 @@ impl eframe::App for App {
                     message_id,
                     transfer_id,
                 } => {
-                    if !self
-                        .pending_voice_sends
+                    let is_group = self
+                        .pending_group_sends
                         .iter()
-                        .any(|p| p.message_id == message_id)
+                        .any(|p| p.message_id == message_id);
+                    if !is_group
+                        && !self
+                            .pending_voice_sends
+                            .iter()
+                            .any(|p| p.message_id == message_id)
                     {
                         self.pending_voice_sends.push(crate::app::PendingVoiceSend {
                             peer: recipient,
@@ -3232,7 +3237,7 @@ impl eframe::App for App {
                                         self.push_toast(msg, ToastKind::Info, TOAST_TTL_SHORT);
                                     } else if self.voice_recorder.has_ready() {
                                         self.add_status(
-                                            "⚠ Выберите контакт слева, чтобы отправить голосовое."
+                                            "⚠ Выберите контакт или группу слева, чтобы отправить голосовое."
                                                 .into(),
                                         );
                                     }
@@ -3292,6 +3297,9 @@ impl eframe::App for App {
                                             members: targets.clone(),
                                             message_id: Some(message_id.clone()),
                                             is_retry: false,
+                                            voice_path: None,
+                                            voice_duration_secs: 0.0,
+                                            voice_transfer_id: None,
                                         }) {
                                             Ok(()) => {
                                                 self.chat_input.clear();
@@ -3303,6 +3311,9 @@ impl eframe::App for App {
                                                     last_send_at: Instant::now(),
                                                     attempts: 0,
                                                     delivered_to: std::collections::HashSet::new(),
+                                                    voice_path: None,
+                                                    voice_duration_secs: 0.0,
+                                                    voice_transfer_id: None,
                                                 });
                                             }
                                             Err(_) => self.add_status(

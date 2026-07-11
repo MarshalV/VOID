@@ -39,11 +39,24 @@ pub(crate) fn transfer_id_from_hex(hex: &str) -> Option<[u8; 16]> {
     if hex.len() != 32 || !hex.chars().all(|c| c.is_ascii_hexdigit()) {
         return None;
     }
-    let mut tid = [0u8; 16];
-    for i in 0..16 {
-        tid[i] = u8::from_str_radix(&hex[i * 2..i * 2 + 2], 16).ok()?;
+    let mut out = [0u8; 16];
+    for (i, chunk) in hex.as_bytes().chunks(2).enumerate() {
+        let hi = chunk[0] as char;
+        let lo = chunk[1] as char;
+        let byte = hi.to_digit(16)? as u8 * 16 + lo.to_digit(16)? as u8;
+        out[i] = byte;
     }
-    Some(tid)
+    Some(out)
+}
+
+/// Уникальный transfer_id file-transfer для каждого участника группы (один base id в UI).
+pub(crate) fn per_peer_voice_transfer_id(base: &[u8; 16], peer: PeerId) -> [u8; 16] {
+    use blake2::digest::{Digest, FixedOutput};
+    let mut h = blake2::Blake2b::<blake2::digest::consts::U16>::new();
+    h.update(b"VOID_GROUP_VOICE_V1");
+    h.update(base);
+    h.update(peer.to_bytes());
+    h.finalize_fixed().into()
 }
 
 fn validate_voice_meta(v: &VoiceMeta) -> bool {

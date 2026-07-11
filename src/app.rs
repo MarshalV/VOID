@@ -158,6 +158,10 @@ pub(crate) struct PendingGroupSend {
     pub(crate) attempts: u32,
     /// Подтверждённые доставки (по одному на каждого участника, кроме себя).
     pub(crate) delivered_to: HashSet<PeerId>,
+    /// Голосовое: локальный WAV и base transfer_id (в UI один id на всю группу).
+    pub(crate) voice_path: Option<String>,
+    pub(crate) voice_duration_secs: f32,
+    pub(crate) voice_transfer_id: Option<[u8; 16]>,
 }
 
 pub(crate) const RESEND_GRACE: Duration = Duration::from_secs(1);
@@ -1255,6 +1259,9 @@ impl App {
                             last_send_at: Instant::now(),
                             attempts: 0,
                             delivered_to: HashSet::new(),
+                            voice_path: None,
+                            voice_duration_secs: 0.0,
+                            voice_transfer_id: None,
                         });
                     }
                     let _ = self.command_tx.try_send(UICommand::SendGroupMessage {
@@ -1264,6 +1271,9 @@ impl App {
                         members: targets,
                         message_id: Some(message_id),
                         is_retry: true,
+                        voice_path: None,
+                        voice_duration_secs: 0.0,
+                        voice_transfer_id: None,
                     });
                 }
                 OutboxEntry::GroupSync {
@@ -1377,14 +1387,23 @@ impl App {
         }
     }
 
-    /// Отправляет готовое голосовое, если выбран контакт. Иначе оставляет `Ready`.
+    /// Отправляет готовое голосовое в выбранный чат (DM или группа).
     pub(crate) fn try_dispatch_ready_voice(&mut self) -> Option<String> {
         if !self.voice_recorder.has_ready() {
             return None;
         }
-        let peer = self.selected_chat.parse::<PeerId>().ok()?;
         let (path, duration) = self.voice_recorder.take_ready()?;
         let dur = crate::voice::fmt_duration(duration);
+        if let Some(gid) = self.selected_group_id().map(str::to_string) {
+            return match self.send_group_voice_message(gid, path, duration) {
+                Ok(()) => Some(format!("🎤 Голосовое {dur} отправлено в группу")),
+                Err(e) => {
+                    self.add_status(format!("⚠ {}", e));
+                    None
+                }
+            };
+        }
+        let peer = self.selected_chat.parse::<PeerId>().ok()?;
         match self.send_voice_message(peer, path, duration) {
             Ok(()) => Some(format!("🎤 Голосовое {dur} отправлено")),
             Err(e) => {
@@ -1498,7 +1517,7 @@ impl App {
                 for msg in msgs {
                     if msg.sender_id == me
                         && msg.delivery == OutgoingDeliveryStatus::Pending
-                        && !msg.text.is_empty()
+                        && (!msg.text.is_empty() || msg.voice.is_some())
                         && !outbox_msg_ids.contains(&msg.id)
                     {
                         out.push((gid.to_string(), msg.clone()));
@@ -1592,6 +1611,15 @@ impl App {
             if targets.is_empty() {
                 continue;
             }
+            let voice_path = msg.voice.as_ref().and_then(|v| {
+                self.resolve_voice_path(&v.transfer_id)
+                    .map(|p| p.display().to_string())
+            });
+            let voice_duration_secs = msg.voice.as_ref().map(|v| v.duration_secs).unwrap_or(0.0);
+            let voice_transfer_id = msg
+                .voice
+                .as_ref()
+                .and_then(|v| transfer_id_from_hex(&v.transfer_id));
             self.pending_group_sends.push(PendingGroupSend {
                 group_id: gid.clone(),
                 members,
@@ -1600,6 +1628,9 @@ impl App {
                 last_send_at: Instant::now(),
                 attempts: 0,
                 delivered_to: HashSet::new(),
+                voice_path: voice_path.clone(),
+                voice_duration_secs,
+                voice_transfer_id,
             });
             let _ = self.command_tx.try_send(UICommand::SendGroupMessage {
                 sender_name: self.local_nickname.clone(),
@@ -1608,6 +1639,9 @@ impl App {
                 members: targets,
                 message_id: Some(msg.id),
                 is_retry: true,
+                voice_path,
+                voice_duration_secs,
+                voice_transfer_id,
             });
         }
     }
@@ -1640,6 +1674,9 @@ impl App {
                 members: targets,
                 message_id: Some(item.message_id.clone()),
                 is_retry: true,
+                voice_path: item.voice_path.clone(),
+                voice_duration_secs: item.voice_duration_secs,
+                voice_transfer_id: item.voice_transfer_id,
             });
         }
     }
@@ -1916,6 +1953,84 @@ impl App {
                     message_id: message_id.clone(),
                     transfer_id: tid,
                     last_attempt: Instant::now(),
+                });
+                Ok(())
+            }
+            Err(_) => Err("Очередь к сети переполнена"),
+        }
+    }
+
+    pub(crate) fn send_group_voice_message(
+        &mut self,
+        group_id: String,
+        path: std::path::PathBuf,
+        duration_secs: f32,
+    ) -> Result<(), &'static str> {
+        let duration_secs = duration_secs.max(0.1);
+        let group = self.groups.get(&group_id).ok_or("Группа не найдена")?;
+        let members = group.member_peer_ids();
+        let targets: Vec<PeerId> = members
+            .iter()
+            .copied()
+            .filter(|p| *p != self.local_peer_id)
+            .collect();
+        if targets.is_empty() {
+            return Err("Нет участников для отправки");
+        }
+        let mut tid = [0u8; 16];
+        rand::thread_rng().fill_bytes(&mut tid);
+        let message_id = new_message_id();
+        let transfer_hex = transfer_id_to_hex(&tid);
+        let voice_name = file_transfer::voice_filename(&tid);
+        let local_copy = file_transfer::unique_download_path_in(
+            file_transfer::voice_dir_absolute()
+                .to_str()
+                .unwrap_or(file_transfer::VOICE_DIR),
+            &voice_name,
+        );
+        let path_str = if std::fs::copy(&path, &local_copy).is_ok() {
+            local_copy.display().to_string()
+        } else {
+            path.display().to_string()
+        };
+        self.register_voice_path(&transfer_hex, path_str.clone());
+        self.stage_outgoing_message(ChatMessage {
+            id: message_id.clone(),
+            sender_id: self.local_peer_id.to_string(),
+            sender_name: self.local_nickname.clone(),
+            recipient_id: None,
+            text: String::new(),
+            timestamp: chrono::Local::now().format("%H:%M").to_string(),
+            delivery: OutgoingDeliveryStatus::Pending,
+            voice: Some(VoiceMeta {
+                transfer_id: transfer_hex,
+                duration_secs,
+            }),
+            group_id: Some(group_id.clone()),
+        });
+        match self.command_tx.try_send(UICommand::SendGroupMessage {
+            sender_name: self.local_nickname.clone(),
+            text: String::new(),
+            group_id: group_id.clone(),
+            members: targets,
+            message_id: Some(message_id.clone()),
+            is_retry: false,
+            voice_path: Some(path_str.clone()),
+            voice_duration_secs: duration_secs,
+            voice_transfer_id: Some(tid),
+        }) {
+            Ok(()) => {
+                self.pending_group_sends.push(PendingGroupSend {
+                    group_id,
+                    members,
+                    text: String::new(),
+                    message_id,
+                    last_send_at: Instant::now(),
+                    attempts: 0,
+                    delivered_to: HashSet::new(),
+                    voice_path: Some(path_str),
+                    voice_duration_secs: duration_secs,
+                    voice_transfer_id: Some(tid),
                 });
                 Ok(())
             }
@@ -2814,6 +2929,9 @@ impl App {
                 members: targets,
                 message_id: Some(item.message_id.clone()),
                 is_retry: true,
+                voice_path: item.voice_path.clone(),
+                voice_duration_secs: item.voice_duration_secs,
+                voice_transfer_id: item.voice_transfer_id,
             });
         }
     }
