@@ -2,9 +2,7 @@
 
 use std::io::Write;
 use std::path::{Path, PathBuf};
-use std::process::Child;
-#[cfg(not(target_os = "linux"))]
-use std::process::{Command, Stdio};
+use std::process::{Child, Command, Stdio};
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::mpsc::{self, Receiver, SyncSender, TrySendError};
 use std::sync::Arc;
@@ -835,8 +833,20 @@ fn play_wav_file(
 ) -> Result<(), String> {
     let path = normalize_playback_path(path);
     voice_log(&format!("play {} from {:.0}%", path.display(), start_ratio * 100.0));
+
+    #[cfg(target_os = "linux")]
+    if start_ratio <= 0.001 {
+        match play_wav_linux_external(&path, stop_flag) {
+            Ok(()) => return Ok(()),
+            Err(e) => voice_log(&format!("linux external miss: {e}")),
+        }
+    }
+
     match play_wav_cpal(&path, stop_flag, start_ratio, frame_pos) {
-        Ok(()) => Ok(()),
+        Ok(()) => {
+            voice_log("play done (cpal)");
+            Ok(())
+        }
         Err(cpal_err) => {
             if stop_flag.load(Ordering::Relaxed) {
                 return Ok(());
@@ -851,12 +861,59 @@ fn play_wav_file(
                 play_wav_winmm(&path, stop_flag)
                     .map_err(|winmm_err| format!("cpal: {cpal_err}; winmm: {winmm_err}"))
             }
-            #[cfg(not(target_os = "windows"))]
+            #[cfg(target_os = "linux")]
+            {
+                play_wav_linux_external(&path, stop_flag)
+                    .map_err(|ext| format!("cpal: {cpal_err}; {ext}"))
+            }
+            #[cfg(all(not(target_os = "windows"), not(target_os = "linux")))]
             {
                 Err(cpal_err)
             }
         }
     }
+}
+
+#[cfg(target_os = "linux")]
+fn play_wav_linux_external(path: &Path, stop_flag: &AtomicBool) -> Result<(), String> {
+    for (cmd, extra_args) in [("paplay", &[][..]), ("aplay", &["-q"][..])] {
+        let mut command = Command::new(cmd);
+        for arg in extra_args {
+            command.arg(arg);
+        }
+        let mut child = match command
+            .arg(path)
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn()
+        {
+            Ok(c) => c,
+            Err(_) => continue,
+        };
+        voice_log(&format!("play via {cmd}: {}", path.display()));
+        loop {
+            if stop_flag.load(Ordering::Relaxed) {
+                let _ = child.kill();
+                let _ = child.wait();
+                voice_log(&format!("play stopped ({cmd})"));
+                return Ok(());
+            }
+            match child.try_wait() {
+                Ok(Some(status)) if status.success() => {
+                    voice_log(&format!("play done ({cmd})"));
+                    return Ok(());
+                }
+                Ok(Some(status)) => {
+                    voice_log(&format!("play {cmd} exit: {status}"));
+                    break;
+                }
+                Ok(None) => std::thread::sleep(Duration::from_millis(40)),
+                Err(e) => return Err(format!("{cmd}: {e}")),
+            }
+        }
+    }
+    Err("paplay/aplay не найдены (sudo apt install pulseaudio-utils alsa-utils)".into())
 }
 
 fn normalize_playback_path(path: &Path) -> PathBuf {

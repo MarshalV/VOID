@@ -792,6 +792,8 @@ impl App {
         self.prune_auto_discovered_contacts();
         self.refresh_outbox_group_sync_snapshots();
         self.scan_chat_journal_for_group_invites();
+        self.index_voice_files_on_disk();
+        self.relink_all_voice_files();
         self.dispatch_outbox();
         self.bootstrap_offline_mail();
 
@@ -1830,6 +1832,40 @@ impl App {
                     .collect()
             })
             .unwrap_or_default();
+        for tid in tids {
+            self.link_voice_file_if_present(&tid);
+        }
+    }
+
+    /// Индексирует все WAV в каталоге голосовых (после рестарта / миграции).
+    pub(crate) fn index_voice_files_on_disk(&mut self) {
+        for dir in file_transfer::voice_search_dirs() {
+            let Ok(entries) = std::fs::read_dir(&dir) else {
+                continue;
+            };
+            for entry in entries.flatten() {
+                let fname = entry.file_name().to_string_lossy().into_owned();
+                if let Some(tid) = file_transfer::voice_transfer_hex_from_filename(&fname) {
+                    if entry.path().is_file() {
+                        self.register_voice_path(&tid, entry.path().display().to_string());
+                    }
+                }
+            }
+        }
+    }
+
+    /// Привязывает WAV ко всем голосовым из журнала.
+    pub(crate) fn relink_all_voice_files(&mut self) {
+        let tids: Vec<String> = {
+            let messages = self.messages.lock();
+            messages
+                .values()
+                .flat_map(|msgs| {
+                    msgs.iter()
+                        .filter_map(|m| m.voice.as_ref().map(|v| v.transfer_id.clone()))
+                })
+                .collect()
+        };
         for tid in tids {
             self.link_voice_file_if_present(&tid);
         }

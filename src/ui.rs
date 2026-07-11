@@ -1872,12 +1872,7 @@ impl eframe::App for App {
                         self.try_process_invite_message(&msg.id, &msg.text);
                     }
                     if let Some(ref voice) = msg.voice {
-                        if let Some(path) = self.resolve_voice_path(&voice.transfer_id) {
-                            self.register_voice_path(
-                                &voice.transfer_id,
-                                path.display().to_string(),
-                            );
-                        }
+                        self.link_voice_file_if_present(&voice.transfer_id);
                     }
                 }
                 NetworkEvent::GroupSync {
