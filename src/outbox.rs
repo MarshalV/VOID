@@ -12,17 +12,32 @@ use serde::{Deserialize, Serialize};
 
 use crate::group::GroupMember;
 
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub(crate) enum OutboxEntry {
     DirectMessage {
         peer: String,
         message_id: String,
         text: String,
     },
+    DirectVoice {
+        peer: String,
+        message_id: String,
+        transfer_id: String,
+        duration_secs: f32,
+        voice_path: String,
+    },
     GroupMessage {
         group_id: String,
         message_id: String,
         text: String,
+        members: Vec<String>,
+    },
+    GroupVoice {
+        group_id: String,
+        message_id: String,
+        transfer_id: String,
+        duration_secs: f32,
+        voice_path: String,
         members: Vec<String>,
     },
     GroupSync {

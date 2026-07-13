@@ -2177,10 +2177,11 @@ impl eframe::App for App {
                     filename,
                     saved_to,
                     is_outgoing,
-                    peer: _,
+                    peer,
                 } => {
                     if is_outgoing && file_transfer::is_voice_filename(&filename) {
                         self.complete_pending_voice_send_by_transfer(&transfer_id);
+                        self.mark_group_voice_file_delivered(peer, &transfer_id);
                     }
                     if file_transfer::is_voice_filename(&filename) && !saved_to.trim().is_empty() {
                         let tid_hex = file_transfer::voice_transfer_hex_from_filename(&filename)
@@ -3306,6 +3307,7 @@ impl eframe::App for App {
                                                     last_send_at: Instant::now(),
                                                     attempts: 0,
                                                     delivered_to: std::collections::HashSet::new(),
+                                                    voice_delivered_to: std::collections::HashSet::new(),
                                                     voice_path: None,
                                                     voice_duration_secs: 0.0,
                                                     voice_transfer_id: None,

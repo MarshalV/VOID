@@ -1095,6 +1095,17 @@ async fn flush_pending_encrypted_messages(
     }
 }
 
+fn voice_transfer_stale(t: &file_transfer::OutgoingTransfer) -> Duration {
+    let bps = if t.is_relay {
+        file_transfer::RELAY_RATE_LIMIT_BPS
+    } else {
+        512 * 1024
+    };
+    let xfer_ms = t.total_size.saturating_mul(1000) / bps;
+    let margin = if t.accepted { 15_000 } else { 45_000 };
+    Duration::from_millis(xfer_ms.saturating_add(margin).max(30_000).min(600_000))
+}
+
 async fn start_voice_file_transfer(
     swarm: &mut libp2p::Swarm<ChatBehaviour>,
     outgoing_transfers: &mut HashMap<[u8; 16], file_transfer::OutgoingTransfer>,
@@ -1103,13 +1114,19 @@ async fn start_voice_file_transfer(
     recipient: PeerId,
     path: &str,
     transfer_id: [u8; 16],
-    allow_restart: bool,
 ) {
     if let Some(existing) = outgoing_transfers.get(&transfer_id) {
-        let done = existing.next_chunk >= existing.chunks.len();
-        if done || !allow_restart {
+        if existing.next_chunk >= existing.chunks.len() {
             return;
         }
+        let stale = voice_transfer_stale(existing);
+        if existing.last_chunk_at.elapsed() < stale {
+            return;
+        }
+        crate::voice::voice_log(&format!(
+            "voice restart stale {}",
+            transfer_id_to_hex(&transfer_id)
+        ));
         outgoing_transfers.remove(&transfer_id);
     }
     match std::fs::read(path) {
@@ -1209,7 +1226,6 @@ async fn flush_pending_voice_transfers(
             peer,
             &item.path,
             item.transfer_id,
-            true,
         )
         .await;
     }
@@ -1525,6 +1541,7 @@ pub async fn run_chat_network(
         // Входящие передачи: transfer_id → состояние.
         let mut incoming_transfers: HashMap<[u8; 16], file_transfer::IncomingTransfer> =
             HashMap::new();
+        let mut chunk_send_rr: usize = 0;
         // Ticker для отправки чанков (с учётом rate-limit на relay).
         let mut chunk_tick = tokio::time::interval(Duration::from_millis(20));
         // RequestId → PeerId для зашифрованных сообщений, чтобы по ответу
@@ -1654,12 +1671,13 @@ pub async fn run_chat_network(
                 }
                 // ─── Tick: отправка очередных чанков с rate-limit ───────────
                 _ = chunk_tick.tick() => {
-                    const VOICE_OFFER_STALE: Duration = Duration::from_secs(25);
+                    const VOICE_OFFER_STALE: Duration = Duration::from_secs(60);
                     let stale_voice: Vec<[u8; 16]> = outgoing_transfers
                         .iter()
                         .filter(|(_, t)| {
                             file_transfer::is_voice_filename(&t.filename)
                                 && !t.accepted
+                                && t.next_chunk == 0
                                 && t.last_chunk_at.elapsed() >= VOICE_OFFER_STALE
                         })
                         .map(|(id, _)| *id)
@@ -1682,19 +1700,23 @@ pub async fn run_chat_network(
                         }
                     }
 
-                    // Ищем одну исходящую передачу, готовую к отправке чанка.
-                    let to_send: Option<([u8; 16], u32, Vec<u8>, PeerId)> = {
-                        let mut found = None;
-                        for (tid, t) in outgoing_transfers.iter() {
-                            if t.ready_to_send() {
+                    let ready: Vec<[u8; 16]> = outgoing_transfers
+                        .iter()
+                        .filter(|(_, t)| t.ready_to_send())
+                        .map(|(id, _)| *id)
+                        .collect();
+                    let to_send: Option<([u8; 16], u32, Vec<u8>, PeerId)> =
+                        if ready.is_empty() {
+                            None
+                        } else {
+                            chunk_send_rr = (chunk_send_rr + 1) % ready.len().max(1);
+                            let tid = ready[chunk_send_rr % ready.len()];
+                            outgoing_transfers.get(&tid).map(|t| {
                                 let idx = t.next_chunk as u32;
                                 let data = t.chunks[t.next_chunk].clone();
-                                found = Some((*tid, idx, data, t.peer));
-                                break;
-                            }
-                        }
-                        found
-                    };
+                                (tid, idx, data, t.peer)
+                            })
+                        };
                     if let Some((tid, chunk_idx, data, peer)) = to_send {
                         let frame =
                             file_transfer::encode_e2ee_file_chunk_frame(&tid, chunk_idx, &data);
@@ -2193,7 +2215,6 @@ pub async fn run_chat_network(
                                                 peer_id,
                                                 &voice_path,
                                                 peer_tid,
-                                                is_retry,
                                             )
                                             .await;
                                         }
@@ -2651,7 +2672,6 @@ pub async fn run_chat_network(
                                     recipient,
                                     &path,
                                     transfer_id,
-                                    is_retry,
                                 )
                                 .await;
                             }
@@ -4451,16 +4471,33 @@ pub async fn run_chat_network(
                                                 total_size
                                             );
                                             let safe = file_transfer::safe_filename(&filename);
-                                            let incoming = file_transfer::IncomingTransfer::new(
-                                                peer,
-                                                transfer_id,
-                                                safe.clone(),
-                                                total_size,
-                                                total_chunks,
-                                                sha256,
-                                                kind,
-                                            );
-                                            incoming_transfers.insert(transfer_id, incoming);
+                                            let resume = incoming_transfers
+                                                .get(&transfer_id)
+                                                .is_some_and(|inc| {
+                                                    inc.received_count > 0
+                                                        && inc.total_size == total_size
+                                                        && inc.total_chunks == total_chunks
+                                                        && inc.sha256 == sha256
+                                                        && inc.filename == safe
+                                                });
+                                            if !resume {
+                                                let incoming =
+                                                    file_transfer::IncomingTransfer::new(
+                                                        peer,
+                                                        transfer_id,
+                                                        safe.clone(),
+                                                        total_size,
+                                                        total_chunks,
+                                                        sha256,
+                                                        kind,
+                                                    );
+                                                incoming_transfers.insert(transfer_id, incoming);
+                                            } else {
+                                                crate::voice::voice_log(&format!(
+                                                    "resume incoming {}",
+                                                    transfer_id_to_hex(&transfer_id)
+                                                ));
+                                            }
                                             let _ = swarm
                                                 .behaviour_mut()
                                                 .file_rr
