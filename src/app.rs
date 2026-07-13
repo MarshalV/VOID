@@ -2046,24 +2046,73 @@ impl App {
                 p = cwd.join(p);
             }
         }
-        if let Ok(abs) = std::fs::canonicalize(&p) {
-            p = abs;
+        let canonical = std::fs::canonicalize(&p).unwrap_or(p.clone());
+        if !canonical.is_file() {
+            if p.is_file() {
+                // canonicalize может падать на symlink/tmp — используем исходный путь
+            } else {
+                crate::voice::voice_log(&format!(
+                    "register miss {} -> {} (файл не найден)",
+                    transfer_id_hex.to_ascii_lowercase(),
+                    p.display()
+                ));
+                return;
+            }
         }
-        if !p.is_file() {
-            crate::voice::voice_log(&format!(
-                "register miss {} -> {} (файл не найден)",
-                transfer_id_hex.to_ascii_lowercase(),
-                p.display()
-            ));
-            return;
+        let stored = if canonical.is_file() {
+            canonical.display().to_string()
+        } else {
+            p.display().to_string()
+        };
+        let key = transfer_id_hex.to_ascii_lowercase();
+        self.voice_audio_paths.insert(key.clone(), stored.clone());
+        crate::voice::voice_log(&format!("registered {key} -> {stored}"));
+    }
+
+    /// Дополнительные transfer_id для группового голосового (base ↔ per-peer).
+    pub(crate) fn voice_transfer_aliases(&self, transfer_id_hex: &str) -> Vec<String> {
+        let tid = transfer_id_hex.to_ascii_lowercase();
+        let mut out = vec![tid.clone()];
+        let Some(base) = transfer_id_from_hex(&tid) else {
+            return out;
+        };
+        let peer_tid = per_peer_voice_transfer_id(&base, self.local_peer_id);
+        let peer_hex = transfer_id_to_hex(&peer_tid);
+        if peer_hex != tid {
+            out.push(peer_hex);
         }
-        self.voice_audio_paths
-            .insert(transfer_id_hex.to_ascii_lowercase(), p.display().to_string());
-        crate::voice::voice_log(&format!(
-            "registered {} -> {}",
-            transfer_id_hex.to_ascii_lowercase(),
-            p.display()
-        ));
+        // Входящее групповое: в журнале base id, на диске per-peer (и наоборот).
+        let messages = self.messages.lock();
+        for msgs in messages.values() {
+            for msg in msgs.iter() {
+                let Some(ref voice) = msg.voice else {
+                    continue;
+                };
+                let vtid = voice.transfer_id.to_ascii_lowercase();
+                if vtid != tid {
+                    continue;
+                }
+                if msg.group_id.is_some() {
+                    if let Some(vbase) = transfer_id_from_hex(&vtid) {
+                        let alt = transfer_id_to_hex(&per_peer_voice_transfer_id(
+                            &vbase,
+                            self.local_peer_id,
+                        ));
+                        if !out.contains(&alt) {
+                            out.push(alt);
+                        }
+                    }
+                }
+            }
+        }
+        out
+    }
+
+    pub(crate) fn relink_voice_transfer_candidates(&mut self, transfer_id_hex: &str) {
+        for alias in self.voice_transfer_aliases(transfer_id_hex) {
+            self.link_voice_file_if_present(&alias);
+        }
+        self.index_voice_files_on_disk();
     }
 
     /// Ищет WAV на диске и привязывает к transfer_id (после приёма или загрузки журнала).
@@ -2150,6 +2199,67 @@ impl App {
         }
     }
 
+    pub(crate) fn resolve_voice_path(&self, transfer_id_hex: &str) -> Option<std::path::PathBuf> {
+        for alias in self.voice_transfer_aliases(transfer_id_hex) {
+            if let Some(p) = self.voice_audio_paths.get(&alias) {
+                let path = std::path::PathBuf::from(p);
+                if path.is_file() {
+                    return Some(path);
+                }
+            }
+            if let Some(path) = self.lookup_voice_file_on_disk(&alias) {
+                return Some(path);
+            }
+        }
+        let tid = transfer_id_hex.to_ascii_lowercase();
+        for pending in &self.pending_voice_sends {
+            if transfer_id_to_hex(&pending.transfer_id) == tid {
+                let path = std::path::PathBuf::from(&pending.path);
+                if path.is_file() {
+                    return Some(path);
+                }
+            }
+        }
+        for pending in &self.pending_group_sends {
+            if let Some(vtid) = pending.voice_transfer_id {
+                if transfer_id_to_hex(&vtid) == tid {
+                    if let Some(ref p) = pending.voice_path {
+                        let path = std::path::PathBuf::from(p);
+                        if path.is_file() {
+                            return Some(path);
+                        }
+                    }
+                }
+            }
+        }
+        None
+    }
+
+    fn voice_message_context(
+        &self,
+        transfer_id_hex: &str,
+    ) -> Option<(String, Option<String>, bool)> {
+        let tid = transfer_id_hex.to_ascii_lowercase();
+        let me = self.local_peer_id.to_string();
+        let messages = self.messages.lock();
+        for msgs in messages.values() {
+            for msg in msgs.iter() {
+                if msg
+                    .voice
+                    .as_ref()
+                    .is_some_and(|v| v.transfer_id.to_ascii_lowercase() == tid)
+                {
+                    return Some((
+                        msg.sender_id.clone(),
+                        msg.group_id.clone(),
+                        msg.sender_id == me,
+                    ));
+                }
+            }
+        }
+        None
+    }
+
     pub(crate) fn apply_voice_click(
         &mut self,
         ctx: &egui::Context,
@@ -2162,7 +2272,7 @@ impl App {
         } else if let Some(ratio) = seek_ratio {
             crate::voice::voice_log(&format!("seek {transfer_id} at {ratio:.2}"));
         }
-        self.link_voice_file_if_present(&transfer_id);
+        self.relink_voice_transfer_candidates(&transfer_id);
         match self.resolve_voice_path(&transfer_id) {
             Some(path) => {
                 if toggle {
@@ -2199,47 +2309,19 @@ impl App {
             }
             None => {
                 crate::voice::voice_log(&format!("resolve miss: {transfer_id}"));
+                let hint = match self.voice_message_context(&transfer_id) {
+                    Some((_, _, false)) => {
+                        "Голосовое ещё не загружено — дождитесь передачи или попросите отправить снова"
+                    }
+                    _ => "Файл не найден на диске — попробуйте отправить голосовое заново",
+                };
                 self.push_toast(
-                    format!("Аудиофайл не найден ({transfer_id})"),
+                    format!("Аудиофайл не найден ({transfer_id}). {hint}"),
                     ToastKind::Error,
                     TOAST_TTL_LONG,
                 );
             }
         }
-    }
-
-    pub(crate) fn resolve_voice_path(&self, transfer_id_hex: &str) -> Option<std::path::PathBuf> {
-        let tid = transfer_id_hex.to_ascii_lowercase();
-        if let Some(p) = self.voice_audio_paths.get(&tid) {
-            let path = std::path::PathBuf::from(p);
-            if path.is_file() {
-                return Some(path);
-            }
-        }
-        if let Some(path) = self.lookup_voice_file_on_disk(&tid) {
-            return Some(path);
-        }
-        for pending in &self.pending_voice_sends {
-            if transfer_id_to_hex(&pending.transfer_id) == tid {
-                let path = std::path::PathBuf::from(&pending.path);
-                if path.is_file() {
-                    return Some(path);
-                }
-            }
-        }
-        for pending in &self.pending_group_sends {
-            if let Some(vtid) = pending.voice_transfer_id {
-                if transfer_id_to_hex(&vtid) == tid {
-                    if let Some(ref p) = pending.voice_path {
-                        let path = std::path::PathBuf::from(p);
-                        if path.is_file() {
-                            return Some(path);
-                        }
-                    }
-                }
-            }
-        }
-        None
     }
 
     pub(crate) fn send_voice_message(

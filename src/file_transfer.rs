@@ -126,12 +126,16 @@ pub fn is_voice_filename(name: &str) -> bool {
     name.starts_with(VOICE_FILENAME_PREFIX) && name.ends_with(".wav")
 }
 
-/// 32 hex-символа transfer_id из имени `void_voice_<hex>.wav`.
+/// 32 hex-символа transfer_id из имени `void_voice_<hex>.wav` (в т.ч. `_(1)`).
 pub fn voice_transfer_hex_from_filename(name: &str) -> Option<String> {
     let safe = safe_filename(name);
     let rest = safe.strip_prefix(VOICE_FILENAME_PREFIX)?;
-    let hex = rest.strip_suffix(".wav")?;
-    if hex.len() == 32 && hex.chars().all(|c| c.is_ascii_hexdigit()) {
+    let hex: String = rest
+        .chars()
+        .take(32)
+        .filter(|c| c.is_ascii_hexdigit())
+        .collect();
+    if hex.len() == 32 {
         Some(hex.to_ascii_lowercase())
     } else {
         None

@@ -1872,7 +1872,7 @@ impl eframe::App for App {
                         self.try_process_invite_message(&msg.id, &msg.text);
                     }
                     if let Some(ref voice) = msg.voice {
-                        self.link_voice_file_if_present(&voice.transfer_id);
+                        self.relink_voice_transfer_candidates(&voice.transfer_id);
                     }
                 }
                 NetworkEvent::GroupSync {
@@ -2182,6 +2182,24 @@ impl eframe::App for App {
                     if is_outgoing && file_transfer::is_voice_filename(&filename) {
                         self.complete_pending_voice_send_by_transfer(&transfer_id);
                         self.mark_group_voice_file_delivered(peer, &transfer_id);
+                        let tid_hex = file_transfer::voice_transfer_hex_from_filename(&filename)
+                            .unwrap_or_else(|| {
+                                transfer_id
+                                    .iter()
+                                    .map(|b| format!("{:02x}", b))
+                                    .collect()
+                            });
+                        let outgoing_path = self
+                            .pending_voice_sends
+                            .iter()
+                            .find(|p| p.transfer_id == transfer_id)
+                            .map(|p| p.path.clone());
+                        if let Some(path) = outgoing_path {
+                            let aliases = self.voice_transfer_aliases(&tid_hex);
+                            for alias in aliases {
+                                self.register_voice_path(&alias, path.clone());
+                            }
+                        }
                     }
                     if file_transfer::is_voice_filename(&filename) && !saved_to.trim().is_empty() {
                         let tid_hex = file_transfer::voice_transfer_hex_from_filename(&filename)
@@ -2191,7 +2209,10 @@ impl eframe::App for App {
                                     .map(|b| format!("{:02x}", b))
                                     .collect()
                             });
-                        self.register_voice_path(&tid_hex, saved_to.clone());
+                        let aliases = self.voice_transfer_aliases(&tid_hex);
+                        for alias in aliases {
+                            self.register_voice_path(&alias, saved_to.clone());
+                        }
                         self.push_toast(
                             "🔊 Голосовое загружено".into(),
                             ToastKind::Info,
@@ -3545,7 +3566,7 @@ impl eframe::App for App {
                                                 );
                                             }
                                             if let Some(ref voice) = msg.voice {
-                                                self.link_voice_file_if_present(&voice.transfer_id);
+                                                self.relink_voice_transfer_candidates(&voice.transfer_id);
                                                 let has_audio =
                                                     self.resolve_voice_path(&voice.transfer_id)
                                                         .is_some();
