@@ -1612,6 +1612,15 @@ pub async fn run_chat_network(
             libp2p::request_response::OutboundRequestId,
             (PeerId, Vec<String>),
         > = HashMap::new();
+        // RequestId → (peer, transfer_id, chunk_index) для чанков файлов/голосовых,
+        // отправленных через E2EE `/void/chat`. Без этого `OutboundFailure` для
+        // потерянного чанка был неотличим от провалившегося Hello-хендшейка —
+        // чанк считался «отправленным» навсегда, и получатель никогда не
+        // собирал файл целиком (голосовые «зависали» без повтора).
+        let mut outbound_chunk_requests: HashMap<
+            libp2p::request_response::OutboundRequestId,
+            (PeerId, [u8; 16], u32),
+        > = HashMap::new();
         let mut dial_backoff: HashMap<PeerId, Instant> = HashMap::new();
         // Схлопываем подряд идущие `OutFailure` одному пиру: при отправке
         // сообщения без сессии мы шлём Hello + packet, и на DialFailure
@@ -1797,7 +1806,7 @@ pub async fn run_chat_network(
                     if let Some((tid, chunk_idx, data, peer)) = to_send {
                         let frame =
                             file_transfer::encode_e2ee_file_chunk_frame(&tid, chunk_idx, &data);
-                        let encrypted_ok = sessions
+                        let sent_request_id = sessions
                             .get_mut(&peer)
                             .and_then(|session| session.encrypt_payload(&frame).ok())
                             .map(|(header, ciphertext)| {
@@ -1808,11 +1817,11 @@ pub async fn run_chat_network(
                                 swarm
                                     .behaviour_mut()
                                     .request_response
-                                    .send_request(&peer, pkt);
-                            })
-                            .is_some();
+                                    .send_request(&peer, pkt)
+                            });
 
-                        if encrypted_ok {
+                        if let Some(req_id) = sent_request_id {
+                            outbound_chunk_requests.insert(req_id, (peer, tid, chunk_idx));
                             if let Some(t) = outgoing_transfers.get_mut(&tid) {
                                 t.next_chunk += 1;
                                 t.last_chunk_at = Instant::now();
@@ -3645,11 +3654,28 @@ pub async fn run_chat_network(
                             }
                         }
                         SwarmEvent::Behaviour(ChatBehaviourEvent::RequestResponse(libp2p::request_response::Event::OutboundFailure { peer, request_id, error, .. })) => {
+                            // Чанк файла/голосового не долетел (таймаут, обрыв связи и т.п.) —
+                            // без этого он считался «отправленным» навсегда, и получатель
+                            // никогда не собирал файл целиком. Перематываем next_chunk назад,
+                            // чтобы chunk_tick повторил отправку именно этого чанка.
+                            let was_chunk = outbound_chunk_requests.remove(&request_id);
+                            if let Some((_, tid, chunk_idx)) = was_chunk {
+                                if let Some(t) = outgoing_transfers.get_mut(&tid) {
+                                    t.next_chunk = t.next_chunk.min(chunk_idx as usize);
+                                    // Throttle retry to the normal per-chunk cadence, чтобы
+                                    // мёртвый пир не вызвал шторм повторов каждые 20мс.
+                                    t.last_chunk_at = Instant::now();
+                                }
+                                crate::voice::voice_log(&format!(
+                                    "chunk send fail {} #{chunk_idx} ({error:?}) — retry",
+                                    transfer_id_to_hex(&tid)
+                                ));
+                            }
                             let was_msg = outbound_msg_requests.remove(&request_id).is_some();
                             let was_delete = outbound_delete_requests.remove(&request_id).is_some();
                             // Неотслеживаемый запрос — это Hello-handshake; сбрасываем, чтобы
                             // повторная отправка не считала хендшейк «уже в полёте».
-                            if !was_msg && !was_delete {
+                            if !was_msg && !was_delete && was_chunk.is_none() {
                                 pending_handshakes.remove(&peer);
                                 // Hello упал — UI не должен вечно ждать E2EE-сессию.
                                 if pending_messages
