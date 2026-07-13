@@ -8,7 +8,7 @@ use std::sync::mpsc::{self, Receiver, SyncSender, TrySendError};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
-use cpal::traits::{DeviceTrait, HostTrait, StreamTrait};
+use cpal::traits::{DeviceTrait, HostTrait};
 use cpal::SampleFormat;
 
 pub(crate) const VOICE_SAMPLE_RATE: u32 = 48_000;
@@ -653,7 +653,7 @@ fn linux_try_recorder(
 
 #[cfg(target_os = "linux")]
 fn linux_record_to_wav(
-    stop_rx: Receiver<()>,
+    stop_rx: &Receiver<()>,
     stop_file: Option<&Path>,
     out: &Path,
 ) -> Result<f32, String> {
@@ -708,7 +708,7 @@ fn linux_record_to_wav(
             );
             if let Ok(d) = linux_try_recorder(
                 &tag,
-                linux_spawn_recorder(cmd, args, out, env),
+                linux_spawn_recorder(cmd, args, out, &env),
                 &stop_rx,
                 stop_file,
                 out,
@@ -729,7 +729,7 @@ fn record_to_wav(
 ) -> Result<f32, String> {
     #[cfg(target_os = "linux")]
     if linux_has_external_recorder() {
-        match linux_record_to_wav(stop_rx, stop_file, out) {
+        match linux_record_to_wav(&stop_rx, stop_file, out) {
             Ok(d) => return Ok(d),
             Err(e) => voice_log(&format!("linux record miss: {e}")),
         }
@@ -838,6 +838,8 @@ fn build_input_stream(
     sample_tx: SyncSender<Vec<f32>>,
     err_flag: Arc<AtomicBool>,
 ) -> Result<cpal::Stream, String> {
+    use cpal::traits::StreamTrait;
+
     let stream_cfg: cpal::StreamConfig = config.clone().into();
     let push = move |chunk: Vec<f32>| {
         match sample_tx.try_send(chunk) {
