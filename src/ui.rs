@@ -2221,6 +2221,29 @@ impl eframe::App for App {
                 }
                 NetworkEvent::FileError { transfer_id, reason } => {
                     self.active_file_transfers.remove(&transfer_id);
+                    let accel = Instant::now() - Duration::from_secs(3600);
+                    for p in self.pending_voice_sends.iter_mut() {
+                        if p.transfer_id == transfer_id {
+                            p.last_attempt = accel;
+                        }
+                    }
+                    for p in self.pending_group_sends.iter_mut() {
+                        if let Some(base) = p.voice_transfer_id {
+                            let me = self.local_peer_id;
+                            let needs = p
+                                .members
+                                .iter()
+                                .copied()
+                                .filter(|m| *m != me)
+                                .any(|m| {
+                                    crate::protocol::per_peer_voice_transfer_id(&base, m)
+                                        == transfer_id
+                                });
+                            if needs {
+                                p.last_send_at = accel;
+                            }
+                        }
+                    }
                     self.push_toast(
                         format!("❌ Файл: {}", reason),
                         ToastKind::Error,

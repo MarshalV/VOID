@@ -431,6 +431,11 @@ async fn apply_incoming_file_chunk(
     let done = if let Some(inc) = incoming_transfers.get_mut(&transfer_id) {
         inc.receive_chunk(chunk_index, data)
     } else {
+        crate::voice::voice_log(&format!(
+            "chunk orphan {} idx={chunk_index} from {}",
+            transfer_id_to_hex(&transfer_id),
+            &peer.to_string()[..8]
+        ));
         false
     };
 
@@ -1108,6 +1113,34 @@ fn voice_transfer_stale(t: &file_transfer::OutgoingTransfer) -> Duration {
     Duration::from_millis(xfer_ms.saturating_add(margin).max(30_000).min(600_000))
 }
 
+const VOICE_OFFER_RESEND: Duration = Duration::from_secs(12);
+
+async fn resend_voice_offer(
+    swarm: &mut libp2p::Swarm<ChatBehaviour>,
+    outgoing_transfers: &mut HashMap<[u8; 16], file_transfer::OutgoingTransfer>,
+    transfer_id: [u8; 16],
+    recipient: PeerId,
+) {
+    let Some(t) = outgoing_transfers.get(&transfer_id) else {
+        return;
+    };
+    if t.accepted || t.next_chunk > 0 {
+        return;
+    }
+    let offer = t.build_offer();
+    swarm
+        .behaviour_mut()
+        .file_rr
+        .send_request(&recipient, offer);
+    if let Some(t) = outgoing_transfers.get_mut(&transfer_id) {
+        t.last_chunk_at = Instant::now();
+    }
+    crate::voice::voice_log(&format!(
+        "voice re-offer {}",
+        transfer_id_to_hex(&transfer_id)
+    ));
+}
+
 async fn start_voice_file_transfer(
     swarm: &mut libp2p::Swarm<ChatBehaviour>,
     outgoing_transfers: &mut HashMap<[u8; 16], file_transfer::OutgoingTransfer>,
@@ -1119,6 +1152,19 @@ async fn start_voice_file_transfer(
 ) {
     if let Some(existing) = outgoing_transfers.get(&transfer_id) {
         if existing.next_chunk >= existing.chunks.len() {
+            return;
+        }
+        if !existing.accepted
+            && existing.next_chunk == 0
+            && existing.last_chunk_at.elapsed() >= VOICE_OFFER_RESEND
+        {
+            resend_voice_offer(
+                swarm,
+                outgoing_transfers,
+                transfer_id,
+                recipient,
+            )
+            .await;
             return;
         }
         let stale = voice_transfer_stale(existing);
@@ -1187,9 +1233,18 @@ async fn start_voice_file_transfer(
                     is_relay,
                     last_chunk_at: Instant::now(),
                     accepted: false,
+                    sha256,
                     kind: file_kind,
                 };
                 outgoing_transfers.insert(transfer_id, transfer);
+
+                crate::voice::voice_log(&format!(
+                    "voice offer {} -> {} ({} ch, {} B)",
+                    transfer_id_to_hex(&transfer_id),
+                    &recipient.to_string()[..8],
+                    total_chunks,
+                    total_size
+                ));
 
                 let _ = event_tx
                     .send(NetworkEvent::FileProgress {
@@ -1673,7 +1728,27 @@ pub async fn run_chat_network(
                 }
                 // ─── Tick: отправка очередных чанков с rate-limit ───────────
                 _ = chunk_tick.tick() => {
-                    const VOICE_OFFER_STALE: Duration = Duration::from_secs(60);
+                    const VOICE_OFFER_STALE: Duration = Duration::from_secs(90);
+                    let voice_reoffer: Vec<([u8; 16], PeerId)> = outgoing_transfers
+                        .iter()
+                        .filter(|(_, t)| {
+                            file_transfer::is_voice_filename(&t.filename)
+                                && !t.accepted
+                                && t.next_chunk == 0
+                                && t.last_chunk_at.elapsed() >= VOICE_OFFER_RESEND
+                        })
+                        .map(|(id, t)| (*id, t.peer))
+                        .collect();
+                    for (tid, peer) in voice_reoffer {
+                        resend_voice_offer(
+                            &mut swarm,
+                            &mut outgoing_transfers,
+                            tid,
+                            peer,
+                        )
+                        .await;
+                    }
+
                     let stale_voice: Vec<[u8; 16]> = outgoing_transfers
                         .iter()
                         .filter(|(_, t)| {
@@ -1784,19 +1859,10 @@ pub async fn run_chat_network(
                             }
                         } else {
                             debug!(
-                                "⚠️ FILE: не удалось зашифровать чанк {} для {} (нет E2EE-сессии).",
+                                "⚠️ FILE: не удалось зашифровать чанк {} для {} (нет E2EE-сессии) — повторим.",
                                 chunk_idx,
                                 &peer.to_string()[..8]
                             );
-                            let _ = event_tx
-                                .send(NetworkEvent::FileError {
-                                    transfer_id: tid,
-                                    reason:
-                                        "Передача файла прервана: нет активной E2EE-сессии с пиром."
-                                            .into(),
-                                })
-                                .await;
-                            outgoing_transfers.remove(&tid);
                         }
                     }
                 }
@@ -2517,6 +2583,7 @@ pub async fn run_chat_network(
                                                 is_relay,
                                                 last_chunk_at: Instant::now(),
                                                 accepted: false,
+                                                sha256,
                                                 kind: file_kind,
                                             };
                                             outgoing_transfers.insert(tid, transfer);

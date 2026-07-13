@@ -306,10 +306,22 @@ pub struct OutgoingTransfer {
     pub last_chunk_at: Instant,
     /// Флаг: получатель принял оффер и ждёт чанки.
     pub accepted: bool,
+    pub sha256: [u8; 32],
     pub kind: FileKind,
 }
 
 impl OutgoingTransfer {
+    pub fn build_offer(&self) -> FilePacket {
+        FilePacket::Offer {
+            transfer_id: self.transfer_id,
+            filename: self.filename.clone(),
+            total_size: self.total_size,
+            total_chunks: self.total_chunks(),
+            sha256: self.sha256,
+            kind: self.kind,
+        }
+    }
+
     /// true — пора слать следующий чанк (с учётом rate-limit).
     pub fn ready_to_send(&self) -> bool {
         if !self.accepted || self.next_chunk >= self.chunks.len() {

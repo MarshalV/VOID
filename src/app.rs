@@ -2417,7 +2417,7 @@ impl App {
         let size = std::fs::metadata(path).map(|m| m.len()).unwrap_or(0);
         let bps = file_transfer::RELAY_RATE_LIMIT_BPS;
         let secs = size.saturating_mul(2) / bps;
-        Duration::from_secs(secs.max(30).min(300))
+        Duration::from_secs(secs.max(5).min(300))
     }
 
     pub(crate) fn tick_pending_voice_sends(&mut self) {
