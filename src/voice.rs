@@ -453,7 +453,7 @@ fn cli_record(out: PathBuf, stop_file: PathBuf) -> Result<f32, String> {
 fn audio_host() -> cpal::Host {
     #[cfg(target_os = "linux")]
     {
-        use cpal::traits::{DeviceTrait, HostTrait};
+        use cpal::traits::HostTrait;
         if let Ok(host) = cpal::host_from_id(cpal::HostId::Alsa) {
             if host.default_input_device().is_some() || host.default_output_device().is_some() {
                 voice_log("audio host: Alsa");
@@ -841,7 +841,7 @@ fn play_wav_file(
     path: &Path,
     stop_flag: &AtomicBool,
     start_ratio: f32,
-    frame_pos: Arc<AtomicUsize>,
+    #[allow(unused_variables)] frame_pos: Arc<AtomicUsize>,
 ) -> Result<(), String> {
     let path = normalize_playback_path(path);
     voice_log(&format!("play {} from {:.0}%", path.display(), start_ratio * 100.0));
@@ -955,6 +955,16 @@ fn linux_prepare_playback_wav(src: &Path) -> Result<(PathBuf, f32), String> {
 }
 
 #[cfg(target_os = "linux")]
+fn linux_push_pulse_server(servers: &mut Vec<String>, path: &Path) {
+    if path.exists() {
+        let s = format!("unix:{}", path.display());
+        if !servers.iter().any(|x| x == &s) {
+            servers.push(s);
+        }
+    }
+}
+
+#[cfg(target_os = "linux")]
 fn linux_pulse_servers() -> Vec<String> {
     if let Ok(existing) = std::env::var("PULSE_SERVER") {
         if !existing.trim().is_empty() {
@@ -962,19 +972,14 @@ fn linux_pulse_servers() -> Vec<String> {
         }
     }
     let mut servers = Vec::new();
-    let mut push = |path: &Path| {
-        if path.exists() {
-            let s = format!("unix:{}", path.display());
-            if !servers.iter().any(|x| x == &s) {
-                servers.push(s);
-            }
-        }
-    };
     if let Ok(uid) = std::env::var("SUDO_UID") {
-        push(&PathBuf::from(format!("/run/user/{uid}/pulse/native")));
+        linux_push_pulse_server(
+            &mut servers,
+            &PathBuf::from(format!("/run/user/{uid}/pulse/native")),
+        );
     }
     if let Ok(xdg) = std::env::var("XDG_RUNTIME_DIR") {
-        push(&PathBuf::from(xdg).join("pulse/native"));
+        linux_push_pulse_server(&mut servers, &PathBuf::from(xdg).join("pulse/native"));
     }
     for session in linux_desktop_sessions() {
         if !servers.iter().any(|s| s == &session.pulse_server) {
@@ -985,7 +990,7 @@ fn linux_pulse_servers() -> Vec<String> {
         let mut uids: Vec<_> = entries.flatten().collect();
         uids.sort_by_key(|e| e.file_name());
         for entry in uids {
-            push(&entry.path().join("pulse/native"));
+            linux_push_pulse_server(&mut servers, &entry.path().join("pulse/native"));
         }
     }
     servers
