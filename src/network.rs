@@ -490,6 +490,12 @@ async fn apply_incoming_file_chunk(
                                 "[{}] ✅ FILE: «{}» сохранён → {}",
                                 now, fname, saved_to
                             );
+                            if file_transfer::is_voice_filename(&fname) {
+                                crate::voice::voice_log(&format!(
+                                    "received {} -> {}",
+                                    fname, saved_to
+                                ));
+                            }
                             let _ = event_tx
                                 .send(NetworkEvent::FileComplete {
                                     transfer_id,
@@ -501,6 +507,11 @@ async fn apply_incoming_file_chunk(
                                 .await;
                         }
                         Err(e) => {
+                            if file_transfer::is_voice_filename(&fname) {
+                                crate::voice::voice_log(&format!(
+                                    "receive save fail {fname}: {e}"
+                                ));
+                            }
                             let _ = event_tx
                                 .send(NetworkEvent::FileError {
                                     transfer_id,
@@ -1092,12 +1103,21 @@ async fn start_voice_file_transfer(
     recipient: PeerId,
     path: &str,
     transfer_id: [u8; 16],
+    allow_restart: bool,
 ) {
-    if outgoing_transfers.contains_key(&transfer_id) {
-        return;
+    if let Some(existing) = outgoing_transfers.get(&transfer_id) {
+        let done = existing.next_chunk >= existing.chunks.len();
+        if done || !allow_restart {
+            return;
+        }
+        outgoing_transfers.remove(&transfer_id);
     }
     match std::fs::read(path) {
         Err(e) => {
+            crate::voice::voice_log(&format!(
+                "voice send read fail {}: {e}",
+                transfer_id_to_hex(&transfer_id)
+            ));
             let _ = event_tx
                 .send(NetworkEvent::Status(format!(
                     "❌ Не удалось прочитать голосовое «{}»: {}",
@@ -1189,6 +1209,7 @@ async fn flush_pending_voice_transfers(
             peer,
             &item.path,
             item.transfer_id,
+            true,
         )
         .await;
     }
@@ -1633,6 +1654,34 @@ pub async fn run_chat_network(
                 }
                 // ─── Tick: отправка очередных чанков с rate-limit ───────────
                 _ = chunk_tick.tick() => {
+                    const VOICE_OFFER_STALE: Duration = Duration::from_secs(25);
+                    let stale_voice: Vec<[u8; 16]> = outgoing_transfers
+                        .iter()
+                        .filter(|(_, t)| {
+                            file_transfer::is_voice_filename(&t.filename)
+                                && !t.accepted
+                                && t.last_chunk_at.elapsed() >= VOICE_OFFER_STALE
+                        })
+                        .map(|(id, _)| *id)
+                        .collect();
+                    for tid in stale_voice {
+                        if let Some(t) = outgoing_transfers.remove(&tid) {
+                            crate::voice::voice_log(&format!(
+                                "voice offer stale, drop {}",
+                                transfer_id_to_hex(&tid)
+                            ));
+                            let _ = event_tx
+                                .send(NetworkEvent::FileError {
+                                    transfer_id: tid,
+                                    reason: format!(
+                                        "Таймаут передачи «{}» — будет повтор",
+                                        t.filename
+                                    ),
+                                })
+                                .await;
+                        }
+                    }
+
                     // Ищем одну исходящую передачу, готовую к отправке чанка.
                     let to_send: Option<([u8; 16], u32, Vec<u8>, PeerId)> = {
                         let mut found = None;
@@ -2144,6 +2193,7 @@ pub async fn run_chat_network(
                                                 peer_id,
                                                 &voice_path,
                                                 peer_tid,
+                                                is_retry,
                                             )
                                             .await;
                                         }
@@ -2601,6 +2651,7 @@ pub async fn run_chat_network(
                                     recipient,
                                     &path,
                                     transfer_id,
+                                    is_retry,
                                 )
                                 .await;
                             }

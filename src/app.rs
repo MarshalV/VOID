@@ -1069,6 +1069,9 @@ impl App {
                 "dm" => {
                     if let Ok(msg) = serde_json::from_slice::<ChatMessage>(&plaintext) {
                         self.ingest_chat_message(msg.clone());
+                        if let Some(ref voice) = msg.voice {
+                            self.link_voice_file_if_present(&voice.transfer_id);
+                        }
                         if !msg.text.is_empty() {
                             self.try_process_invite_message(&msg.id, &msg.text);
                         }
@@ -1368,8 +1371,15 @@ impl App {
         let voice_tid = msg.voice.as_ref().map(|v| v.transfer_id.clone());
 
         let bucket = if let Some(ref gid) = msg.group_id {
-            if group::validate_group_id(gid) && self.is_active_group_member(gid) {
-                Some(group_thread_key(gid))
+            if group::validate_group_id(gid) {
+                if self.is_active_group_member(gid) {
+                    Some(group_thread_key(gid))
+                } else if msg.voice.is_some() && self.groups.contains_key(gid) {
+                    // Голосовое могло прийти чуть раньше group_sync.
+                    Some(group_thread_key(gid))
+                } else {
+                    None
+                }
             } else {
                 None
             }
@@ -3050,6 +3060,21 @@ impl App {
                 slot.last_send_at = now;
                 slot.attempts = slot.attempts.saturating_add(1);
             }
+            let voice_path = item.voice_path.clone().or_else(|| {
+                item.voice_transfer_id.and_then(|vtid| {
+                    self.resolve_voice_path(&transfer_id_to_hex(&vtid))
+                        .map(|p| p.display().to_string())
+                })
+            });
+            if let Some(slot) = self
+                .pending_group_sends
+                .iter_mut()
+                .find(|p| p.message_id == item.message_id)
+            {
+                if slot.voice_path.is_none() {
+                    slot.voice_path = voice_path.clone();
+                }
+            }
             let _ = self.command_tx.try_send(UICommand::SendGroupMessage {
                 sender_name: self.local_nickname.clone(),
                 text: item.text.clone(),
@@ -3057,7 +3082,7 @@ impl App {
                 members: targets,
                 message_id: Some(item.message_id.clone()),
                 is_retry: true,
-                voice_path: item.voice_path.clone(),
+                voice_path,
                 voice_duration_secs: item.voice_duration_secs,
                 voice_transfer_id: item.voice_transfer_id,
             });

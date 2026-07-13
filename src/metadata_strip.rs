@@ -9,6 +9,10 @@ pub fn strip_metadata_for_send(filename: &str, _kind: FileKind, data: Vec<u8>) -
     if data.is_empty() {
         return data;
     }
+    // Голосовые WAV не трогаем — strip может сломать формат (parecord/pw-record).
+    if crate::file_transfer::is_voice_filename(filename) {
+        return data;
+    }
     let ext = extension_lower(filename);
     if let Some(out) = strip_all(&data, &ext) {
         return finish(filename, data, out);

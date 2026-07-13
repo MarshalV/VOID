@@ -1955,6 +1955,10 @@ fn read_wav_mono_f32(path: &Path) -> Result<(Vec<f32>, u32), String> {
             .samples::<i16>()
             .map(|s| s.unwrap_or(0) as f32 / i16::MAX as f32)
             .collect(),
+        (hound::SampleFormat::Int, 24) => reader
+            .samples::<i32>()
+            .map(|s| s.unwrap_or(0) as f32 / 8_388_608.0)
+            .collect(),
         (hound::SampleFormat::Int, 32) => reader
             .samples::<i32>()
             .map(|s| s.unwrap_or(0) as f32 / i32::MAX as f32)
@@ -1962,6 +1966,10 @@ fn read_wav_mono_f32(path: &Path) -> Result<(Vec<f32>, u32), String> {
         (hound::SampleFormat::Float, 32) => reader
             .samples::<f32>()
             .map(|s| s.unwrap_or(0.0))
+            .collect(),
+        (hound::SampleFormat::Int, 8) => reader
+            .samples::<i8>()
+            .map(|s| s.unwrap_or(0) as f32 / i8::MAX as f32)
             .collect(),
         _ => {
             return Err(format!(
