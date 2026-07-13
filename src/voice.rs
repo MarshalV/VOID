@@ -1013,8 +1013,9 @@ impl VoicePlayer {
 
         let duration_secs = wav_duration(path).unwrap_or(0.0);
         self.total_frames = playback_pcm_frames(path).unwrap_or(0);
+        let start_frame = (self.total_frames as f32 * start_ratio.clamp(0.0, 1.0)) as usize;
         let stop_flag = Arc::new(AtomicBool::new(false));
-        let frame_pos = Arc::new(AtomicUsize::new(0));
+        let frame_pos = Arc::new(AtomicUsize::new(start_frame));
         let (done_tx, done_rx) = mpsc::channel();
         self.stop_flag = Some(stop_flag.clone());
         self.frame_pos = Some(frame_pos.clone());
@@ -1066,17 +1067,14 @@ fn play_wav_file(
     path: &Path,
     stop_flag: &AtomicBool,
     start_ratio: f32,
-    #[allow(unused_variables)] frame_pos: Arc<AtomicUsize>,
+    frame_pos: Arc<AtomicUsize>,
 ) -> Result<(), String> {
     let path = normalize_playback_path(path);
     voice_log(&format!("play {} from {:.0}%", path.display(), start_ratio * 100.0));
 
     #[cfg(target_os = "linux")]
     {
-        if start_ratio > 0.001 {
-            return Err("Перемотка на Linux пока недоступна — воспроизведите с начала.".into());
-        }
-        return play_wav_linux(&path, stop_flag);
+        return play_wav_linux(&path, stop_flag, start_ratio, frame_pos);
     }
 
     #[cfg(not(target_os = "linux"))]
@@ -1106,9 +1104,6 @@ fn play_wav_file(
         }
     }
 }
-
-#[cfg(target_os = "linux")]
-const LINUX_PLAYBACK_RATE: u32 = 44_100;
 
 #[cfg(target_os = "linux")]
 struct LinuxDesktopSession {
@@ -1161,22 +1156,36 @@ fn linux_desktop_sessions() -> Vec<LinuxDesktopSession> {
 }
 
 #[cfg(target_os = "linux")]
-fn linux_prepare_playback_wav(src: &Path) -> Result<(PathBuf, f32), String> {
+fn linux_prepare_playback_pcm(
+    src: &Path,
+    start_ratio: f32,
+) -> Result<(Vec<f32>, usize, f32), String> {
     let (mono, src_rate) = read_wav_mono_f32(src)?;
-    let mono = if src_rate == LINUX_PLAYBACK_RATE {
+    let mono = if src_rate == VOICE_SAMPLE_RATE {
         mono
     } else {
-        resample_linear(&mono, src_rate, LINUX_PLAYBACK_RATE)
+        resample_linear(&mono, src_rate, VOICE_SAMPLE_RATE)
     };
-    let duration = mono.len() as f32 / LINUX_PLAYBACK_RATE as f32;
-    let stamp = chrono::Local::now().format("%Y%m%d_%H%M%S_%f");
-    let tmp = std::env::temp_dir().join(format!("void_play_{stamp}.wav"));
-    write_wav_mono(&tmp, &mono, LINUX_PLAYBACK_RATE)?;
+    let start_frame =
+        ((mono.len() as f32 * start_ratio.clamp(0.0, 1.0)) as usize).min(mono.len());
+    let trimmed = mono[start_frame..].to_vec();
+    let duration = trimmed.len() as f32 / VOICE_SAMPLE_RATE as f32;
     voice_log(&format!(
-        "playback wav {} ({duration:.2}s @ {LINUX_PLAYBACK_RATE}Hz)",
-        tmp.display()
+        "playback pcm {}/{} frames ({duration:.2}s @ {VOICE_SAMPLE_RATE}Hz)",
+        trimmed.len(),
+        mono.len()
     ));
-    Ok((tmp, duration))
+    Ok((trimmed, start_frame, duration))
+}
+
+#[cfg(target_os = "linux")]
+fn f32_pcm_as_bytes(samples: &[f32]) -> &[u8] {
+    unsafe {
+        std::slice::from_raw_parts(
+            samples.as_ptr().cast::<u8>(),
+            samples.len() * std::mem::size_of::<f32>(),
+        )
+    }
 }
 
 #[cfg(target_os = "linux")]
@@ -1260,14 +1269,51 @@ fn linux_env_sets() -> Vec<Vec<(String, String)>> {
 }
 
 #[cfg(target_os = "linux")]
-fn linux_wait_player(
+fn linux_player_stderr(child: &mut Child) -> String {
+    let mut err_text = String::new();
+    if let Some(mut stderr) = child.stderr.take() {
+        use std::io::Read;
+        let _ = stderr.read_to_string(&mut err_text);
+    }
+    err_text.trim().to_string()
+}
+
+#[cfg(target_os = "linux")]
+fn linux_write_pcm_and_wait(
     child: &mut Child,
+    pcm: &[f32],
     stop_flag: &AtomicBool,
-    expect_secs: f32,
+    frame_pos: &Arc<AtomicUsize>,
+    start_frame: usize,
     label: &str,
 ) -> Result<(), String> {
-    let started = Instant::now();
-    let min_alive = (expect_secs * 0.55).max(0.12).min(expect_secs.max(0.12));
+    let mut stdin = child
+        .stdin
+        .take()
+        .ok_or_else(|| format!("{label}: нет stdin"))?;
+    const CHUNK_FRAMES: usize = 2048;
+    let mut offset = 0usize;
+    while offset < pcm.len() {
+        if stop_flag.load(Ordering::Relaxed) {
+            let _ = child.kill();
+            let _ = child.wait();
+            voice_log(&format!("play stopped ({label})"));
+            return Ok(());
+        }
+        if let Ok(Some(status)) = child.try_wait() {
+            let err = linux_player_stderr(child);
+            return Err(format!(
+                "{label}: процесс завершился до конца ({status}){err}"
+            ));
+        }
+        let end = (offset + CHUNK_FRAMES).min(pcm.len());
+        stdin
+            .write_all(f32_pcm_as_bytes(&pcm[offset..end]))
+            .map_err(|e| format!("{label}: запись PCM: {e}"))?;
+        frame_pos.store(start_frame + end, Ordering::Relaxed);
+        offset = end;
+    }
+    drop(stdin);
     loop {
         if stop_flag.load(Ordering::Relaxed) {
             let _ = child.kill();
@@ -1277,27 +1323,173 @@ fn linux_wait_player(
         }
         match child.try_wait() {
             Ok(Some(status)) if status.success() => {
-                let elapsed = started.elapsed().as_secs_f32();
-                if elapsed + 0.08 >= min_alive {
-                    voice_log(&format!("play done ({label}, {elapsed:.2}s)"));
-                    return Ok(());
-                }
-                return Err(format!(
-                    "{label}: слишком быстрый выход ({elapsed:.3}s при {expect_secs:.2}s)"
-                ));
+                frame_pos.store(start_frame + pcm.len(), Ordering::Relaxed);
+                voice_log(&format!("play done ({label})"));
+                return Ok(());
             }
             Ok(Some(status)) => {
-                let mut err_text = String::new();
-                if let Some(mut stderr) = child.stderr.take() {
-                    use std::io::Read;
-                    let _ = stderr.read_to_string(&mut err_text);
-                }
-                return Err(format!("{label} exit {status}: {}", err_text.trim()));
+                let err = linux_player_stderr(child);
+                return Err(format!("{label} exit {status}: {err}"));
             }
             Ok(None) => std::thread::sleep(Duration::from_millis(35)),
             Err(e) => return Err(format!("{label}: {e}")),
         }
     }
+}
+
+#[cfg(target_os = "linux")]
+fn linux_spawn_player_stdin(
+    cmd: &str,
+    args: &[&str],
+    env: &[(String, String)],
+) -> Result<Child, String> {
+    let mut command = Command::new(cmd);
+    command.args(args);
+    for (k, v) in env {
+        command.env(k, v);
+    }
+    command
+        .stdin(Stdio::piped())
+        .stdout(Stdio::null())
+        .stderr(Stdio::piped())
+        .spawn()
+        .map_err(|e| format!("{cmd}: {e}"))
+}
+
+#[cfg(target_os = "linux")]
+fn linux_spawn_as_user_stdin(
+    username: &str,
+    cmd: &str,
+    args: &[&str],
+    env: &[(String, String)],
+) -> Result<Child, String> {
+    let mut runuser = Command::new("runuser");
+    runuser.arg("-u").arg(username).arg("--").arg(cmd);
+    runuser.args(args);
+    for (k, v) in env {
+        runuser.env(k, v);
+    }
+    runuser
+        .stdin(Stdio::piped())
+        .stdout(Stdio::null())
+        .stderr(Stdio::piped())
+        .spawn()
+        .map_err(|e| format!("runuser -u {username} {cmd}: {e}"))
+}
+
+#[cfg(target_os = "linux")]
+const LINUX_PAPLAY_ARGS: &[&str] = &[
+    "--raw",
+    "--rate",
+    "48000",
+    "--channels",
+    "1",
+    "--format",
+    "float32le",
+];
+
+#[cfg(target_os = "linux")]
+const LINUX_PW_CAT_ARGS: &[&str] = &[
+    "-p",
+    "--rate",
+    "48000",
+    "--channels",
+    "1",
+    "--format",
+    "f32",
+    "-",
+];
+
+#[cfg(target_os = "linux")]
+fn linux_try_pcm_stdin(
+    label: &str,
+    child: Result<Child, String>,
+    pcm: &[f32],
+    stop_flag: &AtomicBool,
+    frame_pos: &Arc<AtomicUsize>,
+    start_frame: usize,
+    last_err: &mut String,
+) -> Result<(), String> {
+    let mut child = match child {
+        Ok(c) => c,
+        Err(e) => {
+            *last_err = e;
+            return Err(last_err.clone());
+        }
+    };
+    voice_log(&format!("try {label}"));
+    match linux_write_pcm_and_wait(&mut child, pcm, stop_flag, frame_pos, start_frame, label) {
+        Ok(()) => Ok(()),
+        Err(e) => {
+            *last_err = e;
+            voice_log(last_err);
+            Err(last_err.clone())
+        }
+    }
+}
+
+#[cfg(target_os = "linux")]
+fn play_wav_linux_stdin(
+    pcm: &[f32],
+    stop_flag: &AtomicBool,
+    frame_pos: Arc<AtomicUsize>,
+    start_frame: usize,
+) -> Result<(), String> {
+    let players: [(&str, &[&str]); 2] = [("paplay", LINUX_PAPLAY_ARGS), ("pw-cat", LINUX_PW_CAT_ARGS)];
+    let mut last_err = String::from("stdin-плееры недоступны");
+
+    for session in linux_desktop_sessions() {
+        let session_env = [
+            ("PULSE_SERVER".into(), session.pulse_server.clone()),
+            (
+                "XDG_RUNTIME_DIR".into(),
+                session.runtime_dir.display().to_string(),
+            ),
+        ];
+        for (cmd, args) in &players {
+            let tag = format!("runuser:{} {cmd} stdin", session.username);
+            if linux_try_pcm_stdin(
+                &tag,
+                linux_spawn_as_user_stdin(&session.username, cmd, args, &session_env),
+                pcm,
+                stop_flag,
+                &frame_pos,
+                start_frame,
+                &mut last_err,
+            )
+            .is_ok()
+            {
+                return Ok(());
+            }
+        }
+    }
+
+    for (cmd, args) in &players {
+        for env in linux_env_sets() {
+            let tag = format!(
+                "{cmd} stdin{}",
+                env.iter()
+                    .find(|(k, _)| k == "PULSE_SERVER")
+                    .map(|(_, v)| format!("@{v}"))
+                    .unwrap_or_default()
+            );
+            if linux_try_pcm_stdin(
+                &tag,
+                linux_spawn_player_stdin(cmd, args, &env),
+                pcm,
+                stop_flag,
+                &frame_pos,
+                start_frame,
+                &mut last_err,
+            )
+            .is_ok()
+            {
+                return Ok(());
+            }
+        }
+    }
+
+    Err(last_err)
 }
 
 #[cfg(target_os = "linux")]
@@ -1349,6 +1541,45 @@ fn linux_spawn_as_user(
 }
 
 #[cfg(target_os = "linux")]
+fn linux_wait_player(
+    child: &mut Child,
+    stop_flag: &AtomicBool,
+    expect_secs: f32,
+    label: &str,
+) -> Result<(), String> {
+    let started = Instant::now();
+    let max_wait = Duration::from_secs_f32(expect_secs + 2.0);
+    loop {
+        if stop_flag.load(Ordering::Relaxed) {
+            let _ = child.kill();
+            let _ = child.wait();
+            voice_log(&format!("play stopped ({label})"));
+            return Ok(());
+        }
+        if started.elapsed() > max_wait {
+            let _ = child.kill();
+            let _ = child.wait();
+            return Err(format!("{label}: таймаут ({expect_secs:.1}s)"));
+        }
+        match child.try_wait() {
+            Ok(Some(status)) if status.success() => {
+                voice_log(&format!(
+                    "play done ({label}, {:.2}s)",
+                    started.elapsed().as_secs_f32()
+                ));
+                return Ok(());
+            }
+            Ok(Some(status)) => {
+                let err = linux_player_stderr(child);
+                return Err(format!("{label} exit {status}: {err}"));
+            }
+            Ok(None) => std::thread::sleep(Duration::from_millis(35)),
+            Err(e) => return Err(format!("{label}: {e}")),
+        }
+    }
+}
+
+#[cfg(target_os = "linux")]
 fn linux_try_player(
     label: &str,
     child: Result<Child, String>,
@@ -1375,15 +1606,22 @@ fn linux_try_player(
 }
 
 #[cfg(target_os = "linux")]
-fn play_wav_linux(path: &Path, stop_flag: &AtomicBool) -> Result<(), String> {
-    let (play_path, duration) = linux_prepare_playback_wav(path)?;
-    let result = play_wav_linux_inner(&play_path, stop_flag, duration);
-    let _ = std::fs::remove_file(&play_path);
+fn play_wav_linux_file_fallback(
+    pcm: &[f32],
+    stop_flag: &AtomicBool,
+    duration: f32,
+) -> Result<(), String> {
+    let stamp = chrono::Local::now().format("%Y%m%d_%H%M%S_%f");
+    let tmp = std::env::temp_dir().join(format!("void_play_{stamp}.wav"));
+    write_wav_mono(&tmp, pcm, VOICE_SAMPLE_RATE)?;
+    voice_log(&format!("playback wav fallback {}", tmp.display()));
+    let result = play_wav_linux_file_inner(&tmp, stop_flag, duration);
+    let _ = std::fs::remove_file(&tmp);
     result
 }
 
 #[cfg(target_os = "linux")]
-fn play_wav_linux_inner(
+fn play_wav_linux_file_inner(
     play_path: &Path,
     stop_flag: &AtomicBool,
     duration: f32,
@@ -1463,9 +1701,31 @@ fn play_wav_linux_inner(
         }
     }
 
-    Err(format!(
-        "{last_err} (apt install pipewire-audio-client-libraries pulseaudio-utils alsa-utils)"
-    ))
+    Err(last_err)
+}
+
+#[cfg(target_os = "linux")]
+fn play_wav_linux(
+    path: &Path,
+    stop_flag: &AtomicBool,
+    start_ratio: f32,
+    frame_pos: Arc<AtomicUsize>,
+) -> Result<(), String> {
+    let (pcm, start_frame, duration) = linux_prepare_playback_pcm(path, start_ratio)?;
+    if pcm.is_empty() {
+        return Err("Пустой фрагмент воспроизведения".into());
+    }
+    frame_pos.store(start_frame, Ordering::Relaxed);
+
+    if play_wav_linux_stdin(&pcm, stop_flag, frame_pos.clone(), start_frame).is_ok() {
+        return Ok(());
+    }
+
+    play_wav_linux_file_fallback(&pcm, stop_flag, duration).map_err(|file_err| {
+        format!(
+            "{file_err} (apt install pipewire-audio-client-libraries pulseaudio-utils alsa-utils)"
+        )
+    })
 }
 
 fn normalize_playback_path(path: &Path) -> PathBuf {
