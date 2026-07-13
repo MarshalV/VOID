@@ -466,6 +466,18 @@ fn audio_host() -> cpal::Host {
 
 /// Быстрая проверка микрофона при старте.
 pub(crate) fn probe_microphone() -> Result<String, String> {
+    #[cfg(target_os = "linux")]
+    {
+        if linux_desktop_sessions().is_empty() && running_as_root() {
+            voice_log("probe: root без desktop pulse, запись через ALSA");
+        }
+        if Command::new("pw-record").arg("--version").output().is_ok()
+            || Command::new("parecord").arg("--version").output().is_ok()
+        {
+            voice_log("probe ok: pulse/pipewire");
+            return Ok("pulse".into());
+        }
+    }
     let host = audio_host();
     let device = host
         .default_input_device()
@@ -835,13 +847,14 @@ fn play_wav_file(
     voice_log(&format!("play {} from {:.0}%", path.display(), start_ratio * 100.0));
 
     #[cfg(target_os = "linux")]
-    if start_ratio <= 0.001 {
-        match play_wav_linux(&path, stop_flag) {
-            Ok(()) => return Ok(()),
-            Err(e) => voice_log(&format!("linux play miss: {e}")),
+    {
+        if start_ratio > 0.001 {
+            return Err("Перемотка на Linux пока недоступна — воспроизведите с начала.".into());
         }
+        return play_wav_linux(&path, stop_flag);
     }
 
+    #[cfg(not(target_os = "linux"))]
     match play_wav_cpal(&path, stop_flag, start_ratio, frame_pos) {
         Ok(()) => {
             voice_log("play done (cpal)");
@@ -861,17 +874,84 @@ fn play_wav_file(
                 play_wav_winmm(&path, stop_flag)
                     .map_err(|winmm_err| format!("cpal: {cpal_err}; winmm: {winmm_err}"))
             }
-            #[cfg(target_os = "linux")]
-            {
-                play_wav_linux(&path, stop_flag)
-                    .map_err(|ext| format!("cpal: {cpal_err}; {ext}"))
-            }
-            #[cfg(all(not(target_os = "windows"), not(target_os = "linux")))]
+            #[cfg(not(target_os = "windows"))]
             {
                 Err(cpal_err)
             }
         }
     }
+}
+
+#[cfg(target_os = "linux")]
+const LINUX_PLAYBACK_RATE: u32 = 44_100;
+
+#[cfg(target_os = "linux")]
+struct LinuxDesktopSession {
+    username: String,
+    runtime_dir: PathBuf,
+    pulse_server: String,
+}
+
+#[cfg(target_os = "linux")]
+fn running_as_root() -> bool {
+    std::env::var("USER").is_ok_and(|u| u == "root")
+        || std::env::var("UID").is_ok_and(|u| u == "0")
+}
+
+#[cfg(target_os = "linux")]
+fn linux_desktop_sessions() -> Vec<LinuxDesktopSession> {
+    let mut sessions = Vec::new();
+    let Ok(entries) = std::fs::read_dir("/run/user") else {
+        return sessions;
+    };
+    let mut entries: Vec<_> = entries.flatten().collect();
+    entries.sort_by_key(|e| e.file_name());
+    for entry in entries {
+        let uid = entry.file_name().to_string_lossy().into_owned();
+        if uid == "0" {
+            continue;
+        }
+        let runtime_dir = entry.path();
+        let pulse = runtime_dir.join("pulse/native");
+        if !pulse.exists() {
+            continue;
+        }
+        let Ok(out) = Command::new("id").args(["-nu", &uid]).output() else {
+            continue;
+        };
+        if !out.status.success() {
+            continue;
+        }
+        let username = String::from_utf8_lossy(&out.stdout).trim().to_string();
+        if username.is_empty() || username == "root" {
+            continue;
+        }
+        sessions.push(LinuxDesktopSession {
+            username,
+            runtime_dir: runtime_dir.clone(),
+            pulse_server: format!("unix:{}", pulse.display()),
+        });
+    }
+    sessions
+}
+
+#[cfg(target_os = "linux")]
+fn linux_prepare_playback_wav(src: &Path) -> Result<(PathBuf, f32), String> {
+    let (mono, src_rate) = read_wav_mono_f32(src)?;
+    let mono = if src_rate == LINUX_PLAYBACK_RATE {
+        mono
+    } else {
+        resample_linear(&mono, src_rate, LINUX_PLAYBACK_RATE)
+    };
+    let duration = mono.len() as f32 / LINUX_PLAYBACK_RATE as f32;
+    let stamp = chrono::Local::now().format("%Y%m%d_%H%M%S_%f");
+    let tmp = std::env::temp_dir().join(format!("void_play_{stamp}.wav"));
+    write_wav_mono(&tmp, &mono, LINUX_PLAYBACK_RATE)?;
+    voice_log(&format!(
+        "playback wav {} ({duration:.2}s @ {LINUX_PLAYBACK_RATE}Hz)",
+        tmp.display()
+    ));
+    Ok((tmp, duration))
 }
 
 #[cfg(target_os = "linux")]
@@ -893,11 +973,13 @@ fn linux_pulse_servers() -> Vec<String> {
     if let Ok(uid) = std::env::var("SUDO_UID") {
         push(&PathBuf::from(format!("/run/user/{uid}/pulse/native")));
     }
-    if let Ok(uid) = std::env::var("UID") {
-        push(&PathBuf::from(format!("/run/user/{uid}/pulse/native")));
-    }
     if let Ok(xdg) = std::env::var("XDG_RUNTIME_DIR") {
         push(&PathBuf::from(xdg).join("pulse/native"));
+    }
+    for session in linux_desktop_sessions() {
+        if !servers.iter().any(|s| s == &session.pulse_server) {
+            servers.push(session.pulse_server.clone());
+        }
     }
     if let Ok(entries) = std::fs::read_dir("/run/user") {
         let mut uids: Vec<_> = entries.flatten().collect();
@@ -910,36 +992,26 @@ fn linux_pulse_servers() -> Vec<String> {
 }
 
 #[cfg(target_os = "linux")]
-fn linux_aplay_devices() -> Vec<String> {
-    let mut devices = vec![
-        "default".into(),
-        "pipewire".into(),
-        "pulse".into(),
-        "plughw:0,0".into(),
-        "hw:0,0".into(),
-    ];
-    if let Ok(out) = Command::new("aplay").arg("-L").output() {
-        if out.status.success() {
-            let text = String::from_utf8_lossy(&out.stdout);
-            for line in text.lines() {
-                let name = line.trim();
-                if name.is_empty() || name.starts_with(' ') || name.starts_with('\t') {
-                    continue;
-                }
-                if name.contains(':') || name.starts_with("hw:") || name.starts_with("plughw:") {
-                    if !devices.iter().any(|d| d == name) {
-                        devices.push(name.to_string());
-                    }
-                }
-            }
+fn linux_env_sets() -> Vec<Vec<(String, String)>> {
+    let mut sets = Vec::new();
+    for session in linux_desktop_sessions() {
+        sets.push(vec![
+            ("PULSE_SERVER".into(), session.pulse_server.clone()),
+            (
+                "XDG_RUNTIME_DIR".into(),
+                session.runtime_dir.display().to_string(),
+            ),
+        ]);
+    }
+    if let Ok(xdg) = std::env::var("XDG_RUNTIME_DIR") {
+        let mut env = vec![("XDG_RUNTIME_DIR".into(), xdg)];
+        if let Ok(ps) = std::env::var("PULSE_SERVER") {
+            env.push(("PULSE_SERVER".into(), ps));
+        }
+        if !sets.iter().any(|s| s == &env) {
+            sets.push(env);
         }
     }
-    devices
-}
-
-#[cfg(target_os = "linux")]
-fn linux_env_sets() -> Vec<Vec<(String, String)>> {
-    let mut sets = vec![Vec::new()];
     for server in linux_pulse_servers() {
         let mut env = vec![("PULSE_SERVER".into(), server.clone())];
         if let Some(runtime) = server.strip_prefix("unix:/run/user/") {
@@ -947,7 +1019,12 @@ fn linux_env_sets() -> Vec<Vec<(String, String)>> {
                 env.push(("XDG_RUNTIME_DIR".into(), format!("/run/user/{uid_dir}")));
             }
         }
-        sets.push(env);
+        if !sets.iter().any(|s| s == &env) {
+            sets.push(env);
+        }
+    }
+    if !running_as_root() {
+        sets.push(Vec::new());
     }
     sets
 }
@@ -960,11 +1037,7 @@ fn linux_wait_player(
     label: &str,
 ) -> Result<(), String> {
     let started = Instant::now();
-    let min_alive = if expect_secs > 0.4 {
-        (expect_secs * 0.35).min(expect_secs - 0.15).max(0.08)
-    } else {
-        0.04
-    };
+    let min_alive = (expect_secs * 0.55).max(0.12).min(expect_secs.max(0.12));
     loop {
         if stop_flag.load(Ordering::Relaxed) {
             let _ = child.kill();
@@ -975,12 +1048,12 @@ fn linux_wait_player(
         match child.try_wait() {
             Ok(Some(status)) if status.success() => {
                 let elapsed = started.elapsed().as_secs_f32();
-                if elapsed + 0.05 >= min_alive {
+                if elapsed + 0.08 >= min_alive {
                     voice_log(&format!("play done ({label}, {elapsed:.2}s)"));
                     return Ok(());
                 }
                 return Err(format!(
-                    "{label}: мгновенный выход ({elapsed:.3}s, ожидали >= {min_alive:.2}s)"
+                    "{label}: слишком быстрый выход ({elapsed:.3}s при {expect_secs:.2}s)"
                 ));
             }
             Ok(Some(status)) => {
@@ -1021,51 +1094,148 @@ fn linux_spawn_player(
 }
 
 #[cfg(target_os = "linux")]
+fn linux_spawn_as_user(
+    username: &str,
+    cmd: &str,
+    args: &[&str],
+    path: &Path,
+    env: &[(String, String)],
+) -> Result<Child, String> {
+    let mut runuser = Command::new("runuser");
+    runuser.arg("-u").arg(username).arg("--").arg(cmd);
+    for arg in args {
+        runuser.arg(arg);
+    }
+    for (k, v) in env {
+        runuser.env(k, v);
+    }
+    runuser
+        .arg(path)
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::piped())
+        .spawn()
+        .map_err(|e| format!("runuser -u {username} {cmd}: {e}"))
+}
+
+#[cfg(target_os = "linux")]
+fn linux_try_player(
+    label: &str,
+    child: Result<Child, String>,
+    stop_flag: &AtomicBool,
+    duration: f32,
+    last_err: &mut String,
+) -> Result<(), String> {
+    let mut child = match child {
+        Ok(c) => c,
+        Err(e) => {
+            *last_err = e;
+            return Err(last_err.clone());
+        }
+    };
+    voice_log(&format!("try {label}"));
+    match linux_wait_player(&mut child, stop_flag, duration, label) {
+        Ok(()) => Ok(()),
+        Err(e) => {
+            *last_err = e;
+            voice_log(last_err);
+            Err(last_err.clone())
+        }
+    }
+}
+
+#[cfg(target_os = "linux")]
 fn play_wav_linux(path: &Path, stop_flag: &AtomicBool) -> Result<(), String> {
-    let duration = wav_duration(path).unwrap_or(0.5);
+    let (play_path, duration) = linux_prepare_playback_wav(path)?;
+    let result = play_wav_linux_inner(&play_path, stop_flag, duration);
+    let _ = std::fs::remove_file(&play_path);
+    result
+}
+
+#[cfg(target_os = "linux")]
+fn play_wav_linux_inner(
+    play_path: &Path,
+    stop_flag: &AtomicBool,
+    duration: f32,
+) -> Result<(), String> {
     let env_sets = linux_env_sets();
-    let aplay_devices = linux_aplay_devices();
+    let sessions = linux_desktop_sessions();
     let mut last_err = String::from("нет доступных аудиоплееров");
 
-    for env in &env_sets {
-        if let Ok(mut child) = linux_spawn_player("paplay", &[], path, env) {
+    let players: [(&str, &[&str]); 2] = [("pw-play", &[]), ("paplay", &[])];
+
+    for session in &sessions {
+        let session_env = [
+            ("PULSE_SERVER".into(), session.pulse_server.clone()),
+            (
+                "XDG_RUNTIME_DIR".into(),
+                session.runtime_dir.display().to_string(),
+            ),
+        ];
+        for (cmd, args) in &players {
+            let tag = format!("runuser:{} {cmd}", session.username);
+            if linux_try_player(
+                &tag,
+                linux_spawn_as_user(
+                    &session.username,
+                    cmd,
+                    args,
+                    play_path,
+                    &session_env,
+                ),
+                stop_flag,
+                duration,
+                &mut last_err,
+            )
+            .is_ok()
+            {
+                return Ok(());
+            }
+        }
+    }
+
+    for (cmd, args) in &players {
+        for env in &env_sets {
             let tag = format!(
-                "paplay{}",
+                "{cmd}{}",
                 env.iter()
                     .find(|(k, _)| k == "PULSE_SERVER")
                     .map(|(_, v)| format!("@{v}"))
                     .unwrap_or_default()
             );
-            voice_log(&format!("try {tag}: {}", path.display()));
-            match linux_wait_player(&mut child, stop_flag, duration, &tag) {
-                Ok(()) => return Ok(()),
-                Err(e) => {
-                    last_err = e;
-                    voice_log(&last_err);
-                }
+            if linux_try_player(
+                &tag,
+                linux_spawn_player(cmd, args, play_path, env),
+                stop_flag,
+                duration,
+                &mut last_err,
+            )
+            .is_ok()
+            {
+                return Ok(());
             }
         }
     }
 
-    for device in &aplay_devices {
-        for env in &env_sets {
-            let args = ["-q", "-D", device.as_str()];
-            let Ok(mut child) = linux_spawn_player("aplay", &args, path, env) else {
-                continue;
-            };
-            let tag = format!("aplay -D {device}");
-            voice_log(&format!("try {tag}: {}", path.display()));
-            match linux_wait_player(&mut child, stop_flag, duration, &tag) {
-                Ok(()) => return Ok(()),
-                Err(e) => {
-                    last_err = e;
-                    voice_log(&last_err);
-                }
-            }
+    for device in ["pipewire", "pulse", "default"] {
+        let args = ["-q", "-D", device];
+        let tag = format!("aplay -D {device}");
+        if linux_try_player(
+            &tag,
+            linux_spawn_player("aplay", &args, play_path, &[]),
+            stop_flag,
+            duration,
+            &mut last_err,
+        )
+        .is_ok()
+        {
+            return Ok(());
         }
     }
 
-    Err(format!("{last_err} (sudo apt install pulseaudio-utils alsa-utils)"))
+    Err(format!(
+        "{last_err} (apt install pipewire-audio-client-libraries pulseaudio-utils alsa-utils)"
+    ))
 }
 
 fn normalize_playback_path(path: &Path) -> PathBuf {
@@ -1123,6 +1293,14 @@ fn play_wav_cpal(
     start_ratio: f32,
     frame_pos: Arc<AtomicUsize>,
 ) -> Result<(), String> {
+    #[cfg(target_os = "linux")]
+    {
+        let _ = (path, stop_flag, start_ratio, frame_pos);
+        return Err("cpal playback disabled on Linux".into());
+    }
+
+    #[cfg(not(target_os = "linux"))]
+    {
     use cpal::traits::{DeviceTrait, HostTrait};
 
     let (mono, src_rate) = read_wav_mono_f32(path)?;
@@ -1173,8 +1351,10 @@ fn play_wav_cpal(
         }
     }
     Err(last_err)
+    }
 }
 
+#[cfg(not(target_os = "linux"))]
 fn play_wav_cpal_device(
     device: &cpal::Device,
     mono: &[f32],
