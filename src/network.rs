@@ -555,6 +555,8 @@ pub(crate) enum UICommand {
         voice_path: Option<String>,
         voice_duration_secs: f32,
         voice_transfer_id: Option<[u8; 16]>,
+        /// Участники, которым нужен только file-transfer (чат уже доставлен).
+        voice_only_members: Vec<PeerId>,
     },
     /// Синхронизация состава группы (pairwise E2EE).
     SendGroupSync {
@@ -2131,6 +2133,7 @@ pub async fn run_chat_network(
                                 voice_path,
                                 voice_duration_secs,
                                 voice_transfer_id,
+                                voice_only_members,
                             } => {
                                 let now = chrono::Local::now().format("%H:%M:%S").to_string();
                                 let msg_id = message_id.unwrap_or_else(new_message_id);
@@ -2167,6 +2170,7 @@ pub async fn run_chat_network(
                                     if peer_id == local_peer_id {
                                         continue;
                                     }
+                                    let send_chat = !voice_only_members.contains(&peer_id);
                                     let peer_tid = if has_voice {
                                         per_peer_voice_transfer_id(&base_tid, peer_id)
                                     } else {
@@ -2184,27 +2188,28 @@ pub async fn run_chat_network(
                                         Err(_) => continue,
                                     };
                                     if sessions.contains_key(&peer_id) {
-                                        let msg_id_for_send =
-                                            chat_message_id_from_json(per_json.as_slice());
-                                        let in_flight = !is_retry
-                                            && msg_id_for_send.as_ref().is_some_and(|mid| {
+                                        if send_chat {
+                                            let msg_id_for_send =
+                                                chat_message_id_from_json(per_json.as_slice());
+                                            let in_flight = msg_id_for_send.as_ref().is_some_and(|mid| {
                                                 outbound_msg_requests.values().any(|(p, id)| {
                                                     *p == peer_id && id == mid
                                                 })
                                             });
-                                        if !in_flight {
-                                            let _ = send_encrypted_chat_payload(
-                                                &mut swarm,
-                                                &mut sessions,
-                                                &mut outbound_msg_requests,
-                                                &mut outbound_delete_requests,
-                                                &event_tx,
-                                                peer_id,
-                                                per_json,
-                                                None,
-                                                &now,
-                                            )
-                                            .await;
+                                            if !in_flight {
+                                                let _ = send_encrypted_chat_payload(
+                                                    &mut swarm,
+                                                    &mut sessions,
+                                                    &mut outbound_msg_requests,
+                                                    &mut outbound_delete_requests,
+                                                    &event_tx,
+                                                    peer_id,
+                                                    per_json,
+                                                    None,
+                                                    &now,
+                                                )
+                                                .await;
+                                            }
                                         }
                                         if has_voice {
                                             start_voice_file_transfer(
@@ -2233,20 +2238,22 @@ pub async fn run_chat_network(
                                             force_hs,
                                         )
                                         .await;
-                                        let queue =
-                                            pending_messages.entry(peer_id).or_default();
-                                        if let Some(ref mid) =
-                                            chat_message_id_from_json(per_json.as_slice())
-                                        {
-                                            if !queue.iter().any(|b| {
-                                                chat_message_id_from_json(b.as_slice())
-                                                    .as_deref()
-                                                    == Some(mid.as_str())
-                                            }) {
+                                        if send_chat {
+                                            let queue =
+                                                pending_messages.entry(peer_id).or_default();
+                                            if let Some(ref mid) =
+                                                chat_message_id_from_json(per_json.as_slice())
+                                            {
+                                                if !queue.iter().any(|b| {
+                                                    chat_message_id_from_json(b.as_slice())
+                                                        .as_deref()
+                                                        == Some(mid.as_str())
+                                                }) {
+                                                    queue.push(per_json);
+                                                }
+                                            } else {
                                                 queue.push(per_json);
                                             }
-                                        } else {
-                                            queue.push(per_json);
                                         }
                                         if has_voice {
                                             let vq =
@@ -2639,28 +2646,28 @@ pub async fn run_chat_network(
                                     continue;
                                 }
 
+                                let msg_id_for_send =
+                                    chat_message_id_from_json(json_data.as_slice());
+                                let in_flight = msg_id_for_send.as_ref().is_some_and(|mid| {
+                                    outbound_msg_requests
+                                        .values()
+                                        .any(|(p, id)| *p == recipient && id == mid)
+                                });
+                                if !in_flight {
+                                    let _ = send_encrypted_chat_payload(
+                                        &mut swarm,
+                                        &mut sessions,
+                                        &mut outbound_msg_requests,
+                                        &mut outbound_delete_requests,
+                                        &event_tx,
+                                        recipient,
+                                        json_data,
+                                        None,
+                                        &now,
+                                    )
+                                    .await;
+                                }
                                 if !is_retry {
-                                    let msg_id_for_send =
-                                        chat_message_id_from_json(json_data.as_slice());
-                                    let in_flight = msg_id_for_send.as_ref().is_some_and(|mid| {
-                                        outbound_msg_requests
-                                            .values()
-                                            .any(|(p, id)| *p == recipient && id == mid)
-                                    });
-                                    if !in_flight {
-                                        let _ = send_encrypted_chat_payload(
-                                            &mut swarm,
-                                            &mut sessions,
-                                            &mut outbound_msg_requests,
-                                            &mut outbound_delete_requests,
-                                            &event_tx,
-                                            recipient,
-                                            json_data,
-                                            None,
-                                            &now,
-                                        )
-                                        .await;
-                                    }
                                     let _ = event_tx.send(NetworkEvent::ChatMessage(msg)).await;
                                 }
 

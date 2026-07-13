@@ -3296,6 +3296,7 @@ impl eframe::App for App {
                                             voice_path: None,
                                             voice_duration_secs: 0.0,
                                             voice_transfer_id: None,
+                                            voice_only_members: vec![],
                                         }) {
                                             Ok(()) => {
                                                 self.chat_input.clear();
