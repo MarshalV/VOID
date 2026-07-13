@@ -302,9 +302,10 @@ impl VoiceRecorder {
                 let _ = stop_tx.send(());
             });
             let wav_out = wav_path.clone();
+            let stop_path_rec = stop_path.clone();
             let (done_tx, done_rx) = mpsc::channel();
             std::thread::spawn(move || {
-                let result = record_to_wav(stop_rx, &wav_out);
+                let result = record_to_wav(stop_rx, Some(&stop_path_rec), &wav_out);
                 let _ = done_tx.send(result);
             });
             self.record_done_rx = Some(done_rx);
@@ -447,7 +448,7 @@ fn cli_record(out: PathBuf, stop_file: PathBuf) -> Result<f32, String> {
         }
         let _ = stop_tx.send(());
     });
-    record_to_wav(stop_rx, &out)
+    record_to_wav(stop_rx, Some(&stop_file), &out)
 }
 
 fn audio_host() -> cpal::Host {
@@ -468,14 +469,9 @@ fn audio_host() -> cpal::Host {
 pub(crate) fn probe_microphone() -> Result<String, String> {
     #[cfg(target_os = "linux")]
     {
-        if linux_desktop_sessions().is_empty() && running_as_root() {
-            voice_log("probe: root без desktop pulse, запись через ALSA");
-        }
-        if Command::new("pw-record").arg("--version").output().is_ok()
-            || Command::new("parecord").arg("--version").output().is_ok()
-        {
-            voice_log("probe ok: pulse/pipewire");
-            return Ok("pulse".into());
+        if linux_has_external_recorder() {
+            voice_log("probe ok: pw-record/parecord");
+            return Ok("pipewire".into());
         }
     }
     let host = audio_host();
@@ -513,7 +509,234 @@ fn pick_input_config(device: &cpal::Device) -> Result<cpal::SupportedStreamConfi
         .map_err(|e| format!("Микрофон: {e}"))
 }
 
-fn record_to_wav(stop_rx: Receiver<()>, out: &Path) -> Result<f32, String> {
+#[cfg(target_os = "linux")]
+fn linux_has_external_recorder() -> bool {
+    Command::new("pw-record").arg("--version").output().is_ok()
+        || Command::new("parecord").arg("--version").output().is_ok()
+}
+
+#[cfg(target_os = "linux")]
+fn linux_record_should_stop(_stop_rx: &Receiver<()>, stop_file: Option<&Path>) -> bool {
+    stop_file.is_some_and(|p| p.exists())
+}
+
+#[cfg(target_os = "linux")]
+fn linux_term_child(child: &mut Child) {
+    if matches!(child.try_wait(), Ok(Some(_))) {
+        return;
+    }
+    let pid = child.id().to_string();
+    let _ = Command::new("kill").args(["-TERM", &pid]).status();
+    let deadline = Instant::now() + Duration::from_millis(600);
+    while Instant::now() < deadline {
+        if matches!(child.try_wait(), Ok(Some(_))) {
+            return;
+        }
+        std::thread::sleep(Duration::from_millis(25));
+    }
+    let _ = child.kill();
+    let _ = child.wait();
+}
+
+#[cfg(target_os = "linux")]
+fn linux_spawn_recorder(
+    cmd: &str,
+    args: &[&str],
+    out: &Path,
+    env: &[(String, String)],
+) -> Result<Child, String> {
+    let mut command = Command::new(cmd);
+    for arg in args {
+        command.arg(arg);
+    }
+    for (k, v) in env {
+        command.env(k, v);
+    }
+    command
+        .arg(out)
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::piped())
+        .spawn()
+        .map_err(|e| format!("{cmd}: {e}"))
+}
+
+#[cfg(target_os = "linux")]
+fn linux_spawn_recorder_as_user(
+    username: &str,
+    cmd: &str,
+    args: &[&str],
+    out: &Path,
+    env: &[(String, String)],
+) -> Result<Child, String> {
+    let mut runuser = Command::new("runuser");
+    runuser.arg("-u").arg(username).arg("--").arg(cmd);
+    for arg in args {
+        runuser.arg(arg);
+    }
+    for (k, v) in env {
+        runuser.env(k, v);
+    }
+    runuser
+        .arg(out)
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::piped())
+        .spawn()
+        .map_err(|e| format!("runuser -u {username} {cmd}: {e}"))
+}
+
+#[cfg(target_os = "linux")]
+fn linux_wait_recorder(
+    child: &mut Child,
+    stop_rx: &Receiver<()>,
+    stop_file: Option<&Path>,
+    label: &str,
+) {
+    let started = Instant::now();
+    loop {
+        if linux_record_should_stop(stop_rx, stop_file) {
+            voice_log(&format!("record stop ({label})"));
+            linux_term_child(child);
+            return;
+        }
+        if started.elapsed().as_secs_f32() >= MAX_VOICE_DURATION_SECS {
+            voice_log(&format!("record max duration ({label})"));
+            linux_term_child(child);
+            return;
+        }
+        match child.try_wait() {
+            Ok(Some(_)) => return,
+            Ok(None) => std::thread::sleep(Duration::from_millis(35)),
+            Err(e) => {
+                voice_log(&format!("record wait err ({label}): {e}"));
+                return;
+            }
+        }
+    }
+}
+
+#[cfg(target_os = "linux")]
+fn linux_try_recorder(
+    label: &str,
+    child: Result<Child, String>,
+    stop_rx: &Receiver<()>,
+    stop_file: Option<&Path>,
+    out: &Path,
+    last_err: &mut String,
+) -> Result<f32, String> {
+    let mut child = child.map_err(|e| {
+        *last_err = e.clone();
+        e
+    })?;
+    voice_log(&format!("record try {label} -> {}", out.display()));
+    linux_wait_recorder(&mut child, stop_rx, stop_file, label);
+    if !out.is_file() {
+        *last_err = format!("{label}: файл не создан");
+        return Err(last_err.clone());
+    }
+    match wav_duration(out) {
+        Ok(d) if d >= MIN_RECORD_SECS => {
+            voice_log(&format!("record done {label} ({d:.2}s)"));
+            Ok(d)
+        }
+        Ok(d) => {
+            *last_err = format!("{label}: слишком короткая запись ({d:.2}s)");
+            Err(last_err.clone())
+        }
+        Err(e) => {
+            *last_err = format!("{label}: {e}");
+            Err(last_err.clone())
+        }
+    }
+}
+
+#[cfg(target_os = "linux")]
+fn linux_record_to_wav(
+    stop_rx: Receiver<()>,
+    stop_file: Option<&Path>,
+    out: &Path,
+) -> Result<f32, String> {
+    let _ = std::fs::remove_file(out);
+    let mut last_err = String::from("pw-record/parecord недоступны");
+    let recorders: [(&str, &[&str]); 3] = [
+        ("pw-record", &["--rate", "48000", "--channels", "1"]),
+        (
+            "parecord",
+            &["--file-format=wav", "--rate", "48000", "--channels", "1"],
+        ),
+        ("parecord", &["--format=wav", "--rate", "48000", "--channels", "1"]),
+    ];
+
+    for session in linux_desktop_sessions() {
+        let session_env = [
+            ("PULSE_SERVER".into(), session.pulse_server.clone()),
+            (
+                "XDG_RUNTIME_DIR".into(),
+                session.runtime_dir.display().to_string(),
+            ),
+        ];
+        for (cmd, args) in &recorders {
+            let tag = format!("runuser:{} {cmd}", session.username);
+            if let Ok(d) = linux_try_recorder(
+                &tag,
+                linux_spawn_recorder_as_user(
+                    &session.username,
+                    cmd,
+                    args,
+                    out,
+                    &session_env,
+                ),
+                &stop_rx,
+                stop_file,
+                out,
+                &mut last_err,
+            ) {
+                return Ok(d);
+            }
+        }
+    }
+
+    for env in linux_env_sets() {
+        for (cmd, args) in &recorders {
+            let tag = format!(
+                "{cmd}{}",
+                env.iter()
+                    .find(|(k, _)| k == "PULSE_SERVER")
+                    .map(|(_, v)| format!("@{v}"))
+                    .unwrap_or_default()
+            );
+            if let Ok(d) = linux_try_recorder(
+                &tag,
+                linux_spawn_recorder(cmd, args, out, env),
+                &stop_rx,
+                stop_file,
+                out,
+                &mut last_err,
+            ) {
+                return Ok(d);
+            }
+        }
+    }
+
+    Err(last_err)
+}
+
+fn record_to_wav(
+    stop_rx: Receiver<()>,
+    stop_file: Option<&Path>,
+    out: &Path,
+) -> Result<f32, String> {
+    #[cfg(target_os = "linux")]
+    if linux_has_external_recorder() {
+        match linux_record_to_wav(stop_rx, stop_file, out) {
+            Ok(d) => return Ok(d),
+            Err(e) => voice_log(&format!("linux record miss: {e}")),
+        }
+    }
+
+    use cpal::traits::{DeviceTrait, HostTrait, StreamTrait};
+
     let host = audio_host();
     let device = host
         .default_input_device()
@@ -542,7 +765,7 @@ fn record_to_wav(stop_rx: Receiver<()>, out: &Path) -> Result<f32, String> {
         (sample_rate as f32 * MAX_VOICE_DURATION_SECS) as usize * channels.max(1);
 
     loop {
-        if stop_rx.try_recv().is_ok() {
+        if stop_rx.try_recv().is_ok() || stop_file.is_some_and(|p| p.exists()) {
             stop_requested = true;
         }
         if err_flag.load(Ordering::Relaxed) {
