@@ -535,6 +535,38 @@ fn build_diagnostic_report() -> String {
             "\n  всего наборов env для fallback-запуска плееров/рекордеров: {}\n",
             linux_env_sets().len()
         ));
+
+        out.push_str("\n--- Linux: состояние sink (звук/mute/громкость в сессии) ---\n");
+        if sessions.is_empty() {
+            out.push_str("  нет сессии — не проверяю.\n");
+        } else {
+            for s in &sessions {
+                let env = [
+                    ("PULSE_SERVER".to_string(), s.pulse_server.clone()),
+                    (
+                        "XDG_RUNTIME_DIR".to_string(),
+                        s.runtime_dir.display().to_string(),
+                    ),
+                ];
+                for (label, cmd, args) in [
+                    ("default sink", "pactl", vec!["get-default-sink"]),
+                    ("sinks", "pactl", vec!["list", "sinks", "short"]),
+                    ("mute", "pactl", vec!["get-sink-mute", "@DEFAULT_SINK@"]),
+                    ("volume", "pactl", vec!["get-sink-volume", "@DEFAULT_SINK@"]),
+                    ("wpctl status", "wpctl", vec!["status"]),
+                ] {
+                    match linux_run_as_user_capture(&s.username, cmd, &args, &env) {
+                        Ok(text) => {
+                            out.push_str(&format!("  [{}] {label}:\n", s.username));
+                            for line in text.lines() {
+                                out.push_str(&format!("    {line}\n"));
+                            }
+                        }
+                        Err(e) => out.push_str(&format!("  [{}] {label}: ошибка — {e}\n", s.username)),
+                    }
+                }
+            }
+        }
     }
 
     out.push_str("\n--- cpal (ALSA/системный аудио-стек) ---\n");
@@ -1224,6 +1256,37 @@ struct LinuxDesktopSession {
 fn running_as_root() -> bool {
     std::env::var("USER").is_ok_and(|u| u == "root")
         || std::env::var("UID").is_ok_and(|u| u == "0")
+}
+
+#[cfg(target_os = "linux")]
+fn linux_run_as_user_capture(
+    username: &str,
+    cmd: &str,
+    args: &[&str],
+    env: &[(String, String)],
+) -> Result<String, String> {
+    let mut runuser = Command::new("runuser");
+    runuser.arg("-u").arg(username).arg("--").arg(cmd);
+    runuser.args(args);
+    for (k, v) in env {
+        runuser.env(k, v);
+    }
+    let output = runuser
+        .output()
+        .map_err(|e| format!("runuser -u {username} {cmd}: {e}"))?;
+    let mut text = String::from_utf8_lossy(&output.stdout).trim().to_string();
+    let err_text = String::from_utf8_lossy(&output.stderr).trim().to_string();
+    if !err_text.is_empty() {
+        if !text.is_empty() {
+            text.push('\n');
+        }
+        text.push_str("stderr: ");
+        text.push_str(&err_text);
+    }
+    if text.is_empty() {
+        text = format!("(пусто, exit={})", output.status);
+    }
+    Ok(text)
 }
 
 #[cfg(target_os = "linux")]
