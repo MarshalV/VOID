@@ -38,10 +38,55 @@ use crate::vault::{
 };
 use crate::voice::{VoicePlayer, VoiceRecorder};
 
+/// Ограниченный по размеру набор id удалённых сообщений («надгробия»). Без
+/// него ретраи/offline-мейлбокс/повторная доставка от собеседника воскрешают
+/// уже удалённое локально сообщение — `ingest_chat_message` дедуплицирует
+/// только по присутствию в текущем списке, а после удаления его там уже нет.
+#[derive(Default)]
+struct DeletedTombstones {
+    order: std::collections::VecDeque<String>,
+    set: HashSet<String>,
+}
+
+impl DeletedTombstones {
+    const MAX: usize = 20_000;
+
+    fn insert(&mut self, id: String) {
+        if id.is_empty() {
+            return;
+        }
+        if self.set.insert(id.clone()) {
+            self.order.push_back(id);
+            while self.order.len() > Self::MAX {
+                if let Some(old) = self.order.pop_front() {
+                    self.set.remove(&old);
+                }
+            }
+        }
+    }
+
+    fn contains(&self, id: &str) -> bool {
+        self.set.contains(id)
+    }
+
+    fn from_vec(ids: Vec<String>) -> Self {
+        let mut t = Self::default();
+        for id in ids {
+            t.insert(id);
+        }
+        t
+    }
+
+    fn to_vec(&self) -> Vec<String> {
+        self.order.iter().cloned().collect()
+    }
+}
+
 /// Переписки, доступные и UI, и сетевому таску (входящее удаление без roundtrip через egui).
 #[derive(Clone)]
 pub(crate) struct SharedChatMessages {
     inner: Arc<Mutex<HashMap<String, Vec<ChatMessage>>>>,
+    deleted: Arc<Mutex<DeletedTombstones>>,
     journal_dirty: Arc<AtomicBool>,
 }
 
@@ -49,6 +94,7 @@ impl SharedChatMessages {
     pub(crate) fn new() -> Self {
         Self {
             inner: Arc::new(Mutex::new(HashMap::new())),
+            deleted: Arc::new(Mutex::new(DeletedTombstones::default())),
             journal_dirty: Arc::new(AtomicBool::new(false)),
         }
     }
@@ -65,6 +111,41 @@ impl SharedChatMessages {
 
     pub(crate) fn take_dirty(&self) -> bool {
         self.journal_dirty.swap(false, Ordering::AcqRel)
+    }
+
+    /// Помечает id как удалённые — `ingest_chat_message` больше не даст им
+    /// снова попасть в чат (ретрай, offline-мейлбокс, повтор от собеседника).
+    pub(crate) fn mark_deleted<I: IntoIterator<Item = String>>(&self, ids: I) {
+        let mut t = self
+            .deleted
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        for id in ids {
+            t.insert(id);
+        }
+    }
+
+    pub(crate) fn is_deleted(&self, id: &str) -> bool {
+        self.deleted
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .contains(id)
+    }
+
+    pub(crate) fn deleted_snapshot(&self) -> Vec<String> {
+        self.deleted
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .to_vec()
+    }
+
+    /// Восстанавливает надгробия из журнала при старте приложения.
+    pub(crate) fn load_deleted(&self, ids: Vec<String>) {
+        let mut t = self
+            .deleted
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        *t = DeletedTombstones::from_vec(ids);
     }
 
     /// Применяет входящую delete-команду от собеседника (только его сообщения).
@@ -93,6 +174,7 @@ impl SharedChatMessages {
             if !deleted.is_empty() {
                 msgs.retain(|m| !(deleted.contains(&m.id) && m.sender_id == from_str));
                 drop(messages);
+                self.mark_deleted(deleted.iter().cloned());
                 self.mark_dirty();
             }
         } else {
@@ -791,8 +873,9 @@ impl App {
         self.vault_master_key = Some(master_arr.clone());
 
         match ChatJournal::load(&master_arr) {
-            Ok(loaded) => {
+            Ok((loaded, deleted_ids)) => {
                 *self.messages.lock() = loaded;
+                self.messages.load_deleted(deleted_ids);
                 self.ensure_message_ids();
                 info!(
                     "Загружено {} переписок из chat_journal.bin",
@@ -851,7 +934,8 @@ impl App {
         let Some(ref vault_master_key) = self.vault_master_key else {
             return;
         };
-        if let Err(e) = ChatJournal::save(vault_master_key, &*self.messages.lock()) {
+        let deleted_ids = self.messages.deleted_snapshot();
+        if let Err(e) = ChatJournal::save(vault_master_key, &*self.messages.lock(), &deleted_ids) {
             warn!("VOID: не удалось сохранить chat_journal.bin: {}", e);
         }
     }
@@ -1668,6 +1752,11 @@ impl App {
     pub(crate) fn ingest_chat_message(&mut self, mut msg: ChatMessage) {
         if msg.id.is_empty() {
             msg.id = new_message_id();
+        }
+        // Сообщение удалено локально ранее — не даём ретраю/offline-мейлоксу/
+        // повтору от собеседника воскресить его (см. `DeletedTombstones`).
+        if self.messages.is_deleted(&msg.id) {
+            return;
         }
 
         let voice_tid = msg.voice.as_ref().map(|v| v.transfer_id.clone());
@@ -2634,6 +2723,8 @@ impl App {
         if let Some(msgs) = self.messages.lock().get_mut(&peer_str) {
             msgs.retain(|m| !message_ids.contains(&m.id));
         }
+        // Надгробие: без него ретрай/offline-мейлбокс воскресит удалённое.
+        self.messages.mark_deleted(message_ids.iter().cloned());
         self.mark_chat_journal_dirty();
     }
 
@@ -2649,7 +2740,14 @@ impl App {
 
     pub(crate) fn delete_conversation_local(&mut self, peer: PeerId) {
         let peer_str = peer.to_string();
+        let ids: Vec<String> = self
+            .messages
+            .lock()
+            .get(&peer_str)
+            .map(|v| v.iter().map(|m| m.id.clone()).collect())
+            .unwrap_or_default();
         self.messages.lock().remove(&peer_str);
+        self.messages.mark_deleted(ids);
         self.mark_chat_journal_dirty();
     }
 
