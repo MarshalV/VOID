@@ -172,6 +172,11 @@ pub(crate) struct PendingGroupSend {
     /// покроет всех участников (voice_ack ok=true от каждого) — атомарность доставки.
     /// `None` для текстовых сообщений (те показываются сразу, без гейта).
     pub(crate) chat_message: Option<ChatMessage>,
+    /// `true` — голосовое уже показано в чате отправителя (атомарность подтверждена
+    /// хотя бы одним участником). Без этого флага один недоступный участник группы
+    /// блокировал бы отображение сообщения навечно (ждали ACK от ВСЕХ сразу).
+    /// Рассылка/повторы остальным участникам продолжаются независимо от флага.
+    pub(crate) voice_shown: bool,
 }
 
 pub(crate) const RESEND_GRACE: Duration = Duration::from_secs(1);
@@ -1464,6 +1469,7 @@ impl App {
                             voice_duration_secs: 0.0,
                             voice_transfer_id: None,
                             chat_message: None,
+                            voice_shown: false,
                         });
                     }
                     let _ = self.command_tx.try_send(UICommand::SendGroupMessage {
@@ -1545,6 +1551,7 @@ impl App {
                             voice_duration_secs: duration_secs,
                             voice_transfer_id: Some(tid),
                             chat_message: Some(chat_message),
+                            voice_shown: false,
                         });
                     }
                     let _ = self.command_tx.try_send(UICommand::SendGroupMessage {
@@ -1967,6 +1974,8 @@ impl App {
                 voice_path: voice_path.clone(),
                 voice_duration_secs,
                 voice_transfer_id,
+                // Легаси-запись уже была показана в чате как Pending — не переигрываем.
+                voice_shown: chat_message_for_pending.is_some(),
                 chat_message: chat_message_for_pending,
             });
             let _ = self.command_tx.try_send(UICommand::SendGroupMessage {
@@ -2550,6 +2559,7 @@ impl App {
                     voice_duration_secs: duration_secs,
                     voice_transfer_id: Some(tid),
                     chat_message: Some(chat_message),
+                    voice_shown: false,
                 });
                 Ok(())
             }
@@ -3475,6 +3485,7 @@ impl App {
                             voice_duration_secs: 0.0,
                             voice_transfer_id: None,
                             chat_message: None,
+                            voice_shown: false,
                         });
                     }
                     let _ = self.command_tx.try_send(UICommand::SendGroupMessage {
@@ -3556,6 +3567,7 @@ impl App {
                             voice_duration_secs: duration_secs,
                             voice_transfer_id: Some(tid),
                             chat_message: Some(chat_message),
+                            voice_shown: false,
                         });
                     }
                     let _ = self.command_tx.try_send(UICommand::SendGroupMessage {
@@ -3603,14 +3615,14 @@ impl App {
         );
         let me = self.local_peer_id;
         let mut remove = false;
-        let mut ready_voice: Option<ChatMessage> = None;
+        let mut show_voice: Option<ChatMessage> = None;
         if let Some(idx) = self
             .pending_group_sends
             .iter()
             .position(|p| p.message_id == message_id)
         {
             self.pending_group_sends[idx].delivered_to.insert(peer);
-            let pending = &self.pending_group_sends[idx];
+            let pending = &mut self.pending_group_sends[idx];
             let needed: HashSet<PeerId> = pending
                 .members
                 .iter()
@@ -3618,39 +3630,50 @@ impl App {
                 .filter(|p| *p != me)
                 .collect();
             let has_voice = pending.voice_transfer_id.is_some();
+            // Атомарность голосового в группе: показываем сообщение у отправителя,
+            // как только доставка+проверка (voice_ack ok=true) подтвердились хотя бы
+            // ОДНОМУ участнику — иначе один недоступный член группы блокировал бы
+            // отображение навечно (ждать ack от ВСЕХ одновременно слишком строго).
+            // Рассылка остальным продолжается независимо (см. voice_delivered_to ниже).
+            if has_voice
+                && !pending.voice_shown
+                && needed
+                    .iter()
+                    .any(|p| pending.delivered_to.contains(p) && pending.voice_delivered_to.contains(p))
+            {
+                pending.voice_shown = true;
+                show_voice = pending.chat_message.clone();
+            }
             remove = if has_voice {
                 needed.is_subset(&pending.delivered_to)
                     && needed.is_subset(&pending.voice_delivered_to)
             } else {
                 needed.is_subset(&pending.delivered_to)
             };
-            // Условие «доставлено всем» для голосового может завершиться и здесь
-            // (текстовый Ack — последний), а не только в apply_voice_ack — тогда
-            // именно тут нужно наконец показать сообщение (принцип атомарности).
-            if remove && has_voice {
-                ready_voice = pending.chat_message.clone();
-            }
+        }
+        if let Some(mut msg) = show_voice {
+            msg.delivery = OutgoingDeliveryStatus::Delivered;
+            self.ingest_chat_message(msg);
         }
         if remove {
-            if let Some(mut msg) = ready_voice {
-                msg.delivery = OutgoingDeliveryStatus::Delivered;
-                self.ingest_chat_message(msg);
-            }
             self.pending_group_sends
                 .retain(|p| p.message_id != message_id);
             self.remove_outbox_group_message(message_id);
         }
     }
 
-    /// Вызывается только по `voice_ack(ok=true)` конкретного участника. Когда
-    /// подтвердят ВСЕ участники группы (атомарность) — показываем сообщение в чате.
+    /// Вызывается по `voice_ack(ok=true)` конкретного участника. Сообщение
+    /// показывается у отправителя, как только атомарность (доставка+проверка)
+    /// подтвердится хотя бы для ОДНОГО участника — из очереди повторов при этом
+    /// не убирается, пока не подтвердят ВСЕ (рассылка остальным продолжается).
     pub(crate) fn mark_group_voice_file_delivered(
         &mut self,
         peer: PeerId,
         transfer_id: &[u8; 16],
     ) {
         let me = self.local_peer_id;
-        let mut done: Vec<(String, ChatMessage)> = Vec::new();
+        let mut show: Option<ChatMessage> = None;
+        let mut done: Vec<String> = Vec::new();
         for pending in &mut self.pending_group_sends {
             let Some(base_tid) = pending.voice_transfer_id else {
                 continue;
@@ -3666,17 +3689,35 @@ impl App {
                 .copied()
                 .filter(|p| *p != me)
                 .collect();
+            crate::voice::voice_log(&format!(
+                "voice_ack(true) group {} msg={} от {} — voice_delivered_to {}/{}, delivered_to {}/{}",
+                transfer_id_to_hex(transfer_id),
+                &pending.message_id[..8.min(pending.message_id.len())],
+                &peer.to_string()[..8.min(peer.to_string().len())],
+                pending.voice_delivered_to.len(),
+                needed.len(),
+                pending.delivered_to.len(),
+                needed.len(),
+            ));
+            if !pending.voice_shown
+                && needed
+                    .iter()
+                    .any(|p| pending.delivered_to.contains(p) && pending.voice_delivered_to.contains(p))
+            {
+                pending.voice_shown = true;
+                show = pending.chat_message.clone();
+            }
             if needed.is_subset(&pending.delivered_to)
                 && needed.is_subset(&pending.voice_delivered_to)
             {
-                if let Some(ref msg) = pending.chat_message {
-                    done.push((pending.message_id.clone(), msg.clone()));
-                }
+                done.push(pending.message_id.clone());
             }
         }
-        for (message_id, mut msg) in done {
+        if let Some(mut msg) = show {
             msg.delivery = OutgoingDeliveryStatus::Delivered;
             self.ingest_chat_message(msg);
+        }
+        for message_id in done {
             self.pending_group_sends
                 .retain(|p| p.message_id != message_id);
             self.remove_outbox_group_message(&message_id);
@@ -3693,6 +3734,11 @@ impl App {
             .position(|p| p.peer == peer && p.transfer_id == transfer_id)
         {
             if ok {
+                crate::voice::voice_log(&format!(
+                    "voice_ack(true) direct {} от {} — показываю",
+                    transfer_id_to_hex(&transfer_id),
+                    &peer.to_string()[..8.min(peer.to_string().len())]
+                ));
                 let mut msg = self.pending_voice_sends[idx].chat_message.clone();
                 msg.delivery = OutgoingDeliveryStatus::Delivered;
                 self.ingest_chat_message(msg);

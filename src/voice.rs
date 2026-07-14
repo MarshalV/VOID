@@ -1074,7 +1074,24 @@ fn play_wav_file(
 
     #[cfg(target_os = "linux")]
     {
-        return play_wav_linux(&path, stop_flag, start_ratio, frame_pos);
+        match play_wav_linux(&path, stop_flag, start_ratio, frame_pos.clone()) {
+            Ok(()) => return Ok(()),
+            Err(ext_err) => {
+                if stop_flag.load(Ordering::Relaxed) {
+                    return Ok(());
+                }
+                voice_log(&format!(
+                    "linux external players failed ({ext_err}) — пробую cpal/ALSA как последний резерв"
+                ));
+                return match play_wav_cpal(&path, stop_flag, start_ratio, frame_pos) {
+                    Ok(()) => {
+                        voice_log("play done (cpal/ALSA fallback)");
+                        Ok(())
+                    }
+                    Err(cpal_err) => Err(format!("{ext_err}; cpal/ALSA: {cpal_err}")),
+                };
+            }
+        }
     }
 
     #[cfg(not(target_os = "linux"))]
@@ -1783,14 +1800,6 @@ fn play_wav_cpal(
     start_ratio: f32,
     frame_pos: Arc<AtomicUsize>,
 ) -> Result<(), String> {
-    #[cfg(target_os = "linux")]
-    {
-        let _ = (path, stop_flag, start_ratio, frame_pos);
-        return Err("cpal playback disabled on Linux".into());
-    }
-
-    #[cfg(not(target_os = "linux"))]
-    {
     use cpal::traits::{DeviceTrait, HostTrait};
 
     let (mono, src_rate) = read_wav_mono_f32(path)?;
@@ -1841,10 +1850,8 @@ fn play_wav_cpal(
         }
     }
     Err(last_err)
-    }
 }
 
-#[cfg(not(target_os = "linux"))]
 fn play_wav_cpal_device(
     device: &cpal::Device,
     mono: &[f32],

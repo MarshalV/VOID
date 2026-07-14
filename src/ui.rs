@@ -3401,6 +3401,7 @@ impl eframe::App for App {
                                                     voice_duration_secs: 0.0,
                                                     voice_transfer_id: None,
                                                     chat_message: None,
+                                                    voice_shown: false,
                                                 });
                                             }
                                             Err(_) => self.add_status(
