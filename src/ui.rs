@@ -1867,12 +1867,23 @@ impl eframe::App for App {
                         }
                     }
 
-                    self.ingest_chat_message(msg.clone());
-                    if !msg.text.is_empty() {
-                        self.try_process_invite_message(&msg.id, &msg.text);
-                    }
                     if let Some(ref voice) = msg.voice {
+                        // Атомарность: входящее голосовое показываем в чате ТОЛЬКО
+                        // после того, как файл полностью получен и его SHA-256
+                        // подтверждён (см. NetworkEvent::FileComplete ниже) — иначе
+                        // получаем «доставлено», но нечего играть.
+                        let tid = voice.transfer_id.to_ascii_lowercase();
+                        if self.pending_incoming_voice_ready.remove(&tid) {
+                            self.ingest_chat_message(msg.clone());
+                        } else if !self.pending_incoming_voice.iter().any(|m| m.id == msg.id) {
+                            self.pending_incoming_voice.push(msg.clone());
+                        }
                         self.relink_voice_transfer_candidates(&voice.transfer_id);
+                    } else {
+                        self.ingest_chat_message(msg.clone());
+                        if !msg.text.is_empty() {
+                            self.try_process_invite_message(&msg.id, &msg.text);
+                        }
                     }
                 }
                 NetworkEvent::GroupSync {
@@ -1943,6 +1954,9 @@ impl eframe::App for App {
                     self.complete_pending_send(peer, &message_id);
                     self.mark_group_message_delivered(peer, &message_id);
                 }
+                NetworkEvent::VoiceAck { peer, transfer_id, ok } => {
+                    self.apply_voice_ack(peer, transfer_id, ok);
+                }
                 NetworkEvent::MessageRead { peer, message_ids } => {
                     self.mark_outgoing_read(peer, &message_ids);
                 }
@@ -2007,6 +2021,14 @@ impl eframe::App for App {
                             .iter()
                             .any(|p| p.message_id == message_id)
                     {
+                        let transfer_hex = crate::protocol::transfer_id_to_hex(&transfer_id);
+                        let chat_message = self.build_voice_chat_message(
+                            &message_id,
+                            Some(recipient.to_string()),
+                            None,
+                            &transfer_hex,
+                            duration_secs,
+                        );
                         self.pending_voice_sends.push(crate::app::PendingVoiceSend {
                             peer: recipient,
                             path: path.clone(),
@@ -2014,6 +2036,7 @@ impl eframe::App for App {
                             message_id,
                             transfer_id,
                             last_attempt: Instant::now(),
+                            chat_message,
                         });
                         self.add_status(format!(
                             "⏳ Голосовое в очереди — ждём сеть или контакт {}",
@@ -2177,11 +2200,14 @@ impl eframe::App for App {
                     filename,
                     saved_to,
                     is_outgoing,
-                    peer,
+                    peer: _peer,
                 } => {
                     if is_outgoing && file_transfer::is_voice_filename(&filename) {
-                        self.complete_pending_voice_send_by_transfer(&transfer_id);
-                        self.mark_group_voice_file_delivered(peer, &transfer_id);
+                        // Внимание: это лишь «все чанки отправлены», НЕ подтверждённая
+                        // доставка. Атомарность (показ в чате, снятие из очереди повтора)
+                        // управляется исключительно через NetworkEvent::VoiceAck —
+                        // см. apply_voice_ack. Здесь только даём отправителю возможность
+                        // прослушать своё же голосовое локально.
                         let tid_hex = file_transfer::voice_transfer_hex_from_filename(&filename)
                             .unwrap_or_else(|| {
                                 transfer_id
@@ -2201,7 +2227,10 @@ impl eframe::App for App {
                             }
                         }
                     }
-                    if file_transfer::is_voice_filename(&filename) && !saved_to.trim().is_empty() {
+                    if !is_outgoing
+                        && file_transfer::is_voice_filename(&filename)
+                        && !saved_to.trim().is_empty()
+                    {
                         let tid_hex = file_transfer::voice_transfer_hex_from_filename(&filename)
                             .unwrap_or_else(|| {
                                 transfer_id
@@ -2212,6 +2241,21 @@ impl eframe::App for App {
                         let aliases = self.voice_transfer_aliases(&tid_hex);
                         for alias in aliases {
                             self.register_voice_path(&alias, saved_to.clone());
+                        }
+                        // Атомарность: файл получен и SHA-256 совпал (иначе сюда не
+                        // попали бы — см. apply_incoming_file_chunk) — теперь можно
+                        // показать сообщение, если JSON уже пришёл, иначе запомнить,
+                        // что оно готово, и показать как только придёт JSON.
+                        let tid_lower = tid_hex.to_ascii_lowercase();
+                        if let Some(idx) = self.pending_incoming_voice.iter().position(|m| {
+                            m.voice
+                                .as_ref()
+                                .is_some_and(|v| v.transfer_id.eq_ignore_ascii_case(&tid_lower))
+                        }) {
+                            let msg = self.pending_incoming_voice.remove(idx);
+                            self.ingest_chat_message(msg);
+                        } else {
+                            self.pending_incoming_voice_ready.insert(tid_lower);
                         }
                         self.push_toast(
                             "🔊 Голосовое загружено".into(),
@@ -3356,6 +3400,7 @@ impl eframe::App for App {
                                                     voice_path: None,
                                                     voice_duration_secs: 0.0,
                                                     voice_transfer_id: None,
+                                                    chat_message: None,
                                                 });
                                             }
                                             Err(_) => self.add_status(

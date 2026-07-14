@@ -28,12 +28,12 @@ use crate::offline_mail::{
 };
 use crate::relay_mailbox::RelayMailbox;
 use crate::protocol::{
-    build_delete_ack_json, build_v1_hello,
+    build_delete_ack_json, build_v1_hello, build_voice_ack_json,
     chat_message_id_from_json,     delete_command_message_ids, is_delete_command_json,
     is_read_command_json, new_message_id, parse_decrypted_chat_frame,
     read_command_message_ids, verify_hello_transport_binding, validate_bootstrap_gossip_addrs,
     build_group_sync_json, build_group_leave_json, build_group_delete_json,
-    transfer_id_to_hex, per_peer_voice_transfer_id, ChatMessage,
+    transfer_id_to_hex, transfer_id_from_hex, per_peer_voice_transfer_id, ChatMessage,
     DecryptedChatFrame, OutgoingDeliveryStatus, VoiceMeta, V1Packet,
 };
 
@@ -416,9 +416,21 @@ pub(crate) enum NetworkEvent {
         transfer_id: [u8; 16],
         reason: String,
     },
+    /// Атомарность голосового: получатель подтвердил (или отверг) целостность
+    /// собранного файла. Только по `ok: true` отправитель может показать
+    /// голосовое сообщение в чате как реально доставленное.
+    VoiceAck {
+        peer: PeerId,
+        transfer_id: [u8; 16],
+        ok: bool,
+    },
 }
 
 /// Одна машина состояний для приёма чанков (E2EE `/void/chat` и устаревший plain `Chunk` по `/void/file`).
+/// Возвращает `Some((transfer_id, ok))`, если голосовой файл только что дособрался
+/// (успешно или с провалом целостности/записи) — вызывающий код обязан отправить
+/// `voice_ack` отправителю, иначе тот никогда не узнает, что доставка атомарно
+/// завершилась (или провалилась), и не покажет/не повторит голосовое.
 async fn apply_incoming_file_chunk(
     transfer_id: [u8; 16],
     chunk_index: u32,
@@ -427,7 +439,7 @@ async fn apply_incoming_file_chunk(
     now: &str,
     incoming_transfers: &mut HashMap<[u8; 16], file_transfer::IncomingTransfer>,
     event_tx: &mpsc::Sender<NetworkEvent>,
-) {
+) -> Option<([u8; 16], bool)> {
     let done = if let Some(inc) = incoming_transfers.get_mut(&transfer_id) {
         inc.receive_chunk(chunk_index, data)
     } else {
@@ -439,6 +451,7 @@ async fn apply_incoming_file_chunk(
         false
     };
 
+    let mut voice_outcome: Option<([u8; 16], bool)> = None;
     if let Some(inc) = incoming_transfers.get(&transfer_id) {
         let recv = inc.received_count;
         let total = inc.total_chunks;
@@ -468,6 +481,13 @@ async fn apply_incoming_file_chunk(
                         "[{}] ❌ FILE: хэш не совпадает для «{}»!",
                         now, fname
                     );
+                    if file_transfer::is_voice_filename(&fname) {
+                        crate::voice::voice_log(&format!(
+                            "hash mismatch {} — voice_ack(false)",
+                            transfer_id_to_hex(&transfer_id)
+                        ));
+                        voice_outcome = Some((transfer_id, false));
+                    }
                     let _ = event_tx
                         .send(NetworkEvent::FileError {
                             transfer_id,
@@ -500,6 +520,7 @@ async fn apply_incoming_file_chunk(
                                     "received {} -> {}",
                                     fname, saved_to
                                 ));
+                                voice_outcome = Some((transfer_id, true));
                             }
                             let _ = event_tx
                                 .send(NetworkEvent::FileComplete {
@@ -516,6 +537,7 @@ async fn apply_incoming_file_chunk(
                                 crate::voice::voice_log(&format!(
                                     "receive save fail {fname}: {e}"
                                 ));
+                                voice_outcome = Some((transfer_id, false));
                             }
                             let _ = event_tx
                                 .send(NetworkEvent::FileError {
@@ -530,6 +552,7 @@ async fn apply_incoming_file_chunk(
             incoming_transfers.remove(&transfer_id);
         }
     }
+    voice_outcome
 }
 
 pub(crate) enum UICommand {
@@ -2354,8 +2377,13 @@ pub async fn run_chat_network(
                                             .await;
                                     }
                                 }
-                                if !is_retry {
+                                // Атомарность: голосовое групповое не показываем здесь — только
+                                // когда voice_ack(ok=true) придёт от ВСЕХ участников (apply_voice_ack).
+                                // Текстовые групповые сообщения показываем как раньше — сразу.
+                                if !is_retry && !has_voice {
                                     let _ = event_tx.send(NetworkEvent::ChatMessage(msg)).await;
+                                } else {
+                                    let _ = msg;
                                 }
                             }
                             UICommand::SendGroupSync {
@@ -2710,9 +2738,9 @@ pub async fn run_chat_network(
                                             transfer_id,
                                         })
                                         .await;
-                                    if !is_retry {
-                                        let _ = event_tx.send(NetworkEvent::ChatMessage(msg)).await;
-                                    }
+                                    // Атомарность: голосовое не показываем в чате здесь — только
+                                    // после voice_ack(ok=true) от получателя (см. apply_voice_ack).
+                                    let _ = msg;
                                     debug!(
                                         "[{}] ⏳ E2EE: голосовое {} буферизовано до хендшейка с {}",
                                         now,
@@ -2743,9 +2771,10 @@ pub async fn run_chat_network(
                                     )
                                     .await;
                                 }
-                                if !is_retry {
-                                    let _ = event_tx.send(NetworkEvent::ChatMessage(msg)).await;
-                                }
+                                // Атомарность: голосовое не показываем в чате здесь — только
+                                // после voice_ack(ok=true) от получателя (см. apply_voice_ack).
+                                let _ = msg;
+                                let _ = is_retry;
 
                                 start_voice_file_transfer(
                                     &mut swarm,
@@ -3277,7 +3306,7 @@ pub async fn run_chat_network(
                                                                 &plaintext,
                                                             )
                                                         {
-                                                            apply_incoming_file_chunk(
+                                                            let voice_outcome = apply_incoming_file_chunk(
                                                                 tid,
                                                                 idx,
                                                                 pdata,
@@ -3287,6 +3316,25 @@ pub async fn run_chat_network(
                                                                 &event_tx,
                                                             )
                                                             .await;
+                                                            if let Some((vtid, vok)) = voice_outcome {
+                                                                if let Some(ack_json) = build_voice_ack_json(
+                                                                    &transfer_id_to_hex(&vtid),
+                                                                    vok,
+                                                                ) {
+                                                                    let _ = send_encrypted_chat_payload(
+                                                                        &mut swarm,
+                                                                        &mut sessions,
+                                                                        &mut outbound_msg_requests,
+                                                                        &mut outbound_delete_requests,
+                                                                        &event_tx,
+                                                                        peer,
+                                                                        ack_json,
+                                                                        None,
+                                                                        &now,
+                                                                    )
+                                                                    .await;
+                                                                }
+                                                            }
                                                             send_ack = true;
                                                         } else if let Some(frame) =
                                                             parse_decrypted_chat_frame(&plaintext)
@@ -3301,6 +3349,23 @@ pub async fn run_chat_network(
                                                                     let _ = event_tx
                                                                         .send(NetworkEvent::ChatMessage(msg))
                                                                         .await;
+                                                                    send_ack = true;
+                                                                }
+                                                                DecryptedChatFrame::VoiceAck {
+                                                                    transfer_id,
+                                                                    ok,
+                                                                } => {
+                                                                    if let Some(tid) =
+                                                                        transfer_id_from_hex(&transfer_id)
+                                                                    {
+                                                                        let _ = event_tx
+                                                                            .send(NetworkEvent::VoiceAck {
+                                                                                peer,
+                                                                                transfer_id: tid,
+                                                                                ok,
+                                                                            })
+                                                                            .await;
+                                                                    }
                                                                     send_ack = true;
                                                                 }
                                                                 DecryptedChatFrame::Delete {
@@ -3572,7 +3637,7 @@ pub async fn run_chat_network(
                                                             &plaintext,
                                                         )
                                                     {
-                                                        apply_incoming_file_chunk(
+                                                        let voice_outcome = apply_incoming_file_chunk(
                                                             tid,
                                                             idx,
                                                             pdata,
@@ -3582,6 +3647,24 @@ pub async fn run_chat_network(
                                                             &event_tx,
                                                         )
                                                         .await;
+                                                        if let Some((vtid, vok)) = voice_outcome {
+                                                            if let Some(ack_json) =
+                                                                build_voice_ack_json(&transfer_id_to_hex(&vtid), vok)
+                                                            {
+                                                                let _ = send_encrypted_chat_payload(
+                                                                    &mut swarm,
+                                                                    &mut sessions,
+                                                                    &mut outbound_msg_requests,
+                                                                    &mut outbound_delete_requests,
+                                                                    &event_tx,
+                                                                    peer,
+                                                                    ack_json,
+                                                                    None,
+                                                                    &now,
+                                                                )
+                                                                .await;
+                                                            }
+                                                        }
                                                     } else if let Some(frame) =
                                                         parse_decrypted_chat_frame(&plaintext)
                                                     {
@@ -3590,6 +3673,22 @@ pub async fn run_chat_network(
                                                                 let _ = event_tx
                                                                     .send(NetworkEvent::ChatMessage(msg))
                                                                     .await;
+                                                            }
+                                                            DecryptedChatFrame::VoiceAck {
+                                                                transfer_id,
+                                                                ok,
+                                                            } => {
+                                                                if let Some(tid) =
+                                                                    transfer_id_from_hex(&transfer_id)
+                                                                {
+                                                                    let _ = event_tx
+                                                                        .send(NetworkEvent::VoiceAck {
+                                                                            peer,
+                                                                            transfer_id: tid,
+                                                                            ok,
+                                                                        })
+                                                                        .await;
+                                                                }
                                                             }
                                                             DecryptedChatFrame::DeleteAck => {}
                                                             DecryptedChatFrame::Delete { .. } => {}
@@ -4689,7 +4788,9 @@ pub async fn run_chat_network(
                                                 .file_rr
                                                 .send_response(channel, FilePacket::Ack);
                                             // Устаревший путь (plain): совместимость со старыми пирами.
-                                            apply_incoming_file_chunk(
+                                            // Без E2EE-сессии voice_ack не отправить — атомарная
+                                            // доставка голосовых гарантируется только по /void/chat.
+                                            let _ = apply_incoming_file_chunk(
                                                 transfer_id,
                                                 chunk_index,
                                                 data,

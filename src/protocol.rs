@@ -115,6 +115,18 @@ struct ChatReadCommand {
     message_ids: Vec<String>,
 }
 
+/// Подтверждение атомарной доставки голосового: получатель шлёт его ТОЛЬКО
+/// после того, как файл полностью собран и его SHA-256 совпал с заявленным
+/// (см. `apply_incoming_file_chunk`). Отправитель показывает голосовое в чате
+/// не раньше, чем получит `ok: true` — без этого «доставлено» было фикцией
+/// (чек-марка ставилась, как только сам отправитель дослал все чанки).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct VoiceAckCommand {
+    kind: String,
+    transfer_id: String,
+    ok: bool,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 struct GroupSyncCommand {
     kind: String,
@@ -154,6 +166,12 @@ pub(crate) enum DecryptedChatFrame {
     },
     GroupDelete {
         group_id: String,
+    },
+    /// Итог проверки голосового файла на стороне получателя: `ok=true` — SHA-256
+    /// совпал и файл сохранён; `ok=false` — целостность нарушена или сбой записи.
+    VoiceAck {
+        transfer_id: String,
+        ok: bool,
     },
 }
 
@@ -299,6 +317,16 @@ pub(crate) fn build_read_receipt_json(message_ids: &[String]) -> Option<Vec<u8>>
     serde_json::to_vec(&cmd).ok()
 }
 
+pub(crate) fn build_voice_ack_json(transfer_id: &str, ok: bool) -> Option<Vec<u8>> {
+    let tid = transfer_id_from_hex(transfer_id)?;
+    let cmd = VoiceAckCommand {
+        kind: "voice_ack".into(),
+        transfer_id: transfer_id_to_hex(&tid),
+        ok,
+    };
+    serde_json::to_vec(&cmd).ok()
+}
+
 pub(crate) fn chat_message_id_from_json(plaintext: &[u8]) -> Option<String> {
     if plaintext.first() != Some(&b'{') {
         return None;
@@ -342,6 +370,14 @@ pub(crate) fn parse_decrypted_chat_frame(plaintext: &[u8]) -> Option<DecryptedCh
         if cmd.kind == "read" && validate_delete_ids(&cmd.message_ids) {
             return Some(DecryptedChatFrame::Read {
                 message_ids: cmd.message_ids,
+            });
+        }
+    }
+    if let Ok(cmd) = serde_json::from_slice::<VoiceAckCommand>(plaintext) {
+        if cmd.kind == "voice_ack" && transfer_id_from_hex(&cmd.transfer_id).is_some() {
+            return Some(DecryptedChatFrame::VoiceAck {
+                transfer_id: cmd.transfer_id.to_ascii_lowercase(),
+                ok: cmd.ok,
             });
         }
     }

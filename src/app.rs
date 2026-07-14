@@ -145,6 +145,10 @@ pub(crate) struct PendingVoiceSend {
     pub(crate) message_id: String,
     pub(crate) transfer_id: [u8; 16],
     pub(crate) last_attempt: Instant,
+    /// Готовое сообщение чата: показываем его в UI (и пишем в журнал) ТОЛЬКО
+    /// после `voice_ack(ok: true)` от получателя — принцип атомарности: без
+    /// подтверждённой и проверенной доставки голосовое в чат не попадает.
+    pub(crate) chat_message: ChatMessage,
 }
 
 /// Сообщение группового чата в очереди повторной отправки.
@@ -164,6 +168,10 @@ pub(crate) struct PendingGroupSend {
     pub(crate) voice_path: Option<String>,
     pub(crate) voice_duration_secs: f32,
     pub(crate) voice_transfer_id: Option<[u8; 16]>,
+    /// Для голосовых: сообщение показываем в чате только когда `voice_delivered_to`
+    /// покроет всех участников (voice_ack ok=true от каждого) — атомарность доставки.
+    /// `None` для текстовых сообщений (те показываются сразу, без гейта).
+    pub(crate) chat_message: Option<ChatMessage>,
 }
 
 pub(crate) const RESEND_GRACE: Duration = Duration::from_secs(1);
@@ -236,6 +244,12 @@ pub(crate) struct App {
     pub(crate) voice_audio_paths: HashMap<String, String>,
     pub(crate) pending_voice_sends: Vec<PendingVoiceSend>,
     pub(crate) pending_group_sends: Vec<PendingGroupSend>,
+    /// Входящие голосовые, JSON которых уже пришёл, но файл ещё не проверен —
+    /// в чат не показываем (атомарность), пока не подтвердится SHA-256.
+    pub(crate) pending_incoming_voice: Vec<ChatMessage>,
+    /// Файл пришёл и проверен раньше самого JSON-сообщения (переупорядочивание
+    /// сети) — показываем сообщение немедленно, как только оно прилетит.
+    pub(crate) pending_incoming_voice_ready: HashSet<String>,
     /// Групповые чаты (id → метаданные).
     pub(crate) groups: HashMap<String, GroupChat>,
     /// Группы, из которых вышли — не показывать и не принимать новые сообщения.
@@ -367,6 +381,8 @@ impl App {
             voice_audio_paths: HashMap::new(),
             pending_voice_sends: Vec::new(),
             pending_group_sends: Vec::new(),
+            pending_incoming_voice: Vec::new(),
+            pending_incoming_voice_ready: HashSet::new(),
             groups: initial_groups,
             left_groups: initial_left_groups,
             show_create_group: false,
@@ -1380,6 +1396,13 @@ impl App {
                         continue;
                     }
                     if !self.pending_voice_sends.iter().any(|p| p.message_id == message_id) {
+                        let chat_message = self.build_voice_chat_message(
+                            &message_id,
+                            Some(peer.clone()),
+                            None,
+                            &transfer_id,
+                            duration_secs,
+                        );
                         self.pending_voice_sends.push(PendingVoiceSend {
                             peer: pid,
                             path: voice_path.clone(),
@@ -1387,6 +1410,7 @@ impl App {
                             message_id: message_id.clone(),
                             transfer_id: tid,
                             last_attempt: Instant::now(),
+                            chat_message,
                         });
                     }
                     let _ = self.command_tx.try_send(UICommand::SendVoiceMessage {
@@ -1439,6 +1463,7 @@ impl App {
                             voice_path: None,
                             voice_duration_secs: 0.0,
                             voice_transfer_id: None,
+                            chat_message: None,
                         });
                     }
                     let _ = self.command_tx.try_send(UICommand::SendGroupMessage {
@@ -1500,6 +1525,13 @@ impl App {
                         .iter()
                         .any(|p| p.message_id == message_id)
                     {
+                        let chat_message = self.build_voice_chat_message(
+                            &message_id,
+                            None,
+                            Some(group_id.clone()),
+                            &transfer_id,
+                            duration_secs,
+                        );
                         self.pending_group_sends.push(PendingGroupSend {
                             group_id: group_id.clone(),
                             members: member_pids,
@@ -1512,6 +1544,7 @@ impl App {
                             voice_path: Some(voice_path.clone()),
                             voice_duration_secs: duration_secs,
                             voice_transfer_id: Some(tid),
+                            chat_message: Some(chat_message),
                         });
                     }
                     let _ = self.command_tx.try_send(UICommand::SendGroupMessage {
@@ -1597,6 +1630,32 @@ impl App {
                     self.left_groups.contains(&g.id) || self.is_active_group_member(&g.id)
                 })
             })
+    }
+
+    /// Строит голосовое сообщение для очереди отправки. В чат оно попадёт
+    /// только после `voice_ack(ok: true)` — см. `apply_voice_ack`.
+    pub(crate) fn build_voice_chat_message(
+        &self,
+        message_id: &str,
+        recipient_id: Option<String>,
+        group_id: Option<String>,
+        transfer_hex: &str,
+        duration_secs: f32,
+    ) -> ChatMessage {
+        ChatMessage {
+            id: message_id.to_string(),
+            sender_id: self.local_peer_id.to_string(),
+            sender_name: self.local_nickname.clone(),
+            recipient_id,
+            text: String::new(),
+            timestamp: chrono::Local::now().format("%H:%M").to_string(),
+            delivery: OutgoingDeliveryStatus::Pending,
+            voice: Some(VoiceMeta {
+                transfer_id: transfer_hex.to_string(),
+                duration_secs: duration_secs.max(0.1),
+            }),
+            group_id,
+        }
     }
 
     pub(crate) fn ingest_chat_message(&mut self, mut msg: ChatMessage) {
@@ -1815,6 +1874,9 @@ impl App {
                     message_id: msg.id.clone(),
                     transfer_id,
                     last_attempt: Instant::now(),
+                    // Совместимость со старым журналом, где голосовые уже были в
+                    // чате как Pending (до появления атомарного voice_ack).
+                    chat_message: msg.clone(),
                 });
                 let _ = self.command_tx.try_send(UICommand::SendVoiceMessage {
                     sender_name: self.local_nickname.clone(),
@@ -1886,6 +1948,13 @@ impl App {
                 .voice
                 .as_ref()
                 .and_then(|v| transfer_id_from_hex(&v.transfer_id));
+            // Совместимость со старым журналом (голосовое уже было Pending в чате
+            // до появления voice_ack) — новые голосовые сюда не попадают вовсе.
+            let chat_message_for_pending = if msg.voice.is_some() {
+                Some(msg.clone())
+            } else {
+                None
+            };
             self.pending_group_sends.push(PendingGroupSend {
                 group_id: gid.clone(),
                 members,
@@ -1898,6 +1967,7 @@ impl App {
                 voice_path: voice_path.clone(),
                 voice_duration_secs,
                 voice_transfer_id,
+                chat_message: chat_message_for_pending,
             });
             let _ = self.command_tx.try_send(UICommand::SendGroupMessage {
                 sender_name: self.local_nickname.clone(),
@@ -2331,6 +2401,13 @@ impl App {
         duration_secs: f32,
     ) -> Result<(), &'static str> {
         let duration_secs = duration_secs.max(0.1);
+        // Условие 2 атомарности: сообщение должно нести реальные аудио-данные,
+        // а не пустой/битый WAV (44 байта — только заголовок, без сэмплов).
+        let recorded_len = std::fs::metadata(&path).map(|m| m.len()).unwrap_or(0);
+        if recorded_len <= 44 {
+            self.add_status("⚠ Голосовое пустое — запись не содержит аудио".into());
+            return Err("Голосовое сообщение пустое");
+        }
         let mut tid = [0u8; 16];
         rand::thread_rng().fill_bytes(&mut tid);
         let message_id = new_message_id();
@@ -2355,20 +2432,16 @@ impl App {
             duration_secs,
             path_str.clone(),
         );
-        self.ingest_chat_message(ChatMessage {
-            id: message_id.clone(),
-            sender_id: self.local_peer_id.to_string(),
-            sender_name: self.local_nickname.clone(),
-            recipient_id: Some(peer.to_string()),
-            text: String::new(),
-            timestamp: chrono::Local::now().format("%H:%M").to_string(),
-            delivery: OutgoingDeliveryStatus::Pending,
-            voice: Some(VoiceMeta {
-                transfer_id: transfer_hex.clone(),
-                duration_secs,
-            }),
-            group_id: None,
-        });
+        // Атомарность (условия 3+4): сообщение НЕ показываем в чате сразу —
+        // только когда придёт voice_ack(ok=true), т.е. получатель подтвердит,
+        // что файл полностью доставлен и его SHA-256 совпал с отправленным.
+        let chat_message = self.build_voice_chat_message(
+            &message_id,
+            Some(peer.to_string()),
+            None,
+            &transfer_hex,
+            duration_secs,
+        );
         match self.command_tx.try_send(UICommand::SendVoiceMessage {
             sender_name: self.local_nickname.clone(),
             recipient: peer,
@@ -2386,6 +2459,7 @@ impl App {
                     message_id: message_id.clone(),
                     transfer_id: tid,
                     last_attempt: Instant::now(),
+                    chat_message,
                 });
                 Ok(())
             }
@@ -2400,6 +2474,12 @@ impl App {
         duration_secs: f32,
     ) -> Result<(), &'static str> {
         let duration_secs = duration_secs.max(0.1);
+        // Условие 2 атомарности: сообщение должно нести реальные аудио-данные.
+        let recorded_len = std::fs::metadata(&path).map(|m| m.len()).unwrap_or(0);
+        if recorded_len <= 44 {
+            self.add_status("⚠ Голосовое пустое — запись не содержит аудио".into());
+            return Err("Голосовое сообщение пустое");
+        }
         let group = self.groups.get(&group_id).ok_or("Группа не найдена")?;
         let members = group.member_peer_ids();
         let targets: Vec<PeerId> = members
@@ -2435,20 +2515,15 @@ impl App {
             path_str.clone(),
             members.clone(),
         );
-        self.stage_outgoing_message(ChatMessage {
-            id: message_id.clone(),
-            sender_id: self.local_peer_id.to_string(),
-            sender_name: self.local_nickname.clone(),
-            recipient_id: None,
-            text: String::new(),
-            timestamp: chrono::Local::now().format("%H:%M").to_string(),
-            delivery: OutgoingDeliveryStatus::Pending,
-            voice: Some(VoiceMeta {
-                transfer_id: transfer_hex,
-                duration_secs,
-            }),
-            group_id: Some(group_id.clone()),
-        });
+        // Атомарность (условия 3+4): показываем групповое голосовое в чате только
+        // когда voice_ack(ok=true) придёт от ВСЕХ участников — см. apply_voice_ack.
+        let chat_message = self.build_voice_chat_message(
+            &message_id,
+            None,
+            Some(group_id.clone()),
+            &transfer_hex,
+            duration_secs,
+        );
         match self.command_tx.try_send(UICommand::SendGroupMessage {
             sender_name: self.local_nickname.clone(),
             text: String::new(),
@@ -2474,6 +2549,7 @@ impl App {
                     voice_path: Some(path_str),
                     voice_duration_secs: duration_secs,
                     voice_transfer_id: Some(tid),
+                    chat_message: Some(chat_message),
                 });
                 Ok(())
             }
@@ -3304,6 +3380,13 @@ impl App {
                         continue;
                     }
                     if !self.pending_voice_sends.iter().any(|x| x.message_id == message_id) {
+                        let chat_message = self.build_voice_chat_message(
+                            &message_id,
+                            Some(peer.to_string()),
+                            None,
+                            &transfer_id,
+                            duration_secs,
+                        );
                         self.pending_voice_sends.push(PendingVoiceSend {
                             peer,
                             path: voice_path.clone(),
@@ -3311,6 +3394,7 @@ impl App {
                             message_id: message_id.clone(),
                             transfer_id: tid,
                             last_attempt: Instant::now(),
+                            chat_message,
                         });
                     }
                     let _ = self.command_tx.try_send(UICommand::SendVoiceMessage {
@@ -3390,6 +3474,7 @@ impl App {
                             voice_path: None,
                             voice_duration_secs: 0.0,
                             voice_transfer_id: None,
+                            chat_message: None,
                         });
                     }
                     let _ = self.command_tx.try_send(UICommand::SendGroupMessage {
@@ -3451,6 +3536,13 @@ impl App {
                         .iter()
                         .any(|p| p.message_id == message_id)
                     {
+                        let chat_message = self.build_voice_chat_message(
+                            &message_id,
+                            None,
+                            Some(group_id.clone()),
+                            &transfer_id,
+                            duration_secs,
+                        );
                         self.pending_group_sends.push(PendingGroupSend {
                             group_id: group_id.clone(),
                             members: member_pids,
@@ -3463,6 +3555,7 @@ impl App {
                             voice_path: Some(voice_path.clone()),
                             voice_duration_secs: duration_secs,
                             voice_transfer_id: Some(tid),
+                            chat_message: Some(chat_message),
                         });
                     }
                     let _ = self.command_tx.try_send(UICommand::SendGroupMessage {
@@ -3510,6 +3603,7 @@ impl App {
         );
         let me = self.local_peer_id;
         let mut remove = false;
+        let mut ready_voice: Option<ChatMessage> = None;
         if let Some(idx) = self
             .pending_group_sends
             .iter()
@@ -3530,21 +3624,33 @@ impl App {
             } else {
                 needed.is_subset(&pending.delivered_to)
             };
+            // Условие «доставлено всем» для голосового может завершиться и здесь
+            // (текстовый Ack — последний), а не только в apply_voice_ack — тогда
+            // именно тут нужно наконец показать сообщение (принцип атомарности).
+            if remove && has_voice {
+                ready_voice = pending.chat_message.clone();
+            }
         }
         if remove {
+            if let Some(mut msg) = ready_voice {
+                msg.delivery = OutgoingDeliveryStatus::Delivered;
+                self.ingest_chat_message(msg);
+            }
             self.pending_group_sends
                 .retain(|p| p.message_id != message_id);
             self.remove_outbox_group_message(message_id);
         }
     }
 
+    /// Вызывается только по `voice_ack(ok=true)` конкретного участника. Когда
+    /// подтвердят ВСЕ участники группы (атомарность) — показываем сообщение в чате.
     pub(crate) fn mark_group_voice_file_delivered(
         &mut self,
         peer: PeerId,
         transfer_id: &[u8; 16],
     ) {
         let me = self.local_peer_id;
-        let mut done_ids: Vec<String> = Vec::new();
+        let mut done: Vec<(String, ChatMessage)> = Vec::new();
         for pending in &mut self.pending_group_sends {
             let Some(base_tid) = pending.voice_transfer_id else {
                 continue;
@@ -3563,13 +3669,68 @@ impl App {
             if needed.is_subset(&pending.delivered_to)
                 && needed.is_subset(&pending.voice_delivered_to)
             {
-                done_ids.push(pending.message_id.clone());
+                if let Some(ref msg) = pending.chat_message {
+                    done.push((pending.message_id.clone(), msg.clone()));
+                }
             }
         }
-        for message_id in done_ids {
+        for (message_id, mut msg) in done {
+            msg.delivery = OutgoingDeliveryStatus::Delivered;
+            self.ingest_chat_message(msg);
             self.pending_group_sends
                 .retain(|p| p.message_id != message_id);
             self.remove_outbox_group_message(&message_id);
+        }
+    }
+
+    /// Итог атомарной доставки голосового (условия 3+4): получатель проверил
+    /// SHA-256 собранного файла и подтвердил (или отверг) целостность.
+    /// Только по `ok: true` голосовое появляется в чате отправителя.
+    pub(crate) fn apply_voice_ack(&mut self, peer: PeerId, transfer_id: [u8; 16], ok: bool) {
+        if let Some(idx) = self
+            .pending_voice_sends
+            .iter()
+            .position(|p| p.peer == peer && p.transfer_id == transfer_id)
+        {
+            if ok {
+                let mut msg = self.pending_voice_sends[idx].chat_message.clone();
+                msg.delivery = OutgoingDeliveryStatus::Delivered;
+                self.ingest_chat_message(msg);
+                self.complete_pending_voice_send_by_transfer(&transfer_id);
+            } else {
+                // Целостность не подтвердилась (или сбой записи у получателя) —
+                // форсируем скорый повтор вместо ожидания обычного интервала.
+                let accel = Instant::now() - Duration::from_secs(3600);
+                if let Some(p) = self.pending_voice_sends.get_mut(idx) {
+                    p.last_attempt = accel;
+                }
+                crate::voice::voice_log(&format!(
+                    "voice_ack(false) direct {} — форсирую повтор",
+                    transfer_id_to_hex(&transfer_id)
+                ));
+            }
+            return;
+        }
+        if ok {
+            self.mark_group_voice_file_delivered(peer, &transfer_id);
+        } else {
+            let accel = Instant::now() - Duration::from_secs(3600);
+            let mut hit = false;
+            for p in self.pending_group_sends.iter_mut() {
+                if let Some(base) = p.voice_transfer_id {
+                    if per_peer_voice_transfer_id(&base, peer) == transfer_id {
+                        p.last_send_at = accel;
+                        hit = true;
+                    }
+                }
+            }
+            if hit {
+                crate::voice::voice_log(&format!(
+                    "voice_ack(false) group {} от {} — форсирую повтор",
+                    transfer_id_to_hex(&transfer_id),
+                    &peer.to_string()[..8]
+                ));
+            }
         }
     }
 
