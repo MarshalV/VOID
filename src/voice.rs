@@ -1462,6 +1462,8 @@ fn linux_write_pcm_and_wait(
         .stdin
         .take()
         .ok_or_else(|| format!("{label}: нет stdin"))?;
+    let started = Instant::now();
+    let expected_secs = pcm.len() as f32 / VOICE_SAMPLE_RATE as f32;
     const CHUNK_FRAMES: usize = 2048;
     let mut offset = 0usize;
     while offset < pcm.len() {
@@ -1494,8 +1496,19 @@ fn linux_write_pcm_and_wait(
         }
         match child.try_wait() {
             Ok(Some(status)) if status.success() => {
+                let elapsed = started.elapsed().as_secs_f32();
+                // Плеер отчитался «успехом» заметно быстрее, чем реально длится
+                // клип — похоже, он не доиграл (буферизовал и вышел), а не
+                // воспроизвёл. Не верим такому «успеху», пробуем следующий плеер.
+                if expected_secs > 0.4 && elapsed < expected_secs * 0.5 {
+                    let msg = format!(
+                        "{label}: подозрительно быстрый выход ({elapsed:.2}s при ожидаемых {expected_secs:.2}s) — считаю неуспехом"
+                    );
+                    voice_log(&msg);
+                    return Err(msg);
+                }
                 frame_pos.store(start_frame + pcm.len(), Ordering::Relaxed);
-                voice_log(&format!("play done ({label})"));
+                voice_log(&format!("play done ({label}, {elapsed:.2}s)"));
                 return Ok(());
             }
             Ok(Some(status)) => {
@@ -1735,10 +1748,15 @@ fn linux_wait_player(
         }
         match child.try_wait() {
             Ok(Some(status)) if status.success() => {
-                voice_log(&format!(
-                    "play done ({label}, {:.2}s)",
-                    started.elapsed().as_secs_f32()
-                ));
+                let elapsed = started.elapsed().as_secs_f32();
+                if expect_secs > 0.4 && elapsed < expect_secs * 0.5 {
+                    let msg = format!(
+                        "{label}: подозрительно быстрый выход ({elapsed:.2}s при ожидаемых {expect_secs:.2}s) — считаю неуспехом"
+                    );
+                    voice_log(&msg);
+                    return Err(msg);
+                }
+                voice_log(&format!("play done ({label}, {elapsed:.2}s)"));
                 return Ok(());
             }
             Ok(Some(status)) => {
@@ -2056,13 +2074,30 @@ fn play_wav_cpal_device(
         return Err("поток не воспроизводит (тишина)".into());
     }
 
-    while frame_pos.load(Ordering::Relaxed) < total_frames {
+    // Некоторые ALSA/PipeWire-плагины отдают весь буфер аудио-callback'у почти
+    // мгновенно (не в реальном темпе) — если ориентироваться только на frame_pos,
+    // поток обрывается (drop) раньше, чем железо реально успевает его доиграть,
+    // и звук не слышен вовсе. Поэтому держим поток живым не меньше реальной
+    // длительности клипа по wall-clock, независимо от того, что говорит frame_pos.
+    let played_frames = total_frames.saturating_sub(start_frame);
+    let expected_secs = played_frames as f32 / out_rate.max(1) as f32;
+    let min_hold = Instant::now();
+    loop {
+        let frames_done = frame_pos.load(Ordering::Relaxed) >= total_frames;
+        let time_done = min_hold.elapsed().as_secs_f32() >= expected_secs;
+        if frames_done && time_done {
+            break;
+        }
         if stop_flag.load(Ordering::Relaxed) {
             voice_log("play stopped (cpal)");
             return Ok(());
         }
         std::thread::sleep(Duration::from_millis(15));
     }
+    voice_log(&format!(
+        "play done (cpal hold, {:.2}s expected)",
+        expected_secs
+    ));
     Ok(())
 }
 
