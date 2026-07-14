@@ -1499,6 +1499,7 @@ const LINUX_PAPLAY_ARGS: &[&str] = &[
 #[cfg(target_os = "linux")]
 const LINUX_PW_CAT_ARGS: &[&str] = &[
     "-p",
+    "--raw",
     "--rate",
     "48000",
     "--channels",
@@ -1722,6 +1723,13 @@ fn play_wav_linux_file_fallback(
     let stamp = chrono::Local::now().format("%Y%m%d_%H%M%S_%f");
     let tmp = std::env::temp_dir().join(format!("void_play_{stamp}.wav"));
     write_wav_mono(&tmp, pcm, VOICE_SAMPLE_RATE)?;
+    // Файл создаётся текущим (часто root) пользователем, а проигрывать его может
+    // другой юзер desktop-сессии через `runuser` — без этого при строгом umask
+    // (напр. 077 у root) чтение упадёт с Permission denied.
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let _ = std::fs::set_permissions(&tmp, std::fs::Permissions::from_mode(0o644));
+    }
     voice_log(&format!("playback wav fallback {}", tmp.display()));
     let result = play_wav_linux_file_inner(&tmp, stop_flag, duration);
     let _ = std::fs::remove_file(&tmp);
