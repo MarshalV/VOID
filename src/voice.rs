@@ -386,6 +386,10 @@ pub(crate) fn run_cli_mode() -> Option<i32> {
             };
             Some(code)
         }
+        Some("--voice-diag") => {
+            println!("{}", build_diagnostic_report());
+            Some(0)
+        }
         Some("--voice-record") => {
             let out = args.get(2).cloned().unwrap_or_default();
             let stop = args.get(3).cloned().unwrap_or_default();
@@ -484,6 +488,93 @@ pub(crate) fn probe_microphone() -> Result<String, String> {
         .map_err(|e| format!("Профиль микрофона: {e}"))?;
     voice_log(&format!("probe ok: {name}"));
     Ok(name)
+}
+
+/// Полный дамп аудио-окружения для диагностики (`--voice-diag`): какие внешние
+/// плееры/рекордеры найдены, какие desktop-сессии обнаружены, что видит cpal
+/// (устройства входа/выхода). Позволяет понять причину без доступа к машине.
+fn build_diagnostic_report() -> String {
+    let mut out = String::new();
+    out.push_str(&format!("OS: {}\n", std::env::consts::OS));
+    out.push_str(&format!("VOID_BUILD: {VOICE_BUILD}\n\n"));
+
+    #[cfg(target_os = "linux")]
+    {
+        out.push_str("--- Linux: внешние инструменты ---\n");
+        for tool in ["pw-record", "parecord", "paplay", "pw-cat", "pw-play", "aplay", "runuser"] {
+            let found = Command::new(tool).arg("--version").output().is_ok()
+                || Command::new("which").arg(tool).output().is_ok_and(|o| o.status.success());
+            out.push_str(&format!("  {tool}: {}\n", if found { "найден" } else { "НЕ найден" }));
+        }
+        out.push_str(&format!("  запущено как root: {}\n", running_as_root()));
+        out.push_str(&format!(
+            "  USER={:?} XDG_RUNTIME_DIR={:?} PULSE_SERVER={:?}\n",
+            std::env::var("USER").unwrap_or_default(),
+            std::env::var("XDG_RUNTIME_DIR").unwrap_or_default(),
+            std::env::var("PULSE_SERVER").unwrap_or_default(),
+        ));
+
+        out.push_str("\n--- Linux: desktop-сессии (/run/user/<uid>/pulse/native) ---\n");
+        let sessions = linux_desktop_sessions();
+        if sessions.is_empty() {
+            out.push_str("  НЕ найдено ни одной сессии с работающим PulseAudio/PipeWire socket.\n");
+            out.push_str("  (нормально для SSH/headless-сессии без залогиненного desktop; для звука\n");
+            out.push_str("   там нужен виртуальный sink или запуск pipewire/pulseaudio вручную.)\n");
+        } else {
+            for s in &sessions {
+                out.push_str(&format!(
+                    "  user={} runtime_dir={} pulse={}\n",
+                    s.username,
+                    s.runtime_dir.display(),
+                    s.pulse_server
+                ));
+            }
+        }
+
+        out.push_str(&format!(
+            "\n  всего наборов env для fallback-запуска плееров/рекордеров: {}\n",
+            linux_env_sets().len()
+        ));
+    }
+
+    out.push_str("\n--- cpal (ALSA/системный аудио-стек) ---\n");
+    let host = audio_host();
+    out.push_str(&format!("  host: {:?}\n", host.id()));
+    match host.default_input_device() {
+        Some(d) => {
+            out.push_str(&format!(
+                "  default input: {} config={:?}\n",
+                d.name().unwrap_or_default(),
+                d.default_input_config()
+            ));
+        }
+        None => out.push_str("  default input: НЕ найден\n"),
+    }
+    match host.default_output_device() {
+        Some(d) => {
+            out.push_str(&format!(
+                "  default output: {} config={:?}\n",
+                d.name().unwrap_or_default(),
+                d.default_output_config()
+            ));
+        }
+        None => out.push_str("  default output: НЕ найден\n"),
+    }
+    match host.devices() {
+        Ok(devs) => {
+            out.push_str("  все устройства:\n");
+            for d in devs {
+                let name = d.name().unwrap_or_else(|_| "?".into());
+                let is_in = d.default_input_config().is_ok();
+                let is_out = d.default_output_config().is_ok();
+                out.push_str(&format!(
+                    "    - {name} (in={is_in} out={is_out})\n"
+                ));
+            }
+        }
+        Err(e) => out.push_str(&format!("  перечисление устройств: ошибка {e}\n")),
+    }
+    out
 }
 
 pub(crate) fn voice_log(msg: &str) {
