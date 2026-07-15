@@ -2208,6 +2208,16 @@ impl App {
         if path.trim().is_empty() {
             return;
         }
+        let key_probe = transfer_id_hex.to_ascii_lowercase();
+        // Этот путь дёргается из цикла отрисовки чата на КАЖДЫЙ кадр для каждого
+        // голосового пузыря (пока играет прогресс-бар — сотни раз в секунду).
+        // Без этой проверки тут на каждый кадр летит canonicalize() + запись в
+        // лог — это грузит диск/CPU настолько, что может мешать самому
+        // воспроизведению звука. Файл после скачивания не переезжает, поэтому
+        // раз найденный путь можно просто закэшировать и не перепроверять.
+        if self.voice_audio_paths.contains_key(&key_probe) {
+            return;
+        }
         let mut p = std::path::PathBuf::from(&path);
         if p.is_relative() {
             if let Ok(cwd) = std::env::current_dir() {

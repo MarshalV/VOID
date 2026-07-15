@@ -3612,10 +3612,23 @@ impl eframe::App for App {
                                                 );
                                             }
                                             if let Some(ref voice) = msg.voice {
-                                                self.relink_voice_transfer_candidates(&voice.transfer_id);
-                                                let has_audio =
+                                                let mut has_audio =
                                                     self.resolve_voice_path(&voice.transfer_id)
                                                         .is_some();
+                                                if !has_audio {
+                                                    // Полное переиндексирование каталога голосовых —
+                                                    // дорогая операция (read_dir + stat на каждый
+                                                    // файл). Раньше она дёргалась на КАЖДЫЙ кадр для
+                                                    // каждого голосового пузыря, что грузило
+                                                    // диск/CPU до отказа звука. Теперь — только пока
+                                                    // файл реально не найден.
+                                                    self.relink_voice_transfer_candidates(
+                                                        &voice.transfer_id,
+                                                    );
+                                                    has_audio = self
+                                                        .resolve_voice_path(&voice.transfer_id)
+                                                        .is_some();
+                                                }
                                                 let is_playing = self
                                                     .voice_player
                                                     .is_playing(&voice.transfer_id);
