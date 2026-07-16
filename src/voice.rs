@@ -1073,6 +1073,10 @@ pub(crate) struct VoicePlayer {
     frame_pos: Option<Arc<AtomicUsize>>,
     total_frames: usize,
     duration_secs: f32,
+    /// Старт текущего play/seek — визуальный прогресс идёт по wall-clock,
+    /// а не по `frame_pos` (на Linux paplay/cpal часто «съедают» буфер мгновенно).
+    play_started_at: Option<Instant>,
+    play_start_ratio: f32,
 }
 
 impl VoicePlayer {
@@ -1085,6 +1089,8 @@ impl VoicePlayer {
             frame_pos: None,
             total_frames: 0,
             duration_secs: 0.0,
+            play_started_at: None,
+            play_start_ratio: 0.0,
         }
     }
 
@@ -1100,11 +1106,13 @@ impl VoicePlayer {
 
     /// Доля пройденного времени [0..1] для активного голосового.
     pub(crate) fn progress_ratio(&self, transfer_id: &str) -> Option<f32> {
-        if !self.is_playing(transfer_id) || self.total_frames == 0 {
+        if !self.is_playing(transfer_id) || self.duration_secs <= 0.0 {
             return None;
         }
-        let pos = self.frame_pos.as_ref()?.load(Ordering::Relaxed);
-        Some((pos as f32 / self.total_frames as f32).clamp(0.0, 1.0))
+        let started = self.play_started_at?;
+        let absolute =
+            self.play_start_ratio * self.duration_secs + started.elapsed().as_secs_f32();
+        Some((absolute / self.duration_secs).clamp(0.0, 1.0))
     }
 
     /// `true` = запущено, `false` = остановлено.
@@ -1136,7 +1144,8 @@ impl VoicePlayer {
 
         let duration_secs = wav_duration(path).unwrap_or(0.0);
         self.total_frames = playback_pcm_frames(path).unwrap_or(0);
-        let start_frame = (self.total_frames as f32 * start_ratio.clamp(0.0, 1.0)) as usize;
+        let ratio = start_ratio.clamp(0.0, 1.0);
+        let start_frame = (self.total_frames as f32 * ratio) as usize;
         let stop_flag = Arc::new(AtomicBool::new(false));
         let frame_pos = Arc::new(AtomicUsize::new(start_frame));
         let (done_tx, done_rx) = mpsc::channel();
@@ -1145,9 +1154,10 @@ impl VoicePlayer {
         self.done_rx = Some(done_rx);
         self.playing_id = Some(tid);
         self.duration_secs = duration_secs;
+        self.play_started_at = Some(Instant::now());
+        self.play_start_ratio = ratio;
 
         let path = path.to_path_buf();
-        let ratio = start_ratio.clamp(0.0, 1.0);
         std::thread::spawn(move || {
             let result = play_wav_file(&path, &stop_flag, ratio, frame_pos);
             let _ = done_tx.send(result);
@@ -1166,6 +1176,8 @@ impl VoicePlayer {
         self.playing_id = None;
         self.frame_pos = None;
         self.total_frames = 0;
+        self.play_started_at = None;
+        self.play_start_ratio = 0.0;
     }
 
     pub(crate) fn poll(&mut self) {
@@ -1180,6 +1192,8 @@ impl VoicePlayer {
         self.frame_pos = None;
         self.playing_id = None;
         self.total_frames = 0;
+        self.play_started_at = None;
+        self.play_start_ratio = 0.0;
         if let Err(e) = result {
             self.last_error = Some(e);
         }
