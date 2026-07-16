@@ -1292,6 +1292,15 @@ fn linux_run_as_user_capture(
 #[cfg(target_os = "linux")]
 fn linux_desktop_sessions() -> Vec<LinuxDesktopSession> {
     let mut sessions = Vec::new();
+    // Обход через `runuser -u <user> -- ...` нужен ТОЛЬКО когда сам процесс
+    // запущен от root и должен дотянуться до desktop-сессии обычного
+    // пользователя. Если мы уже не root (рекомендуемый режим — запуск от
+    // обычного пользователя напрямую), runuser попытки гарантированно
+    // проваливаются (нет прав на переключение пользователя) и только тратят
+    // время перед реальной прямой попыткой воспроизведения — пропускаем.
+    if !running_as_root() {
+        return sessions;
+    }
     let Ok(entries) = std::fs::read_dir("/run/user") else {
         return sessions;
     };
@@ -1497,10 +1506,16 @@ fn linux_write_pcm_and_wait(
         match child.try_wait() {
             Ok(Some(status)) if status.success() => {
                 let elapsed = started.elapsed().as_secs_f32();
-                // Плеер отчитался «успехом» заметно быстрее, чем реально длится
-                // клип — похоже, он не доиграл (буферизовал и вышел), а не
-                // воспроизвёл. Не верим такому «успеху», пробуем следующий плеер.
-                if expected_secs > 0.4 && elapsed < expected_secs * 0.5 {
+                // Порог как в проверенной рабочей версии: считаем успехом, если
+                // процесс прожил хотя бы ~35% ожидаемой длительности (более
+                // строгий порог 50% на практике отбраковывал реально успешные
+                // быстрые завершения плеера и ломал воспроизведение).
+                let min_alive = if expected_secs > 0.4 {
+                    (expected_secs * 0.35).min(expected_secs - 0.15).max(0.08)
+                } else {
+                    0.04
+                };
+                if elapsed + 0.05 < min_alive {
                     let msg = format!(
                         "{label}: подозрительно быстрый выход ({elapsed:.2}s при ожидаемых {expected_secs:.2}s) — считаю неуспехом"
                     );
@@ -1749,7 +1764,12 @@ fn linux_wait_player(
         match child.try_wait() {
             Ok(Some(status)) if status.success() => {
                 let elapsed = started.elapsed().as_secs_f32();
-                if expect_secs > 0.4 && elapsed < expect_secs * 0.5 {
+                let min_alive = if expect_secs > 0.4 {
+                    (expect_secs * 0.35).min(expect_secs - 0.15).max(0.08)
+                } else {
+                    0.04
+                };
+                if elapsed + 0.05 < min_alive {
                     let msg = format!(
                         "{label}: подозрительно быстрый выход ({elapsed:.2}s при ожидаемых {expect_secs:.2}s) — считаю неуспехом"
                     );
