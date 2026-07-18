@@ -10,6 +10,14 @@ use crate::offline_mail::OfflineEnvelope;
 
 const FILE: &str = "relay_mailbox.bin";
 const MAX_PER_RECIPIENT: usize = 256;
+/// Голосовые чанки — большие, поэтому помимо счётчика конвертов ограничиваем
+/// суммарный объём на одного адресата (иначе один длинный voice завалит диск
+/// relay/bootstrap-ноды). Старые конверты вытесняются первыми.
+const MAX_BYTES_PER_RECIPIENT: usize = 32 * 1024 * 1024;
+
+fn envelope_len(env: &OfflineEnvelope) -> usize {
+    env.ct.len() + 96
+}
 
 #[derive(Default, Serialize, Deserialize)]
 struct RelayData {
@@ -25,9 +33,17 @@ impl RelayMailbox {
             return HashMap::new();
         }
         match std::fs::read(FILE) {
-            Ok(bytes) => serde_json::from_slice::<RelayData>(&bytes)
-                .map(|d| d.by_recipient)
-                .unwrap_or_default(),
+            Ok(bytes) => {
+                // bincode — компактнее JSON для бинарных полей (важно для
+                // голосовых чанков); при апгрейде со старого файла — fallback на JSON.
+                if let Ok(d) = bincode::deserialize::<RelayData>(&bytes) {
+                    d.by_recipient
+                } else {
+                    serde_json::from_slice::<RelayData>(&bytes)
+                        .map(|d| d.by_recipient)
+                        .unwrap_or_default()
+                }
+            }
             Err(_) => HashMap::new(),
         }
     }
@@ -36,7 +52,7 @@ impl RelayMailbox {
         let data = RelayData {
             by_recipient: map.clone(),
         };
-        let bytes = serde_json::to_vec(&data)?;
+        let bytes = bincode::serialize(&data)?;
         std::fs::write(format!("{FILE}.tmp"), &bytes)?;
         if Path::new(FILE).exists() {
             let _ = std::fs::remove_file(format!("{FILE}.bak"));
@@ -63,6 +79,11 @@ impl RelayMailbox {
         if slot.len() > MAX_PER_RECIPIENT {
             let drop = slot.len() - MAX_PER_RECIPIENT;
             slot.drain(0..drop);
+            changed = true;
+        }
+        let mut total: usize = slot.iter().map(envelope_len).sum();
+        while total > MAX_BYTES_PER_RECIPIENT && !slot.is_empty() {
+            total -= envelope_len(&slot.remove(0));
             changed = true;
         }
         changed

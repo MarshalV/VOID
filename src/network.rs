@@ -24,7 +24,7 @@ use crate::crypto;
 use crate::file_transfer;
 use crate::offline_mail::{
     decode_mailbox, encode_mailbox, mailbox_record_key, prekey_record_key, seal_for_recipient,
-    OfflineEnvelope, MAILBOX_TTL_SECS,
+    OfflineEnvelope, MAILBOX_TTL_SECS, OFFLINE_VOICE_CHUNK_KIND,
 };
 use crate::relay_mailbox::RelayMailbox;
 use crate::protocol::{
@@ -696,6 +696,17 @@ fn signal_publish_done(done: &Option<PublishDone>) {
     if let Some(d) = done {
         d();
     }
+}
+
+/// Голосовые чанки (аудио офлайн-доставки) не годятся для DHT-записи почтового
+/// ящика — та ограничена ~64 КБ на весь ящик получателя (см. mailbox_record_key).
+/// Они всё равно доходят через relay/bootstrap store-and-forward (`publish_relay_mail`).
+fn dht_eligible_envelopes(envelopes: &[OfflineEnvelope]) -> Vec<OfflineEnvelope> {
+    envelopes
+        .iter()
+        .filter(|e| e.kind != OFFLINE_VOICE_CHUNK_KIND)
+        .cloned()
+        .collect()
 }
 
 fn publish_self_prekey(
@@ -2890,11 +2901,12 @@ pub async fn run_chat_network(
                                             recipient,
                                             &sealed,
                                         );
+                                        let for_dht = dht_eligible_envelopes(&sealed);
                                         start_mailbox_merge_put(
                                             &mut swarm,
                                             &mut pending_kad_mail,
                                             recipient,
-                                            sealed,
+                                            for_dht,
                                             done_gate.clone(),
                                         );
                                     }
@@ -4405,23 +4417,24 @@ pub async fn run_chat_network(
                                                                 RelayMailbox::save(&relay_mail_store);
                                                         }
                                                         publish_relay_mail(
-                                                            &mut swarm,
-                                                            &bootstrap_peer_ids,
-                                                            &void_bootstraps,
-                                                            local_peer_id,
-                                                            recipient,
-                                                            &sealed,
-                                                        );
-                                                        start_mailbox_merge_put(
-                                                            &mut swarm,
-                                                            &mut pending_kad_mail,
-                                                            recipient,
-                                                            sealed,
-                                                            done,
-                                                        );
-                                                    } else {
-                                                        signal_publish_done(&done);
-                                                    }
+                                            &mut swarm,
+                                            &bootstrap_peer_ids,
+                                            &void_bootstraps,
+                                            local_peer_id,
+                                            recipient,
+                                            &sealed,
+                                        );
+                                        let for_dht = dht_eligible_envelopes(&sealed);
+                                        start_mailbox_merge_put(
+                                            &mut swarm,
+                                            &mut pending_kad_mail,
+                                            recipient,
+                                            for_dht,
+                                            done,
+                                        );
+                                    } else {
+                                        signal_publish_done(&done);
+                                    }
                                                 } else {
                                                     signal_publish_done(&done);
                                                     let _ = event_tx

@@ -24,7 +24,10 @@ use crate::group::{
     is_group_thread, parse_group_thread_key, parse_invite_link, GroupChat, GroupMember,
 };
 use crate::network::{run_chat_network, NetworkEvent, OfflineOutboxItem, UICommand};
-use crate::offline_mail::{open_envelope, OfflineEnvelope};
+use crate::offline_mail::{
+    assemble_voice_chunks, decode_voice_chunk_payload, open_envelope, split_voice_for_offline,
+    OfflineEnvelope, OFFLINE_VOICE_CHUNK_KIND,
+};
 use crate::outbox::{Outbox, OutboxEntry};
 use crate::protocol::{
     build_group_sync_json, new_message_id, parse_decrypted_chat_frame,
@@ -218,7 +221,9 @@ pub(crate) struct PendingFileSend {
     pub(crate) last_attempt: Instant,
 }
 
-/// Голосовое сообщение в очереди до E2EE-сессии.
+/// Голосовое сообщение в очереди до E2EE-сессии / живой file-transfer.
+/// Само сообщение уже в чате (как у текста): живой VoiceAck только обновляет
+/// статус доставки; офлайн-доставка аудио идёт через outbox → voice_chunk.
 #[derive(Clone)]
 pub(crate) struct PendingVoiceSend {
     pub(crate) peer: PeerId,
@@ -227,10 +232,16 @@ pub(crate) struct PendingVoiceSend {
     pub(crate) message_id: String,
     pub(crate) transfer_id: [u8; 16],
     pub(crate) last_attempt: Instant,
-    /// Готовое сообщение чата: показываем его в UI (и пишем в журнал) ТОЛЬКО
-    /// после `voice_ack(ok: true)` от получателя — принцип атомарности: без
-    /// подтверждённой и проверенной доставки голосовое в чат не попадает.
+    /// Сохраняем для восстановления UI/журнала при ретраях.
+    #[allow(dead_code)]
     pub(crate) chat_message: ChatMessage,
+}
+
+/// Сборка WAV из офлайн-чанков (`voice_chunk`), пока не пришли все куски.
+struct OfflineVoiceAssembly {
+    total: u32,
+    total_size: u32,
+    chunks: HashMap<u32, Vec<u8>>,
 }
 
 /// Сообщение группового чата в очереди повторной отправки.
@@ -250,14 +261,10 @@ pub(crate) struct PendingGroupSend {
     pub(crate) voice_path: Option<String>,
     pub(crate) voice_duration_secs: f32,
     pub(crate) voice_transfer_id: Option<[u8; 16]>,
-    /// Для голосовых: сообщение показываем в чате только когда `voice_delivered_to`
-    /// покроет всех участников (voice_ack ok=true от каждого) — атомарность доставки.
-    /// `None` для текстовых сообщений (те показываются сразу, без гейта).
+    /// Для голосовых: сообщение уже показано отправителю сразу (как текст);
+    /// флаг `voice_shown` остаётся для совместимости с живым VoiceAck-путём.
     pub(crate) chat_message: Option<ChatMessage>,
-    /// `true` — голосовое уже показано в чате отправителя (атомарность подтверждена
-    /// хотя бы одним участником). Без этого флага один недоступный участник группы
-    /// блокировал бы отображение сообщения навечно (ждали ACK от ВСЕХ сразу).
-    /// Рассылка/повторы остальным участникам продолжаются независимо от флага.
+    /// `true` — голосовое уже в чате отправителя.
     pub(crate) voice_shown: bool,
 }
 
@@ -331,12 +338,14 @@ pub(crate) struct App {
     pub(crate) voice_audio_paths: HashMap<String, String>,
     pub(crate) pending_voice_sends: Vec<PendingVoiceSend>,
     pub(crate) pending_group_sends: Vec<PendingGroupSend>,
-    /// Входящие голосовые, JSON которых уже пришёл, но файл ещё не проверен —
-    /// в чат не показываем (атомарность), пока не подтвердится SHA-256.
+    /// Входящие голосовые, JSON которых уже пришёл, но файл ещё не на диске —
+    /// в чат не показываем, пока WAV не собран (живой transfer или offline chunks).
     pub(crate) pending_incoming_voice: Vec<ChatMessage>,
     /// Файл пришёл и проверен раньше самого JSON-сообщения (переупорядочивание
     /// сети) — показываем сообщение немедленно, как только оно прилетит.
     pub(crate) pending_incoming_voice_ready: HashSet<String>,
+    /// Сборка офлайн voice_chunk по transfer_id (hex).
+    pending_offline_voice: HashMap<String, OfflineVoiceAssembly>,
     /// Групповые чаты (id → метаданные).
     pub(crate) groups: HashMap<String, GroupChat>,
     /// Группы, из которых вышли — не показывать и не принимать новые сообщения.
@@ -470,6 +479,7 @@ impl App {
             pending_group_sends: Vec::new(),
             pending_incoming_voice: Vec::new(),
             pending_incoming_voice_ready: HashSet::new(),
+            pending_offline_voice: HashMap::new(),
             groups: initial_groups,
             left_groups: initial_left_groups,
             show_create_group: false,
@@ -1097,7 +1107,7 @@ impl App {
                     message_id,
                     transfer_id,
                     duration_secs,
-                    ..
+                    voice_path,
                 } => {
                     let Ok(recipient) = peer.parse::<PeerId>() else {
                         continue;
@@ -1123,6 +1133,9 @@ impl App {
                             kind: "dm".into(),
                             payload,
                         });
+                    }
+                    if let Some(tid) = transfer_id_from_hex(transfer_id) {
+                        Self::push_offline_voice_chunks(&mut items, recipient, &tid, voice_path);
                     }
                 }
                 OutboxEntry::GroupMessage {
@@ -1164,8 +1177,8 @@ impl App {
                     message_id,
                     transfer_id,
                     duration_secs,
+                    voice_path,
                     members,
-                    ..
                 } => {
                     for peer_str in members {
                         let Ok(recipient) = peer_str.parse::<PeerId>() else {
@@ -1198,6 +1211,12 @@ impl App {
                                 payload,
                             });
                         }
+                        Self::push_offline_voice_chunks(
+                            &mut items,
+                            recipient,
+                            &peer_tid,
+                            voice_path,
+                        );
                     }
                 }
                 OutboxEntry::GroupSync {
@@ -1229,6 +1248,45 @@ impl App {
         items
     }
 
+    /// Кладёт зашифрованные куски WAV в offline-очередь (relay; DHT их не берёт).
+    fn push_offline_voice_chunks(
+        items: &mut Vec<OfflineOutboxItem>,
+        recipient: PeerId,
+        transfer_id: &[u8; 16],
+        voice_path: &str,
+    ) {
+        let Ok(bytes) = std::fs::read(voice_path) else {
+            crate::voice::voice_log(&format!(
+                "offline voice: не прочитать {} для {}",
+                voice_path,
+                transfer_id_to_hex(transfer_id)
+            ));
+            return;
+        };
+        let Some(chunks) = split_voice_for_offline(transfer_id, &bytes) else {
+            crate::voice::voice_log(&format!(
+                "offline voice: {} слишком большой ({} байт) — только метаданные",
+                transfer_id_to_hex(transfer_id),
+                bytes.len()
+            ));
+            return;
+        };
+        let tid_hex = transfer_id_to_hex(transfer_id);
+        let n = chunks.len();
+        for (i, payload) in chunks.into_iter().enumerate() {
+            items.push(OfflineOutboxItem {
+                recipient,
+                message_id: format!("vchunk:{tid_hex}:{i}"),
+                kind: OFFLINE_VOICE_CHUNK_KIND.into(),
+                payload,
+            });
+        }
+        crate::voice::voice_log(&format!(
+            "offline voice: {n} чанков для {tid_hex} → {}",
+            &recipient.to_string()[..8.min(recipient.to_string().len())]
+        ));
+    }
+
     pub(crate) fn ingest_offline_mailbox(&mut self, envelopes: Vec<OfflineEnvelope>) {
         if envelopes.is_empty() {
             return;
@@ -1249,23 +1307,20 @@ impl App {
             match env.kind.as_str() {
                 "dm" => {
                     if let Ok(msg) = serde_json::from_slice::<ChatMessage>(&plaintext) {
-                        self.ingest_chat_message(msg.clone());
-                        if let Some(ref voice) = msg.voice {
-                            self.link_voice_file_if_present(&voice.transfer_id);
-                        }
-                        if !msg.text.is_empty() {
-                            self.try_process_invite_message(&msg.id, &msg.text);
-                        }
+                        self.ingest_offline_chat_with_voice(msg);
                         self.offline_mail_processed.insert(env.message_id.clone());
                         any = true;
                     }
                 }
                 "group" => {
                     if let Ok(msg) = serde_json::from_slice::<ChatMessage>(&plaintext) {
-                        self.ingest_chat_message(msg.clone());
-                        if let Some(ref voice) = msg.voice {
-                            self.link_voice_file_if_present(&voice.transfer_id);
-                        }
+                        self.ingest_offline_chat_with_voice(msg);
+                        self.offline_mail_processed.insert(env.message_id.clone());
+                        any = true;
+                    }
+                }
+                k if k == OFFLINE_VOICE_CHUNK_KIND => {
+                    if self.ingest_offline_voice_chunk(&plaintext) {
                         self.offline_mail_processed.insert(env.message_id.clone());
                         any = true;
                     }
@@ -1303,6 +1358,114 @@ impl App {
             self.add_status(format!(
                 "⚠ {decrypt_failed} офлайн-конвертов не удалось расшифровать"
             ));
+        }
+    }
+
+    /// Офлайн DM/group: голосовое в чат только когда WAV уже на диске (как live).
+    fn ingest_offline_chat_with_voice(&mut self, msg: ChatMessage) {
+        if let Some(ref voice) = msg.voice {
+            let tid = voice.transfer_id.to_ascii_lowercase();
+            self.link_voice_file_if_present(&tid);
+            if self.resolve_voice_path(&tid).is_some()
+                || self.pending_incoming_voice_ready.contains(&tid)
+            {
+                self.ingest_chat_message(msg.clone());
+                if !msg.text.is_empty() {
+                    self.try_process_invite_message(&msg.id, &msg.text);
+                }
+            } else if !self.pending_incoming_voice.iter().any(|m| m.id == msg.id) {
+                self.pending_incoming_voice.push(msg);
+            }
+        } else {
+            self.ingest_chat_message(msg.clone());
+            if !msg.text.is_empty() {
+                self.try_process_invite_message(&msg.id, &msg.text);
+            }
+        }
+    }
+
+    /// Принимает один `voice_chunk`; при полной сборке пишет WAV и открывает
+    /// отложенные голосовые сообщения с этим transfer_id.
+    fn ingest_offline_voice_chunk(&mut self, plaintext: &[u8]) -> bool {
+        let Some(chunk) = decode_voice_chunk_payload(plaintext) else {
+            return false;
+        };
+        let tid_hex = transfer_id_to_hex(&chunk.transfer_id);
+        if self.resolve_voice_path(&tid_hex).is_some() {
+            return true;
+        }
+        let entry = self
+            .pending_offline_voice
+            .entry(tid_hex.clone())
+            .or_insert_with(|| OfflineVoiceAssembly {
+                total: chunk.total,
+                total_size: chunk.total_size,
+                chunks: HashMap::new(),
+            });
+        if entry.total != chunk.total || entry.total_size != chunk.total_size {
+            crate::voice::voice_log(&format!(
+                "offline voice_chunk: конфликт метаданных {tid_hex}"
+            ));
+            return false;
+        }
+        entry.chunks.insert(chunk.index, chunk.data);
+        let have = entry.chunks.len();
+        let need = entry.total as usize;
+        if have < need {
+            return true;
+        }
+        let Some(wav) =
+            assemble_voice_chunks(entry.total, entry.total_size, &entry.chunks)
+        else {
+            crate::voice::voice_log(&format!(
+                "offline voice_chunk: не собрался {tid_hex} ({have}/{need})"
+            ));
+            return false;
+        };
+        self.pending_offline_voice.remove(&tid_hex);
+        let tid = chunk.transfer_id;
+        let dir = file_transfer::voice_dir_absolute();
+        let dest = dir.join(file_transfer::voice_filename(&tid));
+        if let Err(e) = std::fs::write(&dest, &wav) {
+            crate::voice::voice_log(&format!(
+                "offline voice: запись {}: {e}",
+                dest.display()
+            ));
+            return false;
+        }
+        self.register_voice_path(&tid_hex, dest.display().to_string());
+        self.pending_incoming_voice_ready.insert(tid_hex.clone());
+        crate::voice::voice_log(&format!(
+            "offline voice assembled {tid_hex} → {} ({} байт)",
+            dest.display(),
+            wav.len()
+        ));
+        self.promote_pending_incoming_voice(&tid_hex);
+        true
+    }
+
+    fn promote_pending_incoming_voice(&mut self, transfer_id_hex: &str) {
+        let tid = transfer_id_hex.to_ascii_lowercase();
+        let ready: Vec<ChatMessage> = self
+            .pending_incoming_voice
+            .iter()
+            .filter(|m| {
+                m.voice
+                    .as_ref()
+                    .is_some_and(|v| v.transfer_id.eq_ignore_ascii_case(&tid))
+            })
+            .cloned()
+            .collect();
+        self.pending_incoming_voice.retain(|m| {
+            !m.voice
+                .as_ref()
+                .is_some_and(|v| v.transfer_id.eq_ignore_ascii_case(&tid))
+        });
+        for msg in ready {
+            self.ingest_chat_message(msg.clone());
+            if !msg.text.is_empty() {
+                self.try_process_invite_message(&msg.id, &msg.text);
+            }
         }
     }
 
@@ -2540,9 +2703,8 @@ impl App {
             duration_secs,
             path_str.clone(),
         );
-        // Атомарность (условия 3+4): сообщение НЕ показываем в чате сразу —
-        // только когда придёт voice_ack(ok=true), т.е. получатель подтвердит,
-        // что файл полностью доставлен и его SHA-256 совпал с отправленным.
+        // Как у текста/инвайтов: сразу в чат + outbox (offline voice_chunk через
+        // relay). Живой VoiceAck только ставит Delivered, если собеседник онлайн.
         let chat_message = self.build_voice_chat_message(
             &message_id,
             Some(peer.to_string()),
@@ -2550,6 +2712,7 @@ impl App {
             &transfer_hex,
             duration_secs,
         );
+        self.ingest_chat_message(chat_message.clone());
         match self.command_tx.try_send(UICommand::SendVoiceMessage {
             sender_name: self.local_nickname.clone(),
             recipient: peer,
@@ -2623,8 +2786,7 @@ impl App {
             path_str.clone(),
             members.clone(),
         );
-        // Атомарность (условия 3+4): показываем групповое голосовое в чате только
-        // когда voice_ack(ok=true) придёт от ВСЕХ участников — см. apply_voice_ack.
+        // Как у текста: сразу в чат; offline chunks на каждого члена + живые ретраи.
         let chat_message = self.build_voice_chat_message(
             &message_id,
             None,
@@ -2632,6 +2794,7 @@ impl App {
             &transfer_hex,
             duration_secs,
         );
+        self.ingest_chat_message(chat_message.clone());
         match self.command_tx.try_send(UICommand::SendGroupMessage {
             sender_name: self.local_nickname.clone(),
             text: String::new(),
@@ -2658,7 +2821,7 @@ impl App {
                     voice_duration_secs: duration_secs,
                     voice_transfer_id: Some(tid),
                     chat_message: Some(chat_message),
-                    voice_shown: false,
+                    voice_shown: true,
                 });
                 Ok(())
             }
@@ -3724,6 +3887,7 @@ impl App {
         let me = self.local_peer_id;
         let mut remove = false;
         let mut show_voice: Option<ChatMessage> = None;
+        let mut mark_delivered_id: Option<String> = None;
         if let Some(idx) = self
             .pending_group_sends
             .iter()
@@ -3738,11 +3902,9 @@ impl App {
                 .filter(|p| *p != me)
                 .collect();
             let has_voice = pending.voice_transfer_id.is_some();
-            // Атомарность голосового в группе: показываем сообщение у отправителя,
-            // как только доставка+проверка (voice_ack ok=true) подтвердились хотя бы
-            // ОДНОМУ участнику — иначе один недоступный член группы блокировал бы
-            // отображение навечно (ждать ack от ВСЕХ одновременно слишком строго).
-            // Рассылка остальным продолжается независимо (см. voice_delivered_to ниже).
+            // Голосовое уже в чате с момента отправки; при первом живом ack —
+            // только Delivered. Старый путь (voice_shown=false) остаётся для
+            // pending, восстановленных из журнала до этого изменения.
             if has_voice
                 && !pending.voice_shown
                 && needed
@@ -3751,6 +3913,13 @@ impl App {
             {
                 pending.voice_shown = true;
                 show_voice = pending.chat_message.clone();
+            } else if has_voice
+                && pending.voice_shown
+                && needed
+                    .iter()
+                    .any(|p| pending.delivered_to.contains(p) && pending.voice_delivered_to.contains(p))
+            {
+                mark_delivered_id = Some(pending.message_id.clone());
             }
             remove = if has_voice {
                 needed.is_subset(&pending.delivered_to)
@@ -3763,6 +3932,9 @@ impl App {
             msg.delivery = OutgoingDeliveryStatus::Delivered;
             self.ingest_chat_message(msg);
         }
+        if let Some(mid) = mark_delivered_id {
+            self.set_outgoing_delivery(peer, &mid, OutgoingDeliveryStatus::Delivered);
+        }
         if remove {
             self.pending_group_sends
                 .retain(|p| p.message_id != message_id);
@@ -3770,10 +3942,8 @@ impl App {
         }
     }
 
-    /// Вызывается по `voice_ack(ok=true)` конкретного участника. Сообщение
-    /// показывается у отправителя, как только атомарность (доставка+проверка)
-    /// подтвердится хотя бы для ОДНОГО участника — из очереди повторов при этом
-    /// не убирается, пока не подтвердят ВСЕ (рассылка остальным продолжается).
+    /// Вызывается по `voice_ack(ok=true)` конкретного участника. Снимает из
+    /// очереди только когда подтвердили все; Delivered — при первом ack.
     pub(crate) fn mark_group_voice_file_delivered(
         &mut self,
         peer: PeerId,
@@ -3781,6 +3951,7 @@ impl App {
     ) {
         let me = self.local_peer_id;
         let mut show: Option<ChatMessage> = None;
+        let mut mark_delivered: Option<(PeerId, String)> = None;
         let mut done: Vec<String> = Vec::new();
         for pending in &mut self.pending_group_sends {
             let Some(base_tid) = pending.voice_transfer_id else {
@@ -3814,6 +3985,12 @@ impl App {
             {
                 pending.voice_shown = true;
                 show = pending.chat_message.clone();
+            } else if pending.voice_shown
+                && needed
+                    .iter()
+                    .any(|p| pending.delivered_to.contains(p) && pending.voice_delivered_to.contains(p))
+            {
+                mark_delivered = Some((peer, pending.message_id.clone()));
             }
             if needed.is_subset(&pending.delivered_to)
                 && needed.is_subset(&pending.voice_delivered_to)
@@ -3825,6 +4002,9 @@ impl App {
             msg.delivery = OutgoingDeliveryStatus::Delivered;
             self.ingest_chat_message(msg);
         }
+        if let Some((p, mid)) = mark_delivered {
+            self.set_outgoing_delivery(p, &mid, OutgoingDeliveryStatus::Delivered);
+        }
         for message_id in done {
             self.pending_group_sends
                 .retain(|p| p.message_id != message_id);
@@ -3832,9 +4012,7 @@ impl App {
         }
     }
 
-    /// Итог атомарной доставки голосового (условия 3+4): получатель проверил
-    /// SHA-256 собранного файла и подтвердил (или отверг) целостность.
-    /// Только по `ok: true` голосовое появляется в чате отправителя.
+    /// Живой VoiceAck: обновляет Delivered / снимает pending. Сообщение уже в чате.
     pub(crate) fn apply_voice_ack(&mut self, peer: PeerId, transfer_id: [u8; 16], ok: bool) {
         if let Some(idx) = self
             .pending_voice_sends
@@ -3842,14 +4020,17 @@ impl App {
             .position(|p| p.peer == peer && p.transfer_id == transfer_id)
         {
             if ok {
+                let message_id = self.pending_voice_sends[idx].message_id.clone();
                 crate::voice::voice_log(&format!(
-                    "voice_ack(true) direct {} от {} — показываю",
+                    "voice_ack(true) direct {} от {} — Delivered",
                     transfer_id_to_hex(&transfer_id),
                     &peer.to_string()[..8.min(peer.to_string().len())]
                 ));
-                let mut msg = self.pending_voice_sends[idx].chat_message.clone();
-                msg.delivery = OutgoingDeliveryStatus::Delivered;
-                self.ingest_chat_message(msg);
+                self.set_outgoing_delivery(
+                    peer,
+                    &message_id,
+                    OutgoingDeliveryStatus::Delivered,
+                );
                 self.complete_pending_voice_send_by_transfer(&transfer_id);
             } else {
                 // Целостность не подтвердилась (или сбой записи у получателя) —
