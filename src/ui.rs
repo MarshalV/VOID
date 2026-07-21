@@ -2451,27 +2451,37 @@ impl eframe::App for App {
                             .desired_width(f32::INFINITY),
                     );
                     ui.add_space(8.0);
-                    ui.label("Участники из контактов");
+                    ui.label("Участники из контактов (только отмеченные)");
                     egui::ScrollArea::vertical()
                         .max_height(200.0)
                         .show(ui, |ui| {
                             let mut peers: Vec<(PeerId, String)> = self
                                 .known_peers
                                 .iter()
+                                .filter(|(p, _)| **p != self.local_peer_id)
                                 .map(|(p, n)| (*p, n.clone()))
                                 .collect();
                             peers.sort_by(|a, b| a.1.to_lowercase().cmp(&b.1.to_lowercase()));
                             for (pid, name) in peers {
-                                let mut checked = create_pick.contains(&pid);
-                                if ui.checkbox(&mut checked, &name).changed() {
-                                    if checked {
-                                        create_pick.insert(pid);
-                                    } else {
-                                        create_pick.remove(&pid);
+                                // Стабильный Id по PeerId — иначе egui путает чекбоксы
+                                // в цикле и «выбирает» чужие контакты.
+                                ui.push_id(pid, |ui| {
+                                    let mut checked = create_pick.contains(&pid);
+                                    if ui.checkbox(&mut checked, &name).changed() {
+                                        if checked {
+                                            create_pick.insert(pid);
+                                        } else {
+                                            create_pick.remove(&pid);
+                                        }
                                     }
-                                }
+                                });
                             }
                         });
+                    ui.label(
+                        egui::RichText::new(format!("Выбрано: {}", create_pick.len()))
+                            .size(12.0)
+                            .color(palette::TEXT_MUTED),
+                    );
                     ui.add_space(12.0);
                     ui.horizontal(|ui| {
                         if ui.button("Отмена").clicked() {
@@ -2479,7 +2489,7 @@ impl eframe::App for App {
                         }
                         if ui
                             .add_enabled(
-                                !create_name.trim().is_empty(),
+                                !create_name.trim().is_empty() && !create_pick.is_empty(),
                                 egui::Button::new("Создать").fill(palette::ACCENT),
                             )
                             .clicked()
@@ -2497,8 +2507,15 @@ impl eframe::App for App {
             if do_create {
                 let name = self.create_group_name.trim().to_string();
                 let members: Vec<PeerId> = self.create_group_pick.iter().copied().collect();
-                if self.create_group(name, members).is_some() {
+                if members.is_empty() {
+                    self.push_toast(
+                        "Выберите хотя бы одного участника".into(),
+                        ToastKind::Warn,
+                        TOAST_TTL_SHORT,
+                    );
+                } else if self.create_group(name, members).is_some() {
                     self.show_create_group = false;
+                    self.create_group_pick.clear();
                     self.push_toast(
                         "Группа создана".into(),
                         ToastKind::Info,

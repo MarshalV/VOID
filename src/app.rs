@@ -3021,21 +3021,35 @@ impl App {
         if name.is_empty() {
             return None;
         }
+        // Только явно переданный список — никогда не подмешиваем known_peers.
+        let mut selected: Vec<PeerId> = Vec::new();
+        let mut seen = HashSet::new();
+        for pid in member_pids {
+            if pid == self.local_peer_id {
+                continue;
+            }
+            if seen.insert(pid) {
+                selected.push(pid);
+            }
+        }
+        if selected.is_empty() {
+            self.add_status("⚠ Выберите хотя бы одного участника группы".into());
+            return None;
+        }
         let id = group::new_group_id();
         let me = self.local_peer_id.to_string();
         let mut members = vec![GroupMember {
             peer_id: me.clone(),
             display_name: self.local_nickname.clone(),
         }];
-        for pid in member_pids {
-            if pid == self.local_peer_id {
-                continue;
-            }
+        for pid in &selected {
             let display_name = self
                 .known_peers
-                .get(&pid)
+                .get(pid)
                 .cloned()
-                .unwrap_or_else(|| format!("Peer {}", &pid.to_string()[..8.min(pid.to_string().len())]));
+                .unwrap_or_else(|| {
+                    format!("Peer {}", &pid.to_string()[..8.min(pid.to_string().len())])
+                });
             members.push(GroupMember {
                 peer_id: pid.to_string(),
                 display_name,
@@ -3051,6 +3065,12 @@ impl App {
         if !group::validate_group_chat(&group) {
             return None;
         }
+        info!(
+            "Создана группа «{}» id={} участников={}",
+            group.name,
+            &id[..8.min(id.len())],
+            group.members.len()
+        );
         self.groups.insert(id.clone(), group.clone());
         self.selected_chat = group_thread_key(&id);
         self.messages
@@ -3060,10 +3080,9 @@ impl App {
         self.persist_vault();
         self.broadcast_group_sync(&group);
         self.dial_group_members(&group);
-        for pid in group.member_peer_ids() {
-            if pid != self.local_peer_id {
-                self.send_group_invite_dm(pid, &group);
-            }
+        // Инвайт — строго выбранным, не всем контактам.
+        for pid in &selected {
+            self.send_group_invite_dm(*pid, &group);
         }
         Some(id)
     }
@@ -3493,6 +3512,14 @@ impl App {
         if !members.iter().any(|m| m.peer_id == me) {
             return;
         }
+
+        // Только создатель может расширять состав. Чужой sync не должен
+        // подмешивать в группу лишних людей («добавляет абсолютно всех»).
+        members = self.sanitize_group_sync_members(&group_id, from, &creator_id, members);
+        if !members.iter().any(|m| m.peer_id == me) {
+            return;
+        }
+
         for m in &mut members {
             if m.display_name.is_empty() {
                 m.display_name = m
@@ -3511,9 +3538,21 @@ impl App {
             .get(&group_id)
             .map(|g| g.created_at.clone())
             .unwrap_or_else(|| chrono::Local::now().format("%Y-%m-%d %H:%M").to_string());
+        let from_str = from.to_string();
+        let name = self
+            .groups
+            .get(&group_id)
+            .map(|g| {
+                if from_str == g.creator_id || from_str == creator_id {
+                    group_name.clone()
+                } else {
+                    g.name.clone()
+                }
+            })
+            .unwrap_or(group_name);
         let group = GroupChat {
             id: group_id.clone(),
-            name: group_name,
+            name,
             creator_id,
             members,
             created_at,
@@ -3524,6 +3563,39 @@ impl App {
         } else {
             warn!("VOID: group_sync отклонён (некорректные данные)");
         }
+    }
+
+    /// Не-создатель не может добавлять участников через group_sync.
+    fn sanitize_group_sync_members(
+        &self,
+        group_id: &str,
+        from: PeerId,
+        creator_id: &str,
+        incoming: Vec<GroupMember>,
+    ) -> Vec<GroupMember> {
+        let me = self.local_peer_id.to_string();
+        let from_str = from.to_string();
+        let Some(existing) = self.groups.get(group_id) else {
+            return incoming;
+        };
+        let am_creator = existing.creator_id == me;
+        let from_is_creator = from_str == existing.creator_id || from_str == creator_id;
+        if !am_creator || from_is_creator {
+            return incoming;
+        }
+        let incoming_has_from = incoming.iter().any(|m| m.peer_id == from_str);
+        let mut out = existing.members.clone();
+        if !incoming_has_from {
+            out.retain(|m| m.peer_id != from_str);
+        }
+        for m in &mut out {
+            if let Some(inc) = incoming.iter().find(|x| x.peer_id == m.peer_id) {
+                if !inc.display_name.is_empty() {
+                    m.display_name = inc.display_name.clone();
+                }
+            }
+        }
+        dedupe_members(out)
     }
 
     fn ensure_self_in_group(&self, group: &mut GroupChat) {

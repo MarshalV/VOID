@@ -9,11 +9,15 @@ use serde::{Deserialize, Serialize};
 use crate::offline_mail::OfflineEnvelope;
 
 const FILE: &str = "relay_mailbox.bin";
-const MAX_PER_RECIPIENT: usize = 256;
+/// Голосовое ~3 МБ ≈ 128 чанков; несколько pending voice на одного адресата.
+const MAX_PER_RECIPIENT: usize = 1024;
 /// Голосовые чанки — большие, поэтому помимо счётчика конвертов ограничиваем
 /// суммарный объём на одного адресата (иначе один длинный voice завалит диск
 /// relay/bootstrap-ноды). Старые конверты вытесняются первыми.
 const MAX_BYTES_PER_RECIPIENT: usize = 32 * 1024 * 1024;
+/// Сколько байт plaintext-конвертов отдаём за один OfflineMailboxDeliver
+/// (JSON раздувает Vec<u8> ~3×; держимся заметно ниже лимита response RR).
+pub(crate) const DELIVER_BATCH_PLAIN_BYTES: usize = 512 * 1024;
 
 fn envelope_len(env: &OfflineEnvelope) -> usize {
     env.ct.len() + 96
@@ -89,10 +93,35 @@ impl RelayMailbox {
         changed
     }
 
-    pub(crate) fn take_for(
+    /// Забирает порцию конвертов (не весь ящик), чтобы ответ RR не превысил
+    /// лимит codec. Остаток остаётся в store — клиент сделает повторный Query.
+    pub(crate) fn take_batch(
         map: &mut HashMap<String, Vec<OfflineEnvelope>>,
         recipient: &str,
+        max_plain_bytes: usize,
     ) -> Vec<OfflineEnvelope> {
-        map.remove(recipient).unwrap_or_default()
+        let Some(slot) = map.get_mut(recipient) else {
+            return Vec::new();
+        };
+        if slot.is_empty() {
+            return Vec::new();
+        }
+        let mut out = Vec::new();
+        let mut used = 0usize;
+        while let Some(env) = slot.first() {
+            let n = envelope_len(env);
+            if !out.is_empty() && used.saturating_add(n) > max_plain_bytes {
+                break;
+            }
+            out.push(slot.remove(0));
+            used = used.saturating_add(n);
+            if used >= max_plain_bytes {
+                break;
+            }
+        }
+        if slot.is_empty() {
+            map.remove(recipient);
+        }
+        out
     }
 }

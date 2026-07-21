@@ -794,6 +794,9 @@ fn put_mailbox_envelopes(
     }
 }
 
+/// JSON RR codec по умолчанию режет request на 1 МиБ. Один OfflineMailboxStore
+/// со всеми voice_chunk (~3 МБ WAV → JSON) гарантированно не проходит — шлём
+/// по одному конверту на запрос.
 fn fanout_relay_mail(
     swarm: &mut libp2p::Swarm<ChatBehaviour>,
     local_peer_id: PeerId,
@@ -803,18 +806,26 @@ fn fanout_relay_mail(
     if envelopes.is_empty() {
         return;
     }
-    let packet = V1Packet::OfflineMailboxStore {
-        recipient: recipient.to_string(),
-        envelopes: envelopes.to_vec(),
-    };
-    for peer in swarm.connected_peers().copied().collect::<Vec<_>>() {
-        if peer == local_peer_id || peer == recipient {
-            continue;
+    let peers: Vec<PeerId> = swarm
+        .connected_peers()
+        .copied()
+        .filter(|p| *p != local_peer_id && *p != recipient)
+        .collect();
+    if peers.is_empty() {
+        return;
+    }
+    let recip = recipient.to_string();
+    for env in envelopes {
+        let packet = V1Packet::OfflineMailboxStore {
+            recipient: recip.clone(),
+            envelopes: vec![env.clone()],
+        };
+        for peer in &peers {
+            let _ = swarm
+                .behaviour_mut()
+                .request_response
+                .send_request(peer, packet.clone());
         }
-        let _ = swarm
-            .behaviour_mut()
-            .request_response
-            .send_request(&peer, packet.clone());
     }
 }
 
@@ -830,19 +841,22 @@ fn fanout_relay_to_bootstraps(
     if envelopes.is_empty() {
         return;
     }
-    let packet = V1Packet::OfflineMailboxStore {
-        recipient: recipient.to_string(),
-        envelopes: envelopes.to_vec(),
-    };
+    let recip = recipient.to_string();
     for pid in bootstrap_peer_ids {
         if *pid == local_peer_id || *pid == recipient {
             continue;
         }
         if swarm.is_connected(pid) {
-            let _ = swarm
-                .behaviour_mut()
-                .request_response
-                .send_request(pid, packet.clone());
+            for env in envelopes {
+                let packet = V1Packet::OfflineMailboxStore {
+                    recipient: recip.clone(),
+                    envelopes: vec![env.clone()],
+                };
+                let _ = swarm
+                    .behaviour_mut()
+                    .request_response
+                    .send_request(pid, packet);
+            }
         } else {
             let addrs: Vec<Multiaddr> = void_bootstraps
                 .iter()
@@ -976,13 +990,23 @@ fn build_void_swarm(
             }
 
             let rr_config = libp2p::request_response::Config::default()
-                .with_request_timeout(Duration::from_secs(30))
+                .with_request_timeout(Duration::from_secs(60))
                 .with_max_concurrent_streams(256);
             let rr_protocol = libp2p::StreamProtocol::new("/void/chat/1.0.0");
-            let rr_behaviour = libp2p::request_response::json::Behaviour::<V1Packet, V1Packet>::new(
-                [(rr_protocol, libp2p::request_response::ProtocolSupport::Full)],
-                rr_config.clone(),
-            );
+            // Offline voice_chunk: один конверт ≈ десятки КБ plaintext, в JSON
+            // раздувается; дефолт codec 1 МиБ / 10 МиБ режет длинные голоса.
+            let rr_codec =
+                libp2p::request_response::json::codec::Codec::<V1Packet, V1Packet>::default()
+                    .set_request_size_maximum(4 * 1024 * 1024)
+                    .set_response_size_maximum(16 * 1024 * 1024);
+            let rr_behaviour =
+                libp2p::request_response::Behaviour::<
+                    libp2p::request_response::json::codec::Codec<V1Packet, V1Packet>,
+                >::with_codec(
+                    rr_codec,
+                    [(rr_protocol, libp2p::request_response::ProtocolSupport::Full)],
+                    rr_config.clone(),
+                );
 
             let file_rr_config = libp2p::request_response::Config::default()
                 .with_request_timeout(Duration::from_secs(300))
@@ -3093,8 +3117,13 @@ pub async fn run_chat_network(
                                                 .send_response(channel, V1Packet::Ack);
                                         }
                                         V1Packet::OfflineMailboxQuery { recipient } => {
-                                            let envs =
-                                                RelayMailbox::take_for(&mut relay_mail_store, &recipient);
+                                            // Порциями: иначе один Deliver со всеми
+                                            // voice_chunk не влезает в лимит JSON response.
+                                            let envs = RelayMailbox::take_batch(
+                                                &mut relay_mail_store,
+                                                &recipient,
+                                                crate::relay_mailbox::DELIVER_BATCH_PLAIN_BYTES,
+                                            );
                                             if !envs.is_empty() {
                                                 let _ = RelayMailbox::save(&relay_mail_store);
                                             }
@@ -3538,6 +3567,9 @@ pub async fn run_chat_network(
                                                 let _ = event_tx
                                                     .send(NetworkEvent::OfflineMailbox(envelopes))
                                                     .await;
+                                                // take_batch отдаёт порциями — сразу
+                                                // запрашиваем остаток ящика.
+                                                query_relay_mailbox(&mut swarm, local_peer_id);
                                             }
                                         }
                                         V1Packet::Hello {
