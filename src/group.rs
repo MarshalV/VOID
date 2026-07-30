@@ -96,7 +96,18 @@ pub(crate) fn extract_invite_links(text: &str) -> Vec<String> {
         let end = tail
             .find(|c: char| c.is_whitespace())
             .unwrap_or(tail.len());
-        links.push(tail[..end].to_string());
+        let mut link = tail[..end].to_string();
+        // Хвост из пунктуации в конце строки/предложения.
+        while link
+            .chars()
+            .last()
+            .is_some_and(|c| matches!(c, '.' | ',' | ';' | ')' | ']' | '}' | '»' | '"' | '\''))
+        {
+            link.pop();
+        }
+        if !link.is_empty() {
+            links.push(link);
+        }
         search_from = start + end;
         if search_from >= text.len() {
             break;
@@ -316,6 +327,24 @@ mod tests {
     #[test]
     fn invite_message_never_auto_joins() {
         assert!(!auto_join_from_invite_message());
+    }
+
+    #[test]
+    fn parse_and_validate_real_invite_link() {
+        let link = concat!(
+            "void://group/397a1e0eda7acce07a7fc2e7932ff1c1",
+            "?name=111",
+            "&m=12D3KooWAaR9gWEA5GUnZVyMrZo3shRxYqopw1mqdy5646k6f5xo",
+            "&creator=12D3KooWAaR9gWEA5GUnZVyMrZo3shRxYqopw1mqdy5646k6f5xo",
+        );
+        let mut g = parse_invite_link(link).expect("parse invite");
+        assert_eq!(g.name, "111");
+        let me = "12D3KooWJOINERPEER00000000000000000000000001";
+        g.members.push(GroupMember {
+            peer_id: me.into(),
+            display_name: "Peer 12D3KooW".into(),
+        });
+        assert!(validate_group_chat(&g));
     }
 
     #[test]

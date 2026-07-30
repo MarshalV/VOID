@@ -354,6 +354,8 @@ pub(crate) struct App {
     pub(crate) create_group_name: String,
     pub(crate) create_group_pick: HashSet<PeerId>,
     pub(crate) join_group_link: String,
+    /// Invite-ссылка, по которой нужно вступить (ставится из UI, обрабатывается в update).
+    pub(crate) pending_invite_join: Option<String>,
     pub(crate) show_group_panel: bool,
     pub(crate) add_group_member_peer: String,
     /// Недоставленное: быстрый `outbox.bin` (переживает выход из приложения).
@@ -486,6 +488,7 @@ impl App {
             create_group_name: String::new(),
             create_group_pick: HashSet::new(),
             join_group_link: String::new(),
+            pending_invite_join: None,
             show_group_panel: false,
             add_group_member_peer: String::new(),
             outbox_entries: Vec::new(),
@@ -982,15 +985,17 @@ impl App {
     }
 
     pub(crate) fn persist_all_before_exit(&mut self) {
-        // Journal/outbox на диск всегда; flush можно повторить из on_exit,
-        // если close_requested не дождался ack.
-        self.persist_chat_journal();
-        self.persist_outbox();
         if self.exit_prepared {
+            self.persist_chat_journal();
+            self.persist_outbox();
             return;
         }
-        self.flush_outbox_to_dht_on_exit();
         self.exit_prepared = true;
+        self.persist_chat_journal();
+        self.persist_outbox();
+        // Только try_send — без join/recv. Иначе закрытие зависает, когда
+        // сетевой поток не читает канал или handoff ждёт Ack десятки секунд.
+        self.flush_outbox_to_dht_on_exit();
     }
 
     fn bootstrap_offline_mail(&mut self) {
@@ -1051,53 +1056,22 @@ impl App {
         }
     }
 
-    /// При выходе: синхронно публикуем outbox в relay/DHT, пока сетевой поток ещё жив.
-    /// `blocking_send` нельзя звать с UI-потока внутри `#[tokio::main]` —
-    /// отправку делаем с отдельного OS-потока, ack ждём здесь.
+    /// При выходе: best-effort публикация. Не блокируем закрытие окна.
+    /// Outbox уже на диске (`persist_outbox`) — дойдёт при следующем запуске.
     fn flush_outbox_to_dht_on_exit(&self) {
         let items = self.build_offline_publish_items();
         if items.is_empty() {
             return;
         }
-        let n = items.len();
-        info!("VOID: exit-flush {} offline item(s)…", n);
-        let (ack_tx, ack_rx) = std::sync::mpsc::channel();
-        let tx = self.command_tx.clone();
-        let join = std::thread::Builder::new()
-            .name("void-exit-publish".into())
-            .spawn(move || {
-                tx.blocking_send(UICommand::PublishOfflineOutbox {
-                    items,
-                    ack: Some(ack_tx),
-                })
-            });
-        let send_ok = match join {
-            Ok(handle) => match handle.join() {
-                Ok(Ok(())) => true,
-                Ok(Err(_)) => {
-                    warn!("VOID: сеть уже остановлена — outbox только на диске");
-                    false
-                }
-                Err(_) => {
-                    warn!("VOID: поток exit-publish паникул");
-                    false
-                }
-            },
-            Err(e) => {
-                warn!("VOID: не удалось стартовать exit-publish: {e}");
-                false
-            }
-        };
-        if !send_ok {
-            return;
-        }
-        match ack_rx.recv_timeout(Duration::from_secs(90)) {
-            Ok(true) => info!("VOID: outbox опубликован перед выходом (все envelopes ack)"),
-            Ok(false) => warn!(
-                "VOID: публикация outbox не подтверждена — сообщения остаются в outbox.bin"
+        match self.command_tx.try_send(UICommand::PublishOfflineOutbox {
+            items,
+            ack: None,
+        }) {
+            Ok(()) => info!(
+                "VOID: exit — outbox поставлен в очередь (best-effort, без ожидания ack)"
             ),
             Err(_) => warn!(
-                "VOID: таймаут публикации outbox при выходе — сообщения остаются в outbox.bin"
+                "VOID: exit — сеть не приняла outbox, останется в outbox.bin до следующего запуска"
             ),
         }
     }
@@ -3130,14 +3104,67 @@ impl App {
         group::auto_join_from_invite_message()
     }
 
+    /// Invite-ссылки в чате, в которые локальный пир ещё не входит.
+    pub(crate) fn joinable_invites_for_chat(&self, chat_key: &str) -> Vec<(String, String)> {
+        let messages = self
+            .messages
+            .lock()
+            .get(chat_key)
+            .cloned()
+            .unwrap_or_default();
+        Self::collect_joinable_invites(self, messages.iter().map(|m| m.text.as_str()))
+    }
+
+    fn collect_joinable_invites<'a>(
+        &self,
+        texts: impl Iterator<Item = &'a str>,
+    ) -> Vec<(String, String)> {
+        let mut out = Vec::new();
+        let mut seen = HashSet::new();
+        for text in texts {
+            for link in extract_invite_links(text) {
+                let Some(parsed) = parse_invite_link(&link) else {
+                    continue;
+                };
+                if self.is_active_group_member(&parsed.id) {
+                    continue;
+                }
+                if seen.insert(parsed.id.clone()) {
+                    out.push((link, parsed.name));
+                }
+            }
+        }
+        out
+    }
+
+    /// Вступает по ссылке и возвращает имя группы при успехе.
     pub(crate) fn join_group_from_invite(&mut self, link: &str) -> Result<(), &'static str> {
-        let group = parse_invite_link(link).ok_or("Некорректная invite-ссылка")?;
+        let group = parse_invite_link(link.trim()).ok_or("Некорректная invite-ссылка")?;
+        info!(
+            "Вступление в группу по invite: «{}» id={}",
+            group.name,
+            &group.id[..8.min(group.id.len())]
+        );
         self.left_groups.remove(&group.id);
         self.group_departed_peers
             .entry(group.id.clone())
             .or_default()
             .remove(&self.local_peer_id.to_string());
         self.install_group(group, true)
+    }
+
+    /// Обрабатывает `pending_invite_join` (результат клика из UI).
+    pub(crate) fn drain_pending_invite_join(&mut self) -> Option<Result<String, &'static str>> {
+        let link = self.pending_invite_join.take()?;
+        Some(match self.join_group_from_invite(&link) {
+            Ok(()) => {
+                let name = parse_invite_link(&link)
+                    .map(|g| g.name)
+                    .unwrap_or_else(|| "группу".into());
+                Ok(name)
+            }
+            Err(e) => Err(e),
+        })
     }
 
     fn install_group(&mut self, mut group: GroupChat, select: bool) -> Result<(), &'static str> {
@@ -3582,10 +3609,25 @@ impl App {
     fn ensure_self_in_group(&self, group: &mut GroupChat) {
         let me = self.local_peer_id.to_string();
         if !group.members.iter().any(|m| m.peer_id == me) {
+            let display_name = if self.local_nickname.trim().is_empty() {
+                let n = me.len().min(8);
+                format!("Peer {}", &me[..n])
+            } else {
+                self.local_nickname.clone()
+            };
             group.members.push(GroupMember {
                 peer_id: me,
-                display_name: self.local_nickname.clone(),
+                display_name,
             });
+        } else if let Some(m) = group.members.iter_mut().find(|m| m.peer_id == me) {
+            if m.display_name.trim().is_empty() {
+                m.display_name = if self.local_nickname.trim().is_empty() {
+                    let n = me.len().min(8);
+                    format!("Peer {}", &me[..n])
+                } else {
+                    self.local_nickname.clone()
+                };
+            }
         }
     }
 

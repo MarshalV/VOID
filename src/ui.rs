@@ -3552,13 +3552,42 @@ impl eframe::App for App {
                 let me_str = self.local_peer_id.to_string();
                 let mut pending_msg_delete: Option<String> = None;
                 let mut voice_actions: Vec<(String, bool, Option<f32>)> = Vec::new();
+                let joinable_invites = self.joinable_invites_for_chat(&self.selected_chat);
                 let chat_peer = self.selected_chat.clone();
                 self.relink_voice_messages_in_chat(&chat_peer);
+
+                // Полоска над лентой (не модалка): клик вне ScrollArea.
+                if !joinable_invites.is_empty() {
+                    egui::Frame::none()
+                        .fill(palette::BG_PANEL)
+                        .inner_margin(egui::Margin::symmetric(12.0, 8.0))
+                        .show(ui, |ui| {
+                            for (link, name) in &joinable_invites {
+                                if ui
+                                    .add_sized(
+                                        [ui.available_width().min(360.0), 32.0],
+                                        egui::Button::new(
+                                            egui::RichText::new(format!(
+                                                "Вступить в «{name}»"
+                                            ))
+                                            .size(14.0)
+                                            .strong(),
+                                        )
+                                        .fill(palette::ACCENT),
+                                    )
+                                    .clicked()
+                                {
+                                    self.pending_invite_join = Some(link.clone());
+                                }
+                            }
+                        });
+                    ui.add_space(4.0);
+                }
 
                 let chat_stream_height = ui.available_height();
                 egui::ScrollArea::vertical()
                     .id_salt("chat_stream")
-                    .stick_to_bottom(true)
+                    .stick_to_bottom(joinable_invites.is_empty())
                     .auto_shrink([false, false])
                     .max_height(chat_stream_height)
                     .show(ui, |ui| {
@@ -3674,17 +3703,14 @@ impl eframe::App for App {
                                                         .size(14.5)
                                                         .color(palette::TEXT),
                                                 );
-                                                for link in invite_links {
+                                                for link in &invite_links {
                                                     let Some(parsed) =
-                                                        parse_invite_link(&link)
+                                                        parse_invite_link(link)
                                                     else {
                                                         continue;
                                                     };
-                                                    let in_group = self
-                                                        .is_active_group_member(
-                                                            &parsed.id,
-                                                        );
-                                                    if in_group {
+                                                    if self.is_active_group_member(&parsed.id)
+                                                    {
                                                         ui.label(
                                                             egui::RichText::new(
                                                                 "✓ Вы уже в группе",
@@ -3693,38 +3719,21 @@ impl eframe::App for App {
                                                             .color(palette::TEXT_MUTED),
                                                         );
                                                     } else if ui
-                                                        .button(
-                                                            egui::RichText::new(format!(
-                                                                "Вступить в «{}»",
-                                                                parsed.name
-                                                            ))
-                                                            .size(13.0),
+                                                        .add(
+                                                            egui::Button::new(
+                                                                egui::RichText::new(format!(
+                                                                    "Вступить в «{}»",
+                                                                    parsed.name
+                                                                ))
+                                                                .size(13.0),
+                                                            )
+                                                            .fill(palette::ACCENT),
                                                         )
                                                         .clicked()
                                                     {
-                                                        match self
-                                                            .join_group_from_invite(&link)
-                                                        {
-                                                            Ok(()) => {
-                                                                self.push_toast(
-                                                                    format!(
-                                                                        "Вы вступили в «{}»",
-                                                                        parsed.name
-                                                                    ),
-                                                                    ToastKind::Info,
-                                                                    TOAST_TTL_SHORT,
-                                                                );
-                                                            }
-                                                            Err(e) => {
-                                                                self.push_toast(
-                                                                    format!(
-                                                                        "Не удалось вступить: {e}"
-                                                                    ),
-                                                                    ToastKind::Error,
-                                                                    TOAST_TTL_LONG,
-                                                                );
-                                                            }
-                                                        }
+                                                        // В App-поле: join после ScrollArea.
+                                                        self.pending_invite_join =
+                                                            Some(link.clone());
                                                     }
                                                 }
                                             }
@@ -3814,6 +3823,26 @@ impl eframe::App for App {
                     self.apply_voice_click(ctx, tid, toggle, seek);
                 }
             });
+
+        // Клик «Вступить» в этом кадре — применяем до toast'ов.
+        if let Some(result) = self.drain_pending_invite_join() {
+            match result {
+                Ok(name) => {
+                    self.push_toast(
+                        format!("Вы вступили в «{name}»"),
+                        ToastKind::Info,
+                        TOAST_TTL_SHORT,
+                    );
+                }
+                Err(e) => {
+                    self.push_toast(
+                        format!("Не удалось вступить: {e}"),
+                        ToastKind::Error,
+                        TOAST_TTL_LONG,
+                    );
+                }
+            }
+        }
 
         // ===== Toasts (поверх всего, правый верхний угол) =====
         self.draw_toasts(ctx);
