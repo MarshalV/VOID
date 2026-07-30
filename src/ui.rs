@@ -3648,191 +3648,244 @@ impl eframe::App for App {
                                 };
 
                                 let msg_id = msg.id.clone();
+                                let invite_links = extract_invite_links(&msg.text);
                                 let mut voice_bubble: Option<(egui::Rect, bool, bool)> = None;
-                                let bubble = egui::Frame::none()
-                                    .fill(bubble_bg)
-                                    .rounding(egui::Rounding {
-                                        nw: 16.0,
-                                        ne: 16.0,
-                                        sw: if is_me { 16.0 } else { 4.0 },
-                                        se: if is_me { 4.0 } else { 16.0 },
-                                    })
-                                    .inner_margin(egui::Margin {
-                                        left: 14.0,
-                                        right: 14.0,
-                                        top: 8.0,
-                                        bottom: 6.0,
-                                    })
-                                    .show(ui, |ui| {
-                                        ui.set_max_width(max_w);
-                                        ui.vertical(|ui| {
-                                            if !is_me {
-                                                ui.label(
-                                                    egui::RichText::new(&msg.sender_name)
-                                                        .size(12.5)
-                                                        .strong()
-                                                        .color(palette::ACCENT_2),
-                                                );
-                                            }
-                                            if let Some(ref voice) = msg.voice {
-                                                let mut has_audio =
-                                                    self.resolve_voice_path(&voice.transfer_id)
-                                                        .is_some();
-                                                if !has_audio {
-                                                    // Полное переиндексирование каталога голосовых —
-                                                    // дорогая операция (read_dir + stat на каждый
-                                                    // файл). Раньше она дёргалась на КАЖДЫЙ кадр для
-                                                    // каждого голосового пузыря, что грузило
-                                                    // диск/CPU до отказа звука. Теперь — только пока
-                                                    // файл реально не найден.
-                                                    self.relink_voice_transfer_candidates(
-                                                        &voice.transfer_id,
+                                // Кнопки join — СНАРУЖИ Frame: иначе context_menu/interact
+                                // на bubble.response съедают click.
+                                ui.vertical(|ui| {
+                                    let bubble = egui::Frame::none()
+                                        .fill(bubble_bg)
+                                        .rounding(egui::Rounding {
+                                            nw: 16.0,
+                                            ne: 16.0,
+                                            sw: if is_me { 16.0 } else { 4.0 },
+                                            se: if is_me { 4.0 } else { 16.0 },
+                                        })
+                                        .inner_margin(egui::Margin {
+                                            left: 14.0,
+                                            right: 14.0,
+                                            top: 8.0,
+                                            bottom: 6.0,
+                                        })
+                                        .show(ui, |ui| {
+                                            ui.set_max_width(max_w);
+                                            ui.vertical(|ui| {
+                                                if !is_me {
+                                                    ui.label(
+                                                        egui::RichText::new(&msg.sender_name)
+                                                            .size(12.5)
+                                                            .strong()
+                                                            .color(palette::ACCENT_2),
                                                     );
-                                                    has_audio = self
+                                                }
+                                                if let Some(ref voice) = msg.voice {
+                                                    let mut has_audio = self
                                                         .resolve_voice_path(&voice.transfer_id)
                                                         .is_some();
-                                                }
-                                                let is_playing = self
-                                                    .voice_player
-                                                    .is_playing(&voice.transfer_id);
-                                                let progress = self
-                                                    .voice_player
-                                                    .progress_ratio(&voice.transfer_id);
-                                                let layout = voice_message_ui(
-                                                    ui,
-                                                    voice.duration_secs,
-                                                    has_audio,
-                                                    is_playing,
-                                                    progress,
-                                                );
-                                                voice_bubble = Some((
-                                                    layout.wave_rect,
-                                                    has_audio,
-                                                    is_playing,
-                                                ));
-                                            } else if !msg.text.is_empty() {
-                                                let invite_links =
-                                                    extract_invite_links(&msg.text);
-                                                if invite_links.is_empty() {
-                                                    ui.label(
-                                                        egui::RichText::new(&msg.text)
-                                                            .size(14.5)
-                                                            .color(palette::TEXT),
-                                                    );
-                                                } else {
-                                                    // Только текст в пузыре. Кнопка — под
-                                                    // полем ввода (и рядом с пузырем ниже),
-                                                    // иначе context_menu/ScrollArea едят click.
-                                                    for link in &invite_links {
-                                                        let Some(parsed) =
-                                                            parse_invite_link(link)
-                                                        else {
-                                                            continue;
-                                                        };
-                                                        ui.label(
-                                                            egui::RichText::new(format!(
-                                                                "📎 Приглашение в группу «{}»",
-                                                                parsed.name
-                                                            ))
-                                                            .size(14.5)
-                                                            .color(palette::TEXT),
+                                                    if !has_audio {
+                                                        self.relink_voice_transfer_candidates(
+                                                            &voice.transfer_id,
                                                         );
-                                                        if self
-                                                            .is_active_group_member(&parsed.id)
-                                                        {
-                                                            ui.add_space(4.0);
+                                                        has_audio = self
+                                                            .resolve_voice_path(
+                                                                &voice.transfer_id,
+                                                            )
+                                                            .is_some();
+                                                    }
+                                                    let is_playing = self
+                                                        .voice_player
+                                                        .is_playing(&voice.transfer_id);
+                                                    let progress = self
+                                                        .voice_player
+                                                        .progress_ratio(&voice.transfer_id);
+                                                    let layout = voice_message_ui(
+                                                        ui,
+                                                        voice.duration_secs,
+                                                        has_audio,
+                                                        is_playing,
+                                                        progress,
+                                                    );
+                                                    voice_bubble = Some((
+                                                        layout.wave_rect,
+                                                        has_audio,
+                                                        is_playing,
+                                                    ));
+                                                } else if !msg.text.is_empty() {
+                                                    if invite_links.is_empty() {
+                                                        ui.label(
+                                                            egui::RichText::new(&msg.text)
+                                                                .size(14.5)
+                                                                .color(palette::TEXT),
+                                                        );
+                                                    } else {
+                                                        for link in &invite_links {
+                                                            let Some(parsed) =
+                                                                parse_invite_link(link)
+                                                            else {
+                                                                continue;
+                                                            };
                                                             ui.label(
-                                                                egui::RichText::new(
-                                                                    "✓ Вы уже в группе",
-                                                                )
-                                                                .size(12.0)
-                                                                .color(palette::TEXT_MUTED),
+                                                                egui::RichText::new(format!(
+                                                                    "📎 Приглашение в группу «{}»",
+                                                                    parsed.name
+                                                                ))
+                                                                .size(14.5)
+                                                                .color(palette::TEXT),
                                                             );
                                                         }
                                                     }
                                                 }
-                                            }
-                                            ui.with_layout(
-                                                egui::Layout::right_to_left(
-                                                    egui::Align::Center,
-                                                ),
-                                                |ui| {
-                                                    if is_me {
-                                                        let status_color = match msg.delivery {
-                                                            OutgoingDeliveryStatus::Read => {
-                                                                palette::ACCENT
-                                                            }
-                                                            OutgoingDeliveryStatus::Delivered => {
-                                                                palette::TEXT_MUTED
-                                                            }
-                                                            OutgoingDeliveryStatus::Pending => {
-                                                                palette::TEXT_MUTED
-                                                            }
-                                                        };
-                                                        paint_delivery_status(
-                                                            ui,
-                                                            msg.delivery,
-                                                            status_color,
+                                                ui.with_layout(
+                                                    egui::Layout::right_to_left(
+                                                        egui::Align::Center,
+                                                    ),
+                                                    |ui| {
+                                                        if is_me {
+                                                            let status_color =
+                                                                match msg.delivery {
+                                                                    OutgoingDeliveryStatus::Read => {
+                                                                        palette::ACCENT
+                                                                    }
+                                                                    OutgoingDeliveryStatus::Delivered => {
+                                                                        palette::TEXT_MUTED
+                                                                    }
+                                                                    OutgoingDeliveryStatus::Pending => {
+                                                                        palette::TEXT_MUTED
+                                                                    }
+                                                                };
+                                                            paint_delivery_status(
+                                                                ui,
+                                                                msg.delivery,
+                                                                status_color,
+                                                            );
+                                                            ui.add_space(4.0);
+                                                        }
+                                                        ui.label(
+                                                            egui::RichText::new(short_time(
+                                                                &msg.timestamp,
+                                                            ))
+                                                            .size(10.5)
+                                                            .color(palette::TEXT_MUTED),
                                                         );
-                                                        ui.add_space(4.0);
-                                                    }
-                                                    ui.label(
-                                                        egui::RichText::new(short_time(
-                                                            &msg.timestamp,
-                                                        ))
-                                                        .size(10.5)
-                                                        .color(palette::TEXT_MUTED),
-                                                    );
-                                                },
-                                            );
+                                                    },
+                                                );
+                                            });
                                         });
-                                    });
-                                let msg_has_invite =
-                                    !extract_invite_links(&msg.text).is_empty();
-                                if let (Some(ref voice), Some((wave_rect, has_audio, is_playing))) =
-                                    (msg.voice.as_ref(), voice_bubble)
-                                {
-                                    let tid = voice.transfer_id.clone();
-                                    let click = bubble
-                                        .response
-                                        .interact(egui::Sense::click());
-                                    if click.clicked() {
-                                        let pos = click
-                                            .interact_pointer_pos()
-                                            .or_else(|| ui.ctx().pointer_latest_pos());
-                                        let seek = has_audio
-                                            && pos.is_some_and(|p| wave_rect.contains(p));
-                                        if seek {
-                                            let p = pos.unwrap();
-                                            let ratio = ((p.x - wave_rect.left())
-                                                / wave_rect.width())
+
+                                    if let (
+                                        Some(ref voice),
+                                        Some((wave_rect, has_audio, is_playing)),
+                                    ) = (msg.voice.as_ref(), voice_bubble)
+                                    {
+                                        let tid = voice.transfer_id.clone();
+                                        let click =
+                                            bubble.response.interact(egui::Sense::click());
+                                        if click.clicked() {
+                                            let pos = click
+                                                .interact_pointer_pos()
+                                                .or_else(|| ui.ctx().pointer_latest_pos());
+                                            let seek = has_audio
+                                                && pos.is_some_and(|p| wave_rect.contains(p));
+                                            if seek {
+                                                let p = pos.unwrap();
+                                                let ratio = ((p.x - wave_rect.left())
+                                                    / wave_rect.width())
                                                 .clamp(0.0, 1.0);
-                                            voice_actions.push((tid, false, Some(ratio)));
+                                                voice_actions.push((tid, false, Some(ratio)));
+                                            } else {
+                                                voice_actions.push((tid, true, None));
+                                            }
+                                        }
+                                        click.on_hover_text(if is_playing {
+                                            "⏹ Остановить"
+                                        } else if has_audio {
+                                            "▶ Воспроизвести · шкала — перемотка"
                                         } else {
-                                            voice_actions.push((tid, true, None));
+                                            "Аудиофайл ещё не загружен"
+                                        });
+                                    }
+
+                                    // Join-кнопка ПОД пузырём, не внутри Frame.
+                                    for link in &invite_links {
+                                        let Some(parsed) = parse_invite_link(link) else {
+                                            continue;
+                                        };
+                                        if self.is_active_group_member(&parsed.id) {
+                                            ui.label(
+                                                egui::RichText::new("✓ Вы уже в группе")
+                                                    .size(12.0)
+                                                    .color(palette::TEXT_MUTED),
+                                            );
+                                            continue;
+                                        }
+                                        ui.add_space(4.0);
+                                        let btn = ui.add(
+                                            egui::Button::new(
+                                                egui::RichText::new(format!(
+                                                    "Вступить в «{}»",
+                                                    parsed.name
+                                                ))
+                                                .size(13.0)
+                                                .strong()
+                                                .color(egui::Color32::WHITE),
+                                            )
+                                            .fill(palette::ACCENT)
+                                            .min_size(egui::vec2(160.0, 30.0)),
+                                        );
+                                        if btn.clicked() {
+                                            self.pending_invite_join = Some(link.clone());
                                         }
                                     }
-                                    click.on_hover_text(if is_playing {
-                                        "⏹ Остановить"
-                                    } else if has_audio {
-                                        "▶ Воспроизвести · шкала — перемотка"
-                                    } else {
-                                        "Аудиофайл ещё не загружен"
-                                    });
-                                }
-                                // context_menu на Frame перехватывает click у кнопок внутри.
-                                if !msg_has_invite {
-                                    bubble.response.context_menu(|ui| {
-                                        if ui.button("🗑 Удалить").clicked() {
-                                            pending_msg_delete = Some(msg_id.clone());
-                                            ui.close_menu();
-                                        }
-                                    });
-                                }
+
+                                    if invite_links.is_empty() {
+                                        bubble.response.context_menu(|ui| {
+                                            if ui.button("🗑 Удалить").clicked() {
+                                                pending_msg_delete = Some(msg_id.clone());
+                                                ui.close_menu();
+                                            }
+                                        });
+                                    }
+                                });
                             });
                         }
                         ui.add_space(12.0);
                     });
+
+                // Под лентой, НАД полем ввода, ВНЕ ScrollArea — клик гарантирован.
+                if !joinable_invites.is_empty() {
+                    ui.add_space(6.0);
+                    ui.separator();
+                    ui.add_space(4.0);
+                    for (link, name) in &joinable_invites {
+                        if ui
+                            .add(
+                                egui::Button::new(
+                                    egui::RichText::new(format!("Вступить в «{name}»"))
+                                        .size(14.0)
+                                        .strong()
+                                        .color(egui::Color32::WHITE),
+                                )
+                                .fill(palette::ACCENT)
+                                .min_size(egui::vec2(200.0, 34.0)),
+                            )
+                            .clicked()
+                        {
+                            match self.join_group_from_invite(link) {
+                                Ok(()) => self.push_toast(
+                                    format!("Вы вступили в «{name}»"),
+                                    ToastKind::Info,
+                                    TOAST_TTL_SHORT,
+                                ),
+                                Err(e) => self.push_toast(
+                                    format!("Не удалось вступить: {e}"),
+                                    ToastKind::Error,
+                                    TOAST_TTL_LONG,
+                                ),
+                            }
+                        }
+                    }
+                    ui.add_space(4.0);
+                }
 
                 if let Some(msg_id) = pending_msg_delete {
                     if let Ok(peer) = self.selected_chat.parse::<PeerId>() {
@@ -3844,7 +3897,7 @@ impl eframe::App for App {
                 }
             });
 
-        // Клик «Вступить» в этом кадре — применяем до toast'ов.
+        // Клик «Вступить» — после всего UI этого кадра.
         if let Some(result) = self.drain_pending_invite_join() {
             match result {
                 Ok(name) => {
