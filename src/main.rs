@@ -1,5 +1,6 @@
 mod group;
 mod offline_mail;
+mod offline_publish;
 mod relay_mailbox;
 mod outbox;
 mod chat_store;

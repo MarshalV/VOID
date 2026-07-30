@@ -907,7 +907,8 @@ impl App {
         self.restore_pending_outgoing();
         self.prune_auto_discovered_contacts();
         self.refresh_outbox_group_sync_snapshots();
-        self.scan_chat_journal_for_group_invites();
+        // Не авто-вступаем по старым invite в журнале — только кнопка/вставка ссылки.
+        // self.scan_chat_journal_for_group_invites();
         self.index_voice_files_on_disk();
         self.relink_all_voice_files();
         self.dispatch_outbox();
@@ -1061,8 +1062,11 @@ impl App {
             ack: Some(ack_tx),
         }) {
             Ok(()) => {
-                match ack_rx.recv_timeout(Duration::from_secs(8)) {
-                    Ok(()) => info!("VOID: outbox опубликован перед выходом"),
+                match ack_rx.recv_timeout(Duration::from_secs(90)) {
+                    Ok(true) => info!("VOID: outbox опубликован перед выходом (все envelopes ack)"),
+                    Ok(false) => warn!(
+                        "VOID: публикация outbox не подтверждена — сообщения остаются в outbox.bin"
+                    ),
                     Err(_) => warn!(
                         "VOID: таймаут публикации outbox при выходе — сообщения остаются в outbox.bin"
                     ),
@@ -3040,17 +3044,18 @@ impl App {
         }
         let id = group::new_group_id();
         let me = self.local_peer_id.to_string();
+        let invitee_ids: Vec<String> = selected.iter().map(|p| p.to_string()).collect();
         // В составе только создатель. Выбранные получают invite-ссылку и
-        // попадают в группу ТОЛЬКО после явного перехода/клика по ссылке —
-        // не через group_sync и не через авто-join по тексту сообщения.
+        // попадают в группу ТОЛЬКО после явного перехода/клика по ссылке.
         let group = GroupChat {
             id: id.clone(),
             name,
             creator_id: me,
-            members: vec![GroupMember {
-                peer_id: self.local_peer_id.to_string(),
-                display_name: self.local_nickname.clone(),
-            }],
+            members: group::members_on_group_create(
+                &self.local_peer_id.to_string(),
+                &self.local_nickname,
+                &invitee_ids,
+            ),
             created_at: chrono::Local::now().format("%Y-%m-%d %H:%M").to_string(),
         };
         if !group::validate_group_chat(&group) {
@@ -3077,13 +3082,13 @@ impl App {
     }
 
     /// Больше не вступаем автоматически по тексту сообщения — только по клику
-    /// на ссылку (см. `accept_invite_link` / кнопка «Вступить» в UI).
+    /// на ссылку (см. `join_group_from_invite` / кнопка «Вступить» в UI).
     pub(crate) fn try_join_groups_from_invite_text(
         &mut self,
         _text: &str,
         _message_id: &str,
     ) -> bool {
-        false
+        group::auto_join_from_invite_message()
     }
 
     pub(crate) fn join_group_from_invite(&mut self, link: &str) -> Result<(), &'static str> {
@@ -3441,7 +3446,7 @@ impl App {
         }
         // Sync не создаёт группу с нуля — иначе invitee попадал бы в группу
         // без клика по ссылке. Вступление только через join_group_from_invite.
-        if !self.groups.contains_key(&group_id) {
+        if !group::may_install_group_from_sync(self.groups.contains_key(&group_id)) {
             return;
         }
         let me = self.local_peer_id.to_string();
@@ -3532,25 +3537,7 @@ impl App {
             return incoming;
         }
         // Принявший invite может добавить только себя; чужих из его sync не берём.
-        let incoming_has_from = incoming.iter().any(|m| m.peer_id == from_str);
-        let mut out = existing.members.clone();
-        if incoming_has_from {
-            if !out.iter().any(|m| m.peer_id == from_str) {
-                if let Some(m) = incoming.iter().find(|x| x.peer_id == from_str) {
-                    out.push(m.clone());
-                }
-            }
-        } else {
-            out.retain(|m| m.peer_id != from_str);
-        }
-        for m in &mut out {
-            if let Some(inc) = incoming.iter().find(|x| x.peer_id == m.peer_id) {
-                if !inc.display_name.is_empty() {
-                    m.display_name = inc.display_name.clone();
-                }
-            }
-        }
-        dedupe_members(out)
+        group::sanitize_sync_members_for_creator(&existing.members, &from_str, &incoming)
     }
 
     fn ensure_self_in_group(&self, group: &mut GroupChat) {

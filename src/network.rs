@@ -1,8 +1,8 @@
 //! libp2p swarm, сетевой цикл и события UI ↔ сеть.
 
 use std::collections::{HashMap, HashSet};
-use std::sync::{mpsc as std_mpsc, Arc};
-use std::sync::atomic::{AtomicU32, Ordering};
+use std::sync::{mpsc as std_mpsc, Arc, Mutex};
+use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 use std::time::{Duration, Instant};
 
 use futures::StreamExt;
@@ -27,6 +27,9 @@ use crate::offline_mail::{
     OfflineEnvelope, MAILBOX_TTL_SECS, OFFLINE_VOICE_CHUNK_KIND,
 };
 use crate::relay_mailbox::RelayMailbox;
+use crate::offline_publish::{
+    accept_dht_as_full_handoff, EnvelopeHandoffState, PendingRelayQueue,
+};
 use crate::protocol::{
     build_delete_ack_json, build_v1_hello, build_voice_ack_json,
     chat_message_id_from_json,     delete_command_message_ids, is_delete_command_json,
@@ -640,10 +643,11 @@ pub(crate) enum UICommand {
     },
     /// Кэш X25519 prekey контактов (из vault).
     CachePeerPrekeys(Vec<(PeerId, [u8; 32])>),
-    /// Опубликовать недоставленное в DHT-почтовые ящики получателей.
+    /// Опубликовать недоставленное в DHT/relay почтовые ящики получателей.
+    /// `ack` получает `true` только при durable handoff (relay Store Ack или DHT Put Ok).
     PublishOfflineOutbox {
         items: Vec<OfflineOutboxItem>,
-        ack: Option<std_mpsc::Sender<()>>,
+        ack: Option<std_mpsc::Sender<bool>>,
     },
     /// Забрать свой почтовый ящик из DHT.
     FetchOfflineMailbox,
@@ -681,21 +685,92 @@ enum MailboxKadOp {
     },
 }
 
-type PublishDone = Arc<dyn Fn() + Send + Sync>;
+type PublishDone = Arc<dyn Fn(bool) + Send + Sync>;
 
-fn publish_done_token(tx: std_mpsc::Sender<()>, total: u32) -> PublishDone {
-    let left = Arc::new(AtomicU32::new(total));
-    Arc::new(move || {
+/// Countdown gate: `true` only if every recipient unit reported ok.
+fn publish_result_token(tx: std_mpsc::Sender<bool>, total: u32) -> PublishDone {
+    let left = Arc::new(AtomicU32::new(total.max(1)));
+    let fails = Arc::new(AtomicU32::new(0));
+    Arc::new(move |ok: bool| {
+        if !ok {
+            fails.fetch_add(1, Ordering::SeqCst);
+        }
         if left.fetch_sub(1, Ordering::SeqCst) == 1 {
-            let _ = tx.send(());
+            let all_ok = fails.load(Ordering::SeqCst) == 0;
+            let _ = tx.send(all_ok);
         }
     })
 }
 
-fn signal_publish_done(done: &Option<PublishDone>) {
-    if let Some(d) = done {
-        d();
+/// Waits until every sealed envelope has a Store Ack (voice), or DHT Ok (text-only).
+struct ActiveHandoff {
+    state: Mutex<EnvelopeHandoffState>,
+    done: PublishDone,
+    fired: AtomicBool,
+}
+
+impl ActiveHandoff {
+    fn new(envelopes: &[OfflineEnvelope], done: PublishDone) -> Arc<Self> {
+        Arc::new(Self {
+            state: Mutex::new(EnvelopeHandoffState::from_envelopes(envelopes)),
+            done,
+            fired: AtomicBool::new(false),
+        })
     }
+
+    fn fire(&self, ok: bool) {
+        if self.fired.swap(true, Ordering::SeqCst) {
+            return;
+        }
+        (self.done)(ok);
+    }
+
+    fn note_store_ack(&self, message_id: &str) {
+        let settle = {
+            let mut st = self.state.lock().unwrap_or_else(|e| e.into_inner());
+            st.on_store_ack(message_id)
+        };
+        if let Some(ok) = settle {
+            self.fire(ok);
+        }
+    }
+
+    fn note_dht_ok(&self) {
+        let settle = {
+            let mut st = self.state.lock().unwrap_or_else(|e| e.into_inner());
+            st.on_dht_ok()
+        };
+        if let Some(ok) = settle {
+            self.fire(ok);
+        }
+    }
+
+    fn note_fail(&self) {
+        let settle = {
+            let mut st = self.state.lock().unwrap_or_else(|e| e.into_inner());
+            st.on_fail()
+        };
+        if let Some(ok) = settle {
+            self.fire(ok);
+        }
+    }
+}
+
+fn signal_publish_done(done: &Option<PublishDone>, ok: bool) {
+    if let Some(d) = done {
+        d(ok);
+    }
+}
+
+/// Each recipient must call the shared gate at most once (legacy fail path).
+fn once_publish_gate(inner: PublishDone) -> PublishDone {
+    let fired = Arc::new(AtomicBool::new(false));
+    Arc::new(move |ok: bool| {
+        if fired.swap(true, Ordering::SeqCst) {
+            return;
+        }
+        inner(ok);
+    })
 }
 
 /// Голосовые чанки (аудио офлайн-доставки) не годятся для DHT-записи почтового
@@ -771,7 +846,8 @@ fn put_mailbox_envelopes(
     done: Option<PublishDone>,
 ) {
     let Ok(value) = encode_mailbox(envelopes) else {
-        signal_publish_done(&done);
+        // DHT encode fail: do not settle false here — relay Store Ack may still
+        // confirm handoff. Exit timeout covers total failure.
         return;
     };
     let record = kad::Record {
@@ -790,18 +866,26 @@ fn put_mailbox_envelopes(
                 pending_kad_mail.insert(qid, MailboxKadOp::AwaitPut { done });
             }
         }
-        Err(_) => signal_publish_done(&done),
+        // Put setup failed — leave gate open for relay Ack / exit timeout.
+        Err(_) => {}
     }
 }
 
 /// JSON RR codec по умолчанию режет request на 1 МиБ. Один OfflineMailboxStore
 /// со всеми voice_chunk (~3 МБ WAV → JSON) гарантированно не проходит — шлём
 /// по одному конверту на запрос.
+type MailboxStoreTrack = HashMap<
+    libp2p::request_response::OutboundRequestId,
+    (Arc<ActiveHandoff>, String),
+>;
+
 fn fanout_relay_mail(
     swarm: &mut libp2p::Swarm<ChatBehaviour>,
     local_peer_id: PeerId,
     recipient: PeerId,
     envelopes: &[OfflineEnvelope],
+    store_track: &mut MailboxStoreTrack,
+    handoff: &Option<Arc<ActiveHandoff>>,
 ) {
     if envelopes.is_empty() {
         return;
@@ -821,15 +905,19 @@ fn fanout_relay_mail(
             envelopes: vec![env.clone()],
         };
         for peer in &peers {
-            let _ = swarm
+            let rid = swarm
                 .behaviour_mut()
                 .request_response
                 .send_request(peer, packet.clone());
+            if let Some(h) = handoff {
+                store_track.insert(rid, (h.clone(), env.message_id.clone()));
+            }
         }
     }
 }
 
-/// Разослать офлайн-почту всем bootstrap-нодам (даже если ещё не в connected_peers — dial).
+/// Разослать офлайн-почту bootstrap-нодам. Если нода ещё не connected —
+/// dial + очередь (раньше был dial-and-forget → mail терялся при выходе).
 fn fanout_relay_to_bootstraps(
     swarm: &mut libp2p::Swarm<ChatBehaviour>,
     bootstrap_peer_ids: &HashSet<PeerId>,
@@ -837,6 +925,10 @@ fn fanout_relay_to_bootstraps(
     local_peer_id: PeerId,
     recipient: PeerId,
     envelopes: &[OfflineEnvelope],
+    pending_relay: &mut PendingRelayQueue,
+    pending_relay_gates: &mut HashMap<(PeerId, PeerId), Arc<ActiveHandoff>>,
+    store_track: &mut MailboxStoreTrack,
+    handoff: &Option<Arc<ActiveHandoff>>,
 ) {
     if envelopes.is_empty() {
         return;
@@ -852,10 +944,13 @@ fn fanout_relay_to_bootstraps(
                     recipient: recip.clone(),
                     envelopes: vec![env.clone()],
                 };
-                let _ = swarm
+                let rid = swarm
                     .behaviour_mut()
                     .request_response
                     .send_request(pid, packet);
+                if let Some(h) = handoff {
+                    store_track.insert(rid, (h.clone(), env.message_id.clone()));
+                }
             }
         } else {
             let addrs: Vec<Multiaddr> = void_bootstraps
@@ -864,6 +959,10 @@ fn fanout_relay_to_bootstraps(
                 .cloned()
                 .collect();
             if !addrs.is_empty() {
+                pending_relay.enqueue(*pid, recipient, envelopes.to_vec());
+                if let Some(h) = handoff {
+                    pending_relay_gates.insert((*pid, recipient), h.clone());
+                }
                 dial_peer_best_effort(swarm, *pid, addrs, void_bootstraps);
             }
         }
@@ -877,8 +976,19 @@ fn publish_relay_mail(
     local_peer_id: PeerId,
     recipient: PeerId,
     envelopes: &[OfflineEnvelope],
+    pending_relay: &mut PendingRelayQueue,
+    pending_relay_gates: &mut HashMap<(PeerId, PeerId), Arc<ActiveHandoff>>,
+    store_track: &mut MailboxStoreTrack,
+    handoff: &Option<Arc<ActiveHandoff>>,
 ) {
-    fanout_relay_mail(swarm, local_peer_id, recipient, envelopes);
+    fanout_relay_mail(
+        swarm,
+        local_peer_id,
+        recipient,
+        envelopes,
+        store_track,
+        handoff,
+    );
     fanout_relay_to_bootstraps(
         swarm,
         bootstrap_peer_ids,
@@ -886,7 +996,38 @@ fn publish_relay_mail(
         local_peer_id,
         recipient,
         envelopes,
+        pending_relay,
+        pending_relay_gates,
+        store_track,
+        handoff,
     );
+}
+
+fn flush_pending_relay_for_peer(
+    swarm: &mut libp2p::Swarm<ChatBehaviour>,
+    pending_relay: &mut PendingRelayQueue,
+    pending_relay_gates: &mut HashMap<(PeerId, PeerId), Arc<ActiveHandoff>>,
+    store_track: &mut MailboxStoreTrack,
+    peer: PeerId,
+) {
+    for (recipient, envelopes) in pending_relay.take_for(&peer) {
+        let handoff = pending_relay_gates.remove(&(peer, recipient));
+        let recip = recipient.to_string();
+        for env in envelopes {
+            let mid = env.message_id.clone();
+            let packet = V1Packet::OfflineMailboxStore {
+                recipient: recip.clone(),
+                envelopes: vec![env],
+            };
+            let rid = swarm
+                .behaviour_mut()
+                .request_response
+                .send_request(&peer, packet);
+            if let Some(ref h) = handoff {
+                store_track.insert(rid, (h.clone(), mid));
+            }
+        }
+    }
 }
 
 fn query_relay_mailbox(
@@ -1679,6 +1820,9 @@ pub async fn run_chat_network(
             libp2p::request_response::OutboundRequestId,
             (PeerId, [u8; 16], u32),
         > = HashMap::new();
+        let mut outbound_mailbox_stores: MailboxStoreTrack = HashMap::new();
+        let mut pending_relay = PendingRelayQueue::default();
+        let mut pending_relay_gates: HashMap<(PeerId, PeerId), Arc<ActiveHandoff>> = HashMap::new();
         let mut dial_backoff: HashMap<PeerId, Instant> = HashMap::new();
         // Схлопываем подряд идущие `OutFailure` одному пиру: при отправке
         // сообщения без сессии мы шлём Hello + packet, и на DialFailure
@@ -2885,9 +3029,15 @@ pub async fn run_chat_network(
                                         .push(item);
                                 }
                                 let work_count = by_recipient.len() as u32;
-                                let done_gate = ack.map(|tx| publish_done_token(tx, work_count.max(1)));
-                                let mut work_queued = false;
+                                let shared_gate =
+                                    ack.map(|tx| publish_result_token(tx, work_count.max(1)));
+                                if by_recipient.is_empty() {
+                                    signal_publish_done(&shared_gate, false);
+                                }
                                 for (recipient, batch) in by_recipient {
+                                    let recip_done = shared_gate
+                                        .as_ref()
+                                        .map(|g| once_publish_gate(g.clone()));
                                     let mut sealed: Vec<OfflineEnvelope> = Vec::new();
                                     let mut need_prekey: Vec<OfflineOutboxItem> = Vec::new();
                                     if let Some(pk_bytes) = peer_prekeys.get(&recipient) {
@@ -2908,8 +3058,11 @@ pub async fn run_chat_network(
                                     } else {
                                         need_prekey = batch;
                                     }
+                                    if sealed.is_empty() && need_prekey.is_empty() {
+                                        signal_publish_done(&recip_done, false);
+                                        continue;
+                                    }
                                     if !sealed.is_empty() {
-                                        work_queued = true;
                                         if RelayMailbox::merge(
                                             &mut relay_mail_store,
                                             &recipient.to_string(),
@@ -2917,6 +3070,9 @@ pub async fn run_chat_network(
                                         ) {
                                             let _ = RelayMailbox::save(&relay_mail_store);
                                         }
+                                        let handoff = recip_done.as_ref().map(|d| {
+                                            ActiveHandoff::new(&sealed, d.clone())
+                                        });
                                         publish_relay_mail(
                                             &mut swarm,
                                             &bootstrap_peer_ids,
@@ -2924,18 +3080,48 @@ pub async fn run_chat_network(
                                             local_peer_id,
                                             recipient,
                                             &sealed,
+                                            &mut pending_relay,
+                                            &mut pending_relay_gates,
+                                            &mut outbound_mailbox_stores,
+                                            &handoff,
                                         );
+                                        if let Some(h) = &handoff {
+                                            let tracked = outbound_mailbox_stores
+                                                .values()
+                                                .any(|(g, _)| Arc::ptr_eq(g, h));
+                                            let queued = pending_relay_gates
+                                                .values()
+                                                .any(|g| Arc::ptr_eq(g, h));
+                                            if !tracked
+                                                && !queued
+                                                && !accept_dht_as_full_handoff(&sealed)
+                                            {
+                                                warn!(
+                                                    "VOID: нет relay для voice offline — handoff fail"
+                                                );
+                                                h.note_fail();
+                                            }
+                                        }
                                         let for_dht = dht_eligible_envelopes(&sealed);
+                                        let dht_done: Option<PublishDone> =
+                                            handoff.as_ref().map(|h| {
+                                                let h = h.clone();
+                                                Arc::new(move |ok: bool| {
+                                                    if ok {
+                                                        h.note_dht_ok();
+                                                    }
+                                                })
+                                                    as PublishDone
+                                            });
                                         start_mailbox_merge_put(
                                             &mut swarm,
                                             &mut pending_kad_mail,
                                             recipient,
                                             for_dht,
-                                            done_gate.clone(),
+                                            dht_done,
                                         );
                                     }
                                     if !need_prekey.is_empty() {
-                                        work_queued = true;
                                         let qid = swarm
                                             .behaviour_mut()
                                             .kad
@@ -2945,14 +3131,11 @@ pub async fn run_chat_network(
                                             MailboxKadOp::PrekeyForPublish {
                                                 recipient,
                                                 items: need_prekey,
-                                                done: done_gate.clone(),
+                                                done: recip_done,
                                                 prekey_bytes: None,
                                             },
                                         );
                                     }
-                                }
-                                if !work_queued {
-                                    signal_publish_done(&done_gate);
                                 }
                             }
                         }
@@ -3538,7 +3721,16 @@ pub async fn run_chat_network(
                                 libp2p::request_response::Message::Response { request_id, response } => {
                                     match response {
                                         V1Packet::Ack => {
-                                            if let Some((delivered_peer, message_id)) =
+                                            if let Some((handoff, message_id)) =
+                                                outbound_mailbox_stores.remove(&request_id)
+                                            {
+                                                debug!(
+                                                    "[{}] ✅ RR: OfflineMailboxStore Ack {}",
+                                                    now,
+                                                    &message_id[..8.min(message_id.len())]
+                                                );
+                                                handoff.note_store_ack(&message_id);
+                                            } else if let Some((delivered_peer, message_id)) =
                                                 outbound_msg_requests.remove(&request_id)
                                             {
                                                 debug!(
@@ -3801,6 +3993,7 @@ pub async fn run_chat_network(
                             // без этого он считался «отправленным» навсегда, и получатель
                             // никогда не собирал файл целиком. Перематываем next_chunk назад,
                             // чтобы chunk_tick повторил отправку именно этого чанка.
+                            let _ = outbound_mailbox_stores.remove(&request_id);
                             let was_chunk = outbound_chunk_requests.remove(&request_id);
                             if let Some((_, tid, chunk_idx)) = was_chunk {
                                 if let Some(t) = outgoing_transfers.get_mut(&tid) {
@@ -3894,6 +4087,13 @@ pub async fn run_chat_network(
                             pending_dials.remove(&peer_id);
                             // Соединение установлено — снимаем задание на реконнект.
                             reconnect_queue.remove(&peer_id);
+                            flush_pending_relay_for_peer(
+                                &mut swarm,
+                                &mut pending_relay,
+                                &mut pending_relay_gates,
+                                &mut outbound_mailbox_stores,
+                                peer_id,
+                            );
                             publish_self_in_dht(&mut swarm.behaviour_mut().kad, local_peer_id);
 
                             // Определяем, идёт ли соединение через relay.
@@ -4329,15 +4529,25 @@ pub async fn run_chat_network(
 
                         SwarmEvent::Behaviour(ChatBehaviourEvent::Kad(kad::Event::OutboundQueryProgressed { id, result, .. })) => {
                             match &result {
-                                libp2p::kad::QueryResult::PutRecord(Ok(_))
-                                | libp2p::kad::QueryResult::PutRecord(Err(_)) => {
+                                libp2p::kad::QueryResult::PutRecord(Ok(_)) => {
                                     if let Some(MailboxKadOp::AwaitPut { done }) =
                                         pending_kad_mail.remove(&id)
                                     {
                                         let _ = event_tx
                                             .send(NetworkEvent::OfflineMailboxPublished)
                                             .await;
-                                        signal_publish_done(&done);
+                                        // Text-only: DHT Put Ok can settle. Voice: ignored
+                                        // until every voice_chunk Store Ack arrives.
+                                        signal_publish_done(&done, true);
+                                    }
+                                }
+                                libp2p::kad::QueryResult::PutRecord(Err(_)) => {
+                                    // Do NOT treat as success (old bug). Relay Store Ack
+                                    // may still settle the once-gate; otherwise exit times out.
+                                    if let Some(MailboxKadOp::AwaitPut { done: _ }) =
+                                        pending_kad_mail.remove(&id)
+                                    {
+                                        debug!("VOID: DHT mailbox PutRecord failed — waiting relay Ack");
                                     }
                                 }
                                 libp2p::kad::QueryResult::GetRecord(Ok(
@@ -4448,27 +4658,45 @@ pub async fn run_chat_network(
                                                             let _ =
                                                                 RelayMailbox::save(&relay_mail_store);
                                                         }
+                                                        let handoff = done.as_ref().map(|d| {
+                                                            ActiveHandoff::new(&sealed, d.clone())
+                                                        });
                                                         publish_relay_mail(
-                                            &mut swarm,
-                                            &bootstrap_peer_ids,
-                                            &void_bootstraps,
-                                            local_peer_id,
-                                            recipient,
-                                            &sealed,
-                                        );
-                                        let for_dht = dht_eligible_envelopes(&sealed);
-                                        start_mailbox_merge_put(
-                                            &mut swarm,
-                                            &mut pending_kad_mail,
-                                            recipient,
-                                            for_dht,
-                                            done,
-                                        );
-                                    } else {
-                                        signal_publish_done(&done);
-                                    }
+                                                            &mut swarm,
+                                                            &bootstrap_peer_ids,
+                                                            &void_bootstraps,
+                                                            local_peer_id,
+                                                            recipient,
+                                                            &sealed,
+                                                            &mut pending_relay,
+                                                            &mut pending_relay_gates,
+                                                            &mut outbound_mailbox_stores,
+                                                            &handoff,
+                                                        );
+                                                        let for_dht =
+                                                            dht_eligible_envelopes(&sealed);
+                                                        let dht_done: Option<PublishDone> =
+                                                            handoff.as_ref().map(|h| {
+                                                                let h = h.clone();
+                                                                Arc::new(move |ok: bool| {
+                                                                    if ok {
+                                                                        h.note_dht_ok();
+                                                                    }
+                                                                })
+                                                                    as PublishDone
+                                                            });
+                                                        start_mailbox_merge_put(
+                                                            &mut swarm,
+                                                            &mut pending_kad_mail,
+                                                            recipient,
+                                                            for_dht,
+                                                            dht_done,
+                                                        );
+                                                    } else {
+                                                        signal_publish_done(&done, false);
+                                                    }
                                                 } else {
-                                                    signal_publish_done(&done);
+                                                    signal_publish_done(&done, false);
                                                     let _ = event_tx
                                                         .send(NetworkEvent::Status(format!(
                                                             "⚠ Нет prekey {} — офлайн-почта не отправлена",
@@ -4500,7 +4728,7 @@ pub async fn run_chat_network(
                                                 );
                                             }
                                             MailboxKadOp::PrekeyForPublish { done, .. } => {
-                                                signal_publish_done(&done);
+                                                signal_publish_done(&done, false);
                                             }
                                             MailboxKadOp::FetchInbox { .. }
                                             | MailboxKadOp::AwaitPut { .. } => {}

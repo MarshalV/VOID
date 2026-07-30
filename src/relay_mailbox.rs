@@ -125,3 +125,38 @@ impl RelayMailbox {
         out
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::offline_mail::OfflineEnvelope;
+
+    fn env(id: &str, ct_len: usize) -> OfflineEnvelope {
+        OfflineEnvelope {
+            v: 1,
+            sender: "s".into(),
+            sender_pk: [0u8; 32],
+            message_id: id.into(),
+            kind: "voice_chunk".into(),
+            eph: [0u8; 32],
+            nonce: [0u8; 12],
+            ct: vec![0u8; ct_len],
+        }
+    }
+
+    #[test]
+    fn take_batch_leaves_remainder_for_next_query() {
+        let mut map = HashMap::new();
+        let recip = "peer";
+        let big = (0..20)
+            .map(|i| env(&format!("c{i}"), 40_000))
+            .collect::<Vec<_>>();
+        assert!(RelayMailbox::merge(&mut map, recip, big));
+        let first = RelayMailbox::take_batch(&mut map, recip, 100_000);
+        assert!(!first.is_empty());
+        assert!(map.get(recip).map(|s| !s.is_empty()).unwrap_or(false));
+        let second = RelayMailbox::take_batch(&mut map, recip, 100_000);
+        assert!(!second.is_empty());
+        assert_ne!(first[0].message_id, second[0].message_id);
+    }
+}

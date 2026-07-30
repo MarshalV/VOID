@@ -246,3 +246,131 @@ fn hex_nibble(c: u8) -> Option<u8> {
         _ => None,
     }
 }
+
+/// Members right after create: creator only. Invitees join only via explicit
+/// `join_group_from_invite` (click / paste), never from DM text or sync.
+pub(crate) fn members_on_group_create(
+    creator_id: &str,
+    creator_name: &str,
+    _invitee_peer_ids: &[String],
+) -> Vec<GroupMember> {
+    vec![GroupMember {
+        peer_id: creator_id.to_string(),
+        display_name: creator_name.to_string(),
+    }]
+}
+
+/// Receiving invite text in chat must never auto-install the group.
+pub(crate) fn auto_join_from_invite_message() -> bool {
+    false
+}
+
+/// `group_sync` must not create a group the local user never joined.
+pub(crate) fn may_install_group_from_sync(already_have_group: bool) -> bool {
+    already_have_group
+}
+
+/// Creator accepting a non-creator sync: only allow `from` to add/remove self.
+pub(crate) fn sanitize_sync_members_for_creator(
+    existing: &[GroupMember],
+    from_peer_id: &str,
+    incoming: &[GroupMember],
+) -> Vec<GroupMember> {
+    let incoming_has_from = incoming.iter().any(|m| m.peer_id == from_peer_id);
+    let mut out = existing.to_vec();
+    if incoming_has_from {
+        if !out.iter().any(|m| m.peer_id == from_peer_id) {
+            if let Some(m) = incoming.iter().find(|x| x.peer_id == from_peer_id) {
+                out.push(m.clone());
+            }
+        }
+    } else {
+        out.retain(|m| m.peer_id != from_peer_id);
+    }
+    for m in &mut out {
+        if let Some(inc) = incoming.iter().find(|x| x.peer_id == m.peer_id) {
+            if !inc.display_name.is_empty() {
+                m.display_name = inc.display_name.clone();
+            }
+        }
+    }
+    dedupe_members(out)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn create_group_members_exclude_invitees() {
+        let members = members_on_group_create(
+            "creator",
+            "Alice",
+            &["bob".into(), "carol".into()],
+        );
+        assert_eq!(members.len(), 1);
+        assert_eq!(members[0].peer_id, "creator");
+        assert!(!members.iter().any(|m| m.peer_id == "bob"));
+    }
+
+    #[test]
+    fn invite_message_never_auto_joins() {
+        assert!(!auto_join_from_invite_message());
+    }
+
+    #[test]
+    fn sync_does_not_install_unknown_group() {
+        assert!(!may_install_group_from_sync(false));
+        assert!(may_install_group_from_sync(true));
+    }
+
+    #[test]
+    fn invite_link_roundtrip_creator_only() {
+        let g = GroupChat {
+            id: "0123456789abcdef0123456789abcdef".into(),
+            name: "Test".into(),
+            creator_id: "creatorpeer".into(),
+            members: members_on_group_create("creatorpeer", "Alice", &["bob".into()]),
+            created_at: "now".into(),
+        };
+        let link = build_invite_link(&g);
+        let parsed = parse_invite_link(&link).expect("parse");
+        assert_eq!(parsed.members.len(), 1);
+        assert_eq!(parsed.members[0].peer_id, "creatorpeer");
+        assert!(!parsed.members.iter().any(|m| m.peer_id == "bob"));
+    }
+
+    #[test]
+    fn extract_invite_from_dm_text() {
+        let text =
+            "invite:\nvoid://group/0123456789abcdef0123456789abcdef?name=G&m=c&creator=c";
+        let links = extract_invite_links(text);
+        assert_eq!(links.len(), 1);
+        assert!(links[0].starts_with("void://group/"));
+    }
+
+    #[test]
+    fn creator_sanitize_adds_only_sender_self() {
+        let existing = vec![GroupMember {
+            peer_id: "creator".into(),
+            display_name: "A".into(),
+        }];
+        let incoming = vec![
+            GroupMember {
+                peer_id: "creator".into(),
+                display_name: "A".into(),
+            },
+            GroupMember {
+                peer_id: "bob".into(),
+                display_name: "B".into(),
+            },
+            GroupMember {
+                peer_id: "eve".into(),
+                display_name: "E".into(),
+            },
+        ];
+        let out = sanitize_sync_members_for_creator(&existing, "bob", &incoming);
+        assert!(out.iter().any(|m| m.peer_id == "bob"));
+        assert!(!out.iter().any(|m| m.peer_id == "eve"));
+    }
+}
