@@ -3556,37 +3556,11 @@ impl eframe::App for App {
                 let chat_peer = self.selected_chat.clone();
                 self.relink_voice_messages_in_chat(&chat_peer);
 
-                // Полоска над лентой (не модалка): клик вне ScrollArea.
-                if !joinable_invites.is_empty() {
-                    egui::Frame::none()
-                        .fill(palette::BG_PANEL)
-                        .inner_margin(egui::Margin::symmetric(12.0, 8.0))
-                        .show(ui, |ui| {
-                            for (link, name) in &joinable_invites {
-                                if ui
-                                    .add_sized(
-                                        [ui.available_width().min(360.0), 32.0],
-                                        egui::Button::new(
-                                            egui::RichText::new(format!(
-                                                "Вступить в «{name}»"
-                                            ))
-                                            .size(14.0)
-                                            .strong(),
-                                        )
-                                        .fill(palette::ACCENT),
-                                    )
-                                    .clicked()
-                                {
-                                    self.pending_invite_join = Some(link.clone());
-                                }
-                            }
-                        });
-                    ui.add_space(4.0);
-                }
-
                 let chat_stream_height = ui.available_height();
                 egui::ScrollArea::vertical()
                     .id_salt("chat_stream")
+                    // Пока висит invite — не прилипаем к низу, иначе click по
+                    // «Вступить» в пузыре пропадает.
                     .stick_to_bottom(joinable_invites.is_empty())
                     .auto_shrink([false, false])
                     .max_height(chat_stream_height)
@@ -3698,42 +3672,59 @@ impl eframe::App for App {
                                             } else if !msg.text.is_empty() {
                                                 let invite_links =
                                                     extract_invite_links(&msg.text);
-                                                ui.label(
-                                                    egui::RichText::new(&msg.text)
-                                                        .size(14.5)
-                                                        .color(palette::TEXT),
-                                                );
-                                                for link in &invite_links {
-                                                    let Some(parsed) =
-                                                        parse_invite_link(link)
-                                                    else {
-                                                        continue;
-                                                    };
-                                                    if self.is_active_group_member(&parsed.id)
-                                                    {
+                                                if invite_links.is_empty() {
+                                                    ui.label(
+                                                        egui::RichText::new(&msg.text)
+                                                            .size(14.5)
+                                                            .color(palette::TEXT),
+                                                    );
+                                                } else {
+                                                    // Не рисуем сырой void:// — длинная
+                                                    // ссылка ломает межстрочный интервал.
+                                                    for link in &invite_links {
+                                                        let Some(parsed) =
+                                                            parse_invite_link(link)
+                                                        else {
+                                                            continue;
+                                                        };
                                                         ui.label(
-                                                            egui::RichText::new(
-                                                                "✓ Вы уже в группе",
-                                                            )
-                                                            .size(12.0)
-                                                            .color(palette::TEXT_MUTED),
+                                                            egui::RichText::new(format!(
+                                                                "📎 Приглашение в группу «{}»",
+                                                                parsed.name
+                                                            ))
+                                                            .size(14.5)
+                                                            .color(palette::TEXT),
                                                         );
-                                                    } else if ui
-                                                        .add(
-                                                            egui::Button::new(
-                                                                egui::RichText::new(format!(
-                                                                    "Вступить в «{}»",
-                                                                    parsed.name
-                                                                ))
-                                                                .size(13.0),
+                                                        ui.add_space(8.0);
+                                                        if self
+                                                            .is_active_group_member(&parsed.id)
+                                                        {
+                                                            ui.label(
+                                                                egui::RichText::new(
+                                                                    "✓ Вы уже в группе",
+                                                                )
+                                                                .size(12.0)
+                                                                .color(palette::TEXT_MUTED),
+                                                            );
+                                                        } else if ui
+                                                            .add(
+                                                                egui::Button::new(
+                                                                    egui::RichText::new(
+                                                                        format!(
+                                                                            "Вступить в «{}»",
+                                                                            parsed.name
+                                                                        ),
+                                                                    )
+                                                                    .size(13.0)
+                                                                    .color(palette::TEXT),
+                                                                )
+                                                                .fill(palette::ACCENT),
                                                             )
-                                                            .fill(palette::ACCENT),
-                                                        )
-                                                        .clicked()
-                                                    {
-                                                        // В App-поле: join после ScrollArea.
-                                                        self.pending_invite_join =
-                                                            Some(link.clone());
+                                                            .clicked()
+                                                        {
+                                                            self.pending_invite_join =
+                                                                Some(link.clone());
+                                                        }
                                                     }
                                                 }
                                             }
