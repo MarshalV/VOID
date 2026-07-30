@@ -178,8 +178,8 @@ async fn main() -> Result<(), Box<dyn Error>> {
 
     info!("🌐 VOID bootstrap: загрузка из vault.bin после разблокировки.");
 
-    let (event_tx, event_rx) = mpsc::channel(256);
-    let (command_tx, command_rx) = mpsc::channel(256);
+    let (event_tx, event_rx) = mpsc::channel(1024);
+    let (command_tx, command_rx) = mpsc::channel(1024);
     let command_tx_for_mdns = command_tx.clone();
 
     let chat_messages = SharedChatMessages::new();
@@ -209,7 +209,7 @@ async fn main() -> Result<(), Box<dyn Error>> {
     let viewport = egui::ViewportBuilder::default()
         .with_inner_size([1280.0, 820.0])
         .with_min_inner_size([820.0, 540.0])
-        .with_title("VOID — пароль vault");
+        .with_title(concat!("VOID — пароль vault [build ", env!("CARGO_PKG_VERSION"), "-2026-07-30]"));
 
     eframe::run_native(
         "VOID P2P",

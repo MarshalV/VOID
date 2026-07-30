@@ -276,7 +276,7 @@ pub(crate) const RESEND_DELAY_MAX: Duration = Duration::from_secs(300);
 pub(crate) const SESSION_WAIT_TIMEOUT: Duration = Duration::from_secs(20);
 /// Журнал переписок пишем на диск не чаще этого интервала (не блокируем отправку).
 pub(crate) const JOURNAL_PERSIST_DEBOUNCE: Duration = Duration::from_secs(2);
-pub(crate) const OFFLINE_DHT_PUBLISH_DEBOUNCE: Duration = Duration::from_secs(1);
+pub(crate) const OFFLINE_DHT_PUBLISH_DEBOUNCE: Duration = Duration::from_millis(200);
 
 pub(crate) fn resend_delay_for_attempt(attempts: u32) -> Duration {
     let exp = attempts.min(6);
@@ -1035,44 +1035,68 @@ impl App {
         }
     }
 
-    /// Неблокирующая публикация outbox в DHT (из UI/tokio-потока).
+    /// Неблокирующая публикация outbox в DHT/relay (из UI-потока).
     pub(crate) fn publish_outbox_to_dht(&self) {
         let items = self.build_offline_publish_items();
         if items.is_empty() {
             return;
         }
-        let _ = self.command_tx.try_send(UICommand::PublishOfflineOutbox {
+        if let Err(e) = self.command_tx.try_send(UICommand::PublishOfflineOutbox {
             items,
             ack: None,
-        });
+        }) {
+            warn!("VOID: PublishOfflineOutbox не встал в очередь: {e}");
+        }
     }
 
     /// При выходе: синхронно публикуем outbox в relay/DHT, пока сетевой поток ещё жив.
-    /// Раньше flush уходил в detached-тред и убивался вместе с процессом — сообщения
-    /// оставались только в outbox.bin и не доходили, если отправитель больше не
-    /// выходил в сеть.
+    /// `blocking_send` нельзя звать с UI-потока внутри `#[tokio::main]` —
+    /// отправку делаем с отдельного OS-потока, ack ждём здесь.
     fn flush_outbox_to_dht_on_exit(&self) {
         let items = self.build_offline_publish_items();
         if items.is_empty() {
             return;
         }
+        let n = items.len();
+        info!("VOID: exit-flush {} offline item(s)…", n);
         let (ack_tx, ack_rx) = std::sync::mpsc::channel();
-        match self.command_tx.blocking_send(UICommand::PublishOfflineOutbox {
-            items,
-            ack: Some(ack_tx),
-        }) {
-            Ok(()) => {
-                match ack_rx.recv_timeout(Duration::from_secs(90)) {
-                    Ok(true) => info!("VOID: outbox опубликован перед выходом (все envelopes ack)"),
-                    Ok(false) => warn!(
-                        "VOID: публикация outbox не подтверждена — сообщения остаются в outbox.bin"
-                    ),
-                    Err(_) => warn!(
-                        "VOID: таймаут публикации outbox при выходе — сообщения остаются в outbox.bin"
-                    ),
+        let tx = self.command_tx.clone();
+        let join = std::thread::Builder::new()
+            .name("void-exit-publish".into())
+            .spawn(move || {
+                tx.blocking_send(UICommand::PublishOfflineOutbox {
+                    items,
+                    ack: Some(ack_tx),
+                })
+            });
+        let send_ok = match join {
+            Ok(handle) => match handle.join() {
+                Ok(Ok(())) => true,
+                Ok(Err(_)) => {
+                    warn!("VOID: сеть уже остановлена — outbox только на диске");
+                    false
                 }
+                Err(_) => {
+                    warn!("VOID: поток exit-publish паникул");
+                    false
+                }
+            },
+            Err(e) => {
+                warn!("VOID: не удалось стартовать exit-publish: {e}");
+                false
             }
-            Err(_) => warn!("VOID: сеть уже остановлена — outbox только на диске"),
+        };
+        if !send_ok {
+            return;
+        }
+        match ack_rx.recv_timeout(Duration::from_secs(90)) {
+            Ok(true) => info!("VOID: outbox опубликован перед выходом (все envelopes ack)"),
+            Ok(false) => warn!(
+                "VOID: публикация outbox не подтверждена — сообщения остаются в outbox.bin"
+            ),
+            Err(_) => warn!(
+                "VOID: таймаут публикации outbox при выходе — сообщения остаются в outbox.bin"
+            ),
         }
     }
 
