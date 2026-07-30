@@ -3093,6 +3093,47 @@ impl eframe::App for App {
                     }),
             )
             .show(ctx, |ui| {
+                // Кнопка вступления ЗДЕСЬ — вне ScrollArea чата. Клик в пузыре
+                // egui глотает из‑за context_menu на Frame.
+                if !self.selected_chat.is_empty() {
+                    let invites =
+                        self.joinable_invites_for_chat(&self.selected_chat.clone());
+                    for (link, name) in invites {
+                        ui.horizontal(|ui| {
+                            if ui
+                                .add(
+                                    egui::Button::new(
+                                        egui::RichText::new(format!(
+                                            "Вступить в «{name}»"
+                                        ))
+                                        .size(14.0)
+                                        .strong()
+                                        .color(egui::Color32::WHITE),
+                                    )
+                                    .fill(palette::ACCENT)
+                                    .min_size(egui::vec2(180.0, 34.0)),
+                                )
+                                .clicked()
+                            {
+                                // Сразу, без отложенного pending — панель не в ScrollArea.
+                                match self.join_group_from_invite(&link) {
+                                    Ok(()) => self.push_toast(
+                                        format!("Вы вступили в «{name}»"),
+                                        ToastKind::Info,
+                                        TOAST_TTL_SHORT,
+                                    ),
+                                    Err(e) => self.push_toast(
+                                        format!("Не удалось вступить: {e}"),
+                                        ToastKind::Error,
+                                        TOAST_TTL_LONG,
+                                    ),
+                                }
+                            }
+                        });
+                        ui.add_space(8.0);
+                    }
+                }
+
                 egui::Frame::none()
                     .fill(palette::BG_CARD)
                     .stroke({
@@ -3679,8 +3720,9 @@ impl eframe::App for App {
                                                             .color(palette::TEXT),
                                                     );
                                                 } else {
-                                                    // Не рисуем сырой void:// — длинная
-                                                    // ссылка ломает межстрочный интервал.
+                                                    // Только текст в пузыре. Кнопка — под
+                                                    // полем ввода (и рядом с пузырем ниже),
+                                                    // иначе context_menu/ScrollArea едят click.
                                                     for link in &invite_links {
                                                         let Some(parsed) =
                                                             parse_invite_link(link)
@@ -3695,10 +3737,10 @@ impl eframe::App for App {
                                                             .size(14.5)
                                                             .color(palette::TEXT),
                                                         );
-                                                        ui.add_space(8.0);
                                                         if self
                                                             .is_active_group_member(&parsed.id)
                                                         {
+                                                            ui.add_space(4.0);
                                                             ui.label(
                                                                 egui::RichText::new(
                                                                     "✓ Вы уже в группе",
@@ -3706,24 +3748,6 @@ impl eframe::App for App {
                                                                 .size(12.0)
                                                                 .color(palette::TEXT_MUTED),
                                                             );
-                                                        } else if ui
-                                                            .add(
-                                                                egui::Button::new(
-                                                                    egui::RichText::new(
-                                                                        format!(
-                                                                            "Вступить в «{}»",
-                                                                            parsed.name
-                                                                        ),
-                                                                    )
-                                                                    .size(13.0)
-                                                                    .color(palette::TEXT),
-                                                                )
-                                                                .fill(palette::ACCENT),
-                                                            )
-                                                            .clicked()
-                                                        {
-                                                            self.pending_invite_join =
-                                                                Some(link.clone());
                                                         }
                                                     }
                                                 }
@@ -3763,6 +3787,8 @@ impl eframe::App for App {
                                             );
                                         });
                                     });
+                                let msg_has_invite =
+                                    !extract_invite_links(&msg.text).is_empty();
                                 if let (Some(ref voice), Some((wave_rect, has_audio, is_playing))) =
                                     (msg.voice.as_ref(), voice_bubble)
                                 {
@@ -3794,12 +3820,15 @@ impl eframe::App for App {
                                         "Аудиофайл ещё не загружен"
                                     });
                                 }
-                                bubble.response.context_menu(|ui| {
-                                    if ui.button("🗑 Удалить").clicked() {
-                                        pending_msg_delete = Some(msg_id.clone());
-                                        ui.close_menu();
-                                    }
-                                });
+                                // context_menu на Frame перехватывает click у кнопок внутри.
+                                if !msg_has_invite {
+                                    bubble.response.context_menu(|ui| {
+                                        if ui.button("🗑 Удалить").clicked() {
+                                            pending_msg_delete = Some(msg_id.clone());
+                                            ui.close_menu();
+                                        }
+                                    });
+                                }
                             });
                         }
                         ui.add_space(12.0);
