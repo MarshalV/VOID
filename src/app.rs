@@ -982,13 +982,15 @@ impl App {
     }
 
     pub(crate) fn persist_all_before_exit(&mut self) {
+        // Journal/outbox на диск всегда; flush можно повторить из on_exit,
+        // если close_requested не дождался ack.
+        self.persist_chat_journal();
+        self.persist_outbox();
         if self.exit_prepared {
             return;
         }
-        self.exit_prepared = true;
-        self.persist_chat_journal();
-        self.persist_outbox();
         self.flush_outbox_to_dht_on_exit();
+        self.exit_prepared = true;
     }
 
     fn bootstrap_offline_mail(&mut self) {
@@ -1143,6 +1145,19 @@ impl App {
                     let Ok(recipient) = peer.parse::<PeerId>() else {
                         continue;
                     };
+                    let Some(tid) = transfer_id_from_hex(transfer_id) else {
+                        continue;
+                    };
+                    // Без чанков не публикуем «пустой» voice-meta — иначе у
+                    // получателя пузырь без аудио.
+                    let before = items.len();
+                    if !Self::push_offline_voice_chunks(&mut items, recipient, &tid, voice_path) {
+                        warn!(
+                            "VOID: offline voice без чанков ({transfer_id}) — пропуск meta"
+                        );
+                        continue;
+                    }
+                    let _ = before;
                     let msg = ChatMessage {
                         id: message_id.clone(),
                         sender_id: me.to_string(),
@@ -1164,9 +1179,6 @@ impl App {
                             kind: "dm".into(),
                             payload,
                         });
-                    }
-                    if let Some(tid) = transfer_id_from_hex(transfer_id) {
-                        Self::push_offline_voice_chunks(&mut items, recipient, &tid, voice_path);
                     }
                 }
                 OutboxEntry::GroupMessage {
@@ -1217,9 +1229,20 @@ impl App {
                         };
                         if recipient == me {
                             continue;
-                        };
+                        }
                         let base_tid = transfer_id_from_hex(transfer_id).unwrap_or([0u8; 16]);
                         let peer_tid = per_peer_voice_transfer_id(&base_tid, recipient);
+                        if !Self::push_offline_voice_chunks(
+                            &mut items,
+                            recipient,
+                            &peer_tid,
+                            voice_path,
+                        ) {
+                            warn!(
+                                "VOID: group offline voice без чанков ({transfer_id}) — пропуск"
+                            );
+                            continue;
+                        }
                         let msg = ChatMessage {
                             id: message_id.clone(),
                             sender_id: me.to_string(),
@@ -1242,12 +1265,6 @@ impl App {
                                 payload,
                             });
                         }
-                        Self::push_offline_voice_chunks(
-                            &mut items,
-                            recipient,
-                            &peer_tid,
-                            voice_path,
-                        );
                     }
                 }
                 OutboxEntry::GroupSync {
@@ -1279,31 +1296,30 @@ impl App {
         items
     }
 
-    /// Кладёт зашифрованные куски WAV в offline-очередь (relay; DHT их не берёт).
+    /// Кладёт куски WAV в offline-очередь. `false` = файла нет/слишком большой.
     fn push_offline_voice_chunks(
         items: &mut Vec<OfflineOutboxItem>,
         recipient: PeerId,
         transfer_id: &[u8; 16],
         voice_path: &str,
-    ) {
+    ) -> bool {
         let Ok(bytes) = std::fs::read(voice_path) else {
             crate::voice::voice_log(&format!(
                 "offline voice: не прочитать {} для {}",
                 voice_path,
                 transfer_id_to_hex(transfer_id)
             ));
-            return;
+            return false;
         };
         let Some(chunks) = split_voice_for_offline(transfer_id, &bytes) else {
             crate::voice::voice_log(&format!(
-                "offline voice: {} слишком большой ({} байт) — только метаданные",
+                "offline voice: слишком большой/пустой {} ({})",
                 transfer_id_to_hex(transfer_id),
                 bytes.len()
             ));
-            return;
+            return false;
         };
         let tid_hex = transfer_id_to_hex(transfer_id);
-        let n = chunks.len();
         for (i, payload) in chunks.into_iter().enumerate() {
             items.push(OfflineOutboxItem {
                 recipient,
@@ -1312,10 +1328,7 @@ impl App {
                 payload,
             });
         }
-        crate::voice::voice_log(&format!(
-            "offline voice: {n} чанков для {tid_hex} → {}",
-            &recipient.to_string()[..8.min(recipient.to_string().len())]
-        ));
+        true
     }
 
     pub(crate) fn ingest_offline_mailbox(&mut self, envelopes: Vec<OfflineEnvelope>) {
@@ -1383,7 +1396,9 @@ impl App {
         if any {
             self.persist_vault();
             self.mark_chat_journal_dirty();
-            let _ = self.command_tx.try_send(UICommand::ClearOfflineMailbox);
+            // НЕ чистим DHT-ящик здесь: take_batch отдаёт порциями, а Clear
+            // убивал оставшийся текст/чанки, которые ещё не пришли с relay/DHT.
+            // Дедуп по message_id защищает от повторов.
             self.add_status("📬 Получена офлайн-почта".into());
         } else if decrypt_failed > 0 {
             self.add_status(format!(

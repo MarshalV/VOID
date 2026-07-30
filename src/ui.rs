@@ -3897,7 +3897,10 @@ impl eframe::App for App {
         }
 
         if ctx.input(|i| i.viewport().close_requested()) {
+            // Держим окно, пока flush не закончит публикацию outbox.
+            ctx.send_viewport_cmd(egui::ViewportCommand::CancelClose);
             self.persist_all_before_exit();
+            ctx.send_viewport_cmd(egui::ViewportCommand::Close);
         }
 
         self.flush_chat_journal_if_dirty();
