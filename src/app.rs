@@ -1046,27 +1046,30 @@ impl App {
         });
     }
 
-    /// При выходе: best-effort публикация outbox (не блокируем UI — outbox уже на диске).
+    /// При выходе: синхронно публикуем outbox в relay/DHT, пока сетевой поток ещё жив.
+    /// Раньше flush уходил в detached-тред и убивался вместе с процессом — сообщения
+    /// оставались только в outbox.bin и не доходили, если отправитель больше не
+    /// выходил в сеть.
     fn flush_outbox_to_dht_on_exit(&self) {
         let items = self.build_offline_publish_items();
         if items.is_empty() {
             return;
         }
-        let command_tx = self.command_tx.clone();
-        let _ = std::thread::Builder::new()
-            .name("void-exit-flush".into())
-            .spawn(move || {
-                let (ack_tx, ack_rx) = std::sync::mpsc::channel();
-                if command_tx
-                    .blocking_send(UICommand::PublishOfflineOutbox {
-                        items,
-                        ack: Some(ack_tx),
-                    })
-                    .is_ok()
-                {
-                    let _ = ack_rx.recv_timeout(Duration::from_secs(2));
+        let (ack_tx, ack_rx) = std::sync::mpsc::channel();
+        match self.command_tx.blocking_send(UICommand::PublishOfflineOutbox {
+            items,
+            ack: Some(ack_tx),
+        }) {
+            Ok(()) => {
+                match ack_rx.recv_timeout(Duration::from_secs(8)) {
+                    Ok(()) => info!("VOID: outbox опубликован перед выходом"),
+                    Err(_) => warn!(
+                        "VOID: таймаут публикации outbox при выходе — сообщения остаются в outbox.bin"
+                    ),
                 }
-            });
+            }
+            Err(_) => warn!("VOID: сеть уже остановлена — outbox только на диске"),
+        }
     }
 
     fn build_offline_publish_items(&self) -> Vec<OfflineOutboxItem> {
@@ -3021,7 +3024,6 @@ impl App {
         if name.is_empty() {
             return None;
         }
-        // Только явно переданный список — никогда не подмешиваем known_peers.
         let mut selected: Vec<PeerId> = Vec::new();
         let mut seen = HashSet::new();
         for pid in member_pids {
@@ -3038,38 +3040,27 @@ impl App {
         }
         let id = group::new_group_id();
         let me = self.local_peer_id.to_string();
-        let mut members = vec![GroupMember {
-            peer_id: me.clone(),
-            display_name: self.local_nickname.clone(),
-        }];
-        for pid in &selected {
-            let display_name = self
-                .known_peers
-                .get(pid)
-                .cloned()
-                .unwrap_or_else(|| {
-                    format!("Peer {}", &pid.to_string()[..8.min(pid.to_string().len())])
-                });
-            members.push(GroupMember {
-                peer_id: pid.to_string(),
-                display_name,
-            });
-        }
+        // В составе только создатель. Выбранные получают invite-ссылку и
+        // попадают в группу ТОЛЬКО после явного перехода/клика по ссылке —
+        // не через group_sync и не через авто-join по тексту сообщения.
         let group = GroupChat {
             id: id.clone(),
             name,
             creator_id: me,
-            members: dedupe_members(members),
+            members: vec![GroupMember {
+                peer_id: self.local_peer_id.to_string(),
+                display_name: self.local_nickname.clone(),
+            }],
             created_at: chrono::Local::now().format("%Y-%m-%d %H:%M").to_string(),
         };
         if !group::validate_group_chat(&group) {
             return None;
         }
         info!(
-            "Создана группа «{}» id={} участников={}",
+            "Создана группа «{}» id={} — инвайт {} чел.",
             group.name,
             &id[..8.min(id.len())],
-            group.members.len()
+            selected.len()
         );
         self.groups.insert(id.clone(), group.clone());
         self.selected_chat = group_thread_key(&id);
@@ -3078,50 +3069,21 @@ impl App {
             .entry(self.selected_chat.clone())
             .or_default();
         self.persist_vault();
-        self.broadcast_group_sync(&group);
-        self.dial_group_members(&group);
-        // Инвайт — строго выбранным, не всем контактам.
         for pid in &selected {
             self.send_group_invite_dm(*pid, &group);
+            let _ = self.command_tx.try_send(UICommand::SearchPeer(*pid));
         }
         Some(id)
     }
 
-    /// Автоматически вступает в группу по invite в тексте. Возвращает true, если было вступление.
-    pub(crate) fn try_join_groups_from_invite_text(&mut self, text: &str, message_id: &str) -> bool {
-        let mut joined = false;
-        for link in extract_invite_links(text) {
-            let Some(parsed) = parse_invite_link(&link) else {
-                continue;
-            };
-            if self.left_groups.contains(&parsed.id) {
-                continue;
-            }
-            if self.is_active_group_member(&parsed.id) {
-                continue;
-            }
-            if self.join_group_from_invite_auto(&link).is_ok() {
-                joined = true;
-                info!("Группа «{}» добавлена из invite (msg {})", parsed.name, message_id);
-                self.push_toast(
-                    format!("Группа «{}» добавлена", parsed.name),
-                    ToastKind::Info,
-                    TOAST_TTL_SHORT,
-                );
-            }
-        }
-        joined
-    }
-
-    fn join_group_from_invite_auto(&mut self, link: &str) -> Result<(), &'static str> {
-        let group = parse_invite_link(link).ok_or("Некорректная invite-ссылка")?;
-        if self.left_groups.contains(&group.id) {
-            return Err("группа в списке покинутых");
-        }
-        if self.is_active_group_member(&group.id) {
-            return Ok(());
-        }
-        self.install_group(group, false)
+    /// Больше не вступаем автоматически по тексту сообщения — только по клику
+    /// на ссылку (см. `accept_invite_link` / кнопка «Вступить» в UI).
+    pub(crate) fn try_join_groups_from_invite_text(
+        &mut self,
+        _text: &str,
+        _message_id: &str,
+    ) -> bool {
+        false
     }
 
     pub(crate) fn join_group_from_invite(&mut self, link: &str) -> Result<(), &'static str> {
@@ -3235,16 +3197,8 @@ impl App {
         )
     }
 
-    /// Обрабатывает invite в входящем сообщении (повторяет, пока не вступит).
-    pub(crate) fn try_process_invite_message(&mut self, message_id: &str, text: &str) {
-        if self.invite_join_processed.contains(message_id) {
-            return;
-        }
-        let joined = self.try_join_groups_from_invite_text(text, message_id);
-        if joined || self.invite_links_handled(text) {
-            self.invite_join_processed.insert(message_id.to_string());
-        }
-    }
+    /// Раньше авто-вступал по тексту invite. Теперь только кнопка / вставка ссылки.
+    pub(crate) fn try_process_invite_message(&mut self, _message_id: &str, _text: &str) {}
 
     fn refresh_outbox_group_sync_snapshots(&mut self) {
         let snapshots: Vec<(String, String, String, Vec<GroupMember>)> = self
@@ -3307,27 +3261,16 @@ impl App {
             .selected_group_id()
             .ok_or("Выберите групповой чат")?
             .to_string();
-        let display_name = self
-            .known_peers
-            .get(&peer)
-            .cloned()
-            .unwrap_or_else(|| format!("Peer {}", &peer.to_string()[..8.min(peer.to_string().len())]));
-        let group = self.groups.get_mut(&group_id).ok_or("Группа не найдена")?;
+        let group = self.groups.get(&group_id).ok_or("Группа не найдена")?.clone();
         if group.members.iter().any(|m| m.peer_id == peer.to_string()) {
             return Err("Участник уже в группе");
         }
-        group.members.push(GroupMember {
-            peer_id: peer.to_string(),
-            display_name,
-        });
-        group.members = dedupe_members(group.members.clone());
+        // Не добавляем в members и не шлём group_sync — иначе пир
+        // окажется в группе без перехода по ссылке. Только invite-DM.
         self.group_departed_peers
-            .entry(group_id.clone())
+            .entry(group_id)
             .or_default()
             .remove(&peer.to_string());
-        let group = group.clone();
-        self.persist_vault();
-        self.broadcast_group_sync(&group);
         self.send_group_invite_dm(peer, &group);
         let _ = self.command_tx.try_send(UICommand::SearchPeer(peer));
         Ok(())
@@ -3496,6 +3439,11 @@ impl App {
         if self.left_groups.contains(&group_id) {
             return;
         }
+        // Sync не создаёт группу с нуля — иначе invitee попадал бы в группу
+        // без клика по ссылке. Вступление только через join_group_from_invite.
+        if !self.groups.contains_key(&group_id) {
+            return;
+        }
         let me = self.local_peer_id.to_string();
         if !members.iter().any(|m| m.peer_id == me) {
             return;
@@ -3583,9 +3531,16 @@ impl App {
         if !am_creator || from_is_creator {
             return incoming;
         }
+        // Принявший invite может добавить только себя; чужих из его sync не берём.
         let incoming_has_from = incoming.iter().any(|m| m.peer_id == from_str);
         let mut out = existing.members.clone();
-        if !incoming_has_from {
+        if incoming_has_from {
+            if !out.iter().any(|m| m.peer_id == from_str) {
+                if let Some(m) = incoming.iter().find(|x| x.peer_id == from_str) {
+                    out.push(m.clone());
+                }
+            }
+        } else {
             out.retain(|m| m.peer_id != from_str);
         }
         for m in &mut out {

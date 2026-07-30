@@ -15,7 +15,9 @@ use crate::{
     FileTransferProgress, NetworkEvent, OutgoingDeliveryStatus, PendingGroupSend, PendingSend, UICommand,
     RESEND_GRACE,
 };
-use crate::group::{group_thread_key, is_group_thread, GroupChat};
+use crate::group::{
+    extract_invite_links, group_thread_key, is_group_thread, parse_invite_link, GroupChat,
+};
 use crate::protocol::ChatMessage;
 use crate::voice;
 
@@ -2517,7 +2519,7 @@ impl eframe::App for App {
                     self.show_create_group = false;
                     self.create_group_pick.clear();
                     self.push_toast(
-                        "Группа создана".into(),
+                        "Группа создана — инвайты отправлены".into(),
                         ToastKind::Info,
                         TOAST_TTL_SHORT,
                     );
@@ -2558,7 +2560,7 @@ impl eframe::App for App {
                         member_peer = pid.to_string();
                     }
                     ui.add_space(8.0);
-                    if ui.button("Добавить").clicked() {
+                    if ui.button("Пригласить").clicked() {
                         do_add = true;
                     }
                 });
@@ -2572,7 +2574,7 @@ impl eframe::App for App {
                             self.show_group_panel = false;
                             self.add_group_member_peer.clear();
                             self.push_toast(
-                                "Участник добавлен".into(),
+                                "Инвайт отправлен — в группе после перехода по ссылке".into(),
                                 ToastKind::Info,
                                 TOAST_TTL_SHORT,
                             );
@@ -3665,11 +3667,66 @@ impl eframe::App for App {
                                                     is_playing,
                                                 ));
                                             } else if !msg.text.is_empty() {
+                                                let invite_links =
+                                                    extract_invite_links(&msg.text);
                                                 ui.label(
                                                     egui::RichText::new(&msg.text)
                                                         .size(14.5)
                                                         .color(palette::TEXT),
                                                 );
+                                                for link in invite_links {
+                                                    let Some(parsed) =
+                                                        parse_invite_link(&link)
+                                                    else {
+                                                        continue;
+                                                    };
+                                                    let in_group = self
+                                                        .is_active_group_member(
+                                                            &parsed.id,
+                                                        );
+                                                    if in_group {
+                                                        ui.label(
+                                                            egui::RichText::new(
+                                                                "✓ Вы уже в группе",
+                                                            )
+                                                            .size(12.0)
+                                                            .color(palette::TEXT_MUTED),
+                                                        );
+                                                    } else if ui
+                                                        .button(
+                                                            egui::RichText::new(format!(
+                                                                "Вступить в «{}»",
+                                                                parsed.name
+                                                            ))
+                                                            .size(13.0),
+                                                        )
+                                                        .clicked()
+                                                    {
+                                                        match self
+                                                            .join_group_from_invite(&link)
+                                                        {
+                                                            Ok(()) => {
+                                                                self.push_toast(
+                                                                    format!(
+                                                                        "Вы вступили в «{}»",
+                                                                        parsed.name
+                                                                    ),
+                                                                    ToastKind::Info,
+                                                                    TOAST_TTL_SHORT,
+                                                                );
+                                                            }
+                                                            Err(e) => {
+                                                                self.push_toast(
+                                                                    format!(
+                                                                        "Не удалось вступить: {e}"
+                                                                    ),
+                                                                    ToastKind::Error,
+                                                                    TOAST_TTL_LONG,
+                                                                );
+                                                            }
+                                                        }
+                                                    }
+                                                }
                                             }
                                             ui.with_layout(
                                                 egui::Layout::right_to_left(
