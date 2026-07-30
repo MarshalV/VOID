@@ -1,15 +1,26 @@
-//! Offline outbox publish policy: durable handoff requires every envelope
-//! to get a relay Store Ack. DHT Put alone is never enough.
+//! Offline outbox publish policy: durable handoff.
+//!
+//! Voice chunks always need a relay Store Ack (DHT mailbox is too small).
+//! Text-only envelopes may complete on DHT Put Ok or Store Ack.
 
 use std::collections::{HashMap, HashSet};
 use libp2p::PeerId;
 use crate::offline_mail::{OfflineEnvelope, OFFLINE_VOICE_CHUNK_KIND};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) enum PublishHandoff { Ok, Failed, Pending }
+pub(crate) enum PublishHandoff {
+    Ok,
+    Failed,
+    Pending,
+}
 
-/// DHT Put Ok is NEVER enough for durable handoff.
-pub(crate) fn accept_dht_as_full_handoff(_envelopes: &[OfflineEnvelope]) -> bool { false }
+/// DHT Put Ok counts as durable handoff only when there are no voice chunks.
+pub(crate) fn accept_dht_as_full_handoff(envelopes: &[OfflineEnvelope]) -> bool {
+    !envelopes.is_empty()
+        && envelopes
+            .iter()
+            .all(|e| e.kind != OFFLINE_VOICE_CHUNK_KIND)
+}
 
 pub(crate) fn required_store_message_ids(envelopes: &[OfflineEnvelope]) -> HashSet<String> {
     envelopes.iter().map(|e| e.message_id.clone()).collect()
@@ -24,25 +35,57 @@ pub(crate) struct EnvelopeHandoffState {
 
 impl EnvelopeHandoffState {
     pub(crate) fn new(message_ids: HashSet<String>, accept_dht: bool) -> Self {
-        Self { pending: message_ids, accept_dht, settled: None }
+        Self {
+            pending: message_ids,
+            accept_dht,
+            settled: None,
+        }
     }
+
     pub(crate) fn from_envelopes(envelopes: &[OfflineEnvelope]) -> Self {
-        Self::new(required_store_message_ids(envelopes), accept_dht_as_full_handoff(envelopes))
+        Self::new(
+            required_store_message_ids(envelopes),
+            accept_dht_as_full_handoff(envelopes),
+        )
     }
+
     pub(crate) fn on_store_ack(&mut self, message_id: &str) -> Option<bool> {
-        if self.settled.is_some() { return None; }
+        if self.settled.is_some() {
+            return None;
+        }
         self.pending.remove(message_id);
-        if self.pending.is_empty() { self.settled = Some(true); Some(true) } else { None }
+        if self.pending.is_empty() {
+            self.settled = Some(true);
+            Some(true)
+        } else {
+            None
+        }
     }
+
     pub(crate) fn on_dht_ok(&mut self) -> Option<bool> {
-        if self.settled.is_some() { return None; }
-        if self.accept_dht { self.pending.clear(); self.settled = Some(true); Some(true) } else { None }
+        if self.settled.is_some() {
+            return None;
+        }
+        if self.accept_dht {
+            self.pending.clear();
+            self.settled = Some(true);
+            Some(true)
+        } else {
+            None
+        }
     }
+
     pub(crate) fn on_fail(&mut self) -> Option<bool> {
-        if self.settled.is_some() { return None; }
-        self.settled = Some(false); Some(false)
+        if self.settled.is_some() {
+            return None;
+        }
+        self.settled = Some(false);
+        Some(false)
     }
-    pub(crate) fn pending_count(&self) -> usize { self.pending.len() }
+
+    pub(crate) fn pending_count(&self) -> usize {
+        self.pending.len()
+    }
 }
 
 pub(crate) fn exit_flush_ok(results: &[PublishHandoff]) -> bool {
@@ -55,53 +98,93 @@ pub(crate) struct PendingRelayQueue {
 }
 
 impl PendingRelayQueue {
-    pub(crate) fn enqueue(&mut self, relay: PeerId, recipient: PeerId, envelopes: Vec<OfflineEnvelope>) {
-        if envelopes.is_empty() { return; }
+    pub(crate) fn enqueue(
+        &mut self,
+        relay: PeerId,
+        recipient: PeerId,
+        envelopes: Vec<OfflineEnvelope>,
+    ) {
+        if envelopes.is_empty() {
+            return;
+        }
         let slot = self.by_relay.entry(relay).or_default();
         if let Some((_, existing)) = slot.iter_mut().find(|(r, _)| *r == recipient) {
             for env in envelopes {
-                if existing.iter().any(|e| e.message_id == env.message_id) { continue; }
+                if existing.iter().any(|e| e.message_id == env.message_id) {
+                    continue;
+                }
                 existing.push(env);
             }
-        } else { slot.push((recipient, envelopes)); }
+        } else {
+            slot.push((recipient, envelopes));
+        }
     }
+
     pub(crate) fn take_for(&mut self, relay: &PeerId) -> Vec<(PeerId, Vec<OfflineEnvelope>)> {
         self.by_relay.remove(relay).unwrap_or_default()
     }
-    pub(crate) fn is_empty(&self) -> bool { self.by_relay.is_empty() }
-    pub(crate) fn queued_relays(&self) -> usize { self.by_relay.len() }
+
+    pub(crate) fn is_empty(&self) -> bool {
+        self.by_relay.is_empty()
+    }
+
+    pub(crate) fn queued_relays(&self) -> usize {
+        self.by_relay.len()
+    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
     fn env(id: &str, kind: &str) -> OfflineEnvelope {
-        OfflineEnvelope { v: 1, sender: "a".into(), sender_pk: [0u8; 32], message_id: id.to_string(), kind: kind.into(), eph: [0u8; 32], nonce: [0u8; 12], ct: vec![1, 2, 3] }
+        OfflineEnvelope {
+            v: 1,
+            sender: "a".into(),
+            sender_pk: [0u8; 32],
+            message_id: id.to_string(),
+            kind: kind.into(),
+            eph: [0u8; 32],
+            nonce: [0u8; 12],
+            ct: vec![1, 2, 3],
+        }
     }
+
     #[test]
-    fn dht_alone_never_counts_as_handoff() {
+    fn text_dm_accepts_dht_handoff() {
         let sealed = vec![env("m1", "dm")];
-        assert!(!accept_dht_as_full_handoff(&sealed));
+        assert!(accept_dht_as_full_handoff(&sealed));
         let mut st = EnvelopeHandoffState::from_envelopes(&sealed);
-        assert_eq!(st.on_dht_ok(), None);
-        assert_eq!(st.on_store_ack("m1"), Some(true));
+        assert_eq!(st.on_dht_ok(), Some(true));
     }
+
     #[test]
-    fn voice_needs_every_chunk_store_ack() {
-        let sealed = vec![env("meta", "dm"), env("c0", OFFLINE_VOICE_CHUNK_KIND), env("c1", OFFLINE_VOICE_CHUNK_KIND)];
+    fn voice_chunks_reject_dht_alone() {
+        let sealed = vec![
+            env("meta", "dm"),
+            env("c0", OFFLINE_VOICE_CHUNK_KIND),
+            env("c1", OFFLINE_VOICE_CHUNK_KIND),
+        ];
+        assert!(!accept_dht_as_full_handoff(&sealed));
         let mut st = EnvelopeHandoffState::from_envelopes(&sealed);
         assert_eq!(st.on_dht_ok(), None);
         assert_eq!(st.on_store_ack("meta"), None);
         assert_eq!(st.on_store_ack("c0"), None);
         assert_eq!(st.on_store_ack("c1"), Some(true));
     }
+
     #[test]
     fn first_ack_does_not_complete_multi_envelope() {
-        let sealed = vec![env("c0", OFFLINE_VOICE_CHUNK_KIND), env("c1", OFFLINE_VOICE_CHUNK_KIND), env("c2", OFFLINE_VOICE_CHUNK_KIND)];
+        let sealed = vec![
+            env("c0", OFFLINE_VOICE_CHUNK_KIND),
+            env("c1", OFFLINE_VOICE_CHUNK_KIND),
+            env("c2", OFFLINE_VOICE_CHUNK_KIND),
+        ];
         let mut st = EnvelopeHandoffState::from_envelopes(&sealed);
         assert_eq!(st.on_store_ack("c0"), None);
         assert_eq!(st.pending_count(), 2);
     }
+
     #[test]
     fn pending_queue_merges_and_drains() {
         let r1 = PeerId::random();

@@ -993,8 +993,8 @@ impl App {
         self.exit_prepared = true;
         self.persist_chat_journal();
         self.persist_outbox();
-        // Только try_send — без join/recv. Иначе закрытие зависает, когда
-        // сетевой поток не читает канал или handoff ждёт Ack десятки секунд.
+        // Ждём handoff до 6с (см. flush_outbox_to_dht_on_exit) — иначе инвайты/
+        // непрочитанные DM не попадут на bootstrap при закрытии отправителя.
         self.flush_outbox_to_dht_on_exit();
     }
 
@@ -1056,22 +1056,31 @@ impl App {
         }
     }
 
-    /// При выходе: best-effort публикация. Не блокируем закрытие окна.
-    /// Outbox уже на диске (`persist_outbox`) — дойдёт при следующем запуске.
+    /// При выходе: публикуем outbox в relay/DHT и ждём handoff (короткий timeout).
+    /// Иначе процесс умирает раньше Store Ack / Put Ok — инвайты и DM не доходят,
+    /// пока отправитель снова не запустит клиент.
     fn flush_outbox_to_dht_on_exit(&self) {
         let items = self.build_offline_publish_items();
         if items.is_empty() {
             return;
         }
-        match self.command_tx.try_send(UICommand::PublishOfflineOutbox {
+        let n = items.len();
+        let (ack_tx, ack_rx) = std::sync::mpsc::channel();
+        match self.command_tx.blocking_send(UICommand::PublishOfflineOutbox {
             items,
-            ack: None,
+            ack: Some(ack_tx),
         }) {
-            Ok(()) => info!(
-                "VOID: exit — outbox поставлен в очередь (best-effort, без ожидания ack)"
-            ),
-            Err(_) => warn!(
-                "VOID: exit — сеть не приняла outbox, останется в outbox.bin до следующего запуска"
+            Ok(()) => match ack_rx.recv_timeout(Duration::from_secs(6)) {
+                Ok(true) => info!("VOID: exit — outbox ({n}) сдан в relay/DHT"),
+                Ok(false) => warn!(
+                    "VOID: exit — handoff outbox ({n}) не подтверждён, останется в outbox.bin"
+                ),
+                Err(_) => warn!(
+                    "VOID: exit — timeout 6s ожидания handoff outbox ({n}), останется в outbox.bin"
+                ),
+            },
+            Err(e) => warn!(
+                "VOID: exit — сеть не приняла outbox ({e}), останется в outbox.bin"
             ),
         }
     }
@@ -3225,6 +3234,9 @@ impl App {
             group_id: None,
         });
         self.outbox_track_direct(peer, message_id.clone(), text.clone());
+        // Сразу в relay/DHT — не ждать tick: иначе при быстром выходе инвайт
+        // остаётся только в outbox.bin у отправителя.
+        self.publish_outbox_to_dht();
         self.pending_sends.push(PendingSend {
             peer,
             text: text.clone(),
