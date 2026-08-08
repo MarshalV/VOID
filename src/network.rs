@@ -644,7 +644,8 @@ pub(crate) enum UICommand {
     /// Кэш X25519 prekey контактов (из vault).
     CachePeerPrekeys(Vec<(PeerId, [u8; 32])>),
     /// Опубликовать недоставленное в DHT/relay почтовые ящики получателей.
-    /// `ack` получает `true` только при durable handoff (relay Store Ack или DHT Put Ok).
+    /// `ack` = true только при durable handoff: Store Ack от bootstrap
+    /// (или, без bootstrap — Ack любого пира / DHT Put Ok для текста).
     PublishOfflineOutbox {
         items: Vec<OfflineOutboxItem>,
         ack: Option<std_mpsc::Sender<bool>>,
@@ -702,7 +703,8 @@ fn publish_result_token(tx: std_mpsc::Sender<bool>, total: u32) -> PublishDone {
     })
 }
 
-/// Waits until every sealed envelope has a Store Ack (voice), or DHT Ok (text-only).
+/// Waits until every sealed envelope has a durable Store Ack, or (LAN-only)
+/// DHT Ok for text-only batches when `allow_dht_fallback` is set.
 struct ActiveHandoff {
     state: Mutex<EnvelopeHandoffState>,
     done: PublishDone,
@@ -710,9 +712,16 @@ struct ActiveHandoff {
 }
 
 impl ActiveHandoff {
-    fn new(envelopes: &[OfflineEnvelope], done: PublishDone) -> Arc<Self> {
+    fn new(
+        envelopes: &[OfflineEnvelope],
+        done: PublishDone,
+        allow_dht_fallback: bool,
+    ) -> Arc<Self> {
         Arc::new(Self {
-            state: Mutex::new(EnvelopeHandoffState::from_envelopes(envelopes)),
+            state: Mutex::new(EnvelopeHandoffState::from_envelopes(
+                envelopes,
+                allow_dht_fallback,
+            )),
             done,
             fired: AtomicBool::new(false),
         })
@@ -886,6 +895,9 @@ fn fanout_relay_mail(
     envelopes: &[OfflineEnvelope],
     store_track: &mut MailboxStoreTrack,
     handoff: &Option<Arc<ActiveHandoff>>,
+    // When false (bootstraps configured), ephemeral peer stores are best-effort
+    // cache only — their Ack must not settle durable handoff.
+    track_handoff: bool,
 ) {
     if envelopes.is_empty() {
         return;
@@ -909,8 +921,10 @@ fn fanout_relay_mail(
                 .behaviour_mut()
                 .request_response
                 .send_request(peer, packet.clone());
-            if let Some(h) = handoff {
-                store_track.insert(rid, (h.clone(), env.message_id.clone()));
+            if track_handoff {
+                if let Some(h) = handoff {
+                    store_track.insert(rid, (h.clone(), env.message_id.clone()));
+                }
             }
         }
     }
@@ -981,6 +995,9 @@ fn publish_relay_mail(
     store_track: &mut MailboxStoreTrack,
     handoff: &Option<Arc<ActiveHandoff>>,
 ) {
+    // With bootstraps: only their Store Ack is durable. Ephemeral peers still
+    // get a copy as cache, but must not settle the exit/publish gate.
+    let track_ephemeral = bootstrap_peer_ids.is_empty();
     fanout_relay_mail(
         swarm,
         local_peer_id,
@@ -988,6 +1005,7 @@ fn publish_relay_mail(
         envelopes,
         store_track,
         handoff,
+        track_ephemeral,
     );
     fanout_relay_to_bootstraps(
         swarm,
@@ -1001,6 +1019,27 @@ fn publish_relay_mail(
         store_track,
         handoff,
     );
+}
+
+/// Dial any configured bootstrap that is not yet connected (for store or fetch).
+fn dial_missing_bootstraps(
+    swarm: &mut libp2p::Swarm<ChatBehaviour>,
+    bootstrap_peer_ids: &HashSet<PeerId>,
+    void_bootstraps: &[Multiaddr],
+) {
+    for pid in bootstrap_peer_ids {
+        if swarm.is_connected(pid) {
+            continue;
+        }
+        let addrs: Vec<Multiaddr> = void_bootstraps
+            .iter()
+            .filter(|ma| peer_id_from_multiaddr(ma) == Some(*pid))
+            .cloned()
+            .collect();
+        if !addrs.is_empty() {
+            dial_peer_best_effort(swarm, *pid, addrs, void_bootstraps);
+        }
+    }
 }
 
 fn flush_pending_relay_for_peer(
@@ -1046,6 +1085,16 @@ fn query_relay_mailbox(
             .request_response
             .send_request(&peer, packet.clone());
     }
+}
+
+fn query_relay_mailbox_with_bootstraps(
+    swarm: &mut libp2p::Swarm<ChatBehaviour>,
+    local_peer_id: PeerId,
+    bootstrap_peer_ids: &HashSet<PeerId>,
+    void_bootstraps: &[Multiaddr],
+) {
+    dial_missing_bootstraps(swarm, bootstrap_peer_ids, void_bootstraps);
+    query_relay_mailbox(swarm, local_peer_id);
 }
 
 async fn remember_peer_prekey(
@@ -1873,7 +1922,12 @@ pub async fn run_chat_network(
                     if let Some(deadline) = fetch_mailbox_after {
                         if Instant::now() >= deadline {
                             mailbox_fetch_attempts = mailbox_fetch_attempts.saturating_add(1);
-                            query_relay_mailbox(&mut swarm, local_peer_id);
+                            query_relay_mailbox_with_bootstraps(
+                                &mut swarm,
+                                local_peer_id,
+                                &bootstrap_peer_ids,
+                                &void_bootstraps,
+                            );
                             let qid = swarm
                                 .behaviour_mut()
                                 .kad
@@ -1930,6 +1984,26 @@ pub async fn run_chat_network(
                             attempt
                         );
                         dial_peer_best_effort(&mut swarm, pid, clean, &void_bootstraps);
+                    }
+                    // Outbox mail waiting for bootstrap dial must not die with a
+                    // single failed attempt — re-dial while the process is alive.
+                    for pid in pending_relay.relay_peer_ids() {
+                        if connected.contains(&pid) {
+                            continue;
+                        }
+                        let addrs: Vec<Multiaddr> = void_bootstraps
+                            .iter()
+                            .filter(|ma| peer_id_from_multiaddr(ma) == Some(pid))
+                            .cloned()
+                            .collect();
+                        if !addrs.is_empty() {
+                            dial_peer_best_effort(
+                                &mut swarm,
+                                pid,
+                                addrs,
+                                &void_bootstraps,
+                            );
+                        }
                     }
                 }
                 // ─── Tick: переобъявление себя в DHT (каждые 10 мин) ───────
@@ -3002,7 +3076,12 @@ pub async fn run_chat_network(
                                 }
                             }
                             UICommand::FetchOfflineMailbox => {
-                                query_relay_mailbox(&mut swarm, local_peer_id);
+                                query_relay_mailbox_with_bootstraps(
+                                    &mut swarm,
+                                    local_peer_id,
+                                    &bootstrap_peer_ids,
+                                    &void_bootstraps,
+                                );
                                 let qid = swarm
                                     .behaviour_mut()
                                     .kad
@@ -3070,8 +3149,17 @@ pub async fn run_chat_network(
                                         ) {
                                             let _ = RelayMailbox::save(&relay_mail_store);
                                         }
+                                        // With bootstraps: require Store Ack from a
+                                        // bootstrap. DHT Put alone used to settle text
+                                        // early → sender quit → mail never on a durable
+                                        // node → offline recipient never got it.
+                                        let allow_dht = bootstrap_peer_ids.is_empty();
                                         let handoff = recip_done.as_ref().map(|d| {
-                                            ActiveHandoff::new(&sealed, d.clone())
+                                            ActiveHandoff::new(
+                                                &sealed,
+                                                d.clone(),
+                                                allow_dht,
+                                            )
                                         });
                                         publish_relay_mail(
                                             &mut swarm,
@@ -3094,10 +3182,13 @@ pub async fn run_chat_network(
                                                 .any(|g| Arc::ptr_eq(g, h));
                                             if !tracked
                                                 && !queued
-                                                && !accept_dht_as_full_handoff(&sealed)
+                                                && !accept_dht_as_full_handoff(
+                                                    &sealed,
+                                                    allow_dht,
+                                                )
                                             {
                                                 warn!(
-                                                    "VOID: нет relay для voice offline — handoff fail"
+                                                    "VOID: нет durable relay для offline — handoff fail"
                                                 );
                                                 h.note_fail();
                                             }
@@ -4536,8 +4627,9 @@ pub async fn run_chat_network(
                                         let _ = event_tx
                                             .send(NetworkEvent::OfflineMailboxPublished)
                                             .await;
-                                        // Text-only: DHT Put Ok can settle. Voice: ignored
-                                        // until every voice_chunk Store Ack arrives.
+                                        // DHT Put Ok may settle only when ActiveHandoff
+                                        // was created with allow_dht_fallback (no bootstraps).
+                                        // With bootstraps, note_dht_ok is a no-op settle.
                                         signal_publish_done(&done, true);
                                     }
                                 }
@@ -4658,8 +4750,14 @@ pub async fn run_chat_network(
                                                             let _ =
                                                                 RelayMailbox::save(&relay_mail_store);
                                                         }
+                                                        let allow_dht =
+                                                            bootstrap_peer_ids.is_empty();
                                                         let handoff = done.as_ref().map(|d| {
-                                                            ActiveHandoff::new(&sealed, d.clone())
+                                                            ActiveHandoff::new(
+                                                                &sealed,
+                                                                d.clone(),
+                                                                allow_dht,
+                                                            )
                                                         });
                                                         publish_relay_mail(
                                                             &mut swarm,
@@ -4673,6 +4771,26 @@ pub async fn run_chat_network(
                                                             &mut outbound_mailbox_stores,
                                                             &handoff,
                                                         );
+                                                        if let Some(h) = &handoff {
+                                                            let tracked = outbound_mailbox_stores
+                                                                .values()
+                                                                .any(|(g, _)| Arc::ptr_eq(g, h));
+                                                            let queued = pending_relay_gates
+                                                                .values()
+                                                                .any(|g| Arc::ptr_eq(g, h));
+                                                            if !tracked
+                                                                && !queued
+                                                                && !accept_dht_as_full_handoff(
+                                                                    &sealed,
+                                                                    allow_dht,
+                                                                )
+                                                            {
+                                                                warn!(
+                                                                    "VOID: нет durable relay для offline (после prekey) — handoff fail"
+                                                                );
+                                                                h.note_fail();
+                                                            }
+                                                        }
                                                         let for_dht =
                                                             dht_eligible_envelopes(&sealed);
                                                         let dht_done: Option<PublishDone> =

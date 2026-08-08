@@ -7,6 +7,7 @@ mod chat_store;
 mod crypto;
 mod file_transfer;
 mod metadata_strip;
+mod tray_bg;
 mod ui;
 mod voice;
 

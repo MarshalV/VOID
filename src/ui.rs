@@ -1685,7 +1685,27 @@ impl App {
 
 impl eframe::App for App {
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
-        if self.vault_unlock_gate(ctx) {
+        let _in_background = self.tray.poll(ctx);
+
+        if self.tray.background {
+            // Keep network/outbox alive without drawing the window.
+            if self.pending_unlock.is_some() {
+                // Auto-unlock only; skip password UI while hidden.
+                if self
+                    .pending_unlock
+                    .as_ref()
+                    .is_some_and(|p| p.try_auto_unlock && !p.password.is_empty())
+                {
+                    let _ = self.vault_unlock_gate(ctx);
+                }
+                self.handle_window_close_request(ctx);
+                if self.pending_unlock.is_some() {
+                    ctx.request_repaint_after(Duration::from_millis(250));
+                    return;
+                }
+            }
+        } else if self.vault_unlock_gate(ctx) {
+            self.handle_window_close_request(ctx);
             return;
         }
 
@@ -2374,6 +2394,15 @@ impl eframe::App for App {
             || !self.toasts.is_empty()
         {
             ctx.request_repaint_after(Duration::from_millis(33));
+        }
+
+        self.handle_window_close_request(ctx);
+
+        // Свёрнуты в трей: сеть/outbox уже обработаны выше — UI не рисуем.
+        if self.tray.background {
+            self.voice_player.poll();
+            ctx.request_repaint_after(Duration::from_millis(250));
+            return;
         }
 
         // ===== Системная консоль (overlay-окно) =====
@@ -3998,11 +4027,7 @@ impl eframe::App for App {
             }
         }
 
-        if ctx.input(|i| i.viewport().close_requested()) {
-            // Без CancelClose: flush блокирует этот кадр, потом окно закрывается.
-            // CancelClose+Close зацикливали закрытие.
-            self.persist_all_before_exit();
-        }
+        self.handle_window_close_request(ctx);
 
         self.flush_chat_journal_if_dirty();
 
@@ -4021,6 +4046,7 @@ impl eframe::App for App {
     }
 
     fn on_exit(&mut self, _gl: Option<&eframe::glow::Context>) {
+        // Реальный выход (пункт «Выйти» в трее / нет трея).
         self.persist_all_before_exit();
     }
 }

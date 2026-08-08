@@ -1,7 +1,9 @@
 //! Offline outbox publish policy: durable handoff.
 //!
-//! Voice chunks always need a relay Store Ack (DHT mailbox is too small).
-//! Text-only envelopes may complete on DHT Put Ok or Store Ack.
+//! When VOID bootstrap nodes are configured, durable handoff requires a
+//! Store Ack from a bootstrap (voice chunks always do — DHT mailbox is too small).
+//! DHT Put Ok / Ack from ephemeral peers is only a fallback when there are no
+//! bootstraps (LAN-only mode).
 
 use std::collections::{HashMap, HashSet};
 use libp2p::PeerId;
@@ -14,9 +16,14 @@ pub(crate) enum PublishHandoff {
     Pending,
 }
 
-/// DHT Put Ok counts as durable handoff only when there are no voice chunks.
-pub(crate) fn accept_dht_as_full_handoff(envelopes: &[OfflineEnvelope]) -> bool {
-    !envelopes.is_empty()
+/// DHT Put Ok may settle handoff only for text-only batches in LAN-only mode
+/// (no bootstrap nodes). With bootstraps configured, DHT is best-effort only.
+pub(crate) fn accept_dht_as_full_handoff(
+    envelopes: &[OfflineEnvelope],
+    allow_dht_fallback: bool,
+) -> bool {
+    allow_dht_fallback
+        && !envelopes.is_empty()
         && envelopes
             .iter()
             .all(|e| e.kind != OFFLINE_VOICE_CHUNK_KIND)
@@ -42,10 +49,13 @@ impl EnvelopeHandoffState {
         }
     }
 
-    pub(crate) fn from_envelopes(envelopes: &[OfflineEnvelope]) -> Self {
+    pub(crate) fn from_envelopes(
+        envelopes: &[OfflineEnvelope],
+        allow_dht_fallback: bool,
+    ) -> Self {
         Self::new(
             required_store_message_ids(envelopes),
-            accept_dht_as_full_handoff(envelopes),
+            accept_dht_as_full_handoff(envelopes, allow_dht_fallback),
         )
     }
 
@@ -131,6 +141,10 @@ impl PendingRelayQueue {
     pub(crate) fn queued_relays(&self) -> usize {
         self.by_relay.len()
     }
+
+    pub(crate) fn relay_peer_ids(&self) -> Vec<PeerId> {
+        self.by_relay.keys().copied().collect()
+    }
 }
 
 #[cfg(test)]
@@ -151,11 +165,14 @@ mod tests {
     }
 
     #[test]
-    fn text_dm_accepts_dht_handoff() {
+    fn text_dm_accepts_dht_only_without_bootstraps() {
         let sealed = vec![env("m1", "dm")];
-        assert!(accept_dht_as_full_handoff(&sealed));
-        let mut st = EnvelopeHandoffState::from_envelopes(&sealed);
+        assert!(accept_dht_as_full_handoff(&sealed, true));
+        assert!(!accept_dht_as_full_handoff(&sealed, false));
+        let mut st = EnvelopeHandoffState::from_envelopes(&sealed, true);
         assert_eq!(st.on_dht_ok(), Some(true));
+        let mut st2 = EnvelopeHandoffState::from_envelopes(&sealed, false);
+        assert_eq!(st2.on_dht_ok(), None);
     }
 
     #[test]
@@ -165,8 +182,8 @@ mod tests {
             env("c0", OFFLINE_VOICE_CHUNK_KIND),
             env("c1", OFFLINE_VOICE_CHUNK_KIND),
         ];
-        assert!(!accept_dht_as_full_handoff(&sealed));
-        let mut st = EnvelopeHandoffState::from_envelopes(&sealed);
+        assert!(!accept_dht_as_full_handoff(&sealed, true));
+        let mut st = EnvelopeHandoffState::from_envelopes(&sealed, true);
         assert_eq!(st.on_dht_ok(), None);
         assert_eq!(st.on_store_ack("meta"), None);
         assert_eq!(st.on_store_ack("c0"), None);
@@ -180,7 +197,7 @@ mod tests {
             env("c1", OFFLINE_VOICE_CHUNK_KIND),
             env("c2", OFFLINE_VOICE_CHUNK_KIND),
         ];
-        let mut st = EnvelopeHandoffState::from_envelopes(&sealed);
+        let mut st = EnvelopeHandoffState::from_envelopes(&sealed, false);
         assert_eq!(st.on_store_ack("c0"), None);
         assert_eq!(st.pending_count(), 2);
     }
@@ -194,5 +211,13 @@ mod tests {
         q.enqueue(r1, recip, vec![env("m2", "dm"), env("m1", "dm")]);
         assert_eq!(q.take_for(&r1)[0].1.len(), 2);
         assert!(q.is_empty());
+    }
+
+    #[test]
+    fn bootstrap_mode_needs_store_ack_for_text() {
+        let sealed = vec![env("invite", "dm")];
+        let mut st = EnvelopeHandoffState::from_envelopes(&sealed, false);
+        assert_eq!(st.on_dht_ok(), None);
+        assert_eq!(st.on_store_ack("invite"), Some(true));
     }
 }

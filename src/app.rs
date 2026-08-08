@@ -373,6 +373,8 @@ pub(crate) struct App {
     journal_persist_after: Option<Instant>,
     /// Выход уже обработан (не повторять сохранение / flush).
     exit_prepared: bool,
+    /// Закрытие окна → трей; сеть продолжает работать в фоне.
+    pub(crate) tray: crate::tray_bg::TrayBackground,
     /// Ожидаемый результат выбора папки сохранения: `(rx, transfer_id, from_peer)`.
     /// Поллим `try_recv()` каждый кадр; `None` = выбор не идёт.
     pub(crate) pending_accept: Option<(
@@ -435,6 +437,7 @@ impl App {
         chat_messages: SharedChatMessages,
     ) -> Self {
         setup_custom_style(&cc.egui_ctx);
+        let tray = crate::tray_bg::TrayBackground::new(&cc.egui_ctx);
 
         Self {
             local_peer_id,
@@ -500,11 +503,30 @@ impl App {
             invite_join_processed: HashSet::new(),
             journal_persist_after: None,
             exit_prepared: false,
+            tray,
             pending_accept: None,
             pending_unlock,
             deferred_network_spawn,
             vault_master_key,
         }
+    }
+
+    /// Close button: hide to tray (network stays up). Real quit only from tray menu.
+    pub(crate) fn handle_window_close_request(&mut self, ctx: &egui::Context) {
+        if !ctx.input(|i| i.viewport().close_requested()) {
+            return;
+        }
+        if self.tray.force_quit || !self.tray.tray_available() {
+            self.persist_all_before_exit();
+            return;
+        }
+        // Quick disk save — no blocking DHT flush (process keeps running).
+        self.persist_chat_journal();
+        self.persist_outbox();
+        self.accelerate_offline_dht_publish();
+        self.publish_outbox_to_dht();
+        self.tray.enter_background(ctx);
+        self.add_status("VOID свёрнут в трей — сеть работает в фоне".into());
     }
 
     // ─── Основные экраны приложения ──────────────────────────────────────────
@@ -993,7 +1015,7 @@ impl App {
         self.exit_prepared = true;
         self.persist_chat_journal();
         self.persist_outbox();
-        // Ждём handoff (см. flush_outbox_to_dht_on_exit): текст ~8с, голос до 30с.
+        // Ждём handoff (см. flush_outbox_to_dht_on_exit): текст ~20с, голос до 45с.
         self.flush_outbox_to_dht_on_exit();
     }
 
@@ -1056,7 +1078,8 @@ impl App {
     }
 
     /// При выходе: публикуем outbox в relay/DHT и ждём durable handoff.
-    /// Голосовые = много Store Ack (по чанку) + возможный dial bootstrap — 6с мало.
+    /// Нужен Store Ack от bootstrap (dial может ещё идти) — раньше текст
+    /// «успевал» через DHT Put Ok и процесс выходил до записи на bootstrap.
     fn flush_outbox_to_dht_on_exit(&self) {
         let items = self.build_offline_publish_items();
         if items.is_empty() {
@@ -1066,11 +1089,11 @@ impl App {
         let has_voice = items
             .iter()
             .any(|i| i.kind == OFFLINE_VOICE_CHUNK_KIND || i.message_id.starts_with("vchunk:"));
-        // Текст/инвайт: несколько секунд. Голос: чанки по одному RR + dial.
+        // Текст/инвайт: dial bootstrap + Store Ack. Голос: чанки по одному RR.
         let wait = if has_voice {
-            Duration::from_secs(30)
+            Duration::from_secs(45)
         } else {
-            Duration::from_secs(8)
+            Duration::from_secs(20)
         };
         let (ack_tx, ack_rx) = std::sync::mpsc::channel();
         match self.command_tx.blocking_send(UICommand::PublishOfflineOutbox {
