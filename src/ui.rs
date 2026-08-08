@@ -1687,6 +1687,16 @@ impl eframe::App for App {
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
         let _in_background = self.tray.poll(ctx);
 
+        // Handle X immediately — before vault UI / heavy frame work.
+        // On Linux this must return without CancelClose and without blocking I/O.
+        if self.handle_window_close_request(ctx) {
+            if self.tray.background {
+                self.voice_player.poll();
+                ctx.request_repaint_after(Duration::from_millis(250));
+            }
+            return;
+        }
+
         if self.tray.background {
             // Keep network/outbox alive without drawing the window.
             if self.pending_unlock.is_some() {
@@ -1698,14 +1708,12 @@ impl eframe::App for App {
                 {
                     let _ = self.vault_unlock_gate(ctx);
                 }
-                self.handle_window_close_request(ctx);
                 if self.pending_unlock.is_some() {
                     ctx.request_repaint_after(Duration::from_millis(250));
                     return;
                 }
             }
         } else if self.vault_unlock_gate(ctx) {
-            self.handle_window_close_request(ctx);
             return;
         }
 
@@ -2399,8 +2407,6 @@ impl eframe::App for App {
         {
             ctx.request_repaint_after(Duration::from_millis(33));
         }
-
-        self.handle_window_close_request(ctx);
 
         // Свёрнуты в трей: сеть/outbox уже обработаны выше — UI не рисуем.
         if self.tray.background {
@@ -4030,8 +4036,6 @@ impl eframe::App for App {
                     });
             }
         }
-
-        self.handle_window_close_request(ctx);
 
         self.flush_chat_journal_if_dirty();
 

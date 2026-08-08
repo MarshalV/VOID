@@ -78,7 +78,7 @@ impl TrayBackground {
     }
 
     /// True when close should hide to tray instead of quitting.
-    /// Linux: always false ? winit Minimized+CancelClose often leaves a stuck window.
+    /// Linux: always false - winit Minimized+CancelClose often leaves a stuck window.
     pub(crate) fn tray_available(&self) -> bool {
         #[cfg(any(windows, target_os = "macos"))]
         {

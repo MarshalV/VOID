@@ -508,22 +508,25 @@ impl App {
         }
     }
 
-    /// Close button: hide to tray (network stays up). Real quit only from tray menu.
-    pub(crate) fn handle_window_close_request(&mut self, ctx: &egui::Context) {
+    /// Close button: tray on Win/macOS; immediate quit elsewhere (Linux).
+    /// Returns `true` when the caller must stop the frame (quit or tray hide).
+    pub(crate) fn handle_window_close_request(&mut self, ctx: &egui::Context) -> bool {
         if !ctx.input(|i| i.viewport().close_requested()) {
-            return;
+            return false;
         }
+        // Linux / no tray: do not CancelClose. Persist in on_exit — never block
+        // the UI thread here (old blocking DHT flush froze the window forever).
         if self.tray.force_quit || !self.tray.tray_available() {
-            self.persist_all_before_exit();
-            return;
+            self.publish_outbox_to_dht();
+            return true;
         }
-        // Quick disk save — no blocking DHT flush (process keeps running).
+        // Win/macOS tray: keep process, hide window.
         self.persist_chat_journal();
         self.persist_outbox();
-        self.accelerate_offline_dht_publish();
         self.publish_outbox_to_dht();
         self.tray.enter_background(ctx);
         self.add_status("VOID свёрнут в трей — сеть работает в фоне".into());
+        true
     }
 
     // ─── Основные экраны приложения ──────────────────────────────────────────
@@ -1011,8 +1014,9 @@ impl App {
         self.exit_prepared = true;
         self.persist_chat_journal();
         self.persist_outbox();
-        // Ждём handoff (см. flush_outbox_to_dht_on_exit): текст ~20с, голос до 45с.
-        self.flush_outbox_to_dht_on_exit();
+        // Только try_send: blocking flush на UI-потоке зависал закрытие окна
+        // (особенно Linux) на десятки секунд или навсегда.
+        self.publish_outbox_to_dht();
     }
 
     fn bootstrap_offline_mail(&mut self) {
@@ -1070,45 +1074,6 @@ impl App {
             ack: None,
         }) {
             warn!("VOID: PublishOfflineOutbox не встал в очередь: {e}");
-        }
-    }
-
-    /// При выходе: публикуем outbox в relay/DHT и ждём durable handoff.
-    /// Нужен Store Ack от bootstrap (dial может ещё идти) — раньше текст
-    /// «успевал» через DHT Put Ok и процесс выходил до записи на bootstrap.
-    fn flush_outbox_to_dht_on_exit(&self) {
-        let items = self.build_offline_publish_items();
-        if items.is_empty() {
-            return;
-        }
-        let n = items.len();
-        let has_voice = items
-            .iter()
-            .any(|i| i.kind == OFFLINE_VOICE_CHUNK_KIND || i.message_id.starts_with("vchunk:"));
-        // Текст/инвайт: dial bootstrap + Store Ack. Голос: чанки по одному RR.
-        let wait = if has_voice {
-            Duration::from_secs(45)
-        } else {
-            Duration::from_secs(20)
-        };
-        let (ack_tx, ack_rx) = std::sync::mpsc::channel();
-        match self.command_tx.blocking_send(UICommand::PublishOfflineOutbox {
-            items,
-            ack: Some(ack_tx),
-        }) {
-            Ok(()) => match ack_rx.recv_timeout(wait) {
-                Ok(true) => info!("VOID: exit — outbox ({n}) сдан в relay/DHT"),
-                Ok(false) => warn!(
-                    "VOID: exit — handoff outbox ({n}) не подтверждён, останется в outbox.bin"
-                ),
-                Err(_) => warn!(
-                    "VOID: exit — timeout {}s ожидания handoff outbox ({n}), останется в outbox.bin",
-                    wait.as_secs()
-                ),
-            },
-            Err(e) => warn!(
-                "VOID: exit — сеть не приняла outbox ({e}), останется в outbox.bin"
-            ),
         }
     }
 
