@@ -526,7 +526,12 @@ impl App {
         self.accelerate_offline_dht_publish();
         self.publish_outbox_to_dht();
         self.tray.enter_background(ctx);
+        #[cfg(any(windows, target_os = "macos"))]
         self.add_status("VOID свёрнут в трей — сеть работает в фоне".into());
+        #[cfg(not(any(windows, target_os = "macos")))]
+        self.add_status(
+            "VOID свёрнут в панель задач — сеть в фоне (повторное закрытие = выход)".into(),
+        );
     }
 
     // ─── Основные экраны приложения ──────────────────────────────────────────

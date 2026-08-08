@@ -59,7 +59,20 @@ fn migrate_legacy_files(dest_dir: &Path) -> Result<(), String> {
     }
     if let Ok(exe) = std::env::current_exe() {
         if let Some(parent) = exe.parent() {
-            if parent != dest_dir && !legacy_roots.iter().any(|p| p == parent) {
+            // Не трогаем Contents/MacOS внутри .app — только чтение чужих путей даёт EACCES.
+            let in_app_bundle = parent
+                .file_name()
+                .and_then(|n| n.to_str())
+                .is_some_and(|n| n.eq_ignore_ascii_case("MacOS"))
+                && parent
+                    .parent()
+                    .and_then(|p| p.file_name())
+                    .and_then(|n| n.to_str())
+                    .is_some_and(|n| n == "Contents");
+            if !in_app_bundle
+                && parent != dest_dir
+                && !legacy_roots.iter().any(|p| p == parent)
+            {
                 legacy_roots.push(parent.to_path_buf());
             }
         }
@@ -87,10 +100,23 @@ fn migrate_one_dir(dest_dir: &Path, legacy_roots: &[PathBuf], name: &str) -> Res
         if !src.is_dir() {
             continue;
         }
-        copy_dir_recursive(&src, &dest)
-            .map_err(|e| format!("миграция каталога {}: {e}", src.display()))?;
-        info!("VOID: перенесён каталог {} → {}", src.display(), dest.display());
-        break;
+        match copy_dir_recursive(&src, &dest) {
+            Ok(()) => {
+                info!(
+                    "VOID: перенесён каталог {} → {}",
+                    src.display(),
+                    dest.display()
+                );
+                break;
+            }
+            // .app на macOS: cwd=/ или Contents/MacOS — EACCES не должен валить старт.
+            Err(e) if e.kind() == std::io::ErrorKind::PermissionDenied => {
+                info!("VOID: пропуск миграции {}: {e}", src.display());
+            }
+            Err(e) => {
+                return Err(format!("миграция каталога {}: {e}", src.display()));
+            }
+        }
     }
     Ok(())
 }
@@ -120,10 +146,16 @@ fn migrate_one_file(dest_dir: &Path, legacy_roots: &[PathBuf], name: &str) -> Re
         if !src.is_file() {
             continue;
         }
-        std::fs::copy(&src, &dest)
-            .map_err(|e| format!("миграция {}: {e}", src.display()))?;
-        info!("VOID: перенесён {} → {}", src.display(), dest.display());
-        break;
+        match std::fs::copy(&src, &dest) {
+            Ok(_) => {
+                info!("VOID: перенесён {} → {}", src.display(), dest.display());
+                break;
+            }
+            Err(e) if e.kind() == std::io::ErrorKind::PermissionDenied => {
+                info!("VOID: пропуск миграции {}: {e}", src.display());
+            }
+            Err(e) => return Err(format!("миграция {}: {e}", src.display())),
+        }
     }
     Ok(())
 }
