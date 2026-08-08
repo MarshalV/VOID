@@ -1,5 +1,5 @@
 //! Background mode after window close.
-//! Windows/macOS: system tray. Linux: minimize to taskbar (no GTK tray).
+//! Windows/macOS: system tray. Linux: normal quit (no GTK tray; minimize is unreliable).
 
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
@@ -77,49 +77,27 @@ impl TrayBackground {
         }
     }
 
-    /// Background mode is available (tray on Win/mac, taskbar minimize on Linux).
+    /// True when close should hide to tray instead of quitting.
+    /// Linux: always false ? winit Minimized+CancelClose often leaves a stuck window.
     pub(crate) fn tray_available(&self) -> bool {
         #[cfg(any(windows, target_os = "macos"))]
         {
-            return self._tray.is_some();
+            self._tray.is_some()
         }
         #[cfg(not(any(windows, target_os = "macos")))]
         {
-            true
+            false
         }
     }
 
     pub(crate) fn enter_background(&mut self, ctx: &egui::Context) {
-        if self.force_quit {
+        if self.force_quit || !self.tray_available() {
             return;
         }
-        #[cfg(any(windows, target_os = "macos"))]
-        if !self.tray_available() {
-            return;
-        }
-
-        // Linux: second close while already minimized => real quit.
-        #[cfg(not(any(windows, target_os = "macos")))]
-        if self.background {
-            self.force_quit = true;
-            self.bg_flag.store(false, Ordering::Relaxed);
-            ctx.send_viewport_cmd(egui::ViewportCommand::Close);
-            return;
-        }
-
         self.background = true;
         self.bg_flag.store(true, Ordering::Relaxed);
         ctx.send_viewport_cmd(egui::ViewportCommand::CancelClose);
-
-        #[cfg(any(windows, target_os = "macos"))]
-        {
-            ctx.send_viewport_cmd(egui::ViewportCommand::Visible(false));
-        }
-        #[cfg(not(any(windows, target_os = "macos")))]
-        {
-            // No GTK tray: keep process alive minimized in the taskbar/dock.
-            ctx.send_viewport_cmd(egui::ViewportCommand::Minimized(true));
-        }
+        ctx.send_viewport_cmd(egui::ViewportCommand::Visible(false));
         ctx.request_repaint_after(Duration::from_millis(250));
     }
 
@@ -174,19 +152,10 @@ impl TrayBackground {
                 }
             }
         }
-
         #[cfg(not(any(windows, target_os = "macos")))]
         {
-            // Restored from taskbar click.
-            if self.background {
-                let minimized = ctx.input(|i| i.viewport().minimized).unwrap_or(true);
-                if !minimized {
-                    self.background = false;
-                    self.bg_flag.store(false, Ordering::Relaxed);
-                }
-            }
+            let _ = ctx;
         }
-
         self.background
     }
 }
