@@ -1,7 +1,6 @@
 //! Быстрая очередь недоставленного (`outbox.bin`) — только pending, без всего журнала.
 
 use std::error::Error;
-use std::path::Path;
 
 use aes_gcm::{
     aead::{Aead, KeyInit},
@@ -11,6 +10,7 @@ use rand::RngCore;
 use serde::{Deserialize, Serialize};
 
 use crate::group::GroupMember;
+use crate::paths;
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub(crate) enum OutboxEntry {
@@ -64,10 +64,11 @@ impl Outbox {
     const PLAINTEXT_MAX: usize = 512 * 1024;
 
     pub(crate) fn load(master_key: &[u8; 32]) -> Result<Vec<OutboxEntry>, Box<dyn Error>> {
-        if !Path::new(Self::FILE).exists() {
+        let path = paths::data_file(Self::FILE);
+        if !path.exists() {
             return Ok(Vec::new());
         }
-        let data = std::fs::read(Self::FILE)?;
+        let data = std::fs::read(&path)?;
         if data.len() < 12 {
             return Err("Invalid outbox".into());
         }
@@ -99,12 +100,15 @@ impl Outbox {
             .map_err(|e| format!("outbox encrypt: {}", e))?;
         let mut final_data = nonce_bytes.to_vec();
         final_data.extend(ciphertext);
-        std::fs::write(Self::FILE_TMP, &final_data)?;
-        if Path::new(Self::FILE).exists() {
-            let _ = std::fs::remove_file("outbox.bin.bak");
-            let _ = std::fs::rename(Self::FILE, "outbox.bin.bak");
+        let path = paths::data_file(Self::FILE);
+        let path_tmp = paths::data_file(Self::FILE_TMP);
+        let path_bak = paths::data_file("outbox.bin.bak");
+        std::fs::write(&path_tmp, &final_data)?;
+        if path.exists() {
+            let _ = std::fs::remove_file(&path_bak);
+            let _ = std::fs::rename(&path, &path_bak);
         }
-        std::fs::rename(Self::FILE_TMP, Self::FILE)?;
+        std::fs::rename(&path_tmp, &path)?;
         Ok(())
     }
 }

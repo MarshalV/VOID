@@ -2,7 +2,6 @@
 
 use std::collections::HashMap;
 use std::error::Error;
-use std::path::Path;
 
 use aes_gcm::{
     aead::{Aead, KeyInit},
@@ -11,6 +10,7 @@ use aes_gcm::{
 use rand::RngCore;
 use serde::{Deserialize, Serialize};
 
+use crate::paths;
 use crate::protocol::ChatMessage;
 
 #[derive(Serialize, Deserialize, Default)]
@@ -75,23 +75,27 @@ impl ChatJournal {
         let mut final_data = nonce_bytes.to_vec();
         final_data.extend(ciphertext);
 
-        std::fs::write(Self::FILE_TMP, &final_data)?;
-        if Path::new(Self::FILE).exists() {
-            let _ = std::fs::remove_file(Self::FILE_BAK);
-            std::fs::rename(Self::FILE, Self::FILE_BAK)?;
+        let path = paths::data_file(Self::FILE);
+        let path_tmp = paths::data_file(Self::FILE_TMP);
+        let path_bak = paths::data_file(Self::FILE_BAK);
+        std::fs::write(&path_tmp, &final_data)?;
+        if path.exists() {
+            let _ = std::fs::remove_file(&path_bak);
+            std::fs::rename(&path, &path_bak)?;
         }
-        std::fs::rename(Self::FILE_TMP, Self::FILE)?;
-        let _ = std::fs::remove_file(Self::FILE_BAK);
+        std::fs::rename(&path_tmp, &path)?;
+        let _ = std::fs::remove_file(&path_bak);
         Ok(())
     }
 
     pub(crate) fn load(
         master_key: &[u8; 32],
     ) -> Result<(HashMap<String, Vec<ChatMessage>>, Vec<String>), Box<dyn Error>> {
-        if !Path::new(Self::FILE).exists() {
+        let path = paths::data_file(Self::FILE);
+        if !path.exists() {
             return Ok((HashMap::new(), Vec::new()));
         }
-        let data = std::fs::read(Self::FILE)?;
+        let data = std::fs::read(&path)?;
         if data.len() < 12 {
             return Err("Invalid chat journal".into());
         }

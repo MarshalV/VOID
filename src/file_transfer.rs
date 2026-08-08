@@ -456,7 +456,7 @@ pub fn safe_filename(raw: &str) -> String {
 /// Формирует уникальный путь к файлу в DOWNLOADS_DIR,
 /// добавляя суффикс _(1), _(2)… если файл уже существует.
 pub fn unique_download_path(filename: &str) -> std::path::PathBuf {
-    unique_download_path_in(DOWNLOADS_DIR, filename)
+    unique_download_path_in_path(&crate::paths::data_dir().join(DOWNLOADS_DIR), filename)
 }
 
 /// Формирует уникальный путь к файлу в указанной директории.

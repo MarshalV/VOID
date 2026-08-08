@@ -1,10 +1,14 @@
 ﻿//! Единая директория данных VOID — vault, outbox, пароль сессии всегда в одном месте.
+//! Все пути абсолютные: на macOS Finder часто стартует с cwd=`/`, куда писать нельзя.
 
 use std::path::{Path, PathBuf};
+use std::sync::OnceLock;
 
-use tracing::info;
+use tracing::{info, warn};
 
 const DATA_DIR_NAME: &str = "VOID";
+
+static DATA_DIR: OnceLock<PathBuf> = OnceLock::new();
 
 const LEGACY_BLOBS: &[&str] = &[
     "vault.bin",
@@ -19,35 +23,102 @@ const LEGACY_DIRS: &[&str] = &["void_downloads"];
 
 /// Переключает cwd на каталог данных и мигрирует файлы из старых мест (cwd, рядом с .exe).
 pub(crate) fn init_storage_paths() -> Result<(), String> {
-    let dir = resolve_data_dir();
+    let dir = pick_writable_data_dir()?;
     std::fs::create_dir_all(&dir)
         .map_err(|e| format!("не удалось создать {}: {}", dir.display(), e))?;
     migrate_legacy_files(&dir)?;
-    std::env::set_current_dir(&dir).map_err(|e| format!("set_current_dir: {e}"))?;
+    let _ = DATA_DIR.set(dir.clone());
+    // Best-effort: относительные пути (void_downloads) тоже попадут сюда.
+    if let Err(e) = std::env::set_current_dir(&dir) {
+        warn!("VOID: set_current_dir({}) не удался: {e}", dir.display());
+    }
     info!("VOID: каталог данных — {}", dir.display());
     Ok(())
 }
 
-/// Каталог данных VOID (после `init_storage_paths` совпадает с cwd).
+/// Каталог данных VOID (абсолютный путь).
 pub(crate) fn data_dir() -> PathBuf {
-    if let Ok(p) = std::env::var("VOID_DATA_DIR") {
-        return PathBuf::from(p);
+    if let Some(d) = DATA_DIR.get() {
+        return d.clone();
     }
-    std::env::current_dir().unwrap_or_else(|_| resolve_data_dir())
+    // Lazy init если init_storage_paths не вызвали / упал раньше set.
+    match pick_writable_data_dir() {
+        Ok(dir) => {
+            let _ = DATA_DIR.set(dir.clone());
+            dir
+        }
+        Err(e) => {
+            warn!("VOID: fallback data_dir: {e}");
+            resolve_preferred_data_dir().unwrap_or_else(|| PathBuf::from("."))
+        }
+    }
 }
 
-fn resolve_data_dir() -> PathBuf {
+/// Абсолютный путь к файлу внутри каталога данных.
+pub(crate) fn data_file(name: impl AsRef<Path>) -> PathBuf {
+    data_dir().join(name)
+}
+
+fn dir_is_writable(dir: &Path) -> bool {
+    if let Err(e) = std::fs::create_dir_all(dir) {
+        warn!("VOID: нельзя создать {}: {e}", dir.display());
+        return false;
+    }
+    let probe = dir.join(".void_write_probe");
+    match std::fs::write(&probe, b"ok") {
+        Ok(()) => {
+            let _ = std::fs::remove_file(&probe);
+            true
+        }
+        Err(e) => {
+            warn!("VOID: нет записи в {}: {e}", dir.display());
+            false
+        }
+    }
+}
+
+fn resolve_preferred_data_dir() -> Option<PathBuf> {
     if let Ok(p) = std::env::var("VOID_DATA_DIR") {
-        return PathBuf::from(p);
+        return Some(PathBuf::from(p));
     }
     if let Some(base) = dirs::data_dir() {
-        return base.join(DATA_DIR_NAME);
+        return Some(base.join(DATA_DIR_NAME));
+    }
+    if let Some(home) = dirs::home_dir() {
+        return Some(home.join(DATA_DIR_NAME));
     }
     std::env::current_exe()
         .ok()
         .and_then(|p| p.parent().map(Path::to_path_buf))
-        .or_else(|| std::env::current_dir().ok())
-        .unwrap_or_else(|| PathBuf::from("."))
+}
+
+fn pick_writable_data_dir() -> Result<PathBuf, String> {
+    let mut candidates: Vec<PathBuf> = Vec::new();
+    if let Ok(p) = std::env::var("VOID_DATA_DIR") {
+        candidates.push(PathBuf::from(p));
+    }
+    if let Some(base) = dirs::data_dir() {
+        candidates.push(base.join(DATA_DIR_NAME));
+    }
+    if let Some(home) = dirs::home_dir() {
+        candidates.push(home.join(DATA_DIR_NAME));
+        candidates.push(home.join(".void"));
+    }
+    candidates.dedup();
+
+    for dir in &candidates {
+        if dir_is_writable(dir) {
+            return Ok(dir.clone());
+        }
+    }
+    Err(format!(
+        "нет доступного каталога данных (пробовали: {})",
+        candidates
+            .iter()
+            .map(|p| p.display().to_string())
+            .collect::<Vec<_>>()
+            .join(", ")
+    ))
 }
 
 fn migrate_legacy_files(dest_dir: &Path) -> Result<(), String> {
@@ -75,6 +146,11 @@ fn migrate_legacy_files(dest_dir: &Path) -> Result<(), String> {
             {
                 legacy_roots.push(parent.to_path_buf());
             }
+        }
+    }
+    if let Some(home) = dirs::home_dir() {
+        if home != dest_dir && !legacy_roots.iter().any(|p| p == &home) {
+            legacy_roots.push(home);
         }
     }
 
@@ -109,7 +185,6 @@ fn migrate_one_dir(dest_dir: &Path, legacy_roots: &[PathBuf], name: &str) -> Res
                 );
                 break;
             }
-            // .app на macOS: cwd=/ или Contents/MacOS — EACCES не должен валить старт.
             Err(e) if e.kind() == std::io::ErrorKind::PermissionDenied => {
                 info!("VOID: пропуск миграции {}: {e}", src.display());
             }

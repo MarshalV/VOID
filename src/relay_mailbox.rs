@@ -2,11 +2,11 @@
 
 use std::collections::HashMap;
 use std::error::Error;
-use std::path::Path;
 
 use serde::{Deserialize, Serialize};
 
 use crate::offline_mail::OfflineEnvelope;
+use crate::paths;
 
 const FILE: &str = "relay_mailbox.bin";
 /// Голосовое ~3 МБ ≈ 128 чанков; несколько pending voice на одного адресата.
@@ -33,10 +33,11 @@ pub(crate) struct RelayMailbox;
 
 impl RelayMailbox {
     pub(crate) fn load() -> HashMap<String, Vec<OfflineEnvelope>> {
-        if !Path::new(FILE).exists() {
+        let path = paths::data_file(FILE);
+        if !path.exists() {
             return HashMap::new();
         }
-        match std::fs::read(FILE) {
+        match std::fs::read(&path) {
             Ok(bytes) => {
                 // bincode — компактнее JSON для бинарных полей (важно для
                 // голосовых чанков); при апгрейде со старого файла — fallback на JSON.
@@ -57,12 +58,15 @@ impl RelayMailbox {
             by_recipient: map.clone(),
         };
         let bytes = bincode::serialize(&data)?;
-        std::fs::write(format!("{FILE}.tmp"), &bytes)?;
-        if Path::new(FILE).exists() {
-            let _ = std::fs::remove_file(format!("{FILE}.bak"));
-            let _ = std::fs::rename(FILE, format!("{FILE}.bak"));
+        let path = paths::data_file(FILE);
+        let path_tmp = paths::data_file(format!("{FILE}.tmp"));
+        let path_bak = paths::data_file(format!("{FILE}.bak"));
+        std::fs::write(&path_tmp, &bytes)?;
+        if path.exists() {
+            let _ = std::fs::remove_file(&path_bak);
+            let _ = std::fs::rename(&path, &path_bak);
         }
-        std::fs::rename(format!("{FILE}.tmp"), FILE)?;
+        std::fs::rename(&path_tmp, &path)?;
         Ok(())
     }
 

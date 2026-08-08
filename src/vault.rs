@@ -1,7 +1,6 @@
 //! Зашифрованный vault (`vault.bin`) и обёртка мастер-ключа (`void.key`).
 
 use std::error::Error;
-use std::path::Path;
 
 use aes_gcm::{
     aead::{Aead, KeyInit},
@@ -15,6 +14,7 @@ use zeroize::Zeroizing;
 
 use crate::crypto;
 use crate::group::GroupChat;
+use crate::paths;
 
 #[derive(Serialize, Deserialize, Clone, Default)]
 pub(crate) struct AddressBookEntry {
@@ -108,13 +108,13 @@ impl Storage {
         blob.extend_from_slice(&salt);
         blob.extend_from_slice(&nonce);
         blob.extend_from_slice(&ct);
-        std::fs::write(Self::KEY_FILE, &blob)?;
+        std::fs::write(paths::data_file(Self::KEY_FILE), &blob)?;
         Ok(())
     }
 
     /// Считывает мастер-ключ из `void.key` v2 (Argon2id + AES-GCM).
     pub(crate) fn unwrap_master_key_file(password: &str) -> Result<[u8; 32], Box<dyn Error>> {
-        let blob = std::fs::read(Self::KEY_FILE)?;
+        let blob = std::fs::read(paths::data_file(Self::KEY_FILE))?;
         Self::unwrap_master_key_bytes(&blob, password)
     }
 
@@ -146,7 +146,7 @@ impl Storage {
     }
 
     pub(crate) fn read_key_blob() -> Result<Vec<u8>, std::io::Error> {
-        std::fs::read(Self::KEY_FILE)
+        std::fs::read(paths::data_file(Self::KEY_FILE))
     }
 
     pub(crate) fn is_wrapped_keyfile(raw: &[u8]) -> bool {
@@ -254,13 +254,16 @@ impl Storage {
         // Сначала пишем во временный файл, затем подменяем vault — иначе при сбое
         // посередине fs::write остаётся усечённый vault и следующий load() ломается,
         // после чего старый save подставлял пустой keypair и окончательно портил ключи.
-        std::fs::write(Self::FILE_TMP, &final_data)?;
-        if Path::new(Self::FILE).exists() {
-            let _ = std::fs::remove_file(Self::FILE_BAK);
-            std::fs::rename(Self::FILE, Self::FILE_BAK)?;
+        let path = paths::data_file(Self::FILE);
+        let path_tmp = paths::data_file(Self::FILE_TMP);
+        let path_bak = paths::data_file(Self::FILE_BAK);
+        std::fs::write(&path_tmp, &final_data)?;
+        if path.exists() {
+            let _ = std::fs::remove_file(&path_bak);
+            std::fs::rename(&path, &path_bak)?;
         }
-        std::fs::rename(Self::FILE_TMP, Self::FILE)?;
-        let _ = std::fs::remove_file(Self::FILE_BAK);
+        std::fs::rename(&path_tmp, &path)?;
+        let _ = std::fs::remove_file(&path_bak);
         Ok(())
     }
 
@@ -362,10 +365,11 @@ impl Storage {
     }
 
     pub(crate) fn load(master_key: &[u8; 32]) -> Result<StorageData, Box<dyn Error>> {
-        if !std::path::Path::new(Self::FILE).exists() {
+        let path = paths::data_file(Self::FILE);
+        if !path.exists() {
             return Err("Vault file not found".into());
         }
-        let data = std::fs::read(Self::FILE)?;
+        let data = std::fs::read(&path)?;
         if data.len() < 12 {
             return Err("Invalid vault".into());
         }
@@ -447,14 +451,14 @@ fn session_file_save_dpapi(password: &str) -> Result<(), Box<dyn Error>> {
     use windows_dpapi::{encrypt_data, Scope};
     let encrypted = encrypt_data(password.as_bytes(), Scope::User)
         .map_err(|e| format!("dpapi encrypt: {e}"))?;
-    std::fs::write(SESSION_PWD_FILE, encrypted)?;
+    std::fs::write(paths::data_file(SESSION_PWD_FILE), encrypted)?;
     Ok(())
 }
 
 #[cfg(windows)]
 fn session_file_load_dpapi() -> Option<String> {
     use windows_dpapi::{decrypt_data, Scope};
-    let data = std::fs::read(SESSION_PWD_FILE).ok()?;
+    let data = std::fs::read(paths::data_file(SESSION_PWD_FILE)).ok()?;
     if data.starts_with(SESSION_PWD_MAGIC) {
         return None;
     }
@@ -509,7 +513,7 @@ fn session_file_save_aes(password: &str) -> Result<(), Box<dyn Error>> {
     blob.extend_from_slice(SESSION_PWD_MAGIC);
     blob.extend_from_slice(&nonce);
     blob.extend_from_slice(&ct);
-    std::fs::write(SESSION_PWD_FILE, &blob)?;
+    std::fs::write(paths::data_file(SESSION_PWD_FILE), &blob)?;
     Ok(())
 }
 
@@ -530,7 +534,7 @@ fn session_file_decrypt_aes(data: &[u8], key: &[u8; 32]) -> Option<String> {
 }
 
 fn session_file_load_aes() -> Option<String> {
-    let data = std::fs::read(SESSION_PWD_FILE).ok()?;
+    let data = std::fs::read(paths::data_file(SESSION_PWD_FILE)).ok()?;
     if let Some(pwd) = session_file_decrypt_aes(&data, &session_file_key()) {
         return Some(pwd);
     }
@@ -561,7 +565,7 @@ fn session_file_load() -> Option<String> {
 }
 
 fn session_file_clear() {
-    let _ = std::fs::remove_file(SESSION_PWD_FILE);
+    let _ = std::fs::remove_file(paths::data_file(SESSION_PWD_FILE));
 }
 
 #[cfg(windows)]
@@ -616,7 +620,7 @@ pub(crate) fn clear_remembered_password() {
 
 /// Определяет сценарий разблокировки по наличию `vault.bin` и формату `void.key`.
 pub(crate) fn detect_vault_unlock_kind() -> Result<VaultUnlockKind, String> {
-    let vault_exists = Path::new(Storage::FILE).exists();
+    let vault_exists = paths::data_file(Storage::FILE).exists();
     let raw_key = Storage::read_key_blob().unwrap_or_else(|_| Vec::new());
     let key_empty = raw_key.is_empty();
 
