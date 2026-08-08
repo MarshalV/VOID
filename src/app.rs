@@ -993,8 +993,7 @@ impl App {
         self.exit_prepared = true;
         self.persist_chat_journal();
         self.persist_outbox();
-        // Ждём handoff до 6с (см. flush_outbox_to_dht_on_exit) — иначе инвайты/
-        // непрочитанные DM не попадут на bootstrap при закрытии отправителя.
+        // Ждём handoff (см. flush_outbox_to_dht_on_exit): текст ~8с, голос до 30с.
         self.flush_outbox_to_dht_on_exit();
     }
 
@@ -1056,27 +1055,36 @@ impl App {
         }
     }
 
-    /// При выходе: публикуем outbox в relay/DHT и ждём handoff (короткий timeout).
-    /// Иначе процесс умирает раньше Store Ack / Put Ok — инвайты и DM не доходят,
-    /// пока отправитель снова не запустит клиент.
+    /// При выходе: публикуем outbox в relay/DHT и ждём durable handoff.
+    /// Голосовые = много Store Ack (по чанку) + возможный dial bootstrap — 6с мало.
     fn flush_outbox_to_dht_on_exit(&self) {
         let items = self.build_offline_publish_items();
         if items.is_empty() {
             return;
         }
         let n = items.len();
+        let has_voice = items
+            .iter()
+            .any(|i| i.kind == OFFLINE_VOICE_CHUNK_KIND || i.message_id.starts_with("vchunk:"));
+        // Текст/инвайт: несколько секунд. Голос: чанки по одному RR + dial.
+        let wait = if has_voice {
+            Duration::from_secs(30)
+        } else {
+            Duration::from_secs(8)
+        };
         let (ack_tx, ack_rx) = std::sync::mpsc::channel();
         match self.command_tx.blocking_send(UICommand::PublishOfflineOutbox {
             items,
             ack: Some(ack_tx),
         }) {
-            Ok(()) => match ack_rx.recv_timeout(Duration::from_secs(6)) {
+            Ok(()) => match ack_rx.recv_timeout(wait) {
                 Ok(true) => info!("VOID: exit — outbox ({n}) сдан в relay/DHT"),
                 Ok(false) => warn!(
                     "VOID: exit — handoff outbox ({n}) не подтверждён, останется в outbox.bin"
                 ),
                 Err(_) => warn!(
-                    "VOID: exit — timeout 6s ожидания handoff outbox ({n}), останется в outbox.bin"
+                    "VOID: exit — timeout {}s ожидания handoff outbox ({n}), останется в outbox.bin",
+                    wait.as_secs()
                 ),
             },
             Err(e) => warn!(
@@ -2732,6 +2740,9 @@ impl App {
             duration_secs,
             path_str.clone(),
         );
+        // Сразу в relay: иначе при быстром выходе чанки не успевают уйти
+        // (tick debounce + короткое окно до close).
+        self.publish_outbox_to_dht();
         // Как у текста/инвайтов: сразу в чат + outbox (offline voice_chunk через
         // relay). Живой VoiceAck только ставит Delivered, если собеседник онлайн.
         let chat_message = self.build_voice_chat_message(
@@ -2815,6 +2826,7 @@ impl App {
             path_str.clone(),
             members.clone(),
         );
+        self.publish_outbox_to_dht();
         // Как у текста: сразу в чат; offline chunks на каждого члена + живые ретраи.
         let chat_message = self.build_voice_chat_message(
             &message_id,
