@@ -652,8 +652,6 @@ pub(crate) enum UICommand {
     },
     /// Забрать свой почтовый ящик из DHT.
     FetchOfflineMailbox,
-    /// Очистить свой почтовый ящик в DHT после успешной обработки.
-    ClearOfflineMailbox,
 }
 
 /// Элемент очереди для публикации в DHT-почту.
@@ -3087,16 +3085,6 @@ pub async fn run_chat_network(
                                     .kad
                                     .get_record(mailbox_record_key(local_peer_id));
                                 pending_kad_mail.insert(qid, MailboxKadOp::FetchInbox { record_bytes: None });
-                            }
-                            UICommand::ClearOfflineMailbox => {
-                                put_mailbox_envelopes(
-                                    &mut swarm,
-                                    &mut pending_kad_mail,
-                                    local_peer_id,
-                                    local_peer_id,
-                                    &[],
-                                    None,
-                                );
                             }
                             UICommand::PublishOfflineOutbox { items, ack } => {
                                 let mut by_recipient: HashMap<PeerId, Vec<OfflineOutboxItem>> =

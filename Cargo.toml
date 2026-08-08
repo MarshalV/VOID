@@ -40,8 +40,8 @@ zip = "2.2"
 keyring = { version = "3", features = ["windows-native"] }
 windows-dpapi = "0.1"
 
-[target.'cfg(target_os = "macos")'.dependencies]
-keyring = { version = "3", features = ["apple-native"] }
+# macOS: no keyring — Keychain prompts on every unsigned/.app launch.
+# Remembered password uses local void.pwd only (see vault.rs).
 
 # tray-icon pulls GTK/libappindicator on Linux and can abort at startup.
 [target.'cfg(any(windows, target_os = "macos"))'.dependencies]

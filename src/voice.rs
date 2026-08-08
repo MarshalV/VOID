@@ -961,8 +961,6 @@ fn build_input_stream(
     sample_tx: SyncSender<Vec<f32>>,
     err_flag: Arc<AtomicBool>,
 ) -> Result<cpal::Stream, String> {
-    use cpal::traits::StreamTrait;
-
     let stream_cfg: cpal::StreamConfig = config.clone().into();
     let push = move |chunk: Vec<f32>| {
         match sample_tx.try_send(chunk) {

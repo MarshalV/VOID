@@ -368,8 +368,6 @@ pub(crate) struct App {
     pub(crate) group_synced_peers: HashSet<PeerId>,
     /// Пиры, покинувшие группу (не возвращать через устаревший group_sync).
     pub(crate) group_departed_peers: HashMap<String, HashSet<String>>,
-    /// Сообщения, по которым уже обработан auto-join по invite (не повторять).
-    invite_join_processed: HashSet<String>,
     journal_persist_after: Option<Instant>,
     /// Выход уже обработан (не повторять сохранение / flush).
     exit_prepared: bool,
@@ -500,7 +498,6 @@ impl App {
             offline_mail_processed: HashSet::new(),
             group_synced_peers: HashSet::new(),
             group_departed_peers: HashMap::new(),
-            invite_join_processed: HashSet::new(),
             journal_persist_after: None,
             exit_prepared: false,
             tray,
@@ -605,8 +602,8 @@ impl App {
                         "Запомнить пароль на этом устройстве",
                     )
                     .on_hover_text(
-                        "Пароль сохраняется в системном хранилище (Windows / macOS / Linux) \
-                         и подставляется при следующем запуске.",
+                        "Пароль сохраняется локально (void.pwd) и подставляется \
+                         при следующем запуске. На macOS Keychain не используется.",
                     );
 
                     if let Some(err) = &p.error {
@@ -938,7 +935,6 @@ impl App {
         self.prune_auto_discovered_contacts();
         self.refresh_outbox_group_sync_snapshots();
         // Не авто-вступаем по старым invite в журнале — только кнопка/вставка ссылки.
-        // self.scan_chat_journal_for_group_invites();
         self.index_voice_files_on_disk();
         self.relink_all_voice_files();
         self.dispatch_outbox();
@@ -1918,37 +1914,6 @@ impl App {
         for group in groups {
             self.dial_group_members(&group);
         }
-    }
-
-    /// Проходит журнал и подхватывает invite-ссылки (только новые, не из покинутых групп).
-    fn scan_chat_journal_for_group_invites(&mut self) {
-        let msgs: Vec<(String, String)> = self
-            .messages
-            .lock()
-            .values()
-            .flatten()
-            .filter(|m| m.sender_id != self.local_peer_id.to_string())
-            .map(|m| (m.id.clone(), m.text.clone()))
-            .collect();
-        for (id, text) in msgs {
-            if self.invite_join_processed.contains(&id) {
-                continue;
-            }
-            let joined = self.try_join_groups_from_invite_text(&text, &id);
-            if joined || self.invite_links_handled(&text) {
-                self.invite_join_processed.insert(id);
-            }
-        }
-    }
-
-    fn invite_links_handled(&self, text: &str) -> bool {
-        let links = extract_invite_links(text);
-        links.is_empty()
-            || links.iter().all(|link| {
-                parse_invite_link(link).is_some_and(|g| {
-                    self.left_groups.contains(&g.id) || self.is_active_group_member(&g.id)
-                })
-            })
     }
 
     /// Строит голосовое сообщение для очереди отправки. В чат оно попадёт
@@ -3141,16 +3106,6 @@ impl App {
             let _ = self.command_tx.try_send(UICommand::SearchPeer(*pid));
         }
         Some(id)
-    }
-
-    /// Больше не вступаем автоматически по тексту сообщения — только по клику
-    /// на ссылку (см. `join_group_from_invite` / кнопка «Вступить» в UI).
-    pub(crate) fn try_join_groups_from_invite_text(
-        &mut self,
-        _text: &str,
-        _message_id: &str,
-    ) -> bool {
-        group::auto_join_from_invite_message()
     }
 
     /// Invite-ссылки в чате, в которые локальный пир ещё не входит.

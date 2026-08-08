@@ -9,13 +9,6 @@ use std::collections::{HashMap, HashSet};
 use libp2p::PeerId;
 use crate::offline_mail::{OfflineEnvelope, OFFLINE_VOICE_CHUNK_KIND};
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) enum PublishHandoff {
-    Ok,
-    Failed,
-    Pending,
-}
-
 /// DHT Put Ok may settle handoff only for text-only batches in LAN-only mode
 /// (no bootstrap nodes). With bootstraps configured, DHT is best-effort only.
 pub(crate) fn accept_dht_as_full_handoff(
@@ -93,13 +86,10 @@ impl EnvelopeHandoffState {
         Some(false)
     }
 
+    #[cfg(test)]
     pub(crate) fn pending_count(&self) -> usize {
         self.pending.len()
     }
-}
-
-pub(crate) fn exit_flush_ok(results: &[PublishHandoff]) -> bool {
-    !results.is_empty() && results.iter().all(|r| *r == PublishHandoff::Ok)
 }
 
 #[derive(Debug, Default, Clone)]
@@ -134,12 +124,9 @@ impl PendingRelayQueue {
         self.by_relay.remove(relay).unwrap_or_default()
     }
 
+    #[cfg(test)]
     pub(crate) fn is_empty(&self) -> bool {
         self.by_relay.is_empty()
-    }
-
-    pub(crate) fn queued_relays(&self) -> usize {
-        self.by_relay.len()
     }
 
     pub(crate) fn relay_peer_ids(&self) -> Vec<PeerId> {

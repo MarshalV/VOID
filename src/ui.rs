@@ -1929,25 +1929,29 @@ impl eframe::App for App {
                     );
                 }
                 NetworkEvent::GroupLeave {
+                    from,
                     group_id,
                     peer_id,
-                    ..
                 } => {
                     let me = self.local_peer_id.to_string();
                     let is_self = peer_id == me;
                     self.handle_incoming_group_leave(group_id, peer_id);
                     if !is_self {
+                        let from_s = from.to_string();
+                        let who = &from_s[..8.min(from_s.len())];
                         self.push_toast(
-                            "Участник покинул группу".into(),
+                            format!("Участник покинул группу ({who}…)"),
                             ToastKind::Info,
                             TOAST_TTL_SHORT,
                         );
                     }
                 }
-                NetworkEvent::GroupDelete { group_id, .. } => {
+                NetworkEvent::GroupDelete { from, group_id } => {
                     self.handle_incoming_group_delete(group_id);
+                    let from_s = from.to_string();
+                    let who = &from_s[..8.min(from_s.len())];
                     self.push_toast(
-                        "Группа удалена".into(),
+                        format!("Группа удалена ({who}…)"),
                         ToastKind::Info,
                         TOAST_TTL_SHORT,
                     );

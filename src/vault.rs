@@ -416,7 +416,7 @@ pub(crate) struct VaultUnlockState {
     pub password: String,
     pub password_confirm: String,
     pub error: Option<String>,
-    /// Сохранить пароль в системном хранилище (Windows Credential Manager / macOS Keychain).
+    /// Сохранить пароль (Windows: Credential Manager + void.pwd; macOS/Linux: void.pwd).
     pub remember_password: bool,
     /// Автоматически разблокировать при старте (пароль подставлен из хранилища).
     pub try_auto_unlock: bool,
@@ -435,7 +435,9 @@ impl VaultUnlockState {
     }
 }
 
+#[cfg(windows)]
 const KEYRING_SERVICE: &str = "void-p2p-messenger";
+#[cfg(windows)]
 const KEYRING_USER: &str = "vault";
 const SESSION_PWD_FILE: &str = "void.pwd";
 const SESSION_PWD_MAGIC: &[u8; 8] = b"VOIDPWD1";
@@ -461,6 +463,25 @@ fn session_file_load_dpapi() -> Option<String> {
 }
 
 fn session_file_key() -> [u8; 32] {
+    let user = std::env::var("USER")
+        .or_else(|_| std::env::var("USERNAME"))
+        .unwrap_or_default();
+    let mut hasher = Blake2b512::new();
+    // v2: do not bind to current_exe() — on macOS cargo binary vs VOID.app
+    // would invalidate void.pwd and force re-entry every packaging change.
+    hasher.update(b"void-session-v2");
+    hasher.update(user.as_bytes());
+    if let Some(home) = dirs::home_dir() {
+        hasher.update(home.to_string_lossy().as_bytes());
+    }
+    let hash = hasher.finalize();
+    let mut key = [0u8; 32];
+    key.copy_from_slice(&hash[..32]);
+    key
+}
+
+/// Legacy key (exe path) — try once so old void.pwd still unlocks after upgrade.
+fn session_file_key_v1() -> [u8; 32] {
     let user = std::env::var("USER")
         .or_else(|_| std::env::var("USERNAME"))
         .unwrap_or_default();
@@ -492,8 +513,7 @@ fn session_file_save_aes(password: &str) -> Result<(), Box<dyn Error>> {
     Ok(())
 }
 
-fn session_file_load_aes() -> Option<String> {
-    let data = std::fs::read(SESSION_PWD_FILE).ok()?;
+fn session_file_decrypt_aes(data: &[u8], key: &[u8; 32]) -> Option<String> {
     if data.len() < SESSION_PWD_MAGIC.len() + 12 + 16 {
         return None;
     }
@@ -502,12 +522,22 @@ fn session_file_load_aes() -> Option<String> {
     }
     let rest = &data[SESSION_PWD_MAGIC.len()..];
     let (nonce, ct) = rest.split_at(12);
-    let key = session_file_key();
-    let cipher = Aes256Gcm::new(Key::<Aes256Gcm>::from_slice(&key));
+    let cipher = Aes256Gcm::new(Key::<Aes256Gcm>::from_slice(key));
     let plain = cipher
         .decrypt(Nonce::from_slice(nonce), ct.as_ref())
         .ok()?;
     String::from_utf8(plain).ok().filter(|s| !s.is_empty())
+}
+
+fn session_file_load_aes() -> Option<String> {
+    let data = std::fs::read(SESSION_PWD_FILE).ok()?;
+    if let Some(pwd) = session_file_decrypt_aes(&data, &session_file_key()) {
+        return Some(pwd);
+    }
+    // Upgrade path: decrypt with v1 key, rewrite under v2.
+    let pwd = session_file_decrypt_aes(&data, &session_file_key_v1())?;
+    let _ = session_file_save_aes(&pwd);
+    Some(pwd)
 }
 
 fn session_file_save(password: &str) -> Result<(), Box<dyn Error>> {
@@ -534,22 +564,24 @@ fn session_file_clear() {
     let _ = std::fs::remove_file(SESSION_PWD_FILE);
 }
 
-#[cfg(not(target_os = "linux"))]
+#[cfg(windows)]
 fn keyring_entry() -> Result<keyring::Entry, Box<dyn Error>> {
     keyring::Entry::new(KEYRING_SERVICE, KEYRING_USER).map_err(|e| e.into())
 }
 
-/// Сохраняет пароль vault (Keychain / Credential Manager + локальный void.pwd).
+/// Сохраняет пароль vault.
+/// Windows: Credential Manager + void.pwd. macOS/Linux: только void.pwd
+/// (Keychain на Mac всплывает при каждом старте без Developer ID).
 pub(crate) fn save_remembered_password(password: &str) -> Result<(), Box<dyn Error>> {
-    #[cfg(not(target_os = "linux"))]
+    #[cfg(windows)]
     let keyring_err = keyring_entry()
         .and_then(|entry| entry.set_password(password).map_err(|e| e.into()));
     session_file_save(password)?;
-    #[cfg(not(target_os = "linux"))]
+    #[cfg(windows)]
     {
-        keyring_err.or(Ok(()))
+        return keyring_err.or(Ok(()));
     }
-    #[cfg(target_os = "linux")]
+    #[cfg(not(windows))]
     {
         Ok(())
     }
@@ -557,20 +589,25 @@ pub(crate) fn save_remembered_password(password: &str) -> Result<(), Box<dyn Err
 
 /// Загружает сохранённый пароль vault (если есть).
 pub(crate) fn load_remembered_password() -> Option<String> {
-    #[cfg(not(target_os = "linux"))]
+    // Сначала локальный файл — на macOS не трогаем Keychain (иначе диалог ACL).
+    if let Some(pwd) = session_file_load() {
+        return Some(pwd);
+    }
+    #[cfg(windows)]
     if let Ok(entry) = keyring_entry() {
         if let Ok(pwd) = entry.get_password() {
             if !pwd.is_empty() {
+                let _ = session_file_save(&pwd);
                 return Some(pwd);
             }
         }
     }
-    session_file_load()
+    None
 }
 
 /// Удаляет сохранённый пароль vault.
 pub(crate) fn clear_remembered_password() {
-    #[cfg(not(target_os = "linux"))]
+    #[cfg(windows)]
     if let Ok(entry) = keyring_entry() {
         let _ = entry.delete_credential();
     }

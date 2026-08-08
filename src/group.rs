@@ -272,6 +272,7 @@ pub(crate) fn members_on_group_create(
 }
 
 /// Receiving invite text in chat must never auto-install the group.
+#[cfg(test)]
 pub(crate) fn auto_join_from_invite_message() -> bool {
     false
 }
