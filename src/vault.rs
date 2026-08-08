@@ -471,8 +471,7 @@ fn session_file_key() -> [u8; 32] {
         .or_else(|_| std::env::var("USERNAME"))
         .unwrap_or_default();
     let mut hasher = Blake2b512::new();
-    // v2: do not bind to current_exe() — on macOS cargo binary vs VOID.app
-    // would invalidate void.pwd and force re-entry every packaging change.
+    // v2: do not bind to current_exe() — path changes would invalidate void.pwd.
     hasher.update(b"void-session-v2");
     hasher.update(user.as_bytes());
     if let Some(home) = dirs::home_dir() {
