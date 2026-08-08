@@ -1,3 +1,6 @@
+// Release/.exe: без чёрного окна консоли. Debug (`cargo run`) — консоль остаётся для логов.
+#![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
+
 mod group;
 mod offline_mail;
 mod offline_publish;
