@@ -514,13 +514,22 @@ impl App {
         if !ctx.input(|i| i.viewport().close_requested()) {
             return false;
         }
-        // Linux / no tray: do not CancelClose. Persist in on_exit — never block
-        // the UI thread here (old blocking DHT flush froze the window forever).
-        if self.tray.force_quit || !self.tray.tray_available() {
+        // Пока в outbox есть недоставленное — полный выход (не трей), иначе
+        // handoff в on_exit не успевает: юзер убивает процесс из Terminal/Dock
+        // и офлайн-почта теряется.
+        let must_quit_for_outbox = !self.outbox_entries.is_empty();
+        if self.tray.force_quit || !self.tray.tray_available() || must_quit_for_outbox {
+            // Не CancelClose. Persist + flush — в on_exit (после закрытия окна).
             self.publish_outbox_to_dht();
+            if must_quit_for_outbox && self.tray.tray_available() && !self.tray.force_quit {
+                self.add_status(
+                    "VOID: в outbox есть недоставленное — полный выход, сдача в relay…"
+                        .into(),
+                );
+            }
             return true;
         }
-        // Win/macOS tray: keep process, hide window.
+        // Win/macOS tray: outbox пуст — можно спрятать, сеть в фоне.
         self.persist_chat_journal();
         self.persist_outbox();
         self.publish_outbox_to_dht();
