@@ -1266,7 +1266,7 @@ async fn send_encrypted_chat_payload(
     sessions: &mut HashMap<PeerId, crypto::SecureSession>,
     outbound_msg_requests: &mut HashMap<
         libp2p::request_response::OutboundRequestId,
-        (PeerId, String),
+        (PeerId, String, Vec<u8>),
     >,
     outbound_delete_requests: &mut HashMap<
         libp2p::request_response::OutboundRequestId,
@@ -1299,7 +1299,8 @@ async fn send_encrypted_chat_payload(
             .unwrap_or_default();
         outbound_delete_requests.insert(req_id, (peer, ids));
     } else if let Some(msg_id) = chat_message_id_from_json(json_data.as_slice()) {
-        outbound_msg_requests.insert(req_id, (peer, msg_id.clone()));
+        // Keep plaintext so Hello-вместо-Ack / OutFailure can requeue.
+        outbound_msg_requests.insert(req_id, (peer, msg_id.clone(), json_data));
         let _ = event_tx
             .send(NetworkEvent::MessageOnWire {
                 peer,
@@ -1322,6 +1323,24 @@ async fn send_encrypted_chat_payload(
     true
 }
 
+fn requeue_pending_chat_json(
+    pending_messages: &mut HashMap<PeerId, Vec<Vec<u8>>>,
+    peer: PeerId,
+    json: Vec<u8>,
+) {
+    let mid = chat_message_id_from_json(json.as_slice());
+    let queue = pending_messages.entry(peer).or_default();
+    if let Some(ref id) = mid {
+        if queue
+            .iter()
+            .any(|b| chat_message_id_from_json(b.as_slice()).as_deref() == Some(id.as_str()))
+        {
+            return;
+        }
+    }
+    queue.push(json);
+}
+
 struct PendingVoiceTransfer {
     path: String,
     transfer_id: [u8; 16],
@@ -1332,7 +1351,7 @@ async fn flush_pending_encrypted_messages(
     sessions: &mut HashMap<PeerId, crypto::SecureSession>,
     outbound_msg_requests: &mut HashMap<
         libp2p::request_response::OutboundRequestId,
-        (PeerId, String),
+        (PeerId, String, Vec<u8>),
     >,
     outbound_delete_requests: &mut HashMap<
         libp2p::request_response::OutboundRequestId,
@@ -1553,7 +1572,7 @@ async fn flush_pending_read_receipts(
     sessions: &mut HashMap<PeerId, crypto::SecureSession>,
     outbound_msg_requests: &mut HashMap<
         libp2p::request_response::OutboundRequestId,
-        (PeerId, String),
+        (PeerId, String, Vec<u8>),
     >,
     outbound_delete_requests: &mut HashMap<
         libp2p::request_response::OutboundRequestId,
@@ -1877,7 +1896,7 @@ pub async fn run_chat_network(
         // pending-ретраи в UI. Hello-handshake'ы сюда НЕ попадают.
         let mut outbound_msg_requests: HashMap<
             libp2p::request_response::OutboundRequestId,
-            (PeerId, String),
+            (PeerId, String, Vec<u8>),
         > = HashMap::new();
         let mut outbound_delete_requests: HashMap<
             libp2p::request_response::OutboundRequestId,
@@ -2548,7 +2567,7 @@ pub async fn run_chat_network(
                                         let in_flight = msg_id_for_send.as_ref().is_some_and(|mid| {
                                             outbound_msg_requests
                                                 .values()
-                                                .any(|(p, id)| *p == peer_id && id == mid)
+                                                .any(|(p, id, _)| *p == peer_id && id == mid)
                                         });
                                         if in_flight {
                                             debug!(
@@ -2708,7 +2727,7 @@ pub async fn run_chat_network(
                                             let msg_id_for_send =
                                                 chat_message_id_from_json(per_json.as_slice());
                                             let in_flight = msg_id_for_send.as_ref().is_some_and(|mid| {
-                                                outbound_msg_requests.values().any(|(p, id)| {
+                                                outbound_msg_requests.values().any(|(p, id, _)| {
                                                     *p == peer_id && id == mid
                                                 })
                                             });
@@ -3176,7 +3195,7 @@ pub async fn run_chat_network(
                                 let in_flight = msg_id_for_send.as_ref().is_some_and(|mid| {
                                     outbound_msg_requests
                                         .values()
-                                        .any(|(p, id)| *p == recipient && id == mid)
+                                        .any(|(p, id, _)| *p == recipient && id == mid)
                                 });
                                 if !in_flight {
                                     let _ = send_encrypted_chat_payload(
@@ -3926,6 +3945,43 @@ pub async fn run_chat_network(
                                                             &peer.to_string()[..8]
                                                         );
                                                         sessions.remove(&peer);
+                                                        // Signal peer to re-handshake (same as no-session).
+                                                        let ephem_secret =
+                                                            crypto::StaticSecret::random_from_rng(
+                                                                &mut rand::rngs::OsRng,
+                                                            );
+                                                        let ephem_pub =
+                                                            crypto::PublicKey::from(&ephem_secret);
+                                                        if let Some(hello) = build_v1_hello(
+                                                            &local_key,
+                                                            local_peer_id,
+                                                            peer,
+                                                            my_public_key,
+                                                            ephem_pub,
+                                                        ) {
+                                                            if let Some(ch) = response_channel.take()
+                                                            {
+                                                                let _ = swarm
+                                                                    .behaviour_mut()
+                                                                    .request_response
+                                                                    .send_response(ch, hello);
+                                                            }
+                                                        }
+                                                        if swarm.is_connected(&peer) {
+                                                            let _ = ensure_e2ee_handshake_started(
+                                                                &mut swarm,
+                                                                &local_key,
+                                                                local_peer_id,
+                                                                my_public_key,
+                                                                peer,
+                                                                &sessions,
+                                                                &mut pending_handshakes,
+                                                                &mut handshake_started,
+                                                                &now,
+                                                                true,
+                                                            )
+                                                            .await;
+                                                        }
                                                     }
                                                 }
                                             } else {
@@ -3953,6 +4009,21 @@ pub async fn run_chat_network(
                                                             .send_response(ch, hello);
                                                     }
                                                 }
+                                                // Also start a real outbound Hello — response
+                                                // ephem above is only a signal (secret discarded).
+                                                let _ = ensure_e2ee_handshake_started(
+                                                    &mut swarm,
+                                                    &local_key,
+                                                    local_peer_id,
+                                                    my_public_key,
+                                                    peer,
+                                                    &sessions,
+                                                    &mut pending_handshakes,
+                                                    &mut handshake_started,
+                                                    &now,
+                                                    false,
+                                                )
+                                                .await;
                                             }
                                             if send_ack {
                                                 if let Some(ch) = response_channel {
@@ -3996,7 +4067,7 @@ pub async fn run_chat_network(
                                                         })
                                                         .await;
                                                 }
-                                            } else if let Some((delivered_peer, message_id)) =
+                                            } else if let Some((delivered_peer, message_id, _)) =
                                                 outbound_msg_requests.remove(&request_id)
                                             {
                                                 debug!(
@@ -4036,18 +4107,51 @@ pub async fn run_chat_network(
                                             transport_sig,
                                             transport_pubkey_pb,
                                         } => {
-                                            if let Some((retry_peer, retry_id)) =
+                                            // Encrypted got Hello instead of Ack: peer has no
+                                            // matching session. That Hello's ephem is disposable —
+                                            // do NOT derive keys from it. Requeue + real Hello.
+                                            if let Some((retry_peer, retry_id, json)) =
                                                 outbound_msg_requests.remove(&request_id)
                                             {
                                                 debug!(
-                                                    "[{}] ↻ RR: {} ответил Hello вместо Ack (msg {}), ждём ретрай",
+                                                    "[{}] ↻ RR: {} ответил Hello вместо Ack (msg {}) — реqueue + Handshake",
                                                     now,
                                                     &peer.to_string()[..8],
                                                     &retry_id[..8.min(retry_id.len())]
                                                 );
-                                                let _ = retry_peer;
-                                            }
-                                            if peer != local_peer_id {
+                                                let _ = retry_id;
+                                                requeue_pending_chat_json(
+                                                    &mut pending_messages,
+                                                    retry_peer,
+                                                    json,
+                                                );
+                                                sessions.remove(&retry_peer);
+                                                pending_handshakes.remove(&retry_peer);
+                                                handshake_started.remove(&retry_peer);
+                                                let _ = event_tx
+                                                    .send(NetworkEvent::MessageAwaitingSession(
+                                                        retry_peer,
+                                                    ))
+                                                    .await;
+                                                if swarm.is_connected(&retry_peer) {
+                                                    let now_hs = chrono::Local::now()
+                                                        .format("%H:%M:%S")
+                                                        .to_string();
+                                                    let _ = ensure_e2ee_handshake_started(
+                                                        &mut swarm,
+                                                        &local_key,
+                                                        local_peer_id,
+                                                        my_public_key,
+                                                        retry_peer,
+                                                        &sessions,
+                                                        &mut pending_handshakes,
+                                                        &mut handshake_started,
+                                                        &now_hs,
+                                                        true,
+                                                    )
+                                                    .await;
+                                                }
+                                            } else if peer != local_peer_id {
                                                 if !verify_hello_transport_binding(
                                                     peer,
                                                     local_peer_id,
@@ -4274,11 +4378,41 @@ pub async fn run_chat_network(
                                     transfer_id_to_hex(&tid)
                                 ));
                             }
-                            let was_msg = outbound_msg_requests.remove(&request_id).is_some();
+                            let was_msg = outbound_msg_requests.remove(&request_id);
+                            let had_msg = was_msg.is_some();
                             let was_delete = outbound_delete_requests.remove(&request_id).is_some();
+                            if let Some((msg_peer, _mid, json)) = was_msg {
+                                requeue_pending_chat_json(
+                                    &mut pending_messages,
+                                    msg_peer,
+                                    json,
+                                );
+                                let _ = event_tx
+                                    .send(NetworkEvent::MessageAwaitingSession(msg_peer))
+                                    .await;
+                                if swarm.is_connected(&msg_peer)
+                                    && !sessions.contains_key(&msg_peer)
+                                {
+                                    let now_hs =
+                                        chrono::Local::now().format("%H:%M:%S").to_string();
+                                    let _ = ensure_e2ee_handshake_started(
+                                        &mut swarm,
+                                        &local_key,
+                                        local_peer_id,
+                                        my_public_key,
+                                        msg_peer,
+                                        &sessions,
+                                        &mut pending_handshakes,
+                                        &mut handshake_started,
+                                        &now_hs,
+                                        true,
+                                    )
+                                    .await;
+                                }
+                            }
                             // Неотслеживаемый запрос — это Hello-handshake; сбрасываем, чтобы
                             // повторная отправка не считала хендшейк «уже в полёте».
-                            if !was_msg && !was_delete && was_chunk.is_none() {
+                            if !had_msg && !was_delete && was_chunk.is_none() {
                                 pending_handshakes.remove(&peer);
                                 handshake_started.remove(&peer);
                                 let still_connected = swarm.is_connected(&peer);
