@@ -3,6 +3,19 @@ name = "p2p-messenger"
 version = "0.1.0"
 edition = "2021"
 
+[lib]
+name = "p2p_messenger"
+path = "src/lib.rs"
+
+[[bin]]
+name = "p2p-messenger"
+path = "src/main.rs"
+required-features = ["egui-ui"]
+
+[features]
+default = ["egui-ui"]
+egui-ui = ["dep:eframe"]
+
 [dependencies]
 libp2p = { version = "0.56", features = ["tcp", "quic", "noise", "yamux", "ping", "macros", "tokio", "mdns", "request-response", "identify", "kad", "relay", "dcutr", "autonat", "upnp", "dns", "rsa", "ed25519", "secp256k1", "json"] }
 tokio = { version = "1.0", features = ["full"] }
@@ -11,7 +24,7 @@ futures = "0.3"
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 chrono = "0.4"
-eframe = "0.29"
+eframe = { version = "0.29", optional = true }
 serde = { version = "1.0", features = ["derive"] }
 serde_json = "1.0"
 image = "0.25"
@@ -36,21 +49,19 @@ mp4ameta = "0.13"
 lopdf = "0.34"
 zip = "2.2"
 
+# tray-icon for system tray
+[target.'cfg(any(windows, target_os = "macos", target_os = "linux"))'.dependencies]
+tray-icon = { version = "0.19" }
+
 [target.'cfg(windows)'.dependencies]
 keyring = { version = "3", features = ["windows-native"] }
 windows-dpapi = "0.1"
 
-# macOS: no keyring — Keychain prompts on every unsigned/.app launch.
-# Remembered password uses local void.pwd only (see vault.rs).
-
-# tray-icon pulls GTK/libappindicator on Linux and can abort at startup.
-[target.'cfg(any(windows, target_os = "macos"))'.dependencies]
-tray-icon = "0.19"
-rfd = { version = "0.15", default-features = false, features = ["file-handle-inner"] }
-
 [target.'cfg(any(target_os = "linux", target_os = "freebsd", target_os = "dragonfly", target_os = "netbsd", target_os = "openbsd"))'.dependencies]
 rfd = { version = "0.15", default-features = false, features = ["file-handle-inner", "xdg-portal", "tokio"] }
 
+[target.'cfg(any(windows, target_os = "macos"))'.dependencies]
+rfd = { version = "0.15", default-features = false, features = ["file-handle-inner"] }
 
 [profile.dev]
 incremental = false

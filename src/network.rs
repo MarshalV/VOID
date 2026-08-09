@@ -19,7 +19,7 @@ use tokio::sync::mpsc;
 use tracing::{debug, warn};
 
 use crate::bootstrap::{parse_seed_input, peer_id_from_multiaddr, void_bootstrap_multiaddrs};
-use crate::app::SharedChatMessages;
+use crate::shared_chat::SharedChatMessages;
 use crate::crypto;
 use crate::file_transfer;
 use crate::offline_mail::{
@@ -1871,6 +1871,10 @@ pub async fn run_chat_network(
         let mut pending_relay = PendingRelayQueue::default();
         let mut pending_relay_gates: HashMap<(PeerId, PeerId), Arc<ActiveHandoff>> = HashMap::new();
         let mut dial_backoff: HashMap<PeerId, Instant> = HashMap::new();
+        /// Bootstrap PeerId → consecutive dial failures (for failover rotation).
+        let mut bootstrap_fail_streak: HashMap<PeerId, u32> = HashMap::new();
+        /// Round-robin cursor into `void_bootstraps` after a bootstrap dial failure.
+        let mut bootstrap_failover_idx: usize = 0;
         // Схлопываем подряд идущие `OutFailure` одному пиру: при отправке
         // сообщения без сессии мы шлём Hello + packet, и на DialFailure
         // оба улетают в лог дубликатом. Храним время последнего лога,
@@ -4166,6 +4170,7 @@ pub async fn run_chat_network(
                             pending_dials.remove(&peer_id);
                             // Соединение установлено — снимаем задание на реконнект.
                             reconnect_queue.remove(&peer_id);
+                            bootstrap_fail_streak.remove(&peer_id);
                             flush_pending_relay_for_peer(
                                 &mut swarm,
                                 &mut pending_relay,
@@ -4403,9 +4408,7 @@ pub async fn run_chat_network(
 
                              if !is_noise {
                                  debug!("❌ ОШИБКА ИСХОДЯЩЕГО СОЕДИНЕНИЯ (peer: {}): {:?}", peer_str, error);
-                                 let _ = event_tx.send(NetworkEvent::Status(
-                                     format!("❌ Ошибка подключения: {}", peer_str)
-                                 )).await;
+                                 // Do not toast transient dial noise (bootstrap failover etc.).
                              } else {
                                  // В консоли пишем кратко
                                  if err_str.contains("Timeout") || err_str.contains("Handshake") {
@@ -4420,6 +4423,54 @@ pub async fn run_chat_network(
                             if let Some(p) = peer_id {
                                 pending_dials.remove(&p);
                                 dial_backoff.insert(p, std::time::Instant::now());
+                                // Bootstrap failover: dial next vault bootstrap quietly (no UI spam).
+                                if bootstrap_peer_ids.contains(&p) {
+                                    let streak = bootstrap_fail_streak.entry(p).or_insert(0);
+                                    *streak = streak.saturating_add(1);
+                                    debug!(
+                                        "bootstrap {} fail streak={}",
+                                        &p.to_string()[..8.min(p.to_string().len())],
+                                        *streak
+                                    );
+                                    if !void_bootstraps.is_empty() {
+                                        let n = void_bootstraps.len();
+                                        for step in 1..=n {
+                                            let idx = (bootstrap_failover_idx + step) % n;
+                                            let ma = &void_bootstraps[idx];
+                                            if let Some(next_pid) = peer_id_from_multiaddr(ma) {
+                                                if next_pid == p {
+                                                    continue;
+                                                }
+                                                if swarm.is_connected(&next_pid) {
+                                                    continue;
+                                                }
+                                                if bootstrap_fail_streak
+                                                    .get(&next_pid)
+                                                    .copied()
+                                                    .unwrap_or(0)
+                                                    > 8
+                                                {
+                                                    continue;
+                                                }
+                                                // Back off if we just failed this peer.
+                                                if dial_backoff
+                                                    .get(&next_pid)
+                                                    .is_some_and(|t| t.elapsed() < Duration::from_secs(3))
+                                                {
+                                                    continue;
+                                                }
+                                                bootstrap_failover_idx = idx;
+                                                dial_peer_best_effort(
+                                                    &mut swarm,
+                                                    next_pid,
+                                                    vec![ma.clone()],
+                                                    &void_bootstraps,
+                                                );
+                                                break;
+                                            }
+                                        }
+                                    }
+                                }
                             }
                         },
                         SwarmEvent::IncomingConnectionError { error, .. } => {

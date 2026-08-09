@@ -1,0 +1,102 @@
+<!DOCTYPE html>
+<html lang="ru">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0" />
+  <title>VOID P2P Messenger</title>
+  <link rel="stylesheet" href="style.css" />
+  <link rel="preconnect" href="https://fonts.googleapis.com" />
+  <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
+  <link href="https://fonts.googleapis.com/css2?family=Orbitron:wght@500;700&family=IBM+Plex+Sans:wght@400;500;600&display=swap" rel="stylesheet" />
+</head>
+<body>
+  <div id="unlock-screen" class="screen">
+    <div class="unlock-card">
+      <img id="brand-logo" class="brand-logo" alt="VOID" />
+      <h1 class="brand">VOID</h1>
+      <p id="unlock-subtitle" class="muted">Разблокировка vault</p>
+      <label class="field">
+        <span>Пароль</span>
+        <input type="password" id="password" autocomplete="current-password" />
+      </label>
+      <label class="field" id="confirm-wrap" hidden>
+        <span>Пароль ещё раз</span>
+        <input type="password" id="password-confirm" autocomplete="new-password" />
+      </label>
+      <label class="check">
+        <input type="checkbox" id="remember" />
+        <span>Запомнить пароль</span>
+      </label>
+      <p id="unlock-error" class="error" hidden></p>
+      <button type="button" id="unlock-btn" class="btn primary">Войти</button>
+    </div>
+  </div>
+
+  <div id="main-screen" class="screen" hidden>
+    <aside id="sidebar">
+      <div class="sidebar-top">
+        <button type="button" id="menu-btn" class="icon-btn" title="Меню">
+          <img data-icon="menu.png" alt="" />
+        </button>
+        <div class="brand-mini">
+          <img data-icon="Image_programm.png" alt="" class="brand-mini-img" />
+          <span>VOID</span>
+        </div>
+        <button type="button" id="network-btn" class="icon-btn" title="Сеть">
+          <img data-icon="star.png" alt="" />
+        </button>
+        <button type="button" id="settings-btn" class="icon-btn" title="Настройки">
+          <img data-icon="setings.png" alt="" />
+        </button>
+      </div>
+      <div id="beacon-banner" class="beacon" hidden>Маяк активен — сеть в фоне</div>
+      <div class="search-row">
+        <input type="search" id="contact-filter" placeholder="Поиск…" />
+      </div>
+      <div id="chat-list" class="chat-list"></div>
+      <div class="sidebar-foot">
+        <span id="conn-status" class="muted">—</span>
+      </div>
+    </aside>
+
+    <main id="chat-area">
+      <header id="chat-header">
+        <button type="button" id="toggle-sidebar" class="icon-btn sidebar-toggle" title="Показать / скрыть панель">
+          <img data-icon="scip_panele.png" alt="" />
+        </button>
+        <div class="chat-header-text">
+          <h2 id="chat-title">Выберите чат</h2>
+          <p id="chat-sub" class="muted"></p>
+        </div>
+        <button type="button" id="header-settings-btn" class="icon-btn" title="Настройки">
+          <img data-icon="setings.png" alt="" />
+        </button>
+      </header>
+      <div id="messages" class="messages"></div>
+      <div id="file-offers" class="file-offers"></div>
+      <form id="composer" class="composer">
+        <button type="button" id="attach-btn" class="icon-btn" title="Файл">
+          <img data-icon="send file.png" alt="" />
+        </button>
+        <button type="button" id="voice-btn" class="icon-btn" title="Голос">
+          <img data-icon="voice.png" alt="" />
+        </button>
+        <input type="text" id="message-input" placeholder="Сообщение…" autocomplete="off" disabled />
+        <button type="submit" id="send-btn" class="icon-btn primary-icon" title="Отправить" disabled>
+          <img data-icon="send.png" alt="" />
+        </button>
+      </form>
+    </main>
+  </div>
+
+  <div id="overlay" class="overlay" hidden aria-hidden="true">
+    <div class="modal" id="modal-panel" role="dialog" aria-modal="true">
+      <button type="button" class="modal-close" id="modal-close" aria-label="Закрыть">×</button>
+      <div id="modal-body"></div>
+    </div>
+  </div>
+
+  <div id="toast" class="toast" hidden role="status" aria-live="polite"></div>
+  <script src="app.js"></script>
+</body>
+</html>
