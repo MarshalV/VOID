@@ -160,7 +160,13 @@
     if (s.selected_chat) {
       const c = (s.contacts || []).find((x) => x.peer_id === s.selected_chat);
       els.chatTitle.textContent = c?.display_name || s.selected_chat.slice(0, 16);
-      els.chatSub.textContent = c?.is_group ? "Группа" : s.selected_chat.slice(0, 28);
+      if (c?.is_group) {
+        els.chatSub.textContent = "Группа";
+      } else if (c?.online) {
+        els.chatSub.textContent = "в сети";
+      } else {
+        els.chatSub.textContent = "не в сети";
+      }
     } else {
       els.chatTitle.textContent = "Выберите чат";
       els.chatSub.textContent = "";
@@ -199,7 +205,9 @@
           <p></p>
         </div>`;
       item.querySelector("h3").textContent = c.display_name;
-      item.querySelector("p").textContent = c.last_preview || (c.is_group ? "Группа" : c.peer_id.slice(0, 20));
+      item.querySelector("p").textContent = c.online
+        ? "в сети"
+        : c.last_preview || (c.is_group ? "Группа" : c.peer_id.slice(0, 20));
       item.addEventListener("click", async () => {
         const next = await invoke("select_chat", { chatId: c.peer_id });
         applySnapshot(next);
