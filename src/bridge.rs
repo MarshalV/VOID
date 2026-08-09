@@ -885,6 +885,7 @@ impl VoidRuntime {
                                 OutgoingDeliveryStatus::Delivered,
                             );
                             g.complete_pending_send(peer, &message_id);
+                            g.persist_journal();
                             emit_snapshot = true;
                         }
                         NetworkEvent::MessageAwaitingSession(peer) => {
@@ -1526,6 +1527,7 @@ impl VoidRuntime {
                 }
             }
             g.schedule_offline_publish();
+            g.publish_outbox_to_dht();
             if let Some(tx) = &g.command_tx {
                 let _ = tx.try_send(UICommand::SendMessage {
                     sender_name: nick,

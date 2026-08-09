@@ -892,7 +892,7 @@ fn put_mailbox_envelopes(
 /// по одному конверту на запрос.
 type MailboxStoreTrack = HashMap<
     libp2p::request_response::OutboundRequestId,
-    (Arc<ActiveHandoff>, String),
+    (Arc<ActiveHandoff>, PeerId, String),
 >;
 
 fn fanout_relay_mail(
@@ -930,7 +930,7 @@ fn fanout_relay_mail(
                 .send_request(peer, packet.clone());
             if track_handoff {
                 if let Some(h) = handoff {
-                    store_track.insert(rid, (h.clone(), env.message_id.clone()));
+                    store_track.insert(rid, (h.clone(), recipient, env.message_id.clone()));
                 }
             }
         }
@@ -970,7 +970,7 @@ fn fanout_relay_to_bootstraps(
                     .request_response
                     .send_request(pid, packet);
                 if let Some(h) = handoff {
-                    store_track.insert(rid, (h.clone(), env.message_id.clone()));
+                    store_track.insert(rid, (h.clone(), recipient, env.message_id.clone()));
                 }
             }
         } else {
@@ -1070,7 +1070,7 @@ fn flush_pending_relay_for_peer(
                 .request_response
                 .send_request(&peer, packet);
             if let Some(ref h) = handoff {
-                store_track.insert(rid, (h.clone(), mid));
+                store_track.insert(rid, (h.clone(), recipient, mid));
             }
         }
     }
@@ -2226,6 +2226,10 @@ pub async fn run_chat_network(
                                 {
                                     continue;
                                 }
+                                swarm
+                                    .behaviour_mut()
+                                    .kad
+                                    .get_record(prekey_record_key(peer_id));
                                 if !swarm.is_connected(&peer_id) {
                                     let mut addrs: Vec<Multiaddr> = peer_addrs
                                         .get(&peer_id)
@@ -2244,6 +2248,8 @@ pub async fn run_chat_network(
                                         addrs,
                                         &void_bootstraps,
                                     );
+                                    // Hello after ConnectionEstablished — not now.
+                                    continue;
                                 }
                                 let now_hs =
                                     chrono::Local::now().format("%H:%M:%S").to_string();
@@ -2462,7 +2468,8 @@ pub async fn run_chat_network(
                                 if let Some(peer_id) = recipient {
                                     // Same-NAT / no direct path: kick DHT + dial
                                     // (incl. bootstrap circuit) before handshake/send.
-                                    if !swarm.is_connected(&peer_id) {
+                                    let connected = swarm.is_connected(&peer_id);
+                                    if !connected {
                                         let mut addrs: Vec<Multiaddr> = peer_addrs
                                             .get(&peer_id)
                                             .cloned()
@@ -2482,6 +2489,10 @@ pub async fn run_chat_network(
                                         let key = peer_dht_record_key(peer_id);
                                         swarm.behaviour_mut().kad.get_providers(key);
                                         swarm.behaviour_mut().kad.get_closest_peers(peer_id);
+                                        swarm
+                                            .behaviour_mut()
+                                            .kad
+                                            .get_record(prekey_record_key(peer_id));
                                         dial_peer_best_effort(
                                             &mut swarm,
                                             peer_id,
@@ -2527,20 +2538,23 @@ pub async fn run_chat_network(
                                             .await;
                                         }
                                     } else {
-                                        let force_hs = pending_handshakes.contains_key(&peer_id)
-                                            && swarm.is_connected(&peer_id);
-                                        let _ = ensure_e2ee_handshake_started(
-                                            &mut swarm,
-                                            &local_key,
-                                            local_peer_id,
-                                            my_public_key,
-                                            peer_id,
-                                            &sessions,
-                                            &mut pending_handshakes,
-                                            &now,
-                                            force_hs,
-                                        )
-                                        .await;
+                                        // Never Hello until connected — bare send_request
+                                        // dials without circuit addrs and fails → stuck ○.
+                                        if connected {
+                                            let force_hs = pending_handshakes.contains_key(&peer_id);
+                                            let _ = ensure_e2ee_handshake_started(
+                                                &mut swarm,
+                                                &local_key,
+                                                local_peer_id,
+                                                my_public_key,
+                                                peer_id,
+                                                &sessions,
+                                                &mut pending_handshakes,
+                                                &now,
+                                                force_hs,
+                                            )
+                                            .await;
+                                        }
                                         let msg_id_for_dedup =
                                             chat_message_id_from_json(json_data.as_slice());
                                         let queue = pending_messages.entry(peer_id).or_default();
@@ -2563,6 +2577,10 @@ pub async fn run_chat_network(
                                         }
                                         let _ = event_tx
                                             .send(NetworkEvent::MessageAwaitingSession(peer_id))
+                                            .await;
+                                        // Nudge offline path immediately while waiting for live.
+                                        let _ = event_tx
+                                            .send(NetworkEvent::SendFailedDial(peer_id))
                                             .await;
                                         debug!(
                                             "[{}] ⏳ E2EE: Сообщение буферизовано до хендшейка с {}",
@@ -3272,7 +3290,7 @@ pub async fn run_chat_network(
                                         if let Some(h) = &handoff {
                                             let tracked = outbound_mailbox_stores
                                                 .values()
-                                                .any(|(g, _)| Arc::ptr_eq(g, h));
+                                                .any(|(g, _, _)| Arc::ptr_eq(g, h));
                                             let queued = pending_relay_gates
                                                 .values()
                                                 .any(|g| Arc::ptr_eq(g, h));
@@ -3908,7 +3926,7 @@ pub async fn run_chat_network(
                                 libp2p::request_response::Message::Response { request_id, response } => {
                                     match response {
                                         V1Packet::Ack => {
-                                            if let Some((handoff, message_id)) =
+                                            if let Some((handoff, recip, message_id)) =
                                                 outbound_mailbox_stores.remove(&request_id)
                                             {
                                                 debug!(
@@ -3917,6 +3935,22 @@ pub async fn run_chat_network(
                                                     &message_id[..8.min(message_id.len())]
                                                 );
                                                 handoff.note_store_ack(&message_id);
+                                                // One ✓ = accepted by bootstrap/relay (or live peer path).
+                                                if !message_id.starts_with("vchunk:")
+                                                    && !message_id.starts_with("gsync:")
+                                                {
+                                                    let mid = message_id
+                                                        .split(':')
+                                                        .next()
+                                                        .unwrap_or(message_id.as_str())
+                                                        .to_string();
+                                                    let _ = event_tx
+                                                        .send(NetworkEvent::MessageDelivered {
+                                                            peer: recip,
+                                                            message_id: mid,
+                                                        })
+                                                        .await;
+                                                }
                                             } else if let Some((delivered_peer, message_id)) =
                                                 outbound_msg_requests.remove(&request_id)
                                             {
@@ -4923,7 +4957,7 @@ pub async fn run_chat_network(
                                                         if let Some(h) = &handoff {
                                                             let tracked = outbound_mailbox_stores
                                                                 .values()
-                                                                .any(|(g, _)| Arc::ptr_eq(g, h));
+                                                                .any(|(g, _, _)| Arc::ptr_eq(g, h));
                                                             let queued = pending_relay_gates
                                                                 .values()
                                                                 .any(|g| Arc::ptr_eq(g, h));
