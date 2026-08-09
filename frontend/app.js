@@ -112,12 +112,15 @@
     }
     els.beaconBanner.hidden = !s.beacon_active;
     const pidShort = (s.peer_id || "").slice(0, 12);
+    const live = (s.bootstrap_connected || 0) + (s.connected_peers || 0);
     const netLabel = s.network_ok
-      ? (s.bootstrap_connected > 0 ? "в сети" : "пиры онлайн")
+      ? (s.bootstrap_connected > 0 ? "в сети" : "есть соединения")
       : (s.bootstraps?.length ? "нет связи с bootstrap" : "bootstrap не задан");
     els.connStatus.textContent =
-      `${netLabel} · ${pidShort}… · контакты ${s.connected_peers} · bootstrap ${s.bootstrap_connected}/${s.bootstraps?.length || 0}`;
-    els.connStatus.title = s.peer_id || "";
+      `${netLabel} · ${pidShort}… · live ${live} · контакты ${s.connected_peers} · bootstrap ${s.bootstrap_connected}/${s.bootstraps?.length || 0}`;
+    els.connStatus.title = [s.peer_id || "", ...(s.bootstraps || []).slice(0, 4)]
+      .filter(Boolean)
+      .join("\n");
     els.connStatus.style.color = s.network_ok ? "var(--accent)" : "var(--danger)";
     renderContacts();
     renderMessages();

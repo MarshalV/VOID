@@ -196,6 +196,13 @@ fn fetch_void_bootstrap_list(url: &str) -> Option<String> {
 
 /// Разбирает ввод «войти в сеть»: полный multiaddr, `IP`, `IP:PORT`. Возвращает multiaddr и (опц.) PeerId.
 pub(crate) fn parse_seed_input(raw: &str) -> Option<(Multiaddr, Option<PeerId>)> {
+    let (addrs, pid) = parse_seed_dial_addrs(raw)?;
+    Some((addrs.into_iter().next()?, pid))
+}
+
+/// Как [`parse_seed_input`], но для `IP`/`IP:PORT` отдаёт и QUIC, и TCP
+/// (VOID bootstrap обычно на `/udp/…/quic-v1`, не на голом TCP).
+pub(crate) fn parse_seed_dial_addrs(raw: &str) -> Option<(Vec<Multiaddr>, Option<PeerId>)> {
     let t = raw.trim();
     if t.is_empty() {
         return None;
@@ -203,7 +210,11 @@ pub(crate) fn parse_seed_input(raw: &str) -> Option<(Multiaddr, Option<PeerId>)>
     if t.starts_with('/') {
         let ma: Multiaddr = t.parse().ok()?;
         let pid = peer_id_from_multiaddr(&ma);
-        return Some((ma, pid));
+        let mut addrs = expand_transport_variants(&ma);
+        if addrs.is_empty() {
+            addrs.push(ma);
+        }
+        return Some((addrs, pid));
     }
     let (host, port) = if let Some((h, p)) = t.rsplit_once(':') {
         let port: u16 = p.parse().ok()?;
@@ -212,12 +223,104 @@ pub(crate) fn parse_seed_input(raw: &str) -> Option<(Multiaddr, Option<PeerId>)>
         (t.to_string(), 4001u16)
     };
     let ip: std::net::IpAddr = host.parse().ok()?;
-    let base = match ip {
-        std::net::IpAddr::V4(v4) => format!("/ip4/{}/tcp/{}", v4, port),
-        std::net::IpAddr::V6(v6) => format!("/ip6/{}/tcp/{}", v6, port),
+    let (quic_s, tcp_s) = match ip {
+        std::net::IpAddr::V4(v4) => (
+            format!("/ip4/{v4}/udp/{port}/quic-v1"),
+            format!("/ip4/{v4}/tcp/{port}"),
+        ),
+        std::net::IpAddr::V6(v6) => (
+            format!("/ip6/{v6}/udp/{port}/quic-v1"),
+            format!("/ip6/{v6}/tcp/{port}"),
+        ),
     };
-    let ma: Multiaddr = base.parse().ok()?;
-    Some((ma, None))
+    let mut addrs = Vec::new();
+    if let Ok(ma) = quic_s.parse() {
+        addrs.push(ma);
+    }
+    if let Ok(ma) = tcp_s.parse() {
+        addrs.push(ma);
+    }
+    if addrs.is_empty() {
+        return None;
+    }
+    Some((addrs, None))
+}
+
+/// Если в multiaddr только TCP — добавить QUIC-вариант (и наоборот), сохранив `/p2p/`.
+pub(crate) fn expand_transport_variants(ma: &Multiaddr) -> Vec<Multiaddr> {
+    let s = ma.to_string();
+    let mut out = vec![ma.clone()];
+    let pid_suffix = s
+        .rfind("/p2p/")
+        .map(|i| s[i..].to_string())
+        .unwrap_or_default();
+
+    if let Some(rest) = s.strip_prefix("/ip4/") {
+        if let Some((ip, after)) = rest.split_once('/') {
+            if let Some(tcp_port) = after.strip_prefix("tcp/") {
+                let port = tcp_port
+                    .split('/')
+                    .next()
+                    .unwrap_or("")
+                    .to_string();
+                if !port.is_empty() {
+                    let alt = format!("/ip4/{ip}/udp/{port}/quic-v1{pid_suffix}");
+                    if let Ok(ma2) = alt.parse() {
+                        if !out.contains(&ma2) {
+                            out.push(ma2);
+                        }
+                    }
+                }
+            } else if let Some(udp_port) = after.strip_prefix("udp/") {
+                let port = udp_port
+                    .split('/')
+                    .next()
+                    .unwrap_or("")
+                    .to_string();
+                if !port.is_empty() {
+                    let alt = format!("/ip4/{ip}/tcp/{port}{pid_suffix}");
+                    if let Ok(ma2) = alt.parse() {
+                        if !out.contains(&ma2) {
+                            out.push(ma2);
+                        }
+                    }
+                }
+            }
+        }
+    } else if let Some(rest) = s.strip_prefix("/ip6/") {
+        if let Some((ip, after)) = rest.split_once('/') {
+            if let Some(tcp_port) = after.strip_prefix("tcp/") {
+                let port = tcp_port
+                    .split('/')
+                    .next()
+                    .unwrap_or("")
+                    .to_string();
+                if !port.is_empty() {
+                    let alt = format!("/ip6/{ip}/udp/{port}/quic-v1{pid_suffix}");
+                    if let Ok(ma2) = alt.parse() {
+                        if !out.contains(&ma2) {
+                            out.push(ma2);
+                        }
+                    }
+                }
+            } else if let Some(udp_port) = after.strip_prefix("udp/") {
+                let port = udp_port
+                    .split('/')
+                    .next()
+                    .unwrap_or("")
+                    .to_string();
+                if !port.is_empty() {
+                    let alt = format!("/ip6/{ip}/tcp/{port}{pid_suffix}");
+                    if let Ok(ma2) = alt.parse() {
+                        if !out.contains(&ma2) {
+                            out.push(ma2);
+                        }
+                    }
+                }
+            }
+        }
+    }
+    out
 }
 
 pub(crate) fn hex_decode_32(s: &str) -> Option<[u8; 32]> {

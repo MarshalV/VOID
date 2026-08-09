@@ -731,7 +731,7 @@ impl Inner {
                 let n = self.bootstrap_connected_count();
                 n
             },
-            network_ok: self.bootstrap_connected_count() > 0 || self.connected_peers > 0,
+            network_ok: !self.connected_peer_ids.is_empty(),
             listen_addrs: self.listen_addrs.clone(),
             selected_chat: self.selected_chat.clone(),
             contacts,
@@ -1298,6 +1298,19 @@ impl VoidRuntime {
                                 g.push_pending_send(pid, text, message_id);
                                 g.ensure_peer_routed(pid);
                             }
+                        }
+                    }
+                    // Vault entries without /p2p/ never enter kad dial list —
+                    // kick JoinViaNode (QUIC+TCP) for each bare IP / incomplete addr.
+                    let bare: Vec<String> = g
+                        .void_bootstrap_strings
+                        .iter()
+                        .filter(|s| void_bootstrap_multiaddrs(&[(*s).clone()]).is_empty())
+                        .cloned()
+                        .collect();
+                    if let Some(tx) = &g.command_tx {
+                        for s in bare {
+                            let _ = tx.try_send(UICommand::JoinViaNode(s));
                         }
                     }
                 } else {

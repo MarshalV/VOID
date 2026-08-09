@@ -18,7 +18,10 @@ use libp2p::{
 use tokio::sync::mpsc;
 use tracing::{debug, warn};
 
-use crate::bootstrap::{parse_seed_input, peer_id_from_multiaddr, void_bootstrap_multiaddrs};
+use crate::bootstrap::{
+    expand_transport_variants, parse_seed_dial_addrs, peer_id_from_multiaddr,
+    void_bootstrap_multiaddrs,
+};
 use crate::shared_chat::SharedChatMessages;
 use crate::crypto;
 use crate::file_transfer;
@@ -274,10 +277,14 @@ fn expand_dial_addrs(
     addrs: Vec<Multiaddr>,
     bootstrap_addrs: &[Multiaddr],
 ) -> Vec<Multiaddr> {
-    let mut expanded: Vec<Multiaddr> = addrs
-        .into_iter()
-        .filter(|a| !is_junk_addr(a))
-        .collect();
+    let mut expanded: Vec<Multiaddr> = Vec::new();
+    for a in addrs.into_iter().filter(|a| !is_junk_addr(a)) {
+        for v in expand_transport_variants(&a) {
+            if !is_junk_addr(&v) && !expanded.contains(&v) {
+                expanded.push(v);
+            }
+        }
+    }
     for relay_ma in bootstrap_addrs {
         for circuit in relay_circuit_dial_addrs(std::slice::from_ref(relay_ma), peer_id) {
             if !expanded.contains(&circuit) {
@@ -2257,37 +2264,58 @@ pub async fn run_chat_network(
                                  }
                              }
                             UICommand::JoinViaNode(input) => {
-                                let parsed = parse_seed_input(&input);
+                                let parsed = parse_seed_dial_addrs(&input);
                                 match parsed {
-                                    Some((ma, peer_id_opt)) => {
+                                    Some((addrs, peer_id_opt)) => {
                                         if let Some(pid) = peer_id_opt {
-                                            swarm.behaviour_mut().kad.add_address(&pid, ma.clone());
+                                            for ma in &addrs {
+                                                swarm.behaviour_mut().kad.add_address(&pid, ma.clone());
+                                            }
                                             pending_seed_peers.insert(pid);
+                                            dial_peer_best_effort(
+                                                &mut swarm,
+                                                pid,
+                                                addrs.clone(),
+                                                &void_bootstraps,
+                                            );
+                                            let _ = event_tx
+                                                .send(NetworkEvent::Status(format!(
+                                                    "📞 Вход в сеть: дозваниваюсь до {} ({} адр.)…",
+                                                    pid,
+                                                    addrs.len()
+                                                )))
+                                                .await;
                                         } else {
                                             pending_seed_bare = true;
                                             let _ = event_tx
                                                 .send(NetworkEvent::Status(
-                                                    "⚠ Вход без /p2p/<PeerId>: транспортный PeerId \
-                                                     будет известен только после соединения; \
-                                                     для bootstrap предпочтительно полный multiaddr."
+                                                    "⚠ Вход без /p2p/<PeerId>: пробуем QUIC+TCP; \
+                                                     для bootstrap лучше полный multiaddr."
                                                         .into(),
                                                 ))
                                                 .await;
-                                        }
-                                        match swarm.dial(ma.clone()) {
-                                            Ok(_) => {
-                                                let _ = event_tx
-                                                    .send(NetworkEvent::Status(format!(
-                                                        "📞 Вход в сеть: дозваниваюсь до {}…",
-                                                        ma
-                                                    )))
-                                                    .await;
+                                            let mut any_ok = false;
+                                            for ma in addrs {
+                                                match swarm.dial(ma.clone()) {
+                                                    Ok(_) => {
+                                                        any_ok = true;
+                                                        let _ = event_tx
+                                                            .send(NetworkEvent::Status(format!(
+                                                                "📞 Вход в сеть: дозваниваюсь до {}…",
+                                                                ma
+                                                            )))
+                                                            .await;
+                                                    }
+                                                    Err(e) => {
+                                                        debug!("JoinViaNode dial {}: {:?}", ma, e);
+                                                    }
+                                                }
                                             }
-                                            Err(e) => {
+                                            if !any_ok {
                                                 let _ = event_tx
                                                     .send(NetworkEvent::Status(format!(
-                                                        "❌ Не дозвониться до {}: {}",
-                                                        ma, e
+                                                        "❌ Не дозвониться до {}",
+                                                        input
                                                     )))
                                                     .await;
                                             }
@@ -2296,7 +2324,7 @@ pub async fn run_chat_network(
                                     None => {
                                         let _ = event_tx
                                             .send(NetworkEvent::Status(format!(
-                                                "⚠ Не понял адрес: {}. Нужен IP, IP:PORT или /ip4/…/tcp/…[/p2p/…]",
+                                                "⚠ Не понял адрес: {}. Нужен IP, IP:PORT или /ip4/…/udp/…/quic-v1[/p2p/…]",
                                                 input
                                             )))
                                             .await;
