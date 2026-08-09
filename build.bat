@@ -10,6 +10,16 @@ if errorlevel 1 (
     exit /b 1
 )
 
+cargo tauri --version >nul 2>&1
+if errorlevel 1 (
+    echo cargo-tauri not found — installing tauri-cli (v2^)...
+    cargo install tauri-cli --locked --version "^2.0.0"
+    if errorlevel 1 (
+        echo Failed to install tauri-cli.
+        exit /b %errorlevel%
+    )
+)
+
 cargo tauri build
 if errorlevel 1 (
     echo Build failed!

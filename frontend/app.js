@@ -2,7 +2,7 @@
   const asset = (name) => {
     const encoded = name.split("/").map(encodeURIComponent).join("/");
     // cache-bust cropped icons (old padded PNGs were cached by WebView)
-    return `static/${encoded}?v=2`;
+    return `static/${encoded}?v=6`;
   };
 
   function resolveInvoke() {
