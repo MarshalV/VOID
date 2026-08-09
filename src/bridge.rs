@@ -5,7 +5,7 @@ use std::collections::{HashMap, HashSet};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::{self as std_mpsc, Receiver as StdReceiver, Sender as StdSender};
 use std::sync::{Arc, Mutex};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use libp2p::Multiaddr;
 use libp2p::PeerId;
@@ -17,7 +17,7 @@ use zeroize::{Zeroize, Zeroizing};
 
 use crate::bootstrap::{
     merge_bootstrap_string_lists, migrate_void_bootstrap_txt, parse_seed_input,
-    void_bootstrap_multiaddrs,
+    peer_id_from_multiaddr, void_bootstrap_multiaddrs,
 };
 use crate::chat_store::ChatJournal;
 use crate::crypto;
@@ -26,7 +26,8 @@ use crate::group::{
     self, build_invite_link, dedupe_members, group_thread_key, parse_invite_link, GroupChat,
     GroupMember,
 };
-use crate::network::{run_chat_network, NetworkEvent, UICommand};
+use crate::network::{run_chat_network, NetworkEvent, OfflineOutboxItem, UICommand};
+use crate::offline_mail::open_envelope;
 use crate::outbox::{Outbox, OutboxEntry};
 use crate::protocol::{new_message_id, ChatMessage, OutgoingDeliveryStatus};
 use crate::shared_chat::SharedChatMessages;
@@ -35,6 +36,38 @@ use crate::vault::{
     save_remembered_password, AddressBookEntry, Storage, VaultUnlockKind,
 };
 use crate::voice::VoiceRecorder;
+
+const RESEND_GRACE: Duration = Duration::from_secs(1);
+const RESEND_DELAY_BASE: Duration = Duration::from_secs(2);
+const RESEND_DELAY_MAX: Duration = Duration::from_secs(300);
+const SESSION_WAIT_TIMEOUT: Duration = Duration::from_secs(20);
+const OFFLINE_DHT_PUBLISH_DEBOUNCE: Duration = Duration::from_millis(200);
+
+fn resend_delay_for_attempt(attempts: u32) -> Duration {
+    let exp = attempts.min(6);
+    let secs = RESEND_DELAY_BASE.as_secs().saturating_mul(1u64 << exp);
+    Duration::from_secs(secs.min(RESEND_DELAY_MAX.as_secs()))
+}
+
+/// Outgoing DM waiting for live delivery / DHT / offline handoff (egui parity).
+struct PendingSend {
+    peer: PeerId,
+    text: String,
+    message_id: String,
+    last_send_at: Instant,
+    dht_kicked: bool,
+    dht_kicked_at: Option<Instant>,
+    attempts: u32,
+    awaiting_session: bool,
+}
+
+fn bootstrap_peer_ids(bootstraps: &[String]) -> HashSet<PeerId> {
+    bootstraps
+        .iter()
+        .filter_map(|s| s.parse::<Multiaddr>().ok())
+        .filter_map(|ma| peer_id_from_multiaddr(&ma))
+        .collect()
+}
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -148,6 +181,7 @@ struct Inner {
     local_peer_id: Option<PeerId>,
     local_nickname: String,
     vault_master_key: Option<Zeroizing<[u8; 32]>>,
+    local_static: Option<crypto::StaticSecret>,
     command_tx: Option<mpsc::Sender<UICommand>>,
     messages: SharedChatMessages,
     known_peers: HashMap<PeerId, String>,
@@ -168,6 +202,9 @@ struct Inner {
     incoming_file_offers: Vec<FileOfferDto>,
     voice_recorder: VoiceRecorder,
     voice_recording: bool,
+    pending_sends: Vec<PendingSend>,
+    offline_dht_publish_after: Option<Instant>,
+    offline_mail_processed: HashSet<String>,
 }
 
 impl Inner {
@@ -178,6 +215,7 @@ impl Inner {
             local_peer_id: None,
             local_nickname: String::new(),
             vault_master_key: None,
+            local_static: None,
             command_tx: None,
             messages,
             known_peers: HashMap::new(),
@@ -198,6 +236,290 @@ impl Inner {
             incoming_file_offers: Vec::new(),
             voice_recorder: VoiceRecorder::new(),
             voice_recording: false,
+            pending_sends: Vec::new(),
+            offline_dht_publish_after: None,
+            offline_mail_processed: HashSet::new(),
+        }
+    }
+
+    fn recount_connected(&mut self) {
+        let boots = bootstrap_peer_ids(&self.void_bootstrap_strings);
+        self.connected_peers = self
+            .connected_peer_ids
+            .iter()
+            .filter(|p| !boots.contains(p))
+            .count();
+    }
+
+    fn schedule_offline_publish(&mut self) {
+        if self.outbox_entries.is_empty() {
+            return;
+        }
+        self.offline_dht_publish_after =
+            Some(Instant::now() + OFFLINE_DHT_PUBLISH_DEBOUNCE);
+    }
+
+    fn accelerate_offline_publish(&mut self) {
+        if !self.outbox_entries.is_empty() {
+            self.offline_dht_publish_after = Some(Instant::now());
+        }
+    }
+
+    fn remove_outbox_direct(&mut self, peer: &str, message_id: &str) {
+        let before = self.outbox_entries.len();
+        self.outbox_entries.retain(|e| {
+            !matches!(
+                e,
+                OutboxEntry::DirectMessage { peer: p, message_id: id, .. }
+                    | OutboxEntry::DirectVoice { peer: p, message_id: id, .. }
+                    if p == peer && id == message_id
+            )
+        });
+        if self.outbox_entries.len() != before {
+            self.persist_outbox();
+        }
+    }
+
+    fn complete_pending_send(&mut self, peer: PeerId, message_id: &str) {
+        self.pending_sends
+            .retain(|p| !(p.peer == peer && p.message_id == message_id));
+        self.remove_outbox_direct(&peer.to_string(), message_id);
+    }
+
+    fn build_offline_publish_items(&self) -> Vec<OfflineOutboxItem> {
+        let Some(me) = self.local_peer_id else {
+            return Vec::new();
+        };
+        let mut items = Vec::new();
+        for entry in &self.outbox_entries {
+            match entry {
+                OutboxEntry::DirectMessage {
+                    peer,
+                    message_id,
+                    text,
+                } => {
+                    let Ok(recipient) = peer.parse::<PeerId>() else {
+                        continue;
+                    };
+                    let msg = ChatMessage {
+                        id: message_id.clone(),
+                        sender_id: me.to_string(),
+                        sender_name: self.local_nickname.clone(),
+                        recipient_id: Some(peer.clone()),
+                        text: text.clone(),
+                        timestamp: chrono::Local::now().format("%H:%M").to_string(),
+                        delivery: OutgoingDeliveryStatus::Pending,
+                        voice: None,
+                        group_id: None,
+                    };
+                    if let Ok(payload) = serde_json::to_vec(&msg) {
+                        items.push(OfflineOutboxItem {
+                            recipient,
+                            message_id: message_id.clone(),
+                            kind: "dm".into(),
+                            payload,
+                        });
+                    }
+                }
+                OutboxEntry::GroupMessage {
+                    group_id,
+                    message_id,
+                    text,
+                    members,
+                } => {
+                    for peer_str in members {
+                        let Ok(recipient) = peer_str.parse::<PeerId>() else {
+                            continue;
+                        };
+                        if recipient == me {
+                            continue;
+                        }
+                        let msg = ChatMessage {
+                            id: message_id.clone(),
+                            sender_id: me.to_string(),
+                            sender_name: self.local_nickname.clone(),
+                            recipient_id: None,
+                            text: text.clone(),
+                            timestamp: chrono::Local::now().format("%H:%M").to_string(),
+                            delivery: OutgoingDeliveryStatus::Pending,
+                            voice: None,
+                            group_id: Some(group_id.clone()),
+                        };
+                        if let Ok(payload) = serde_json::to_vec(&msg) {
+                            items.push(OfflineOutboxItem {
+                                recipient,
+                                message_id: format!("{message_id}:{peer_str}"),
+                                kind: "group".into(),
+                                payload,
+                            });
+                        }
+                    }
+                }
+                _ => {}
+            }
+        }
+        items
+    }
+
+    fn publish_outbox_to_dht(&self) {
+        let items = self.build_offline_publish_items();
+        if items.is_empty() {
+            return;
+        }
+        if let Some(tx) = &self.command_tx {
+            if let Err(e) = tx.try_send(UICommand::PublishOfflineOutbox {
+                items,
+                ack: None,
+            }) {
+                warn!("VOID: PublishOfflineOutbox queue full/closed: {e}");
+            }
+        }
+    }
+
+    fn ensure_peer_routed(&self, peer: PeerId) {
+        let Some(tx) = &self.command_tx else {
+            return;
+        };
+        let _ = tx.try_send(UICommand::SearchPeer(peer));
+        if let Some(addrs) = self.contact_addrs.get(&peer) {
+            if !addrs.is_empty() {
+                let _ = tx.try_send(UICommand::DialPeer(peer, addrs.clone()));
+            }
+        }
+    }
+
+    fn push_pending_send(&mut self, peer: PeerId, text: String, message_id: String) {
+        if self
+            .pending_sends
+            .iter()
+            .any(|p| p.peer == peer && p.message_id == message_id)
+        {
+            return;
+        }
+        self.pending_sends.push(PendingSend {
+            peer,
+            text,
+            message_id,
+            last_send_at: Instant::now(),
+            dht_kicked: false,
+            dht_kicked_at: None,
+            attempts: 0,
+            awaiting_session: false,
+        });
+    }
+
+    fn ingest_offline_mailbox(&mut self, envelopes: Vec<crate::offline_mail::OfflineEnvelope>) {
+        let Some(ref secret) = self.local_static else {
+            return;
+        };
+        let mut any = false;
+        for env in envelopes {
+            if self.offline_mail_processed.contains(&env.message_id) {
+                continue;
+            }
+            let Ok(plaintext) = open_envelope(secret, &env) else {
+                continue;
+            };
+            match env.kind.as_str() {
+                "dm" | "group" => {
+                    let Ok(msg) = serde_json::from_slice::<ChatMessage>(&plaintext) else {
+                        continue;
+                    };
+                    let chat_id = msg
+                        .group_id
+                        .as_ref()
+                        .map(|id| group_thread_key(id))
+                        .or_else(|| {
+                            let local = self.local_peer_id.map(|p| p.to_string())?;
+                            if msg.sender_id == local {
+                                msg.recipient_id.clone()
+                            } else {
+                                Some(msg.sender_id.clone())
+                            }
+                        })
+                        .unwrap_or_else(|| msg.sender_id.clone());
+                    if !self.messages.is_deleted(&msg.id) {
+                        let mut map = self.messages.lock();
+                        let list = map.entry(chat_id).or_default();
+                        if !list.iter().any(|m| m.id == msg.id) {
+                            list.push(msg);
+                            drop(map);
+                            self.messages.mark_dirty();
+                            self.persist_journal();
+                            any = true;
+                        }
+                    }
+                    self.offline_mail_processed.insert(env.message_id);
+                }
+                _ => {}
+            }
+        }
+        if any {
+            self.add_status("Получена офлайн-почта".into());
+        }
+    }
+
+    fn tick_pending_sends(&mut self) {
+        let now = Instant::now();
+        let mut search_cmds: Vec<PeerId> = Vec::new();
+        let mut resend_cmds: Vec<(PeerId, String, String)> = Vec::new();
+        let nick = self.local_nickname.clone();
+
+        for p in self.pending_sends.iter_mut() {
+            if p.awaiting_session {
+                if now.duration_since(p.last_send_at) >= SESSION_WAIT_TIMEOUT {
+                    p.awaiting_session = false;
+                    p.last_send_at = now
+                        .checked_sub(RESEND_GRACE + Duration::from_millis(50))
+                        .unwrap_or(now);
+                } else {
+                    continue;
+                }
+            }
+
+            if !p.dht_kicked && now.duration_since(p.last_send_at) >= RESEND_GRACE {
+                search_cmds.push(p.peer);
+                p.dht_kicked = true;
+                p.dht_kicked_at = Some(now);
+            }
+
+            if let Some(kicked_at) = p.dht_kicked_at {
+                let delay = resend_delay_for_attempt(p.attempts);
+                if now.duration_since(kicked_at) >= delay {
+                    resend_cmds.push((p.peer, p.text.clone(), p.message_id.clone()));
+                    p.attempts = p.attempts.saturating_add(1);
+                    p.last_send_at = now;
+                    p.dht_kicked = false;
+                    p.dht_kicked_at = None;
+                }
+            }
+        }
+
+        if let Some(tx) = &self.command_tx {
+            for peer in search_cmds {
+                let _ = tx.try_send(UICommand::SearchPeer(peer));
+                if let Some(addrs) = self.contact_addrs.get(&peer) {
+                    if !addrs.is_empty() {
+                        let _ = tx.try_send(UICommand::DialPeer(peer, addrs.clone()));
+                    }
+                }
+            }
+            for (peer, text, message_id) in resend_cmds {
+                let _ = tx.try_send(UICommand::SendMessage {
+                    sender_name: nick.clone(),
+                    text,
+                    recipient: Some(peer),
+                    message_id: Some(message_id),
+                    is_retry: true,
+                });
+            }
+        }
+
+        if let Some(deadline) = self.offline_dht_publish_after {
+            if Instant::now() >= deadline {
+                self.offline_dht_publish_after = None;
+                self.publish_outbox_to_dht();
+            }
         }
     }
 
@@ -457,7 +779,7 @@ impl VoidRuntime {
                         }
                         NetworkEvent::Connected(pid) => {
                             g.connected_peer_ids.insert(pid);
-                            g.connected_peers = g.connected_peer_ids.len();
+                            g.recount_connected();
                             bridge_evs.push(BridgeEvent::Peer {
                                 peer_id: pid.to_string(),
                                 online: true,
@@ -466,7 +788,7 @@ impl VoidRuntime {
                         }
                         NetworkEvent::Disconnected(pid) | NetworkEvent::MdnsExpired(pid) => {
                             g.connected_peer_ids.remove(&pid);
-                            g.connected_peers = g.connected_peer_ids.len();
+                            g.recount_connected();
                             bridge_evs.push(BridgeEvent::Peer {
                                 peer_id: pid.to_string(),
                                 online: false,
@@ -537,6 +859,55 @@ impl VoidRuntime {
                                 &message_id,
                                 OutgoingDeliveryStatus::Delivered,
                             );
+                            g.complete_pending_send(peer, &message_id);
+                            emit_snapshot = true;
+                        }
+                        NetworkEvent::MessageAwaitingSession(peer) => {
+                            for p in g.pending_sends.iter_mut().filter(|p| p.peer == peer) {
+                                p.awaiting_session = true;
+                                p.last_send_at = Instant::now();
+                                p.dht_kicked = false;
+                                p.dht_kicked_at = None;
+                            }
+                        }
+                        NetworkEvent::MessageOnWire { peer, message_id } => {
+                            if let Some(p) = g
+                                .pending_sends
+                                .iter_mut()
+                                .find(|p| p.peer == peer && p.message_id == message_id)
+                            {
+                                p.awaiting_session = false;
+                                p.last_send_at = Instant::now();
+                            }
+                        }
+                        NetworkEvent::SendFailedDial(peer) => {
+                            g.accelerate_offline_publish();
+                            for p in g
+                                .pending_sends
+                                .iter_mut()
+                                .filter(|p| p.peer == peer && !p.dht_kicked)
+                            {
+                                p.awaiting_session = false;
+                                p.last_send_at = Instant::now()
+                                    .checked_sub(RESEND_GRACE + Duration::from_millis(50))
+                                    .unwrap_or_else(Instant::now);
+                            }
+                            if let Some(addrs) = g.contact_addrs.get(&peer) {
+                                if !addrs.is_empty() {
+                                    if let Some(tx) = &g.command_tx {
+                                        let _ = tx.try_send(UICommand::DialPeer(
+                                            peer,
+                                            addrs.clone(),
+                                        ));
+                                    }
+                                }
+                            }
+                            if let Some(tx) = &g.command_tx {
+                                let _ = tx.try_send(UICommand::SearchPeer(peer));
+                            }
+                        }
+                        NetworkEvent::OfflineMailbox(envelopes) => {
+                            g.ingest_offline_mailbox(envelopes);
                             emit_snapshot = true;
                         }
                         NetworkEvent::MessageRead { peer, message_ids } => {
@@ -612,6 +983,7 @@ impl VoidRuntime {
                         | NetworkEvent::SendFailedUnsupported(pid) => {
                             g.known_peers.remove(&pid);
                             g.contact_addrs.remove(&pid);
+                            g.pending_sends.retain(|p| p.peer != pid);
                             g.persist_vault();
                             emit_snapshot = true;
                         }
@@ -660,6 +1032,20 @@ impl VoidRuntime {
                 }
                 for ev in bridge_evs {
                     let _ = pump_bridge.send(ev);
+                }
+            }
+        });
+
+        // Delivery loop: DHT search → resend → offline outbox (egui parity).
+        let tick_inner = inner.clone();
+        handle.spawn(async move {
+            let mut interval = tokio::time::interval(Duration::from_millis(400));
+            interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+            loop {
+                interval.tick().await;
+                let mut g = tick_inner.lock().unwrap_or_else(|p| p.into_inner());
+                if g.unlocked && g.command_tx.is_some() {
+                    g.tick_pending_sends();
                 }
             }
         });
@@ -785,6 +1171,7 @@ impl VoidRuntime {
                 )
                 .map_err(|e| e.to_string())?;
                 let static_secret = crypto::StaticSecret::from(storage.static_secret_bytes);
+                let static_for_inner = crypto::StaticSecret::from(storage.static_secret_bytes);
                 let my_id = PeerId::from(local_key.public());
 
                 let mut bootstraps = storage.void_bootstraps.clone();
@@ -861,6 +1248,7 @@ impl VoidRuntime {
                     g.local_peer_id = Some(my_id);
                     g.local_nickname = storage.nickname;
                     g.vault_master_key = Some(master_arr);
+                    g.local_static = Some(static_for_inner);
                     g.command_tx = Some(command_tx);
                     g.known_peers = book;
                     g.contact_addrs = addrs_map;
@@ -876,6 +1264,24 @@ impl VoidRuntime {
                             let _ = tx.try_send(UICommand::CachePeerPrekeys(cache));
                         }
                     }
+                    if let Some(tx) = &g.command_tx {
+                        let _ = tx.try_send(UICommand::FetchOfflineMailbox);
+                    }
+                    g.schedule_offline_publish();
+                    // Restore live-retry queue from durable outbox.
+                    for entry in g.outbox_entries.clone() {
+                        if let OutboxEntry::DirectMessage {
+                            peer,
+                            message_id,
+                            text,
+                        } = entry
+                        {
+                            if let Ok(pid) = peer.parse::<PeerId>() {
+                                g.push_pending_send(pid, text, message_id);
+                                g.ensure_peer_routed(pid);
+                            }
+                        }
+                    }
                 } else {
                     // Network already running — keep existing command_tx (do not orphan the swarm).
                     drop(command_rx);
@@ -884,6 +1290,7 @@ impl VoidRuntime {
                     g.local_peer_id = Some(my_id);
                     g.local_nickname = storage.nickname;
                     g.vault_master_key = Some(master_arr);
+                    g.local_static = Some(static_for_inner);
                     g.known_peers = book;
                     g.contact_addrs = addrs_map;
                     g.void_bootstrap_strings = bootstraps;
@@ -897,6 +1304,7 @@ impl VoidRuntime {
                 let local_key = libp2p::identity::Keypair::generate_ed25519();
                 let static_secret =
                     crypto::StaticSecret::random_from_rng(&mut rand::rngs::OsRng);
+                let static_for_inner = crypto::StaticSecret::from(*static_secret.as_bytes());
                 let my_id = PeerId::from(local_key.public());
                 let nickname = format!("User_{}", &my_id.to_string()[..4]);
                 Storage::save(
@@ -930,6 +1338,7 @@ impl VoidRuntime {
                     g.local_peer_id = Some(my_id);
                     g.local_nickname = nickname;
                     g.vault_master_key = Some(master_arr);
+                    g.local_static = Some(static_for_inner);
                     g.command_tx = Some(command_tx);
                     g.add_status("Профиль создан — войдите в сеть через IP ноды".into());
                 } else {
@@ -939,6 +1348,7 @@ impl VoidRuntime {
                     g.local_peer_id = Some(my_id);
                     g.local_nickname = nickname;
                     g.vault_master_key = Some(master_arr);
+                    g.local_static = Some(static_for_inner);
                 }
             }
         }
@@ -961,7 +1371,12 @@ impl VoidRuntime {
     pub fn select_chat(&self, chat_id: String) -> SnapshotDto {
         {
             let mut g = self.inner.lock().unwrap_or_else(|p| p.into_inner());
-            g.selected_chat = chat_id;
+            g.selected_chat = chat_id.clone();
+            if group::parse_group_thread_key(&chat_id).is_none() {
+                if let Ok(pid) = chat_id.parse::<PeerId>() {
+                    g.ensure_peer_routed(pid);
+                }
+            }
         }
         self.emit_snapshot();
         self.get_snapshot()
@@ -1041,6 +1456,9 @@ impl VoidRuntime {
                 text: text.clone(),
             });
             g.persist_outbox();
+            g.push_pending_send(peer, text.clone(), mid.clone());
+            g.ensure_peer_routed(peer);
+            g.schedule_offline_publish();
             if let Some(tx) = &g.command_tx {
                 let _ = tx.try_send(UICommand::SendMessage {
                     sender_name: nick,
@@ -1413,10 +1831,38 @@ impl VoidRuntime {
     }
 
     pub fn prepare_quit(&self) {
-        let g = self.inner.lock().unwrap_or_else(|p| p.into_inner());
-        g.persist_journal();
-        g.persist_outbox();
-        g.persist_vault();
+        let (items, tx_opt) = {
+            let g = self.inner.lock().unwrap_or_else(|p| p.into_inner());
+            g.persist_journal();
+            g.persist_outbox();
+            g.persist_vault();
+            (g.build_offline_publish_items(), g.command_tx.clone())
+        };
+        if items.is_empty() {
+            return;
+        }
+        let Some(tx) = tx_opt else {
+            return;
+        };
+        let n = items.len();
+        let (ack_tx, ack_rx) = std_mpsc::channel();
+        self.tokio_handle.spawn(async move {
+            let _ = tx
+                .send(UICommand::PublishOfflineOutbox {
+                    items,
+                    ack: Some(ack_tx),
+                })
+                .await;
+        });
+        match ack_rx.recv_timeout(Duration::from_secs(20)) {
+            Ok(true) => info!("VOID: exit — outbox ({n}) сдан в relay/DHT"),
+            Ok(false) => warn!(
+                "VOID: exit — handoff outbox ({n}) не подтверждён, останется в outbox.bin"
+            ),
+            Err(_) => warn!(
+                "VOID: exit — timeout ожидания handoff outbox ({n}), останется в outbox.bin"
+            ),
+        }
     }
 
     pub fn has_pending_outbox(&self) -> bool {
