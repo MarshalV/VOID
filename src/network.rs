@@ -277,22 +277,50 @@ fn expand_dial_addrs(
     addrs: Vec<Multiaddr>,
     bootstrap_addrs: &[Multiaddr],
 ) -> Vec<Multiaddr> {
-    let mut expanded: Vec<Multiaddr> = Vec::new();
+    let mut direct: Vec<Multiaddr> = Vec::new();
     for a in addrs.into_iter().filter(|a| !is_junk_addr(a)) {
         for v in expand_transport_variants(&a) {
-            if !is_junk_addr(&v) && !expanded.contains(&v) {
-                expanded.push(v);
+            if !is_junk_addr(&v) && !direct.contains(&v) {
+                direct.push(v);
             }
         }
     }
+    // Prefer stable LAN addrs before ephemeral public NAT mappings.
+    direct.sort_by_key(|a| if is_likely_lan_addr(a) { 0u8 } else { 1u8 });
+
+    let mut circuits: Vec<Multiaddr> = Vec::new();
     for relay_ma in bootstrap_addrs {
         for circuit in relay_circuit_dial_addrs(std::slice::from_ref(relay_ma), peer_id) {
-            if !expanded.contains(&circuit) {
-                expanded.push(circuit);
+            if !circuits.contains(&circuit) {
+                circuits.push(circuit);
             }
+        }
+    }
+    // Circuit FIRST — a stuck dial to a dead NAT addr never reaches relay, and
+    // PeerCondition::NotDialing then blocks a second dial that would use circuit.
+    let mut expanded = circuits;
+    for d in direct {
+        if !expanded.contains(&d) {
+            expanded.push(d);
         }
     }
     expanded
+}
+
+fn is_likely_lan_addr(ma: &Multiaddr) -> bool {
+    let ip = ma.iter().find_map(|p| match p {
+        libp2p::multiaddr::Protocol::Ip4(v4) => Some(v4),
+        _ => None,
+    });
+    match ip {
+        Some(v4) => {
+            let o = v4.octets();
+            o[0] == 10
+                || (o[0] == 192 && o[1] == 168)
+                || (o[0] == 172 && (16..=31).contains(&o[1]))
+        }
+        None => false,
+    }
 }
 
 fn dial_peer_best_effort(
@@ -330,6 +358,7 @@ fn dial_unconnected_contacts(
     min_interval: Duration,
 ) {
     let connected: HashSet<PeerId> = swarm.connected_peers().copied().collect();
+    let boot_live = bootstrap_peer_ids.iter().any(|b| connected.contains(b));
     let now = Instant::now();
     for (pid, addrs) in reconnect_targets {
         if bootstrap_peer_ids.contains(pid) || connected.contains(pid) {
@@ -342,6 +371,10 @@ fn dial_unconnected_contacts(
             continue;
         }
         contact_dial_at.insert(*pid, now);
+        if boot_live {
+            // Empty addrs → expand still injects circuits first (NAT path).
+            dial_peer_best_effort(swarm, *pid, Vec::new(), void_bootstraps);
+        }
         dial_peer_best_effort(swarm, *pid, addrs.clone(), void_bootstraps);
     }
 }
@@ -1282,7 +1315,9 @@ fn build_void_swarm(
         })
         .map_err(|e| format!("with_behaviour: {:?}", e))?
         .with_swarm_config(|c| {
-            c.with_idle_connection_timeout(Duration::MAX)
+            // Bound idle so half-open / zombie peers (Mac shows online, Windows not)
+            // get dropped; ping (20s/40s) should close sooner on real failures.
+            c.with_idle_connection_timeout(Duration::from_secs(120))
                 .with_per_connection_event_buffer_size(256)
         })
         .build())
@@ -4497,6 +4532,13 @@ pub async fn run_chat_network(
                             match error {
                                 libp2p::request_response::OutboundFailure::DialFailure => {
                                     if !is_dup {
+                                        // Circuit-only first — avoid hanging on stale NAT.
+                                        dial_peer_best_effort(
+                                            &mut swarm,
+                                            peer,
+                                            Vec::new(),
+                                            &void_bootstraps,
+                                        );
                                         if let Some(addrs) = reconnect_targets.get(&peer) {
                                             dial_peer_best_effort(
                                                 &mut swarm,
@@ -4510,6 +4552,25 @@ pub async fn run_chat_network(
                                             .kad
                                             .get_providers(peer_dht_record_key(peer));
                                         let _ = event_tx.send(NetworkEvent::SendFailedDial(peer)).await;
+                                    }
+                                }
+                                libp2p::request_response::OutboundFailure::ConnectionClosed
+                                | libp2p::request_response::OutboundFailure::Timeout => {
+                                    // Zombie connection: one side still "connected".
+                                    let _ = swarm.disconnect_peer_id(peer);
+                                    dial_peer_best_effort(
+                                        &mut swarm,
+                                        peer,
+                                        Vec::new(),
+                                        &void_bootstraps,
+                                    );
+                                    if let Some(addrs) = reconnect_targets.get(&peer) {
+                                        dial_peer_best_effort(
+                                            &mut swarm,
+                                            peer,
+                                            addrs.clone(),
+                                            &void_bootstraps,
+                                        );
                                     }
                                 }
                                 libp2p::request_response::OutboundFailure::UnsupportedProtocols => {
@@ -4673,23 +4734,28 @@ pub async fn run_chat_network(
                                  // Передаём рабочий multiaddr в UI: для Dialer — кого набирали,
                                  // для Listener — кто пришёл (send_back_addr + /p2p/peer_id).
                                  // UI сохранит его в контактную книгу.
-                                 let learned: Option<Multiaddr> = match endpoint {
+                                 let learned: Option<(Multiaddr, bool)> = match endpoint {
                                      libp2p::core::ConnectedPoint::Dialer { address, .. } => {
-                                         Some(address.clone())
+                                         // Dialer address is known-good — prefer it.
+                                         Some((address.clone(), true))
                                      }
                                      libp2p::core::ConnectedPoint::Listener { send_back_addr, .. } => {
+                                         // Ephemeral NAT mapping — keep for LAN hints but never
+                                         // ahead of circuit (Windows↔Mac asymmetry).
                                          let mut a = send_back_addr.clone();
                                          a.push(libp2p::multiaddr::Protocol::P2p(peer_id));
-                                         Some(a)
+                                         Some((a, false))
                                      }
                                  };
-                                 if let Some(ref addr) = learned {
+                                 if let Some((ref addr, prefer)) = learned {
                                      if !is_junk_addr(addr) {
-                                         // Обновляем таблицу реконнекта: ставим рабочий адрес первым,
-                                         // чтобы следующая попытка начиналась с него.
                                          let list = reconnect_targets.entry(peer_id).or_default();
                                          list.retain(|a| a != addr);
-                                         list.insert(0, addr.clone());
+                                         if prefer || addr.to_string().contains("p2p-circuit") {
+                                             list.insert(0, addr.clone());
+                                         } else {
+                                             list.push(addr.clone());
+                                         }
 
                                          let _ = event_tx
                                              .send(NetworkEvent::PeerAddress(peer_id, addr.clone()))
@@ -5061,6 +5127,33 @@ pub async fn run_chat_network(
                                 "📡 Relay: исходящий circuit через {}",
                                 &relay_peer_id.to_string()[..8]
                             );
+                        }
+                        SwarmEvent::Behaviour(ChatBehaviourEvent::Ping(ev)) => {
+                            if let Err(e) = ev.result {
+                                debug!(
+                                    "⚠️ Ping fail {}: {:?} — drop zombie connection",
+                                    &ev.peer.to_string()[..8.min(ev.peer.to_string().len())],
+                                    e
+                                );
+                                let peer = ev.peer;
+                                let _ = swarm.disconnect_peer_id(peer);
+                                if !bootstrap_peer_ids.contains(&peer) {
+                                    dial_peer_best_effort(
+                                        &mut swarm,
+                                        peer,
+                                        Vec::new(),
+                                        &void_bootstraps,
+                                    );
+                                    if let Some(addrs) = reconnect_targets.get(&peer) {
+                                        dial_peer_best_effort(
+                                            &mut swarm,
+                                            peer,
+                                            addrs.clone(),
+                                            &void_bootstraps,
+                                        );
+                                    }
+                                }
+                            }
                         }
 
                         SwarmEvent::Behaviour(ChatBehaviourEvent::Kad(kad::Event::OutboundQueryProgressed { id, result, .. })) => {
