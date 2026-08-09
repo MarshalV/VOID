@@ -1523,19 +1523,23 @@ impl VoidRuntime {
             g.ensure_peer_routed(peer);
             if g.connected_peer_ids.contains(&peer) {
                 if let Some(tx) = &g.command_tx {
-                    let _ = tx.try_send(UICommand::EnsureChatSession(peer));
+                    if let Err(e) = tx.try_send(UICommand::EnsureChatSession(peer)) {
+                        eprintln!("VOID: EnsureChatSession drop: {e}");
+                    }
                 }
             }
             g.schedule_offline_publish();
             g.publish_outbox_to_dht();
             if let Some(tx) = &g.command_tx {
-                let _ = tx.try_send(UICommand::SendMessage {
+                if let Err(e) = tx.try_send(UICommand::SendMessage {
                     sender_name: nick,
                     text,
                     recipient: Some(peer),
                     message_id: Some(mid),
                     is_retry: false,
-                });
+                }) {
+                    eprintln!("VOID: SendMessage drop: {e}");
+                }
             }
         }
         drop(g);

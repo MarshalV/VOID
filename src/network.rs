@@ -688,6 +688,11 @@ enum MailboxKadOp {
         done: Option<PublishDone>,
         prekey_bytes: Option<Vec<u8>>,
     },
+    /// Prefetch contact X25519 into peer_prekeys (for offline seal).
+    CachePrekey {
+        peer: PeerId,
+        prekey_bytes: Option<Vec<u8>>,
+    },
     AwaitPut {
         done: Option<PublishDone>,
     },
@@ -1586,6 +1591,8 @@ async fn flush_pending_read_receipts(
 
 /// Запускает E2EE Hello, если сессии ещё нет. `force` сбрасывает «зависший»
 /// pending-handshake (например после DialFailure, когда пир был офлайн).
+/// Без force повтор разрешён только если Hello «завис» дольше ~20 с —
+/// иначе новый ephemeral ломает ответ на старый Hello.
 async fn ensure_e2ee_handshake_started(
     swarm: &mut libp2p::Swarm<ChatBehaviour>,
     local_key: &libp2p::identity::Keypair,
@@ -1594,14 +1601,21 @@ async fn ensure_e2ee_handshake_started(
     peer_id: PeerId,
     sessions: &HashMap<PeerId, crypto::SecureSession>,
     pending_handshakes: &mut HashMap<PeerId, crypto::StaticSecret>,
+    handshake_started: &mut HashMap<PeerId, Instant>,
     now: &str,
     force: bool,
 ) -> bool {
     if sessions.contains_key(&peer_id) {
         return false;
     }
-    if force {
+    const STALE_HELLO: Duration = Duration::from_secs(20);
+    let stale = handshake_started
+        .get(&peer_id)
+        .map(|t| t.elapsed() >= STALE_HELLO)
+        .unwrap_or(false);
+    if force || stale {
         pending_handshakes.remove(&peer_id);
+        handshake_started.remove(&peer_id);
     } else if pending_handshakes.contains_key(&peer_id) {
         return false;
     }
@@ -1622,6 +1636,7 @@ async fn ensure_e2ee_handshake_started(
         return false;
     };
     pending_handshakes.insert(peer_id, ephem_secret);
+    handshake_started.insert(peer_id, Instant::now());
     let _ = swarm
         .behaviour_mut()
         .request_response
@@ -1630,7 +1645,7 @@ async fn ensure_e2ee_handshake_started(
         "[{}] 🤝 E2EE: Hello (+Ephem) → {}{}",
         now,
         &peer_id.to_string()[..8.min(peer_id.to_string().len())],
-        if force { " (повтор)" } else { "" }
+        if force || stale { " (повтор)" } else { "" }
     );
     true
 }
@@ -1668,6 +1683,7 @@ pub async fn run_chat_network(
         let mut void_bootstraps = void_bootstraps;
         let mut sessions: HashMap<PeerId, crypto::SecureSession> = HashMap::new();
         let mut pending_handshakes: HashMap<PeerId, crypto::StaticSecret> = HashMap::new();
+        let mut handshake_started: HashMap<PeerId, Instant> = HashMap::new();
         let mut pending_messages: HashMap<PeerId, Vec<Vec<u8>>> = HashMap::new();
         let mut pending_voice_transfers: HashMap<PeerId, Vec<PendingVoiceTransfer>> =
             HashMap::new();
@@ -2226,10 +2242,19 @@ pub async fn run_chat_network(
                                 {
                                     continue;
                                 }
-                                swarm
-                                    .behaviour_mut()
-                                    .kad
-                                    .get_record(prekey_record_key(peer_id));
+                                if !peer_prekeys.contains_key(&peer_id) {
+                                    let qid = swarm
+                                        .behaviour_mut()
+                                        .kad
+                                        .get_record(prekey_record_key(peer_id));
+                                    pending_kad_mail.insert(
+                                        qid,
+                                        MailboxKadOp::CachePrekey {
+                                            peer: peer_id,
+                                            prekey_bytes: None,
+                                        },
+                                    );
+                                }
                                 if !swarm.is_connected(&peer_id) {
                                     let mut addrs: Vec<Multiaddr> = peer_addrs
                                         .get(&peer_id)
@@ -2253,6 +2278,8 @@ pub async fn run_chat_network(
                                 }
                                 let now_hs =
                                     chrono::Local::now().format("%H:%M:%S").to_string();
+                                // Do not force — ConnectionEstablished may already have
+                                // a valid pending Hello; clobbering it breaks E2EE.
                                 let _ = ensure_e2ee_handshake_started(
                                     &mut swarm,
                                     &local_key,
@@ -2261,8 +2288,9 @@ pub async fn run_chat_network(
                                     peer_id,
                                     &sessions,
                                     &mut pending_handshakes,
+                                    &mut handshake_started,
                                     &now_hs,
-                                    true,
+                                    false,
                                 )
                                 .await;
                             }
@@ -2489,10 +2517,19 @@ pub async fn run_chat_network(
                                         let key = peer_dht_record_key(peer_id);
                                         swarm.behaviour_mut().kad.get_providers(key);
                                         swarm.behaviour_mut().kad.get_closest_peers(peer_id);
-                                        swarm
-                                            .behaviour_mut()
-                                            .kad
-                                            .get_record(prekey_record_key(peer_id));
+                                        if !peer_prekeys.contains_key(&peer_id) {
+                                            let qid = swarm
+                                                .behaviour_mut()
+                                                .kad
+                                                .get_record(prekey_record_key(peer_id));
+                                            pending_kad_mail.insert(
+                                                qid,
+                                                MailboxKadOp::CachePrekey {
+                                                    peer: peer_id,
+                                                    prekey_bytes: None,
+                                                },
+                                            );
+                                        }
                                         dial_peer_best_effort(
                                             &mut swarm,
                                             peer_id,
@@ -2540,8 +2577,9 @@ pub async fn run_chat_network(
                                     } else {
                                         // Never Hello until connected — bare send_request
                                         // dials without circuit addrs and fails → stuck ○.
+                                        // Never force Hello on normal send — that clobbers
+                                        // an in-flight ephem secret and breaks the ratchet.
                                         if connected {
-                                            let force_hs = pending_handshakes.contains_key(&peer_id);
                                             let _ = ensure_e2ee_handshake_started(
                                                 &mut swarm,
                                                 &local_key,
@@ -2550,8 +2588,9 @@ pub async fn run_chat_network(
                                                 peer_id,
                                                 &sessions,
                                                 &mut pending_handshakes,
+                                                &mut handshake_started,
                                                 &now,
-                                                force_hs,
+                                                false,
                                             )
                                             .await;
                                         }
@@ -2578,10 +2617,12 @@ pub async fn run_chat_network(
                                         let _ = event_tx
                                             .send(NetworkEvent::MessageAwaitingSession(peer_id))
                                             .await;
-                                        // Nudge offline path immediately while waiting for live.
-                                        let _ = event_tx
-                                            .send(NetworkEvent::SendFailedDial(peer_id))
-                                            .await;
+                                        // Offline nudge only when we are NOT live-connected.
+                                        if !connected {
+                                            let _ = event_tx
+                                                .send(NetworkEvent::SendFailedDial(peer_id))
+                                                .await;
+                                        }
                                         debug!(
                                             "[{}] ⏳ E2EE: Сообщение буферизовано до хендшейка с {}",
                                             now,
@@ -2699,20 +2740,21 @@ pub async fn run_chat_network(
                                             .await;
                                         }
                                     } else {
-                                        let force_hs = pending_handshakes.contains_key(&peer_id)
-                                            && swarm.is_connected(&peer_id);
-                                        let _ = ensure_e2ee_handshake_started(
-                                            &mut swarm,
-                                            &local_key,
-                                            local_peer_id,
-                                            my_public_key,
-                                            peer_id,
-                                            &sessions,
-                                            &mut pending_handshakes,
-                                            &now,
-                                            force_hs,
-                                        )
-                                        .await;
+                                        if swarm.is_connected(&peer_id) {
+                                            let _ = ensure_e2ee_handshake_started(
+                                                &mut swarm,
+                                                &local_key,
+                                                local_peer_id,
+                                                my_public_key,
+                                                peer_id,
+                                                &sessions,
+                                                &mut pending_handshakes,
+                                                &mut handshake_started,
+                                                &now,
+                                                false,
+                                            )
+                                            .await;
+                                        }
                                         if send_chat {
                                             let queue =
                                                 pending_messages.entry(peer_id).or_default();
@@ -2797,20 +2839,21 @@ pub async fn run_chat_network(
                                         )
                                         .await;
                                     } else {
-                                        let force_hs = pending_handshakes.contains_key(&peer_id)
-                                            && swarm.is_connected(&peer_id);
-                                        let _ = ensure_e2ee_handshake_started(
-                                            &mut swarm,
-                                            &local_key,
-                                            local_peer_id,
-                                            my_public_key,
-                                            peer_id,
-                                            &sessions,
-                                            &mut pending_handshakes,
-                                            &now,
-                                            force_hs,
-                                        )
-                                        .await;
+                                        if swarm.is_connected(&peer_id) {
+                                            let _ = ensure_e2ee_handshake_started(
+                                                &mut swarm,
+                                                &local_key,
+                                                local_peer_id,
+                                                my_public_key,
+                                                peer_id,
+                                                &sessions,
+                                                &mut pending_handshakes,
+                                                &mut handshake_started,
+                                                &now,
+                                                false,
+                                            )
+                                            .await;
+                                        }
                                         pending_messages
                                             .entry(peer_id)
                                             .or_default()
@@ -3066,20 +3109,21 @@ pub async fn run_chat_network(
                                 };
 
                                 if !sessions.contains_key(&recipient) {
-                                    let force_hs = pending_handshakes.contains_key(&recipient)
-                                        && swarm.is_connected(&recipient);
-                                    let _ = ensure_e2ee_handshake_started(
-                                        &mut swarm,
-                                        &local_key,
-                                        local_peer_id,
-                                        my_public_key,
-                                        recipient,
-                                        &sessions,
-                                        &mut pending_handshakes,
-                                        &now,
-                                        force_hs,
-                                    )
-                                    .await;
+                                    if swarm.is_connected(&recipient) {
+                                        let _ = ensure_e2ee_handshake_started(
+                                            &mut swarm,
+                                            &local_key,
+                                            local_peer_id,
+                                            my_public_key,
+                                            recipient,
+                                            &sessions,
+                                            &mut pending_handshakes,
+                                            &mut handshake_started,
+                                            &now,
+                                            false,
+                                        )
+                                        .await;
+                                    }
                                     let msg_id_for_dedup =
                                         chat_message_id_from_json(json_data.as_slice());
                                     let queue = pending_messages.entry(recipient).or_default();
@@ -3572,6 +3616,7 @@ pub async fn run_chat_network(
                                                 // Наш незавершённый Hello (если был) — одно значение; либо дополняем им
                                                 // рукопожатие, либо уступаем ответом как responder.
                                                 let took_outgoing = pending_handshakes.remove(&peer);
+                                                handshake_started.remove(&peer);
 
                                                 let remote_static_pub = crypto::PublicKey::from(public_key);
                                                 remember_peer_prekey(
@@ -4041,6 +4086,7 @@ pub async fn run_chat_network(
                                                     .await;
                                                     let remote_ephem_pub = crypto::PublicKey::from(ephemeral_key);
                                                     if let Some(local_ephem_secret) = pending_handshakes.remove(&peer) {
+                                                        handshake_started.remove(&peer);
                                                         let session = crypto::SecureSession::new_initiator(&local_static, &remote_static_pub, local_ephem_secret, &remote_ephem_pub);
                                                         sessions.insert(peer, session);
                                                         debug!(
@@ -4234,11 +4280,29 @@ pub async fn run_chat_network(
                             // повторная отправка не считала хендшейк «уже в полёте».
                             if !was_msg && !was_delete && was_chunk.is_none() {
                                 pending_handshakes.remove(&peer);
-                                // Hello упал — UI не должен вечно ждать E2EE-сессию.
-                                if pending_messages
+                                handshake_started.remove(&peer);
+                                let still_connected = swarm.is_connected(&peer);
+                                let has_buf = pending_messages
                                     .get(&peer)
-                                    .is_some_and(|q| !q.is_empty())
-                                {
+                                    .is_some_and(|q| !q.is_empty());
+                                if still_connected && has_buf {
+                                    // Живое соединение: не уводим в offline — повторяем Hello.
+                                    let now_hs =
+                                        chrono::Local::now().format("%H:%M:%S").to_string();
+                                    let _ = ensure_e2ee_handshake_started(
+                                        &mut swarm,
+                                        &local_key,
+                                        local_peer_id,
+                                        my_public_key,
+                                        peer,
+                                        &sessions,
+                                        &mut pending_handshakes,
+                                        &mut handshake_started,
+                                        &now_hs,
+                                        true,
+                                    )
+                                    .await;
+                                } else if has_buf && !still_connected {
                                     let _ = event_tx.send(NetworkEvent::SendFailedDial(peer)).await;
                                 }
                             }
@@ -4377,6 +4441,7 @@ pub async fn run_chat_network(
                                          peer_id,
                                          &sessions,
                                          &mut pending_handshakes,
+                                         &mut handshake_started,
                                          &now_hs,
                                          false,
                                      )
@@ -4501,6 +4566,7 @@ pub async fn run_chat_network(
                             // и новые Hello игнорируются (отправлялся только Ack → чат мёртв).
                             sessions.remove(&peer_id);
                             pending_handshakes.remove(&peer_id);
+                            handshake_started.remove(&peer_id);
                             // pending_messages сохраняем — UI/ретрай переотправит после реконнекта.
 
                             // Планируем переподключение для контактов из vault.
@@ -4672,6 +4738,7 @@ pub async fn run_chat_network(
                                     peer_id,
                                     &sessions,
                                     &mut pending_handshakes,
+                                    &mut handshake_started,
                                     &now,
                                     false,
                                 )
@@ -4844,6 +4911,10 @@ pub async fn run_chat_network(
                                                 *prekey_bytes =
                                                     Some(peer_record.record.value.clone());
                                             }
+                                            MailboxKadOp::CachePrekey { prekey_bytes, .. } => {
+                                                *prekey_bytes =
+                                                    Some(peer_record.record.value.clone());
+                                            }
                                             MailboxKadOp::AwaitPut { .. } => {}
                                         }
                                     }
@@ -5006,6 +5077,28 @@ pub async fn run_chat_network(
                                                         .await;
                                                 }
                                             }
+                                            MailboxKadOp::CachePrekey {
+                                                peer,
+                                                prekey_bytes,
+                                            } => {
+                                                if let Some(pk_bytes) =
+                                                    prekey_bytes.and_then(|bytes| {
+                                                        bytes.get(..32).map(|s| {
+                                                            let mut arr = [0u8; 32];
+                                                            arr.copy_from_slice(s);
+                                                            arr
+                                                        })
+                                                    })
+                                                {
+                                                    remember_peer_prekey(
+                                                        &mut peer_prekeys,
+                                                        &event_tx,
+                                                        peer,
+                                                        pk_bytes,
+                                                    )
+                                                    .await;
+                                                }
+                                            }
                                             MailboxKadOp::AwaitPut { .. } => {}
                                         }
                                     }
@@ -5032,7 +5125,8 @@ pub async fn run_chat_network(
                                                 signal_publish_done(&done, false);
                                             }
                                             MailboxKadOp::FetchInbox { .. }
-                                            | MailboxKadOp::AwaitPut { .. } => {}
+                                            | MailboxKadOp::AwaitPut { .. }
+                                            | MailboxKadOp::CachePrekey { .. } => {}
                                         }
                                     }
                                 }
