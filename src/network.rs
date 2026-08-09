@@ -2390,6 +2390,40 @@ pub async fn run_chat_network(
                                 };
 
                                 if let Some(peer_id) = recipient {
+                                    // Same-NAT / no direct path: kick DHT + dial
+                                    // (incl. bootstrap circuit) before handshake/send.
+                                    if !swarm.is_connected(&peer_id) {
+                                        let mut addrs: Vec<Multiaddr> = peer_addrs
+                                            .get(&peer_id)
+                                            .cloned()
+                                            .unwrap_or_default();
+                                        if let Some(more) = reconnect_targets.get(&peer_id) {
+                                            for a in more {
+                                                if !addrs.contains(a) {
+                                                    addrs.push(a.clone());
+                                                }
+                                            }
+                                        }
+                                        for (pid, ma) in &contact_seed_addrs {
+                                            if *pid == peer_id && !addrs.contains(ma) {
+                                                addrs.push(ma.clone());
+                                            }
+                                        }
+                                        let key = peer_dht_record_key(peer_id);
+                                        swarm.behaviour_mut().kad.get_providers(key);
+                                        swarm.behaviour_mut().kad.get_closest_peers(peer_id);
+                                        dial_peer_best_effort(
+                                            &mut swarm,
+                                            peer_id,
+                                            addrs,
+                                            &void_bootstraps,
+                                        );
+                                        debug!(
+                                            "[{}] 📡 UI_SEND: dial/DHT к {} (нет живой сессии)",
+                                            now,
+                                            &peer_id.to_string()[..8]
+                                        );
+                                    }
                                     if sessions.contains_key(&peer_id) {
                                         let msg_id_for_send =
                                             chat_message_id_from_json(json_data.as_slice());
@@ -4347,9 +4381,15 @@ pub async fn run_chat_network(
                                     .await;
                             }
                         },
-                        SwarmEvent::ConnectionClosed { peer_id, cause, .. } => {
+                        SwarmEvent::ConnectionClosed { peer_id, cause, num_established, .. } => {
                             let connected_count = swarm.connected_peers().count();
-                            debug!("❌ СОЕДИНЕНИЕ ЗАКРЫТО: {}. Причина: {:?}. Осталось: {}", peer_id, cause, connected_count);
+                            debug!("❌ СОЕДИНЕНИЕ ЗАКРЫТО: {}. Причина: {:?}. Осталось: {} (с пиром ещё {})", peer_id, cause, connected_count, num_established);
+
+                            // libp2p may close a duplicate connection while another remains.
+                            if num_established > 0 || swarm.is_connected(&peer_id) {
+                                continue;
+                            }
+
                             relay_peers.remove(&peer_id);
 
                             // E2EE: при обрыве TCP/QUIC сбрасываем криптосостояние с пиром.

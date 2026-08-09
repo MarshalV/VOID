@@ -111,7 +111,14 @@
       els.mainScreen.hidden = false;
     }
     els.beaconBanner.hidden = !s.beacon_active;
-    els.connStatus.textContent = `${s.connected_peers} онлайн · ${s.bootstraps.length} bootstrap`;
+    const pidShort = (s.peer_id || "").slice(0, 12);
+    const netLabel = s.network_ok
+      ? (s.bootstrap_connected > 0 ? "в сети" : "пиры онлайн")
+      : (s.bootstraps?.length ? "нет связи с bootstrap" : "bootstrap не задан");
+    els.connStatus.textContent =
+      `${netLabel} · ${pidShort}… · контакты ${s.connected_peers} · bootstrap ${s.bootstrap_connected}/${s.bootstraps?.length || 0}`;
+    els.connStatus.title = s.peer_id || "";
+    els.connStatus.style.color = s.network_ok ? "var(--accent)" : "var(--danger)";
     renderContacts();
     renderMessages();
     renderFileOffers();
@@ -268,6 +275,13 @@
     openModal(`
       <h3>Сеть VOID</h3>
       <div class="stack">
+        <p class="muted">Ваш PeerId:</p>
+        <div class="bootstrap-list" style="user-select:all">${escapeHtml(snapshot?.peer_id || "—")}</div>
+        <p class="muted">Статус: ${
+          snapshot?.network_ok
+            ? `в сети (bootstrap ${snapshot?.bootstrap_connected || 0}, контакты ${snapshot?.connected_peers || 0})`
+            : "нет активного соединения"
+        }</p>
         <p class="muted">Bootstrap-адреса хранятся в vault.bin и дополняются при подключении новых нод.</p>
         <label class="field"><span>IP / IP:PORT / multiaddr</span><input id="n-join" placeholder="например 1.2.3.4:50001" /></label>
         <button class="btn primary" id="n-go">Войти в VOID</button>

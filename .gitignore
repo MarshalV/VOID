@@ -1,4 +1,5 @@
 /target
+/src-tauri
 /dist
 /void_downloads
 vault.bin

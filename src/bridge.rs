@@ -138,7 +138,12 @@ pub struct SnapshotDto {
     pub nickname: String,
     pub peer_id: String,
     pub public_ip: Option<String>,
+    /// Chat contacts currently connected (bootstrap nodes excluded).
     pub connected_peers: usize,
+    /// How many configured VOID bootstrap nodes are currently connected.
+    pub bootstrap_connected: usize,
+    /// True if at least one bootstrap is up, or a chat peer is connected.
+    pub network_ok: bool,
     pub listen_addrs: Vec<String>,
     pub selected_chat: String,
     pub contacts: Vec<ContactDto>,
@@ -249,6 +254,14 @@ impl Inner {
             .iter()
             .filter(|p| !boots.contains(p))
             .count();
+    }
+
+    fn bootstrap_connected_count(&self) -> usize {
+        let boots = bootstrap_peer_ids(&self.void_bootstrap_strings);
+        self.connected_peer_ids
+            .iter()
+            .filter(|p| boots.contains(p))
+            .count()
     }
 
     fn schedule_offline_publish(&mut self) {
@@ -714,6 +727,11 @@ impl Inner {
             peer_id: local_id,
             public_ip: self.public_ip.clone(),
             connected_peers: self.connected_peers,
+            bootstrap_connected: {
+                let n = self.bootstrap_connected_count();
+                n
+            },
+            network_ok: self.bootstrap_connected_count() > 0 || self.connected_peers > 0,
             listen_addrs: self.listen_addrs.clone(),
             selected_chat: self.selected_chat.clone(),
             contacts,
