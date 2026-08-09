@@ -21,14 +21,7 @@ echo "Build succeeded."
 echo "Copying application and installers to target/ ..."
 mkdir -p target
 
-# App binary
-if [ -f src-tauri/target/release/app ]; then
-  cp -f src-tauri/target/release/app target/VOID-P2P-Messenger
-  chmod +x target/VOID-P2P-Messenger
-fi
-
-# macOS bundles
-cp -f src-tauri/target/release/bundle/dmg/*.dmg target/ 2>/dev/null || true
+# Prefer the .app bundle (GUI, no Terminal console).
 if ls src-tauri/target/release/bundle/macos/*.app >/dev/null 2>&1; then
   for appdir in src-tauri/target/release/bundle/macos/*.app; do
     base="$(basename "$appdir")"
@@ -36,10 +29,25 @@ if ls src-tauri/target/release/bundle/macos/*.app >/dev/null 2>&1; then
     cp -R "$appdir" "target/$base"
   done
 fi
+
+cp -f src-tauri/target/release/bundle/dmg/*.dmg target/ 2>/dev/null || true
 cp -f src-tauri/target/release/bundle/zip/*.zip target/ 2>/dev/null || true
 cp -f src-tauri/target/release/bundle/pkg/*.pkg target/ 2>/dev/null || true
+
+# Bare binary is for debugging only — launching it from Terminal keeps a console.
+if [ -f src-tauri/target/release/app ]; then
+  cp -f src-tauri/target/release/app target/VOID-P2P-Messenger-cli
+  chmod +x target/VOID-P2P-Messenger-cli
+fi
 
 echo
 echo "Artifacts in target/:"
 ls -la target/ || true
+echo
+APP="$(ls -d target/*.app 2>/dev/null | head -n1 || true)"
+if [ -n "${APP}" ]; then
+  echo "GUI (без консоли): open \"${APP}\""
+else
+  echo "WARNING: .app bundle not found — check tauri bundle macos target"
+fi
 echo "Done."

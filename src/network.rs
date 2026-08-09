@@ -569,6 +569,8 @@ pub(crate) enum UICommand {
     Dial(String),
     DialPeer(PeerId, Vec<Multiaddr>),
     SearchPeer(PeerId),
+    /// Force (re)start E2EE Hello with a connected chat peer.
+    EnsureChatSession(PeerId),
     /// Перечитать bootstrap из vault + глобальные источники и переподключиться.
     ReloadBootstraps(Vec<String>),
     /// Войти в сеть через один узел: IP, IP:PORT или полный multiaddr; после коннекта — kad.bootstrap.
@@ -2217,6 +2219,46 @@ pub async fn run_chat_network(
                                     swarm.behaviour_mut().kad.get_providers(key);
                                     swarm.behaviour_mut().kad.get_closest_peers(peer_id);
                                 }
+                            }
+                            UICommand::EnsureChatSession(peer_id) => {
+                                if peer_id == local_peer_id
+                                    || bootstrap_peer_ids.contains(&peer_id)
+                                {
+                                    continue;
+                                }
+                                if !swarm.is_connected(&peer_id) {
+                                    let mut addrs: Vec<Multiaddr> = peer_addrs
+                                        .get(&peer_id)
+                                        .cloned()
+                                        .unwrap_or_default();
+                                    if let Some(more) = reconnect_targets.get(&peer_id) {
+                                        for a in more {
+                                            if !addrs.contains(a) {
+                                                addrs.push(a.clone());
+                                            }
+                                        }
+                                    }
+                                    dial_peer_best_effort(
+                                        &mut swarm,
+                                        peer_id,
+                                        addrs,
+                                        &void_bootstraps,
+                                    );
+                                }
+                                let now_hs =
+                                    chrono::Local::now().format("%H:%M:%S").to_string();
+                                let _ = ensure_e2ee_handshake_started(
+                                    &mut swarm,
+                                    &local_key,
+                                    local_peer_id,
+                                    my_public_key,
+                                    peer_id,
+                                    &sessions,
+                                    &mut pending_handshakes,
+                                    &now_hs,
+                                    true,
+                                )
+                                .await;
                             }
                             UICommand::DialPeer(peer_id, addrs) => {
                                  let short = &peer_id.to_string()[..16];

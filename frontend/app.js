@@ -54,6 +54,23 @@
   let vaultKind = "open_wrapped_key";
   let recording = false;
   let filter = "";
+  let lastMsgSig = "";
+  let lastContactSig = "";
+  let snapTimer = null;
+  let pendingSnap = null;
+
+  function messagesSig(s) {
+    const msgs = s?.messages || [];
+    return msgs
+      .map((m) => `${m.id}:${m.delivery}:${m.text?.length || 0}:${m.voice_transfer_id || ""}`)
+      .join("|");
+  }
+
+  function contactsSig(s) {
+    return (s?.contacts || [])
+      .map((c) => `${c.peer_id}:${c.online}:${c.last_preview || ""}`)
+      .join("|");
+  }
 
   function wireIcons() {
     document.querySelectorAll("[data-icon]").forEach((img) => {
@@ -103,7 +120,7 @@
     return `hsl(${h % 360} 32% 38%)`;
   }
 
-  function applySnapshot(s) {
+  function applySnapshotNow(s) {
     if (!s) return;
     snapshot = s;
     if (s.unlocked) {
@@ -122,8 +139,20 @@
       .filter(Boolean)
       .join("\n");
     els.connStatus.style.color = s.network_ok ? "var(--accent)" : "var(--danger)";
-    renderContacts();
-    renderMessages();
+
+    const cSig = contactsSig(s);
+    if (cSig !== lastContactSig) {
+      lastContactSig = cSig;
+      renderContacts();
+    }
+    const mSig = messagesSig(s);
+    if (mSig !== lastMsgSig) {
+      lastMsgSig = mSig;
+      const nearBottom =
+        els.messages.scrollHeight - els.messages.scrollTop - els.messages.clientHeight < 80;
+      renderMessages();
+      if (nearBottom) els.messages.scrollTop = els.messages.scrollHeight;
+    }
     renderFileOffers();
     const enabled = !!s.selected_chat;
     els.messageInput.disabled = !enabled;
@@ -138,6 +167,18 @@
     }
     recording = !!s.voice_recording;
     els.composer.classList.toggle("recording", recording);
+  }
+
+  function applySnapshot(s) {
+    if (!s) return;
+    pendingSnap = s;
+    if (snapTimer) return;
+    snapTimer = setTimeout(() => {
+      snapTimer = null;
+      const next = pendingSnap;
+      pendingSnap = null;
+      applySnapshotNow(next);
+    }, 80);
   }
 
   function renderContacts() {
@@ -173,6 +214,8 @@
 
   function renderMessages() {
     const msgs = snapshot?.messages || [];
+    const prevScroll = els.messages.scrollTop;
+    const prevHeight = els.messages.scrollHeight;
     els.messages.innerHTML = "";
     msgs.forEach((m) => {
       const div = document.createElement("div");
@@ -187,7 +230,10 @@
       meta[1].textContent = m.outgoing ? deliveryMark(m.delivery) : "";
       els.messages.appendChild(div);
     });
-    els.messages.scrollTop = els.messages.scrollHeight;
+    // Keep position unless caller scrolls to bottom.
+    if (els.messages.scrollHeight === prevHeight) {
+      els.messages.scrollTop = prevScroll;
+    }
   }
 
   function renderFileOffers() {
@@ -387,16 +433,10 @@
     const listen = resolveListen();
     if (listen) {
       await listen("void://snapshot", (e) => applySnapshot(e.payload));
-      await listen("void://status", (e) => {
-        // Keep in snapshot status_log only — no toast spam.
-        const _ = e.payload;
-      });
-      await listen("void://message", async () => {
-        applySnapshot(await invoke("get_snapshot"));
-      });
-      await listen("void://bootstraps", async () => {
-        applySnapshot(await invoke("get_snapshot"));
-      });
+      await listen("void://status", () => {});
+      // Snapshot already covers message/bootstrap — avoid triple re-fetch flicker.
+      await listen("void://message", () => {});
+      await listen("void://bootstraps", () => {});
       await listen("void://file", async () => {
         applySnapshot(await invoke("get_snapshot"));
       });

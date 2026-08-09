@@ -210,6 +210,7 @@ struct Inner {
     pending_sends: Vec<PendingSend>,
     offline_dht_publish_after: Option<Instant>,
     offline_mail_processed: HashSet<String>,
+    snapshot_dirty: bool,
 }
 
 impl Inner {
@@ -244,6 +245,7 @@ impl Inner {
             pending_sends: Vec::new(),
             offline_dht_publish_after: None,
             offline_mail_processed: HashSet::new(),
+            snapshot_dirty: false,
         }
     }
 
@@ -779,7 +781,7 @@ impl VoidRuntime {
 
         // Event pump: NetworkEvent → state + BridgeEvent
         let pump_inner = inner.clone();
-        let pump_bridge = bridge_tx;
+        let pump_bridge = bridge_tx.clone();
         handle.spawn(async move {
             let mut event_rx = event_rx;
             while let Some(ev) = event_rx.recv().await {
@@ -802,6 +804,11 @@ impl VoidRuntime {
                                 peer_id: pid.to_string(),
                                 online: true,
                             });
+                            if g.known_peers.contains_key(&pid) {
+                                if let Some(tx) = &g.command_tx {
+                                    let _ = tx.try_send(UICommand::EnsureChatSession(pid));
+                                }
+                            }
                             emit_snapshot = true;
                         }
                         NetworkEvent::Disconnected(pid) | NetworkEvent::MdnsExpired(pid) => {
@@ -1045,12 +1052,36 @@ impl VoidRuntime {
                         _ => {}
                     }
                     if emit_snapshot {
-                        bridge_evs.push(BridgeEvent::Snapshot(g.snapshot()));
+                        // Debounced below — mark dirty instead of flooding UI.
+                        g.snapshot_dirty = true;
+                    }
+                    for ev in bridge_evs {
+                        // Don't push Snapshot here; flusher task coalesces.
+                        if !matches!(ev, BridgeEvent::Snapshot(_)) {
+                            let _ = pump_bridge.send(ev);
+                        }
                     }
                 }
-                for ev in bridge_evs {
-                    let _ = pump_bridge.send(ev);
-                }
+            }
+        });
+
+        // Coalesce snapshot emits (~8 fps max) — stops chat flicker on connect flaps.
+        let flush_inner = inner.clone();
+        let flush_bridge = bridge_tx.clone();
+        handle.spawn(async move {
+            let mut interval = tokio::time::interval(Duration::from_millis(120));
+            interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+            loop {
+                interval.tick().await;
+                let snap = {
+                    let mut g = flush_inner.lock().unwrap_or_else(|p| p.into_inner());
+                    if !g.snapshot_dirty {
+                        continue;
+                    }
+                    g.snapshot_dirty = false;
+                    g.snapshot()
+                };
+                let _ = flush_bridge.send(BridgeEvent::Snapshot(snap));
             }
         });
 
@@ -1489,6 +1520,11 @@ impl VoidRuntime {
             g.persist_outbox();
             g.push_pending_send(peer, text.clone(), mid.clone());
             g.ensure_peer_routed(peer);
+            if g.connected_peer_ids.contains(&peer) {
+                if let Some(tx) = &g.command_tx {
+                    let _ = tx.try_send(UICommand::EnsureChatSession(peer));
+                }
+            }
             g.schedule_offline_publish();
             if let Some(tx) = &g.command_tx {
                 let _ = tx.try_send(UICommand::SendMessage {
