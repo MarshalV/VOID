@@ -14,8 +14,8 @@
   --font-display: "Orbitron", sans-serif;
   --font-body: "IBM Plex Sans", system-ui, sans-serif;
   --sidebar-w: min(340px, 34vw);
-  --icon: 20px;
-  --icon-btn: 28px;
+  --icon: 22px;
+  --icon-btn: 32px;
   --input-pad-y: 0.85rem;
   --input-pad-x: 1rem;
 }
