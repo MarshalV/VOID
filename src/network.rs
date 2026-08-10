@@ -329,7 +329,19 @@ fn dial_peer_best_effort(
     addrs: Vec<Multiaddr>,
     bootstrap_addrs: &[Multiaddr],
 ) {
-    let clean = expand_dial_addrs(peer_id, addrs, bootstrap_addrs);
+    // Живые bootstrap/relay первыми — иначе dial к мёртвому relay блокирует
+    // PeerCondition::NotDialing и обратный набор через NAT не происходит.
+    let mut live_boot = Vec::new();
+    let mut cold_boot = Vec::new();
+    for ma in bootstrap_addrs {
+        if peer_id_from_multiaddr(ma).is_some_and(|p| swarm.is_connected(&p)) {
+            live_boot.push(ma.clone());
+        } else {
+            cold_boot.push(ma.clone());
+        }
+    }
+    live_boot.extend(cold_boot);
+    let clean = expand_dial_addrs(peer_id, addrs, &live_boot);
     let opts = if clean.is_empty() {
         DialOpts::peer_id(peer_id)
             .condition(libp2p::swarm::dial_opts::PeerCondition::DisconnectedAndNotDialing)
@@ -346,6 +358,20 @@ fn dial_peer_best_effort(
             debug!("dial {}: {:?}", &peer_id.to_string()[..8.min(peer_id.to_string().len())], e);
         }
     }
+}
+
+/// Запоминаем контакт для периодического dial (даже без известных multiaddr —
+/// хватит p2p-circuit через живой bootstrap).
+fn watch_contact_peer(
+    reconnect_targets: &mut HashMap<PeerId, Vec<Multiaddr>>,
+    peer_id: PeerId,
+    bootstrap_peer_ids: &HashSet<PeerId>,
+    local_peer_id: PeerId,
+) {
+    if peer_id == local_peer_id || bootstrap_peer_ids.contains(&peer_id) {
+        return;
+    }
+    reconnect_targets.entry(peer_id).or_default();
 }
 
 /// Dial vault contacts that are not live yet (direct + bootstrap circuit).
@@ -631,6 +657,8 @@ pub(crate) enum UICommand {
     SearchPeer(PeerId),
     /// Force (re)start E2EE Hello with a connected chat peer.
     EnsureChatSession(PeerId),
+    /// Зарегистрировать контакты для авто-дозвона (в т.ч. без multiaddr → relay).
+    WatchContacts(Vec<PeerId>),
     /// Перечитать bootstrap из vault + глобальные источники и переподключиться.
     ReloadBootstraps(Vec<String>),
     /// Войти в сеть через один узел: IP, IP:PORT или полный multiaddr; после коннекта — kad.bootstrap.
@@ -2307,29 +2335,67 @@ pub async fn run_chat_network(
                                             "⚠ Подключение к своему PeerId бессмысленно.".into(),
                                         ))
                                         .await;
-                                } else if let Some(addrs) = kad_local_addrs_for_peer(
-                                    &mut swarm.behaviour_mut().kad,
-                                    peer_id,
-                                ) {
-                                    let _ = event_tx
-                                        .send(NetworkEvent::Status(format!(
-                                            "📍 Пир {} найден в локальной таблице Kademlia ({} адр.) — набор.",
-                                            &peer_id.to_string()[..12],
-                                            addrs.len()
-                                        )))
-                                        .await;
-                                    let _ = command_tx_for_mdns.try_send(UICommand::DialPeer(
-                                        peer_id,
-                                        addrs,
-                                    ));
                                 } else {
-                                    let _ = event_tx.send(NetworkEvent::Status(
-                                        format!("🔍 Запрос DHT: {}… (providers + closest)", &peer_id.to_string()[..16])
-                                    )).await;
-                                    let key = peer_dht_record_key(peer_id);
-                                    swarm.behaviour_mut().kad.get_providers(key);
-                                    swarm.behaviour_mut().kad.get_closest_peers(peer_id);
+                                    watch_contact_peer(
+                                        &mut reconnect_targets,
+                                        peer_id,
+                                        &bootstrap_peer_ids,
+                                        local_peer_id,
+                                    );
+                                    // Сразу пробуем circuit через живой bootstrap —
+                                    // иначе при пустой Kademlia ждём DHT и «не в сети»
+                                    // зависает, пока собеседник сам не дозвонится.
+                                    dial_peer_best_effort(
+                                        &mut swarm,
+                                        peer_id,
+                                        peer_addrs
+                                            .get(&peer_id)
+                                            .cloned()
+                                            .unwrap_or_default(),
+                                        &void_bootstraps,
+                                    );
+                                    if let Some(addrs) = kad_local_addrs_for_peer(
+                                        &mut swarm.behaviour_mut().kad,
+                                        peer_id,
+                                    ) {
+                                        let _ = event_tx
+                                            .send(NetworkEvent::Status(format!(
+                                                "📍 Пир {} найден в локальной таблице Kademlia ({} адр.) — набор.",
+                                                &peer_id.to_string()[..12],
+                                                addrs.len()
+                                            )))
+                                            .await;
+                                        let _ = command_tx_for_mdns.try_send(UICommand::DialPeer(
+                                            peer_id,
+                                            addrs,
+                                        ));
+                                    } else {
+                                        let _ = event_tx.send(NetworkEvent::Status(
+                                            format!("🔍 Запрос DHT: {}… (providers + closest)", &peer_id.to_string()[..16])
+                                        )).await;
+                                        let key = peer_dht_record_key(peer_id);
+                                        swarm.behaviour_mut().kad.get_providers(key);
+                                        swarm.behaviour_mut().kad.get_closest_peers(peer_id);
+                                    }
                                 }
+                            }
+                            UICommand::WatchContacts(peers) => {
+                                for peer_id in peers {
+                                    watch_contact_peer(
+                                        &mut reconnect_targets,
+                                        peer_id,
+                                        &bootstrap_peer_ids,
+                                        local_peer_id,
+                                    );
+                                }
+                                dial_unconnected_contacts(
+                                    &mut swarm,
+                                    &reconnect_targets,
+                                    &bootstrap_peer_ids,
+                                    &void_bootstraps,
+                                    &mut contact_dial_at,
+                                    Duration::from_secs(2),
+                                );
                             }
                             UICommand::EnsureChatSession(peer_id) => {
                                 if peer_id == local_peer_id
@@ -2337,6 +2403,12 @@ pub async fn run_chat_network(
                                 {
                                     continue;
                                 }
+                                watch_contact_peer(
+                                    &mut reconnect_targets,
+                                    peer_id,
+                                    &bootstrap_peer_ids,
+                                    local_peer_id,
+                                );
                                 if !peer_prekeys.contains_key(&peer_id) {
                                     let qid = swarm
                                         .behaviour_mut()
@@ -2391,12 +2463,31 @@ pub async fn run_chat_network(
                             }
                             UICommand::DialPeer(peer_id, addrs) => {
                                  let short = &peer_id.to_string()[..16];
+                                 watch_contact_peer(
+                                     &mut reconnect_targets,
+                                     peer_id,
+                                     &bootstrap_peer_ids,
+                                     local_peer_id,
+                                 );
+                                 // Живые relay первыми (как в dial_peer_best_effort).
+                                 let mut live_boot = Vec::new();
+                                 let mut cold_boot = Vec::new();
+                                 for ma in &void_bootstraps {
+                                     if peer_id_from_multiaddr(ma)
+                                         .is_some_and(|p| swarm.is_connected(&p))
+                                     {
+                                         live_boot.push(ma.clone());
+                                     } else {
+                                         cold_boot.push(ma.clone());
+                                     }
+                                 }
+                                 live_boot.extend(cold_boot);
                                  // Выкидываем loopback и виртуальные интерфейсы — чтобы
                                  // не тратить время на заведомо пустой dial.
                                  let addrs: Vec<Multiaddr> = expand_dial_addrs(
                                      peer_id,
                                      addrs,
-                                     &void_bootstraps,
+                                     &live_boot,
                                  );
                                  debug!("🔌 UI_COMMAND: DialPeer {} ({} addresses)", short, addrs.len());
 

@@ -415,11 +415,22 @@ impl Inner {
         let Some(tx) = &self.command_tx else {
             return;
         };
+        let _ = tx.try_send(UICommand::EnsureChatSession(peer));
         let _ = tx.try_send(UICommand::SearchPeer(peer));
         if let Some(addrs) = self.contact_addrs.get(&peer) {
             if !addrs.is_empty() {
                 let _ = tx.try_send(UICommand::DialPeer(peer, addrs.clone()));
             }
+        }
+    }
+
+    fn watch_all_contacts(&self) {
+        let Some(tx) = &self.command_tx else {
+            return;
+        };
+        let peers: Vec<PeerId> = self.known_peers.keys().copied().collect();
+        if !peers.is_empty() {
+            let _ = tx.try_send(UICommand::WatchContacts(peers));
         }
     }
 
@@ -532,6 +543,7 @@ impl Inner {
 
         if let Some(tx) = &self.command_tx {
             for peer in search_cmds {
+                let _ = tx.try_send(UICommand::EnsureChatSession(peer));
                 let _ = tx.try_send(UICommand::SearchPeer(peer));
                 if let Some(addrs) = self.contact_addrs.get(&peer) {
                     if !addrs.is_empty() {
@@ -540,6 +552,7 @@ impl Inner {
                 }
             }
             for (peer, text, message_id) in resend_cmds {
+                let _ = tx.try_send(UICommand::EnsureChatSession(peer));
                 let _ = tx.try_send(UICommand::SendMessage {
                     sender_name: nick.clone(),
                     text,
@@ -1502,6 +1515,7 @@ impl VoidRuntime {
                             let _ = tx.try_send(UICommand::CachePeerPrekeys(cache));
                         }
                     }
+                    g.watch_all_contacts();
                     if let Some(tx) = &g.command_tx {
                         let _ = tx.try_send(UICommand::FetchOfflineMailbox);
                     }
@@ -1709,13 +1723,6 @@ impl VoidRuntime {
             g.persist_outbox();
             g.push_pending_send(peer, text.clone(), mid.clone());
             g.ensure_peer_routed(peer);
-            if g.connected_peer_ids.contains(&peer) {
-                if let Some(tx) = &g.command_tx {
-                    if let Err(e) = tx.try_send(UICommand::EnsureChatSession(peer)) {
-                        eprintln!("VOID: EnsureChatSession drop: {e}");
-                    }
-                }
-            }
             g.schedule_offline_publish();
             g.publish_outbox_to_dht();
             if let Some(tx) = &g.command_tx {
@@ -1747,14 +1754,14 @@ impl VoidRuntime {
         if let Ok(pid) = input.parse::<PeerId>() {
             g.known_peers.insert(pid, display);
             g.persist_vault();
-            if let Some(tx) = &g.command_tx {
-                let _ = tx.try_send(UICommand::SearchPeer(pid));
-            }
+            g.watch_all_contacts();
+            g.ensure_peer_routed(pid);
         } else if let Some((ma, pid_opt)) = parse_seed_input(&input) {
             if let Some(pid) = pid_opt {
                 g.known_peers.insert(pid, display);
                 g.contact_addrs.entry(pid).or_default().push(ma.clone());
                 g.persist_vault();
+                g.watch_all_contacts();
                 if let Some(tx) = &g.command_tx {
                     let _ = tx.try_send(UICommand::DialPeer(pid, vec![ma]));
                 }
