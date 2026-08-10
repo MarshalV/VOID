@@ -211,6 +211,60 @@ fn reject_file(state: State<'_, Mutex<AppState>>, transfer_id: String) -> Result
 }
 
 #[tauri::command]
+fn downloads_path() -> String {
+    p2p_messenger::downloads_dir().display().to_string()
+}
+
+#[tauri::command]
+fn open_downloads() -> Result<(), String> {
+    let dir = p2p_messenger::downloads_dir();
+    std::fs::create_dir_all(&dir).map_err(|e| e.to_string())?;
+    open_in_file_manager(&dir)
+}
+
+#[tauri::command]
+fn reveal_path(path: String) -> Result<(), String> {
+    let p = std::path::PathBuf::from(path.trim());
+    if p.is_file() {
+        if let Some(parent) = p.parent() {
+            // Открываем папку (надёжнее, чем /select на путях с пробелами).
+            return open_in_file_manager(parent);
+        }
+    }
+    if p.is_dir() {
+        return open_in_file_manager(&p);
+    }
+    Err(format!("Путь не найден: {}", p.display()))
+}
+
+fn open_in_file_manager(dir: &std::path::Path) -> Result<(), String> {
+    #[cfg(target_os = "windows")]
+    {
+        std::process::Command::new("explorer")
+            .arg(dir)
+            .spawn()
+            .map_err(|e| format!("explorer: {e}"))?;
+        Ok(())
+    }
+    #[cfg(target_os = "macos")]
+    {
+        std::process::Command::new("open")
+            .arg(dir)
+            .spawn()
+            .map_err(|e| format!("open: {e}"))?;
+        Ok(())
+    }
+    #[cfg(all(unix, not(target_os = "macos")))]
+    {
+        std::process::Command::new("xdg-open")
+            .arg(dir)
+            .spawn()
+            .map_err(|e| format!("xdg-open: {e}"))?;
+        Ok(())
+    }
+}
+
+#[tauri::command]
 fn start_voice(state: State<'_, Mutex<AppState>>) -> Result<(), String> {
     state
         .lock()
@@ -443,6 +497,9 @@ pub fn run() {
             send_file,
             accept_file,
             reject_file,
+            downloads_path,
+            open_downloads,
+            reveal_path,
             start_voice,
             stop_voice_send,
             create_group,

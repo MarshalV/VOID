@@ -256,8 +256,28 @@
       acc.className = "btn primary";
       acc.textContent = "Принять";
       acc.onclick = async () => {
-        await invoke("accept_file", { transferId: f.transfer_id, saveDir: null });
-        applySnapshot(await invoke("get_snapshot"));
+        try {
+          let saveDir = null;
+          const dialog = window.__TAURI__?.dialog;
+          if (dialog?.open) {
+            const picked = await dialog.open({
+              directory: true,
+              multiple: false,
+              title: "Куда сохранить файл",
+            });
+            if (picked === null) {
+              // Отмена диалога → папка по умолчанию VOID/void_downloads
+              saveDir = null;
+            } else {
+              saveDir = Array.isArray(picked) ? picked[0] : picked;
+            }
+          }
+          await invoke("accept_file", { transferId: f.transfer_id, saveDir });
+          showToast("Принято — ждём передачу…");
+          applySnapshot(await invoke("get_snapshot"));
+        } catch (e) {
+          showToast(String(e));
+        }
       };
       const rej = document.createElement("button");
       rej.className = "btn";
@@ -386,6 +406,7 @@
         <p class="muted">Публичный IP: ${escapeHtml(snapshot?.public_ip || "—")}</p>
         <button class="btn primary" id="s-save">Сохранить ник</button>
         <button class="btn" id="s-copy">Копировать Peer ID</button>
+        <button class="btn" id="s-downloads">Открыть папку загрузок</button>
         <button class="btn" id="s-quit">Полный выход</button>
       </div>`);
     document.getElementById("s-save").onclick = async () => {
@@ -402,6 +423,15 @@
         showToast("Peer ID скопирован");
       } catch {
         showToast("Не удалось скопировать");
+      }
+    };
+    document.getElementById("s-downloads").onclick = async () => {
+      try {
+        const path = await invoke("downloads_path");
+        await invoke("open_downloads");
+        showToast(path);
+      } catch (e) {
+        showToast(String(e));
       }
     };
     document.getElementById("s-quit").onclick = () => invoke("quit_application");
@@ -469,7 +499,14 @@
       await listen("void://file-complete", async (e) => {
         const p = e?.payload || {};
         if (p.saved_to) {
-          showToast(`Файл сохранён: ${p.filename || ""}`);
+          showToast(`Сохранено:\n${p.saved_to}`);
+          try {
+            await invoke("reveal_path", { path: p.saved_to });
+          } catch (_) {
+            try {
+              await invoke("open_downloads");
+            } catch (_) {}
+          }
         } else if (p.filename) {
           showToast(`Файл доставлен: ${p.filename}`);
         }

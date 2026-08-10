@@ -38,6 +38,13 @@ pub fn init_paths() -> Result<(), String> {
     paths::init_storage_paths()
 }
 
+/// Absolute path to `void_downloads` (accepted files).
+pub fn downloads_dir() -> std::path::PathBuf {
+    let dir = paths::data_dir().join(file_transfer::DOWNLOADS_DIR);
+    let _ = std::fs::create_dir_all(&dir);
+    dir
+}
+
 /// Handle `--voice-record` / `--voice-probe` CLI before starting any UI.
 /// Returns `Some(exit_code)` if the process should exit.
 pub fn run_cli_if_requested() -> Option<i32> {

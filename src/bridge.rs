@@ -436,6 +436,39 @@ impl Inner {
         }
     }
 
+    /// После успешного file/E2EE — сразу ретраим текст этому пиру (не ждём backoff).
+    fn kick_pending_for_peer(&mut self, peer: PeerId) {
+        let nick = self.local_nickname.clone();
+        let due: Vec<(String, String)> = self
+            .pending_sends
+            .iter_mut()
+            .filter(|p| p.peer == peer)
+            .map(|p| {
+                p.awaiting_session = false;
+                p.dht_kicked = false;
+                p.dht_kicked_at = None;
+                p.last_send_at = Instant::now();
+                p.attempts = p.attempts.saturating_add(1);
+                (p.text.clone(), p.message_id.clone())
+            })
+            .collect();
+        if due.is_empty() {
+            return;
+        }
+        if let Some(tx) = &self.command_tx {
+            let _ = tx.try_send(UICommand::EnsureChatSession(peer));
+            for (text, message_id) in due {
+                let _ = tx.try_send(UICommand::SendMessage {
+                    sender_name: nick.clone(),
+                    text,
+                    recipient: Some(peer),
+                    message_id: Some(message_id),
+                    is_retry: true,
+                });
+            }
+        }
+    }
+
     fn push_pending_send(&mut self, peer: PeerId, text: String, message_id: String) {
         if self
             .pending_sends
@@ -1013,11 +1046,16 @@ impl VoidRuntime {
                             emit_snapshot = true;
                         }
                         NetworkEvent::MessageAwaitingSession(peer) => {
+                            // Не блокируем ретраи надолго, если пир уже online —
+                            // иначе ○ висит, пока file/E2EE уже работает.
+                            let online = g.connected_peer_ids.contains(&peer);
                             for p in g.pending_sends.iter_mut().filter(|p| p.peer == peer) {
-                                p.awaiting_session = true;
+                                p.awaiting_session = !online;
                                 p.last_send_at = Instant::now();
-                                p.dht_kicked = false;
-                                p.dht_kicked_at = None;
+                                if !online {
+                                    p.dht_kicked = false;
+                                    p.dht_kicked_at = None;
+                                }
                             }
                         }
                         NetworkEvent::MessageOnWire { peer, message_id } => {
@@ -1123,6 +1161,9 @@ impl VoidRuntime {
                             } else if !saved_to.is_empty() {
                                 g.add_status(format!("✅ Файл «{filename}» сохранён: {saved_to}"));
                             }
+                            // E2EE с этим пиром точно жив (чанки прошли) —
+                            // немедленно досылаем зависшие ○-сообщения.
+                            g.kick_pending_for_peer(peer);
                             bridge_evs.push(BridgeEvent::FileComplete {
                                 transfer_id: tid,
                                 filename,
@@ -2192,6 +2233,16 @@ fn update_delivery(
             m.delivery = status;
             drop(map);
             messages.mark_dirty();
+            return;
+        }
+    }
+    // PeerId в событии мог не совпасть с ключом треда — ищем по id.
+    for list in map.values_mut() {
+        if let Some(m) = list.iter_mut().find(|m| m.id == message_id) {
+            m.delivery = status;
+            drop(map);
+            messages.mark_dirty();
+            return;
         }
     }
 }

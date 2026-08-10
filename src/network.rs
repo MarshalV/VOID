@@ -2231,6 +2231,29 @@ pub async fn run_chat_network(
                             );
                         }
                     }
+                    // Сообщения, застрявшие в pending при живой E2EE (файлы уже ходят).
+                    let flush_peers: Vec<PeerId> = pending_messages
+                        .iter()
+                        .filter(|(p, q)| !q.is_empty() && sessions.contains_key(p))
+                        .map(|(p, _)| *p)
+                        .collect();
+                    if !flush_peers.is_empty() {
+                        let now_flush =
+                            chrono::Local::now().format("%H:%M:%S").to_string();
+                        for peer in flush_peers {
+                            flush_pending_encrypted_messages(
+                                &mut swarm,
+                                &mut sessions,
+                                &mut outbound_msg_requests,
+                                &mut outbound_delete_requests,
+                                &event_tx,
+                                peer,
+                                &mut pending_messages,
+                                &now_flush,
+                            )
+                            .await;
+                        }
+                    }
                 }
                 // ─── Tick: переобъявление себя в DHT (каждые 10 мин) ───────
                 _ = provider_tick.tick() => {
@@ -2825,6 +2848,14 @@ pub async fn run_chat_network(
                                     if sessions.contains_key(&peer_id) {
                                         let msg_id_for_send =
                                             chat_message_id_from_json(json_data.as_slice());
+                                        // Retry: снимаем залипший in-flight (таймаут ещё не пришёл).
+                                        if is_retry {
+                                            if let Some(ref mid) = msg_id_for_send {
+                                                outbound_msg_requests.retain(|_, (p, id, _)| {
+                                                    !(*p == peer_id && id == mid)
+                                                });
+                                            }
+                                        }
                                         let in_flight = msg_id_for_send.as_ref().is_some_and(|mid| {
                                             outbound_msg_requests
                                                 .values()
@@ -2854,6 +2885,18 @@ pub async fn run_chat_network(
                                             )
                                             .await;
                                         }
+                                        // Заодно сливаем всё, что застряло в буфере «до сессии».
+                                        flush_pending_encrypted_messages(
+                                            &mut swarm,
+                                            &mut sessions,
+                                            &mut outbound_msg_requests,
+                                            &mut outbound_delete_requests,
+                                            &event_tx,
+                                            peer_id,
+                                            &mut pending_messages,
+                                            &now,
+                                        )
+                                        .await;
                                     } else {
                                         // Never Hello until connected — bare send_request
                                         // dials without circuit addrs and fails → stuck ○.
@@ -4198,6 +4241,17 @@ pub async fn run_chat_network(
                                                                     send_ack = true;
                                                                 }
                                                             }
+                                                        } else {
+                                                            // Расшифровали, но кадр не chat/file —
+                                                            // всё равно Ack, иначе отправитель
+                                                            // крутит ○ и на OutFailure шлёт дубликат.
+                                                            debug!(
+                                                                "[{}] ⚠ E2EE: неизвестный plaintext от {} ({} б) — Ack",
+                                                                now,
+                                                                &peer.to_string()[..8],
+                                                                plaintext.len()
+                                                            );
+                                                            send_ack = true;
                                                         }
                                                     }
                                                     Err(_) => {
@@ -4735,33 +4789,57 @@ pub async fn run_chat_network(
                             let was_msg = outbound_msg_requests.remove(&request_id);
                             let had_msg = was_msg.is_some();
                             let was_delete = outbound_delete_requests.remove(&request_id).is_some();
-                            if let Some((msg_peer, _mid, json)) = was_msg {
-                                requeue_pending_chat_json(
-                                    &mut pending_messages,
-                                    msg_peer,
-                                    json,
-                                );
-                                let _ = event_tx
-                                    .send(NetworkEvent::MessageAwaitingSession(msg_peer))
-                                    .await;
-                                if swarm.is_connected(&msg_peer)
-                                    && !sessions.contains_key(&msg_peer)
-                                {
-                                    let now_hs =
+                            if let Some((msg_peer, mid, json)) = was_msg {
+                                let has_session = sessions.contains_key(&msg_peer);
+                                let live = swarm.is_connected(&msg_peer);
+                                if has_session && live {
+                                    // Сессия жива (файлы уже ходят) — не паркуем в
+                                    // pending_messages до нового Hello: иначе ○ навсегда.
+                                    debug!(
+                                        "↻ RR OutFailure msg {} к {} при живой E2EE — сразу resend",
+                                        &mid[..8.min(mid.len())],
+                                        &msg_peer.to_string()[..8]
+                                    );
+                                    let now_rs =
                                         chrono::Local::now().format("%H:%M:%S").to_string();
-                                    let _ = ensure_e2ee_handshake_started(
+                                    let _ = send_encrypted_chat_payload(
                                         &mut swarm,
-                                        &local_key,
-                                        local_peer_id,
-                                        my_public_key,
+                                        &mut sessions,
+                                        &mut outbound_msg_requests,
+                                        &mut outbound_delete_requests,
+                                        &event_tx,
                                         msg_peer,
-                                        &sessions,
-                                        &mut pending_handshakes,
-                                        &mut handshake_started,
-                                        &now_hs,
-                                        true,
+                                        json,
+                                        None,
+                                        &now_rs,
                                     )
                                     .await;
+                                } else {
+                                    requeue_pending_chat_json(
+                                        &mut pending_messages,
+                                        msg_peer,
+                                        json,
+                                    );
+                                    let _ = event_tx
+                                        .send(NetworkEvent::MessageAwaitingSession(msg_peer))
+                                        .await;
+                                    if live && !has_session {
+                                        let now_hs =
+                                            chrono::Local::now().format("%H:%M:%S").to_string();
+                                        let _ = ensure_e2ee_handshake_started(
+                                            &mut swarm,
+                                            &local_key,
+                                            local_peer_id,
+                                            my_public_key,
+                                            msg_peer,
+                                            &sessions,
+                                            &mut pending_handshakes,
+                                            &mut handshake_started,
+                                            &now_hs,
+                                            true,
+                                        )
+                                        .await;
+                                    }
                                 }
                             }
                             // Неотслеживаемый запрос — это Hello-handshake; сбрасываем, чтобы
