@@ -130,11 +130,12 @@
     els.beaconBanner.hidden = !s.beacon_active;
     const pidShort = (s.peer_id || "").slice(0, 12);
     const live = (s.bootstrap_connected || 0) + (s.connected_peers || 0);
+    const relay = s.relay_reserved ? " · relay OK" : " · нет relay (NAT!)";
     const netLabel = s.network_ok
       ? (s.bootstrap_connected > 0 ? "в сети" : "есть соединения")
       : (s.bootstraps?.length ? "нет связи с bootstrap" : "bootstrap не задан");
     els.connStatus.textContent =
-      `${netLabel} · ${pidShort}… · live ${live} · контакты ${s.connected_peers} · bootstrap ${s.bootstrap_connected}/${s.bootstraps?.length || 0}`;
+      `${netLabel}${relay} · ${pidShort}… · live ${live} · контакты ${s.connected_peers} · bootstrap ${s.bootstrap_connected}/${s.bootstraps?.length || 0}`;
     els.connStatus.title = [s.peer_id || "", ...(s.bootstraps || []).slice(0, 4)]
       .filter(Boolean)
       .join("\n");
@@ -338,6 +339,17 @@
           snapshot?.network_ok
             ? `в сети (bootstrap ${snapshot?.bootstrap_connected || 0}, контакты ${snapshot?.connected_peers || 0})`
             : "нет активного соединения"
+        }</p>
+        <p class="muted">${
+          snapshot?.relay_reserved
+            ? "Relay-резервация есть — вас можно набрать из‑за NAT."
+            : "Нет relay-резервации — собеседники за NAT до вас не дозвонятся. Подключите bootstrap и дождитесь «СВЯЗЬ ЧЕРЕЗ RELAY»."
+        }</p>
+        <p class="muted">Сейчас online: ${
+          (snapshot?.contacts || [])
+            .filter((c) => c.online)
+            .map((c) => escapeHtml(c.display_name || c.peer_id.slice(0, 12)))
+            .join(", ") || "—"
         }</p>
         <p class="muted">Bootstrap-адреса хранятся в vault.bin и дополняются при подключении новых нод.</p>
         <label class="field"><span>IP / IP:PORT / multiaddr</span><input id="n-join" placeholder="например 1.2.3.4:50001" /></label>

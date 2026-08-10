@@ -161,6 +161,8 @@ pub struct SnapshotDto {
     /// True if at least one bootstrap is up, or a chat peer is connected.
     pub network_ok: bool,
     pub listen_addrs: Vec<String>,
+    /// True if we have at least one p2p-circuit listen (reachable behind NAT).
+    pub relay_reserved: bool,
     pub selected_chat: String,
     pub contacts: Vec<ContactDto>,
     pub messages: Vec<MessageDto>,
@@ -853,6 +855,10 @@ impl Inner {
             },
             network_ok: !self.connected_peer_ids.is_empty(),
             listen_addrs: self.listen_addrs.clone(),
+            relay_reserved: self
+                .listen_addrs
+                .iter()
+                .any(|a| a.contains("p2p-circuit")),
             selected_chat: self.selected_chat.clone(),
             contacts,
             messages,
