@@ -310,6 +310,9 @@ pub struct OutgoingTransfer {
     pub last_chunk_at: Instant,
     /// Флаг: получатель принял оффер и ждёт чанки.
     pub accepted: bool,
+    /// Ждём Ack/Failure на последний отправленный чанк (stop-and-wait).
+    /// Иначе при Hello вместо Ack чанк теряется, а transfer уже удалён.
+    pub chunk_inflight: bool,
     pub sha256: [u8; 32],
     pub kind: FileKind,
 }
@@ -326,9 +329,9 @@ impl OutgoingTransfer {
         }
     }
 
-    /// true — пора слать следующий чанк (с учётом rate-limit).
+    /// true — пора слать следующий чанк (с учётом rate-limit и stop-and-wait).
     pub fn ready_to_send(&self) -> bool {
-        if !self.accepted || self.next_chunk >= self.chunks.len() {
+        if !self.accepted || self.chunk_inflight || self.next_chunk >= self.chunks.len() {
             return false;
         }
         let delay = if self.is_relay {
@@ -337,6 +340,11 @@ impl OutgoingTransfer {
             DIRECT_CHUNK_DELAY
         };
         self.last_chunk_at.elapsed() >= delay
+    }
+
+    /// Все чанки ушли и подтверждены (нет inflight).
+    pub fn all_chunks_acked(&self) -> bool {
+        self.accepted && !self.chunk_inflight && self.next_chunk >= self.chunks.len()
     }
 
     pub fn total_chunks(&self) -> u32 {

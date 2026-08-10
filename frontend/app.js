@@ -441,11 +441,29 @@
     const listen = resolveListen();
     if (listen) {
       await listen("void://snapshot", (e) => applySnapshot(e.payload));
-      await listen("void://status", () => {});
-      // Snapshot already covers message/bootstrap — avoid triple re-fetch flicker.
-      await listen("void://message", () => {});
+      await listen("void://status", (e) => {
+        const msg = String(e?.payload ?? "");
+        if (/файл|голос|доставл|сохран|очеред|ошибка записи|микрофон/i.test(msg)) {
+          showToast(msg);
+        }
+      });
+      await listen("void://message", async () => {
+        applySnapshot(await invoke("get_snapshot"));
+      });
       await listen("void://bootstraps", () => {});
       await listen("void://file", async () => {
+        applySnapshot(await invoke("get_snapshot"));
+      });
+      await listen("void://file-complete", async (e) => {
+        const p = e?.payload || {};
+        if (p.saved_to) {
+          showToast(`Файл сохранён: ${p.filename || ""}`);
+        } else if (p.filename) {
+          showToast(`Файл доставлен: ${p.filename}`);
+        }
+        applySnapshot(await invoke("get_snapshot"));
+      });
+      await listen("void://file-progress", async () => {
         applySnapshot(await invoke("get_snapshot"));
       });
     }

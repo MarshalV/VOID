@@ -61,6 +61,22 @@ struct PendingSend {
     awaiting_session: bool,
 }
 
+struct PendingFileSend {
+    peer: PeerId,
+    path: String,
+    kind: file_transfer::FileKind,
+    last_attempt: Instant,
+}
+
+struct PendingVoiceSend {
+    peer: PeerId,
+    path: String,
+    duration_secs: f32,
+    message_id: String,
+    transfer_id: [u8; 16],
+    last_attempt: Instant,
+}
+
 fn bootstrap_peer_ids(bootstraps: &[String]) -> HashSet<PeerId> {
     bootstraps
         .iter()
@@ -208,6 +224,8 @@ struct Inner {
     voice_recorder: VoiceRecorder,
     voice_recording: bool,
     pending_sends: Vec<PendingSend>,
+    pending_file_sends: Vec<PendingFileSend>,
+    pending_voice_sends: Vec<PendingVoiceSend>,
     offline_dht_publish_after: Option<Instant>,
     offline_mail_processed: HashSet<String>,
     snapshot_dirty: bool,
@@ -243,6 +261,8 @@ impl Inner {
             voice_recorder: VoiceRecorder::new(),
             voice_recording: false,
             pending_sends: Vec::new(),
+            pending_file_sends: Vec::new(),
+            pending_voice_sends: Vec::new(),
             offline_dht_publish_after: None,
             offline_mail_processed: HashSet::new(),
             snapshot_dirty: false,
@@ -535,6 +555,91 @@ impl Inner {
                 self.offline_dht_publish_after = None;
                 self.publish_outbox_to_dht();
             }
+        }
+    }
+
+    fn tick_pending_file_sends(&mut self) {
+        const RETRY: Duration = Duration::from_secs(8);
+        let now = Instant::now();
+        let due: Vec<(PeerId, String, file_transfer::FileKind)> = self
+            .pending_file_sends
+            .iter()
+            .filter(|p| now.duration_since(p.last_attempt) >= RETRY)
+            .map(|p| (p.peer, p.path.clone(), p.kind))
+            .collect();
+        for (peer, path, kind) in due {
+            if let Some(slot) = self
+                .pending_file_sends
+                .iter_mut()
+                .find(|p| p.peer == peer && p.path == path)
+            {
+                slot.last_attempt = now;
+            }
+            self.ensure_peer_routed(peer);
+            if let Some(tx) = &self.command_tx {
+                let _ = tx.try_send(UICommand::EnsureChatSession(peer));
+                let _ = tx.try_send(UICommand::SendFile {
+                    recipient: peer,
+                    path,
+                    kind,
+                });
+            }
+        }
+    }
+
+    fn tick_pending_voice_sends(&mut self) {
+        const RETRY: Duration = Duration::from_secs(8);
+        let now = Instant::now();
+        let due: Vec<_> = self
+            .pending_voice_sends
+            .iter()
+            .filter(|p| now.duration_since(p.last_attempt) >= RETRY)
+            .map(|p| {
+                (
+                    p.peer,
+                    p.path.clone(),
+                    p.duration_secs,
+                    p.message_id.clone(),
+                    p.transfer_id,
+                )
+            })
+            .collect();
+        let nick = self.local_nickname.clone();
+        for (peer, path, duration_secs, message_id, transfer_id) in due {
+            if let Some(slot) = self
+                .pending_voice_sends
+                .iter_mut()
+                .find(|p| p.message_id == message_id)
+            {
+                slot.last_attempt = now;
+            }
+            self.ensure_peer_routed(peer);
+            if let Some(tx) = &self.command_tx {
+                let _ = tx.try_send(UICommand::EnsureChatSession(peer));
+                let _ = tx.try_send(UICommand::SendVoiceMessage {
+                    sender_name: nick.clone(),
+                    recipient: peer,
+                    path,
+                    duration_secs,
+                    message_id,
+                    transfer_id,
+                    is_retry: true,
+                });
+            }
+        }
+    }
+
+    fn tick_voice_recorder(&mut self) {
+        let became_ready = self.voice_recorder.poll();
+        if became_ready {
+            self.voice_recording = false;
+            self.snapshot_dirty = true;
+        } else if let Some(e) = self.voice_recorder.take_error() {
+            self.voice_recording = false;
+            self.add_status(format!("🎤 {e}"));
+            self.snapshot_dirty = true;
+        } else {
+            self.voice_recording = self.voice_recorder.on_air();
         }
     }
 
@@ -987,11 +1092,18 @@ impl VoidRuntime {
                             transfer_id,
                             filename,
                             saved_to,
-                            ..
+                            is_outgoing,
+                            peer,
                         } => {
                             let tid = hex::encode(transfer_id);
                             g.incoming_file_offers
                                 .retain(|f| f.transfer_id != tid);
+                            if is_outgoing {
+                                g.pending_file_sends.retain(|p| p.peer != peer);
+                                g.add_status(format!("✅ Файл «{filename}» доставлен"));
+                            } else if !saved_to.is_empty() {
+                                g.add_status(format!("✅ Файл «{filename}» сохранён: {saved_to}"));
+                            }
                             bridge_evs.push(BridgeEvent::FileComplete {
                                 transfer_id: tid,
                                 filename,
@@ -1005,11 +1117,84 @@ impl VoidRuntime {
                                 text: reason,
                             });
                         }
+                        NetworkEvent::VoiceAck {
+                            peer,
+                            transfer_id,
+                            ok,
+                        } => {
+                            g.pending_voice_sends
+                                .retain(|p| p.transfer_id != transfer_id);
+                            if ok {
+                                g.add_status("Голосовое доставлено".into());
+                            } else {
+                                g.add_status("Голосовое: ошибка доставки — будет повтор".into());
+                            }
+                            let _ = peer;
+                            emit_snapshot = true;
+                        }
+                        NetworkEvent::FileSendDeferred {
+                            recipient,
+                            path,
+                            kind,
+                        } => {
+                            if !g
+                                .pending_file_sends
+                                .iter()
+                                .any(|p| p.peer == recipient && p.path == path)
+                            {
+                                g.pending_file_sends.push(PendingFileSend {
+                                    peer: recipient,
+                                    path: path.clone(),
+                                    kind,
+                                    last_attempt: Instant::now(),
+                                });
+                            }
+                            g.ensure_peer_routed(recipient);
+                            if let Some(tx) = &g.command_tx {
+                                let _ = tx.try_send(UICommand::EnsureChatSession(recipient));
+                            }
+                            g.add_status(format!(
+                                "⏳ Файл в очереди — ждём E2EE с {}",
+                                &recipient.to_string()[..8.min(recipient.to_string().len())]
+                            ));
+                        }
+                        NetworkEvent::VoiceSendDeferred {
+                            recipient,
+                            path,
+                            duration_secs,
+                            message_id,
+                            transfer_id,
+                        } => {
+                            if !g
+                                .pending_voice_sends
+                                .iter()
+                                .any(|p| p.message_id == message_id)
+                            {
+                                g.pending_voice_sends.push(PendingVoiceSend {
+                                    peer: recipient,
+                                    path,
+                                    duration_secs,
+                                    message_id,
+                                    transfer_id,
+                                    last_attempt: Instant::now(),
+                                });
+                            }
+                            g.ensure_peer_routed(recipient);
+                            if let Some(tx) = &g.command_tx {
+                                let _ = tx.try_send(UICommand::EnsureChatSession(recipient));
+                            }
+                            g.add_status(format!(
+                                "⏳ Голосовое в очереди — ждём E2EE с {}",
+                                &recipient.to_string()[..8.min(recipient.to_string().len())]
+                            ));
+                        }
                         NetworkEvent::PeerIsNotVoidChat(pid)
                         | NetworkEvent::SendFailedUnsupported(pid) => {
                             g.known_peers.remove(&pid);
                             g.contact_addrs.remove(&pid);
                             g.pending_sends.retain(|p| p.peer != pid);
+                            g.pending_file_sends.retain(|p| p.peer != pid);
+                            g.pending_voice_sends.retain(|p| p.peer != pid);
                             g.persist_vault();
                             emit_snapshot = true;
                         }
@@ -1096,6 +1281,9 @@ impl VoidRuntime {
                 let mut g = tick_inner.lock().unwrap_or_else(|p| p.into_inner());
                 if g.unlocked && g.command_tx.is_some() {
                     g.tick_pending_sends();
+                    g.tick_pending_file_sends();
+                    g.tick_pending_voice_sends();
+                    g.tick_voice_recorder();
                 }
             }
         });
@@ -1681,12 +1869,26 @@ impl VoidRuntime {
         let chat = g.selected_chat.clone();
         let peer: PeerId = chat.parse().map_err(|_| "Выберите личный чат")?;
         let kind = file_transfer::FileKind::Other;
+        g.ensure_peer_routed(peer);
         if let Some(tx) = &g.command_tx {
+            let _ = tx.try_send(UICommand::EnsureChatSession(peer));
             let _ = tx.try_send(UICommand::SendFile {
                 recipient: peer,
-                path,
+                path: path.clone(),
                 kind,
             });
+            if !g
+                .pending_file_sends
+                .iter()
+                .any(|p| p.peer == peer && p.path == path)
+            {
+                g.pending_file_sends.push(PendingFileSend {
+                    peer,
+                    path,
+                    kind,
+                    last_attempt: Instant::now(),
+                });
+            }
             g.add_status("Отправка файла…".into());
         }
         drop(g);
@@ -1704,6 +1906,7 @@ impl VoidRuntime {
             .ok_or("Предложение не найдено")?;
         let peer: PeerId = from.parse().map_err(|_| "bad peer")?;
         if let Some(tx) = &g.command_tx {
+            let _ = tx.try_send(UICommand::EnsureChatSession(peer));
             let _ = tx.try_send(UICommand::AcceptFile {
                 transfer_id: tid,
                 from: peer,
@@ -1753,21 +1956,29 @@ impl VoidRuntime {
     }
 
     pub fn stop_voice_send(&self) -> Result<SnapshotDto, String> {
+        {
+            let mut g = self.inner.lock().unwrap_or_else(|p| p.into_inner());
+            if g.voice_recorder.on_air() {
+                let _ = g.voice_recorder.handle_mic_click();
+            }
+            g.voice_recording = false;
+        }
+        // Не держим Mutex Inner во время ожидания WAV — иначе event pump
+        // (сообщения/файлы) встанет на несколько секунд.
+        for _ in 0..80 {
+            {
+                let mut g = self.inner.lock().unwrap_or_else(|p| p.into_inner());
+                let _ = g.voice_recorder.poll();
+                if g.voice_recorder.has_ready() {
+                    break;
+                }
+                if let Some(e) = g.voice_recorder.take_error() {
+                    return Err(e);
+                }
+            }
+            std::thread::sleep(std::time::Duration::from_millis(50));
+        }
         let mut g = self.inner.lock().unwrap_or_else(|p| p.into_inner());
-        if g.voice_recorder.on_air() {
-            let _ = g.voice_recorder.handle_mic_click();
-        }
-        for _ in 0..50 {
-            let _ = g.voice_recorder.poll();
-            if g.voice_recorder.has_ready() {
-                break;
-            }
-            if let Some(e) = g.voice_recorder.take_error() {
-                return Err(e);
-            }
-            std::thread::sleep(std::time::Duration::from_millis(100));
-        }
-        g.voice_recording = false;
         let (path, duration) = g
             .voice_recorder
             .take_ready()
@@ -1797,7 +2008,9 @@ impl VoidRuntime {
         g.messages.lock().entry(chat).or_default().push(msg);
         g.messages.mark_dirty();
         g.persist_journal();
+        g.ensure_peer_routed(peer);
         if let Some(tx) = &g.command_tx {
+            let _ = tx.try_send(UICommand::EnsureChatSession(peer));
             let _ = tx.try_send(UICommand::SendVoiceMessage {
                 sender_name: nick,
                 recipient: peer,

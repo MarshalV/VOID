@@ -1574,6 +1574,7 @@ async fn start_voice_file_transfer(
                     is_relay,
                     last_chunk_at: Instant::now(),
                     accepted: false,
+                    chunk_inflight: false,
                     sha256,
                     kind: file_kind,
                 };
@@ -2223,6 +2224,7 @@ pub async fn run_chat_network(
                             outbound_chunk_requests.insert(req_id, (peer, tid, chunk_idx));
                             if let Some(t) = outgoing_transfers.get_mut(&tid) {
                                 t.next_chunk += 1;
+                                t.chunk_inflight = true;
                                 t.last_chunk_at = Instant::now();
                             }
                             if let Some(t) = outgoing_transfers.get(&tid) {
@@ -2230,40 +2232,19 @@ pub async fn run_chat_network(
                                 let total = t.total_chunks();
                                 let fname = t.filename.clone();
                                 let sz = t.total_size;
-                                let is_relay = t.is_relay;
                                 let fkind = t.kind;
-                                let all_sent = t.next_chunk >= t.chunks.len();
                                 let _ = event_tx
                                     .send(NetworkEvent::FileProgress {
                                         transfer_id: tid,
                                         sent_chunks: sent,
                                         total_chunks: total,
-                                        filename: fname.clone(),
+                                        filename: fname,
                                         total_size: sz,
                                         is_outgoing: true,
                                         peer,
                                         kind: fkind,
                                     })
                                     .await;
-                                if all_sent {
-                                    debug!(
-                                        "📤 FILE[{}]: все {} чанк(ов) «{}» отправлены через E2EE{}.",
-                                        fkind.label(),
-                                        total,
-                                        fname,
-                                        if is_relay { " (relay rate-limit)" } else { "" }
-                                    );
-                                    let _ = event_tx
-                                        .send(NetworkEvent::FileComplete {
-                                            transfer_id: tid,
-                                            filename: fname,
-                                            saved_to: String::new(),
-                                            is_outgoing: true,
-                                            peer,
-                                        })
-                                        .await;
-                                    outgoing_transfers.remove(&tid);
-                                }
                             }
                         } else {
                             debug!(
@@ -2271,6 +2252,24 @@ pub async fn run_chat_network(
                                 chunk_idx,
                                 &peer.to_string()[..8]
                             );
+                            // Подталкиваем хендшейк — иначе Accept есть, а чанки вечно стоят.
+                            if swarm.is_connected(&peer) && !sessions.contains_key(&peer) {
+                                let now_hs =
+                                    chrono::Local::now().format("%H:%M:%S").to_string();
+                                let _ = ensure_e2ee_handshake_started(
+                                    &mut swarm,
+                                    &local_key,
+                                    local_peer_id,
+                                    my_public_key,
+                                    peer,
+                                    &sessions,
+                                    &mut pending_handshakes,
+                                    &mut handshake_started,
+                                    &now_hs,
+                                    false,
+                                )
+                                .await;
+                            }
                         }
                     }
                 }
@@ -3136,6 +3135,7 @@ pub async fn run_chat_network(
                                                 is_relay,
                                                 last_chunk_at: Instant::now(),
                                                 accepted: false,
+                                                chunk_inflight: false,
                                                 sha256,
                                                 kind: file_kind,
                                             };
@@ -4144,6 +4144,51 @@ pub async fn run_chat_network(
                                                         })
                                                         .await;
                                                 }
+                                            } else if let Some((chunk_peer, tid, chunk_idx)) =
+                                                outbound_chunk_requests.remove(&request_id)
+                                            {
+                                                let _ = chunk_idx;
+                                                let mut done_xfer = None;
+                                                if let Some(t) =
+                                                    outgoing_transfers.get_mut(&tid)
+                                                {
+                                                    t.chunk_inflight = false;
+                                                    t.last_chunk_at = Instant::now()
+                                                        - file_transfer::DIRECT_CHUNK_DELAY;
+                                                    if t.all_chunks_acked() {
+                                                        done_xfer = Some((
+                                                            t.filename.clone(),
+                                                            t.kind,
+                                                            t.total_chunks(),
+                                                            t.is_relay,
+                                                        ));
+                                                    }
+                                                }
+                                                if let Some((fname, fkind, total, is_relay)) =
+                                                    done_xfer
+                                                {
+                                                    debug!(
+                                                        "📤 FILE[{}]: все {} чанк(ов) «{}» подтверждены E2EE{}.",
+                                                        fkind.label(),
+                                                        total,
+                                                        fname,
+                                                        if is_relay {
+                                                            " (relay rate-limit)"
+                                                        } else {
+                                                            ""
+                                                        }
+                                                    );
+                                                    let _ = event_tx
+                                                        .send(NetworkEvent::FileComplete {
+                                                            transfer_id: tid,
+                                                            filename: fname,
+                                                            saved_to: String::new(),
+                                                            is_outgoing: true,
+                                                            peer: chunk_peer,
+                                                        })
+                                                        .await;
+                                                    outgoing_transfers.remove(&tid);
+                                                }
                                             } else if let Some((delivered_peer, message_id, _)) =
                                                 outbound_msg_requests.remove(&request_id)
                                             {
@@ -4220,6 +4265,52 @@ pub async fn run_chat_network(
                                                         local_peer_id,
                                                         my_public_key,
                                                         retry_peer,
+                                                        &sessions,
+                                                        &mut pending_handshakes,
+                                                        &mut handshake_started,
+                                                        &now_hs,
+                                                        true,
+                                                    )
+                                                    .await;
+                                                }
+                                            } else if let Some((chunk_peer, tid, chunk_idx)) =
+                                                outbound_chunk_requests.remove(&request_id)
+                                            {
+                                                // Чанк файла получил Hello вместо Ack — сессия
+                                                // рассинхронизирована. Раньше next_chunk уже
+                                                // сдвигался и transfer мог быть удалён → файл
+                                                // «принимали», но байты не доходили.
+                                                if let Some(t) =
+                                                    outgoing_transfers.get_mut(&tid)
+                                                {
+                                                    t.next_chunk =
+                                                        t.next_chunk.min(chunk_idx as usize);
+                                                    t.chunk_inflight = false;
+                                                    t.last_chunk_at = Instant::now();
+                                                }
+                                                crate::voice::voice_log(&format!(
+                                                    "chunk Hello instead of Ack {} #{chunk_idx} — rewind + handshake",
+                                                    transfer_id_to_hex(&tid)
+                                                ));
+                                                debug!(
+                                                    "[{}] ↻ FILE: {} ответил Hello на чанк {} — rewind + Handshake",
+                                                    now,
+                                                    &chunk_peer.to_string()[..8],
+                                                    chunk_idx
+                                                );
+                                                sessions.remove(&chunk_peer);
+                                                pending_handshakes.remove(&chunk_peer);
+                                                handshake_started.remove(&chunk_peer);
+                                                if swarm.is_connected(&chunk_peer) {
+                                                    let now_hs = chrono::Local::now()
+                                                        .format("%H:%M:%S")
+                                                        .to_string();
+                                                    let _ = ensure_e2ee_handshake_started(
+                                                        &mut swarm,
+                                                        &local_key,
+                                                        local_peer_id,
+                                                        my_public_key,
+                                                        chunk_peer,
                                                         &sessions,
                                                         &mut pending_handshakes,
                                                         &mut handshake_started,
@@ -4446,6 +4537,7 @@ pub async fn run_chat_network(
                             if let Some((_, tid, chunk_idx)) = was_chunk {
                                 if let Some(t) = outgoing_transfers.get_mut(&tid) {
                                     t.next_chunk = t.next_chunk.min(chunk_idx as usize);
+                                    t.chunk_inflight = false;
                                     // Throttle retry to the normal per-chunk cadence, чтобы
                                     // мёртвый пир не вызвал шторм повторов каждые 20мс.
                                     t.last_chunk_at = Instant::now();
@@ -5704,8 +5796,31 @@ pub async fn run_chat_network(
                                                 outgoing_transfers.get_mut(&transfer_id)
                                             {
                                                 t.accepted = true;
+                                                t.chunk_inflight = false;
                                                 t.last_chunk_at =
                                                     Instant::now() - file_transfer::DIRECT_CHUNK_DELAY;
+                                            }
+                                            // Чанки идут только по E2EE — без сессии Accept
+                                            // «есть», а файл не поедет.
+                                            if !sessions.contains_key(&peer)
+                                                && swarm.is_connected(&peer)
+                                            {
+                                                let now_hs = chrono::Local::now()
+                                                    .format("%H:%M:%S")
+                                                    .to_string();
+                                                let _ = ensure_e2ee_handshake_started(
+                                                    &mut swarm,
+                                                    &local_key,
+                                                    local_peer_id,
+                                                    my_public_key,
+                                                    peer,
+                                                    &sessions,
+                                                    &mut pending_handshakes,
+                                                    &mut handshake_started,
+                                                    &now_hs,
+                                                    false,
+                                                )
+                                                .await;
                                             }
                                             let _ = swarm
                                                 .behaviour_mut()

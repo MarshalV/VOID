@@ -293,6 +293,10 @@ fn load_tray_icon(app: &AppHandle) -> Option<Image<'static>> {
 
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
+    if let Some(code) = p2p_messenger::run_cli_if_requested() {
+        std::process::exit(code);
+    }
+
     let _ = p2p_messenger::init_paths();
 
     tauri::Builder::default()
@@ -351,8 +355,35 @@ pub fn run() {
                         Ok(BridgeEvent::FileOffer(f)) => {
                             let _ = handle.emit("void://file", f);
                         }
-                        Ok(other) => {
-                            let _ = handle.emit("void://event", other);
+                        Ok(BridgeEvent::FileComplete {
+                            transfer_id,
+                            filename,
+                            saved_to,
+                        }) => {
+                            let _ = handle.emit(
+                                "void://file-complete",
+                                serde_json::json!({
+                                    "transfer_id": transfer_id,
+                                    "filename": filename,
+                                    "saved_to": saved_to,
+                                }),
+                            );
+                        }
+                        Ok(BridgeEvent::FileProgress {
+                            transfer_id,
+                            sent_chunks,
+                            total_chunks,
+                            filename,
+                        }) => {
+                            let _ = handle.emit(
+                                "void://file-progress",
+                                serde_json::json!({
+                                    "transfer_id": transfer_id,
+                                    "sent_chunks": sent_chunks,
+                                    "total_chunks": total_chunks,
+                                    "filename": filename,
+                                }),
+                            );
                         }
                         Err(_) => break,
                     }

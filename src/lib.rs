@@ -38,6 +38,12 @@ pub fn init_paths() -> Result<(), String> {
     paths::init_storage_paths()
 }
 
+/// Handle `--voice-record` / `--voice-probe` CLI before starting any UI.
+/// Returns `Some(exit_code)` if the process should exit.
+pub fn run_cli_if_requested() -> Option<i32> {
+    voice::run_cli_mode()
+}
+
 /// Native egui desktop entry (used by the `p2p-messenger` binary).
 #[cfg(feature = "egui-ui")]
 pub fn run_native() -> Result<(), Box<dyn std::error::Error>> {

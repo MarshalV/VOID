@@ -2,7 +2,9 @@
 
 use std::io::Write;
 use std::path::{Path, PathBuf};
-use std::process::{Child, Command, Stdio};
+use std::process::Child;
+#[cfg(target_os = "linux")]
+use std::process::{Command, Stdio};
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::mpsc::{self, Receiver, SyncSender, TrySendError};
 use std::sync::Arc;
@@ -73,14 +75,11 @@ impl VoiceRecorder {
             }
         }
 
-        #[cfg(target_os = "linux")]
-        {
-            if let Some(rx) = self.record_done_rx.as_ref() {
-                if let Ok(result) = rx.try_recv() {
-                    self.record_done_rx = None;
-                    self.recording_started = None;
-                    return self.finish_recording_result(result);
-                }
+        if let Some(rx) = self.record_done_rx.as_ref() {
+            if let Ok(result) = rx.try_recv() {
+                self.record_done_rx = None;
+                self.recording_started = None;
+                return self.finish_recording_result(result);
             }
         }
 
@@ -136,7 +135,6 @@ impl VoiceRecorder {
         }
     }
 
-    #[cfg(target_os = "linux")]
     fn finish_recording_result(&mut self, result: Result<f32, String>) -> bool {
         match result {
             Ok(duration_secs) if self.wav_path.is_file() && duration_secs >= MIN_RECORD_SECS => {
@@ -282,69 +280,40 @@ impl VoiceRecorder {
         let _ = std::fs::remove_file(&wav_path);
         let _ = std::fs::remove_file(&stop_path);
 
-        #[cfg(target_os = "linux")]
-        {
-            voice_log(&format!(
-                "linux thread record -> {} stop={}",
-                wav_path.display(),
-                stop_path.display()
-            ));
-            let (stop_tx, stop_rx) = mpsc::channel::<()>();
-            let stop_flag = stop_path.clone();
-            std::thread::spawn(move || {
-                let started = Instant::now();
-                while !stop_flag.exists() {
-                    if started.elapsed().as_secs_f32() >= MAX_VOICE_DURATION_SECS {
-                        break;
-                    }
-                    std::thread::sleep(Duration::from_millis(40));
+        // In-process запись во всех ОС: Tauri/Windows раньше делали spawn
+        // current_exe --voice-record, но app.exe игнорировал CLI и открывал
+        // второе окно — запись не работала и ломала P2P (два процесса на один vault).
+        voice_log(&format!(
+            "thread record -> {} stop={}",
+            wav_path.display(),
+            stop_path.display()
+        ));
+        let (stop_tx, stop_rx) = mpsc::channel::<()>();
+        let stop_flag = stop_path.clone();
+        std::thread::spawn(move || {
+            let started = Instant::now();
+            while !stop_flag.exists() {
+                if started.elapsed().as_secs_f32() >= MAX_VOICE_DURATION_SECS {
+                    break;
                 }
-                let _ = stop_tx.send(());
-            });
-            let wav_out = wav_path.clone();
-            let stop_path_rec = stop_path.clone();
-            let (done_tx, done_rx) = mpsc::channel();
-            std::thread::spawn(move || {
-                let result = record_to_wav(stop_rx, Some(&stop_path_rec), &wav_out);
-                let _ = done_tx.send(result);
-            });
-            self.record_done_rx = Some(done_rx);
-            self.wav_path = wav_path;
-            self.stop_path = stop_path;
-            let started = Instant::now();
-            self.recording_started = Some(started);
-            self.state = VoiceRecorderState::Recording { started };
-            return Ok(());
-        }
-
-        #[cfg(not(target_os = "linux"))]
-        {
-            let exe = std::env::current_exe().map_err(|e| format!("exe: {e}"))?;
-            voice_log(&format!(
-                "spawn {} --voice-record {} {}",
-                exe.display(),
-                wav_path.display(),
-                stop_path.display()
-            ));
-
-            let child = Command::new(&exe)
-                .arg("--voice-record")
-                .arg(&wav_path)
-                .arg(&stop_path)
-                .stdin(Stdio::null())
-                .stdout(Stdio::null())
-                .stderr(Stdio::null())
-                .spawn()
-                .map_err(|e| format!("Не удалось запустить запись: {e}"))?;
-
-            self.child = Some(child);
-            self.wav_path = wav_path;
-            self.stop_path = stop_path;
-            let started = Instant::now();
-            self.recording_started = Some(started);
-            self.state = VoiceRecorderState::Recording { started };
-            Ok(())
-        }
+                std::thread::sleep(Duration::from_millis(40));
+            }
+            let _ = stop_tx.send(());
+        });
+        let wav_out = wav_path.clone();
+        let stop_path_rec = stop_path.clone();
+        let (done_tx, done_rx) = mpsc::channel();
+        std::thread::spawn(move || {
+            let result = record_to_wav(stop_rx, Some(&stop_path_rec), &wav_out);
+            let _ = done_tx.send(result);
+        });
+        self.record_done_rx = Some(done_rx);
+        self.wav_path = wav_path;
+        self.stop_path = stop_path;
+        let started = Instant::now();
+        self.recording_started = Some(started);
+        self.state = VoiceRecorderState::Recording { started };
+        Ok(())
     }
 
     fn stop_recording(&mut self) {
