@@ -38,6 +38,26 @@ use crate::vault::{
 use crate::voice::VoiceRecorder;
 
 const RESEND_GRACE: Duration = Duration::from_secs(1);
+
+fn multiaddr_lan_or_circuit(a: &Multiaddr) -> bool {
+    if a.iter()
+        .any(|p| matches!(p, libp2p::multiaddr::Protocol::P2pCircuit))
+    {
+        return true;
+    }
+    match a.iter().find_map(|p| match p {
+        libp2p::multiaddr::Protocol::Ip4(v4) => Some(v4),
+        _ => None,
+    }) {
+        Some(v4) => {
+            let o = v4.octets();
+            o[0] == 10
+                || (o[0] == 192 && o[1] == 168)
+                || (o[0] == 172 && (16..=31).contains(&o[1]))
+        }
+        None => false,
+    }
+}
 const RESEND_DELAY_BASE: Duration = Duration::from_secs(2);
 const RESEND_DELAY_MAX: Duration = Duration::from_secs(300);
 const SESSION_WAIT_TIMEOUT: Duration = Duration::from_secs(20);
@@ -1022,6 +1042,9 @@ impl VoidRuntime {
                         }
                         NetworkEvent::PeerAddress(pid, addr) => {
                             let list = g.contact_addrs.entry(pid).or_default();
+                            // Вычищаем ядовитые public NAT; новый addr (в т.ч.
+                            // dialer-proven) оставляем.
+                            list.retain(|a| a == &addr || multiaddr_lan_or_circuit(a));
                             if !list.contains(&addr) {
                                 list.push(addr);
                                 g.persist_vault();
@@ -1505,6 +1528,7 @@ impl VoidRuntime {
                                 .addrs
                                 .iter()
                                 .filter_map(|s| s.parse().ok())
+                                .filter(multiaddr_lan_or_circuit)
                                 .collect();
                             if !parsed.is_empty() {
                                 addrs_map.entry(pid).or_default().append(&mut parsed);

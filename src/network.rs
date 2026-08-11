@@ -323,6 +323,28 @@ fn is_likely_lan_addr(ma: &Multiaddr) -> bool {
     }
 }
 
+fn is_circuit_addr(ma: &Multiaddr) -> bool {
+    ma.iter()
+        .any(|p| matches!(p, libp2p::multiaddr::Protocol::P2pCircuit))
+}
+
+/// Адрес чат-контакта, по которому безопасно redial (LAN / circuit).
+/// Публичные ephemeral NAT listen (Identify / Listener) — яд: dial к ним
+/// висит и через NotDialing блокирует набор Windows↔Mac.
+fn is_usable_contact_redial_addr(ma: &Multiaddr) -> bool {
+    !is_junk_addr(ma) && (is_circuit_addr(ma) || is_likely_lan_addr(ma))
+}
+
+fn normalize_peer_addr(mut addr: Multiaddr, peer_id: PeerId) -> Multiaddr {
+    if !addr
+        .iter()
+        .any(|p| matches!(p, libp2p::multiaddr::Protocol::P2p(_)))
+    {
+        addr.push(libp2p::multiaddr::Protocol::P2p(peer_id));
+    }
+    addr
+}
+
 fn dial_peer_best_effort(
     swarm: &mut libp2p::Swarm<ChatBehaviour>,
     peer_id: PeerId,
@@ -339,9 +361,10 @@ fn dial_peer_best_effort(
     );
 }
 
-/// Только circuit через уже живые bootstrap-relay (без прямых NAT-адресов).
-/// Прямые ephemeral mapping с Listener часто «ядовиты»: dial к ним висит и
-/// блокирует NotDialing — обратный набор к Mac/Windows за NAT тогда мёртв.
+/// Circuit через VOID bootstrap-relay (без прямых NAT-адресов).
+/// Живые relay первыми, затем остальные из списка: резервация пира может
+/// быть на другой ноде, чем та, к которой мы сейчас подключены — иначе
+/// Windows↔Mac «в разных сетях» через VOID не сходятся.
 fn dial_peer_live_circuits(
     swarm: &mut libp2p::Swarm<ChatBehaviour>,
     peer_id: PeerId,
@@ -364,8 +387,8 @@ fn dial_peer_with_condition(
     condition: libp2p::swarm::dial_opts::PeerCondition,
     circuits_only: bool,
 ) {
-    // Живые bootstrap/relay первыми — иначе dial к мёртвому relay блокирует
-    // PeerCondition::NotDialing и обратный набор через NAT не происходит.
+    // Живые bootstrap/relay первыми — быстрее; cold тоже нужны: пир мог
+    // зарезервировать circuit на другой VOID-ноде.
     let mut live_boot = Vec::new();
     let mut cold_boot = Vec::new();
     for ma in bootstrap_addrs {
@@ -375,21 +398,25 @@ fn dial_peer_with_condition(
             cold_boot.push(ma.clone());
         }
     }
-    // Для circuit-only без живого relay набор бессмысленен — не стартуем
-    // «пустой» dial, который потом блокирует NotDialing.
-    if circuits_only && live_boot.is_empty() {
+    if circuits_only && live_boot.is_empty() && cold_boot.is_empty() {
         debug!(
-            "dial skip {} — нет живого bootstrap для circuit",
+            "dial skip {} — нет bootstrap для circuit",
             &peer_id.to_string()[..8.min(peer_id.to_string().len())]
         );
         return;
     }
-    let boot = if circuits_only {
-        live_boot
-    } else {
-        live_boot.extend(cold_boot);
-        live_boot
-    };
+    // Без хотя бы одного живого bootstrap VOID-сеть ещё не поднята —
+    // cold-only circuit часто бесполезен и только занимает NotDialing.
+    // Но если live есть — обязательно пробуем и cold (другая нода пира).
+    if circuits_only && live_boot.is_empty() {
+        debug!(
+            "dial skip {} — нет живого bootstrap (VOID offline)",
+            &peer_id.to_string()[..8.min(peer_id.to_string().len())]
+        );
+        return;
+    }
+    live_boot.extend(cold_boot);
+    let boot = live_boot;
     let clean = if circuits_only {
         let mut circuits = Vec::new();
         for relay_ma in &boot {
@@ -464,13 +491,14 @@ fn dial_unconnected_contacts(
         }
         contact_dial_at.insert(*pid, now);
         if boot_live {
-            // Сначала ТОЛЬКО circuit через живой relay — без ядовитых NAT addrs.
-            dial_peer_live_circuits(swarm, *pid, void_bootstraps, false);
+            // Always: иначе залипший dial к ядовитому NAT держит NotDialing
+            // и Windows «не находит» Mac через relay.
+            dial_peer_live_circuits(swarm, *pid, void_bootstraps, true);
         }
-        // LAN/mDNS addrs (без public ephemeral) — вторым заходом.
+        // LAN/mDNS (без public ephemeral) — вторым заходом.
         let lan: Vec<Multiaddr> = addrs
             .iter()
-            .filter(|a| is_likely_lan_addr(a) && !is_junk_addr(a))
+            .filter(|a| is_usable_contact_redial_addr(a) && !is_circuit_addr(a))
             .cloned()
             .collect();
         if !lan.is_empty() {
@@ -2201,8 +2229,8 @@ pub async fn run_chat_network(
                         );
                         dial_peer_best_effort(&mut swarm, pid, clean, &void_bootstraps);
                     }
-                    // While any bootstrap is up, keep chasing contacts via circuit
-                    // (initial dial often fails before relay reservation exists).
+                    // Пока хоть один bootstrap жив — набираем контакты через VOID circuit
+                    // (LAN не требуется: путь relay/p2p-circuit/p2p/<peer>).
                     dial_unconnected_contacts(
                         &mut swarm,
                         &reconnect_targets,
@@ -2210,6 +2238,13 @@ pub async fn run_chat_network(
                         &void_bootstraps,
                         &mut contact_dial_at,
                         Duration::from_secs(15),
+                    );
+                    // Тянем остальные VOID-ноды: резервация пира может быть не на
+                    // той же, к которой мы уже подключены (bootstrap 1/6 → N/6).
+                    dial_missing_bootstraps(
+                        &mut swarm,
+                        &bootstrap_peer_ids,
+                        &void_bootstraps,
                     );
                     // Outbox mail waiting for bootstrap dial must not die with a
                     // single failed attempt — re-dial while the process is alive.
@@ -2575,60 +2610,56 @@ pub async fn run_chat_network(
                                      &bootstrap_peer_ids,
                                      local_peer_id,
                                  );
-                                 // Живые relay первыми (как в dial_peer_best_effort).
-                                 let mut live_boot = Vec::new();
-                                 let mut cold_boot = Vec::new();
-                                 for ma in &void_bootstraps {
-                                     if peer_id_from_multiaddr(ma)
-                                         .is_some_and(|p| swarm.is_connected(&p))
-                                     {
-                                         live_boot.push(ma.clone());
-                                     } else {
-                                         cold_boot.push(ma.clone());
-                                     }
-                                 }
-                                 live_boot.extend(cold_boot);
-                                 // Выкидываем loopback и виртуальные интерфейсы — чтобы
-                                 // не тратить время на заведомо пустой dial.
-                                 let addrs: Vec<Multiaddr> = expand_dial_addrs(
-                                     peer_id,
-                                     addrs,
-                                     &live_boot,
-                                 );
-                                 debug!("🔌 UI_COMMAND: DialPeer {} ({} addresses)", short, addrs.len());
-
-                                 for addr in &addrs {
-                                     swarm.behaviour_mut().kad.add_address(&peer_id, addr.clone());
-                                     // Сохраняем адрес в таблице реконнекта: пир, до которого
-                                     // явно дозванивались, — кандидат на автопереподключение.
+                                 // Только LAN/circuit в книгу реконнекта — без public NAT.
+                                 let safe: Vec<Multiaddr> = addrs
+                                     .into_iter()
+                                     .map(|a| normalize_peer_addr(a, peer_id))
+                                     .filter(|a| is_usable_contact_redial_addr(a))
+                                     .collect();
+                                 {
                                      let list = reconnect_targets.entry(peer_id).or_default();
-                                     if !list.contains(addr) {
-                                         list.push(addr.clone());
+                                     list.retain(is_usable_contact_redial_addr);
+                                     for addr in &safe {
+                                         if !list.contains(addr) {
+                                             list.push(addr.clone());
+                                         }
+                                         swarm.behaviour_mut().kad.add_address(&peer_id, addr.clone());
                                      }
                                  }
-
-                                 if addrs.is_empty() {
+                                 let lan: Vec<Multiaddr> = safe
+                                     .iter()
+                                     .filter(|a| !is_circuit_addr(a))
+                                     .cloned()
+                                     .collect();
+                                 debug!(
+                                     "🔌 UI_COMMAND: DialPeer {} (lan={}, circuit-first)",
+                                     short,
+                                     lan.len()
+                                 );
+                                 dial_peer_live_circuits(
+                                     &mut swarm,
+                                     peer_id,
+                                     &void_bootstraps,
+                                     true,
+                                 );
+                                 if !lan.is_empty() {
+                                     dial_peer_best_effort(
+                                         &mut swarm,
+                                         peer_id,
+                                         lan,
+                                         &void_bootstraps,
+                                     );
+                                 } else if !bootstrap_peer_ids
+                                     .iter()
+                                     .any(|b| swarm.is_connected(b))
+                                 {
                                      let _ = event_tx
                                          .send(NetworkEvent::Status(format!(
-                                             "🔍 У {} нет годных адресов — ищу через DHT…",
+                                             "🔍 У {} нет LAN/relay — ищу через DHT…",
                                              short
                                          )))
                                          .await;
                                      swarm.behaviour_mut().kad.get_closest_peers(peer_id);
-                                     continue;
-                                 }
-
-                                  let opts = DialOpts::peer_id(peer_id)
-                                     .condition(libp2p::swarm::dial_opts::PeerCondition::DisconnectedAndNotDialing)
-                                     .addresses(addrs)
-                                     .build();
-
-                                 if let Err(e) = swarm.dial(opts) {
-                                      let err_str = format!("{:?}", e);
-                                      if !err_str.contains("Condition") {
-                                          debug!("❌ Dial ERROR для {}: {:?}", short, e);
-                                      }
-                                      pending_dials.remove(&peer_id);
                                  }
                              }
                             UICommand::JoinViaNode(input) => {
@@ -5105,14 +5136,14 @@ pub async fn run_chat_network(
                                  if let Some((ref addr, prefer)) = learned {
                                      // Не сохраняем public ephemeral NAT с Listener —
                                      // следующий исходящий dial к ним зависает.
-                                     let usable = !is_junk_addr(addr)
-                                         && (prefer
-                                             || addr.to_string().contains("p2p-circuit")
-                                             || is_likely_lan_addr(addr));
+                                     let usable = prefer || is_usable_contact_redial_addr(addr);
                                      if usable {
                                          let list = reconnect_targets.entry(peer_id).or_default();
+                                         if !prefer {
+                                             list.retain(is_usable_contact_redial_addr);
+                                         }
                                          list.retain(|a| a != addr);
-                                         if prefer || addr.to_string().contains("p2p-circuit") {
+                                         if prefer || is_circuit_addr(addr) {
                                              list.insert(0, addr.clone());
                                          } else {
                                              list.push(addr.clone());
@@ -5375,24 +5406,25 @@ pub async fn run_chat_network(
                             }
                             let mut bootstrap_learned: Vec<String> = Vec::new();
                             for addr in info.listen_addrs {
-                                // Не тащим к себе заведомо-невалидные адреса пира
-                                // (VirtualBox/Docker/link-local). Они только
-                                // провоцируют долгие таймауты в dial.
                                 if is_junk_addr(&addr) {
                                     continue;
                                 }
-                                swarm.behaviour_mut().kad.add_address(&peer_id, addr.clone());
-
-                                // Нормализуем адрес: добавляем /p2p/<peer_id> если нет.
-                                let mut a = addr.clone();
-                                if !a.iter().any(|p| matches!(p, libp2p::multiaddr::Protocol::P2p(_))) {
-                                    a.push(libp2p::multiaddr::Protocol::P2p(peer_id));
+                                let a = normalize_peer_addr(addr.clone(), peer_id);
+                                // Bootstrap — публичные IP ок. Чат-пиры: только LAN/circuit.
+                                // Иначе Identify травит vault ядовитыми NAT listen и
+                                // Windows не может найти Mac (dial hangs → NotDialing).
+                                let keep = is_bootstrap
+                                    || is_usable_contact_redial_addr(&a);
+                                if !keep {
+                                    continue;
                                 }
+                                swarm.behaviour_mut().kad.add_address(&peer_id, a.clone());
 
-                                // Обновляем таблицу реконнекта: при следующем disconnet/restart
-                                // dial будет по актуальным listen-адресам, а не по устаревшим.
                                 if peer_id != local_peer_id {
                                     let list = reconnect_targets.entry(peer_id).or_default();
+                                    if !is_bootstrap {
+                                        list.retain(is_usable_contact_redial_addr);
+                                    }
                                     if !list.contains(&a) {
                                         list.push(a.clone());
                                     }
@@ -5402,9 +5434,6 @@ pub async fn run_chat_network(
                                     bootstrap_learned.push(a.to_string());
                                 }
 
-                                // Если это настоящий VOID-клиент — сохраним его
-                                // listen-адрес в контактной книге, чтобы связь поднялась
-                                // после рестарта без ручного ПОДКЛЮЧИТЬ.
                                 if has_chat && peer_id != local_peer_id {
                                     let _ = event_tx
                                         .send(NetworkEvent::PeerAddress(peer_id, a))
@@ -5478,6 +5507,24 @@ pub async fn run_chat_network(
                             publish_self_in_dht(
                                 &mut swarm.behaviour_mut().kad,
                                 local_peer_id,
+                            );
+                            // Мы только что стали достижимы через VOID relay —
+                            // чужие клиенты (другая сеть/NAT) могут дозвониться к нам;
+                            // сами тоже сразу набираем контакты по всем bootstrap.
+                            if !renewal {
+                                let _ = event_tx
+                                    .send(NetworkEvent::Status(
+                                        "СВЯЗЬ ЧЕРЕЗ RELAY — можно принимать звонки из VOID".into(),
+                                    ))
+                                    .await;
+                            }
+                            dial_unconnected_contacts(
+                                &mut swarm,
+                                &reconnect_targets,
+                                &bootstrap_peer_ids,
+                                &void_bootstraps,
+                                &mut contact_dial_at,
+                                Duration::from_secs(2),
                             );
                         }
                         SwarmEvent::Behaviour(ChatBehaviourEvent::Relay(
