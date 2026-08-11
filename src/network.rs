@@ -197,6 +197,55 @@ fn relay_circuit_dial_addrs(relay_addrs: &[Multiaddr], target: PeerId) -> Vec<Mu
     out
 }
 
+/// Адреса, по которым собеседник может набрать НАС через VOID relay.
+fn our_circuit_dial_hints(
+    local_peer_id: PeerId,
+    void_bootstraps: &[Multiaddr],
+    local_listen_addrs: &HashSet<Multiaddr>,
+) -> Vec<String> {
+    let mut out: Vec<String> = Vec::new();
+    for ma in local_listen_addrs {
+        let s = ma.to_string();
+        if !s.contains("p2p-circuit") {
+            continue;
+        }
+        let mut dial = ma.clone();
+        let has_self = dial.iter().any(|p| matches!(p, libp2p::multiaddr::Protocol::P2p(pid) if pid == local_peer_id));
+        if !has_self {
+            dial.push(libp2p::multiaddr::Protocol::P2p(local_peer_id));
+        }
+        let ds = dial.to_string();
+        if !out.contains(&ds) {
+            out.push(ds);
+        }
+    }
+    for circuit in relay_circuit_dial_addrs(void_bootstraps, local_peer_id) {
+        let s = circuit.to_string();
+        if !out.contains(&s) {
+            out.push(s);
+        }
+    }
+    out
+}
+
+fn send_dial_back_hint(
+    swarm: &mut libp2p::Swarm<ChatBehaviour>,
+    peer: PeerId,
+    local_peer_id: PeerId,
+    void_bootstraps: &[Multiaddr],
+    local_listen_addrs: &HashSet<Multiaddr>,
+) {
+    let circuit_addrs =
+        our_circuit_dial_hints(local_peer_id, void_bootstraps, local_listen_addrs);
+    if circuit_addrs.is_empty() {
+        return;
+    }
+    let _ = swarm.behaviour_mut().request_response.send_request(
+        &peer,
+        V1Packet::DialBack { circuit_addrs },
+    );
+}
+
 fn bootstrap_peer_ids_from(void_bootstraps: &[Multiaddr]) -> HashSet<PeerId> {
     void_bootstraps
         .iter()
@@ -620,6 +669,8 @@ pub(crate) enum NetworkEvent {
     PeerAddress(PeerId, Multiaddr),
     /// Новые bootstrap-ноды узнаны из сети — сохранить в vault.
     BootstrapsLearned(Vec<String>),
+    /// Hop ReservationReqAccepted — мы реально reachable через VOID relay.
+    RelayHopReady { relay: PeerId },
     /// Получен Response (Ack) на ранее отправленное сообщение — доставка подтверждена.
     MessageDelivered { peer: PeerId, message_id: String },
     /// Собеседник прочитал наши сообщения.
@@ -4010,6 +4061,57 @@ pub async fn run_chat_network(
                                                 .request_response
                                                 .send_response(channel, V1Packet::Ack);
                                         }
+                                        V1Packet::DialBack { circuit_addrs } => {
+                                            // Собеседник просит обратный dial через relay —
+                                            // обязательно при асимметрии NAT (Mac→Win ok, Win→Mac нет).
+                                            watch_contact_peer(
+                                                &mut reconnect_targets,
+                                                peer,
+                                                &bootstrap_peer_ids,
+                                                local_peer_id,
+                                            );
+                                            let mut hints: Vec<Multiaddr> = circuit_addrs
+                                                .iter()
+                                                .filter_map(|s| s.parse().ok())
+                                                .filter(|a: &Multiaddr| {
+                                                    is_circuit_addr(a) && !is_junk_addr(a)
+                                                })
+                                                .collect();
+                                            hints.sort_by(|a, b| a.to_string().cmp(&b.to_string()));
+                                            hints.dedup();
+                                            if !hints.is_empty() {
+                                                let list =
+                                                    reconnect_targets.entry(peer).or_default();
+                                                for h in &hints {
+                                                    if !list.contains(h) {
+                                                        list.insert(0, h.clone());
+                                                    }
+                                                }
+                                                dial_peer_with_condition(
+                                                    &mut swarm,
+                                                    peer,
+                                                    hints,
+                                                    &void_bootstraps,
+                                                    libp2p::swarm::dial_opts::PeerCondition::Always,
+                                                    false,
+                                                );
+                                            }
+                                            dial_peer_live_circuits(
+                                                &mut swarm,
+                                                peer,
+                                                &void_bootstraps,
+                                                true,
+                                            );
+                                            let _ = swarm
+                                                .behaviour_mut()
+                                                .request_response
+                                                .send_response(channel, V1Packet::Ack);
+                                            debug!(
+                                                "[{}] ↩ DialBack от {} — обратный circuit dial",
+                                                now,
+                                                &peer.to_string()[..8]
+                                            );
+                                        }
                                         V1Packet::Hello {
                                             public_key,
                                             ephemeral_key,
@@ -4871,6 +4973,7 @@ pub async fn run_chat_network(
                                             }
                                         }
                                         V1Packet::BootstrapGossip { .. } => {}
+                                        V1Packet::DialBack { .. } => {}
                                         V1Packet::OfflineMailboxStore { .. }
                                         | V1Packet::OfflineMailboxQuery { .. } => {}
                                     }
@@ -5159,6 +5262,15 @@ pub async fn run_chat_network(
                                              V1Packet::BootstrapGossip { addrs: gossip },
                                          );
                                      }
+                                     // Просим собеседника набрать НАС через circuit —
+                                     // иначе при асимметрии NAT он так и останется «не в сети».
+                                     send_dial_back_hint(
+                                         &mut swarm,
+                                         peer_id,
+                                         local_peer_id,
+                                         &void_bootstraps,
+                                         &local_listen_addrs,
+                                     );
                                  }
                                  // Передаём рабочий multiaddr в UI: для Dialer — кого набирали,
                                  // для Listener — кто пришёл (send_back_addr + /p2p/peer_id).
@@ -5547,6 +5659,11 @@ pub async fn run_chat_network(
                                 &relay_peer_id.to_string()[..8]
                             );
                             relay_circuit_reserved.insert(relay_peer_id);
+                            let _ = event_tx
+                                .send(NetworkEvent::RelayHopReady {
+                                    relay: relay_peer_id,
+                                })
+                                .await;
                             publish_self_in_dht(
                                 &mut swarm.behaviour_mut().kad,
                                 local_peer_id,

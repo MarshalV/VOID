@@ -571,6 +571,11 @@ pub(crate) enum V1Packet {
     BootstrapGossip {
         addrs: Vec<String>,
     },
+    /// «Дозвонись ко мне через relay» — чинит асимметрию NAT (A→B есть, B→A нет).
+    DialBack {
+        /// Полные multiaddr вида `…/p2p/<relay>/p2p-circuit/p2p/<me>`.
+        circuit_addrs: Vec<String>,
+    },
     /// Store-and-forward: сохранить офлайн-почту для получателя (E2EE-конверты).
     OfflineMailboxStore {
         recipient: String,

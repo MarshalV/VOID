@@ -130,7 +130,7 @@
     els.beaconBanner.hidden = !s.beacon_active;
     const pidShort = (s.peer_id || "").slice(0, 12);
     const live = (s.bootstrap_connected || 0) + (s.connected_peers || 0);
-    const relay = s.relay_reserved ? " · relay OK" : " · нет relay (NAT!)";
+    const relay = s.relay_reserved ? " · relay Hop OK" : " · нет Hop (NAT закрыт)";
     const netLabel = s.network_ok
       ? (s.bootstrap_connected > 0 ? "в сети" : "есть соединения")
       : (s.bootstraps?.length ? "нет связи с bootstrap" : "bootstrap не задан");
@@ -139,7 +139,9 @@
     els.connStatus.title = [s.peer_id || "", ...(s.bootstraps || []).slice(0, 4)]
       .filter(Boolean)
       .join("\n");
-    els.connStatus.style.color = s.network_ok ? "var(--accent)" : "var(--danger)";
+    els.connStatus.style.color = s.relay_reserved
+      ? "var(--accent)"
+      : (s.network_ok ? "#c9a227" : "var(--danger)");
 
     const cSig = contactsSig(s);
     if (cSig !== lastContactSig) {

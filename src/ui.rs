@@ -2352,6 +2352,16 @@ impl eframe::App for App {
                 NetworkEvent::BootstrapsLearned(addrs) => {
                     self.merge_learned_bootstraps(addrs);
                 }
+                NetworkEvent::RelayHopReady { relay } => {
+                    self.push_toast(
+                        format!(
+                            "Relay Hop OK ({})",
+                            &relay.to_string()[..12.min(relay.to_string().len())]
+                        ),
+                        ToastKind::Info,
+                        TOAST_TTL_SHORT,
+                    );
+                }
                 NetworkEvent::PeerAddress(peer, ma) => {
                     if peer == self.local_peer_id {
                         continue;

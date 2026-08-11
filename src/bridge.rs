@@ -251,6 +251,8 @@ struct Inner {
     offline_dht_publish_after: Option<Instant>,
     offline_mail_processed: HashSet<String>,
     snapshot_dirty: bool,
+    /// Confirmed Circuit Relay Hop (ReservationReqAccepted).
+    relay_hop_ready: bool,
 }
 
 impl Inner {
@@ -288,6 +290,7 @@ impl Inner {
             offline_dht_publish_after: None,
             offline_mail_processed: HashSet::new(),
             snapshot_dirty: false,
+            relay_hop_ready: false,
         }
     }
 
@@ -908,10 +911,11 @@ impl Inner {
             },
             network_ok: !self.connected_peer_ids.is_empty(),
             listen_addrs: self.listen_addrs.clone(),
-            relay_reserved: self
-                .listen_addrs
-                .iter()
-                .any(|a| a.contains("p2p-circuit")),
+            relay_reserved: self.relay_hop_ready
+                || self
+                    .listen_addrs
+                    .iter()
+                    .any(|a| a.contains("p2p-circuit")),
             selected_chat: self.selected_chat.clone(),
             contacts,
             messages,
@@ -991,6 +995,9 @@ impl VoidRuntime {
                         NetworkEvent::Disconnected(pid) | NetworkEvent::MdnsExpired(pid) => {
                             g.connected_peer_ids.remove(&pid);
                             g.recount_connected();
+                            if g.bootstrap_connected_count() == 0 {
+                                g.relay_hop_ready = false;
+                            }
                             bridge_evs.push(BridgeEvent::Peer {
                                 peer_id: pid.to_string(),
                                 online: false,
@@ -1001,6 +1008,15 @@ impl VoidRuntime {
                             g.contact_addrs.entry(pid).or_default().push(addr);
                         }
                         NetworkEvent::ChatMessage(msg) => {
+                            if let Ok(pid) = msg.sender_id.parse::<PeerId>() {
+                                if g.connected_peer_ids.insert(pid) {
+                                    g.recount_connected();
+                                    bridge_evs.push(BridgeEvent::Peer {
+                                        peer_id: pid.to_string(),
+                                        online: true,
+                                    });
+                                }
+                            }
                             let chat_id = msg
                                 .group_id
                                 .as_ref()
@@ -1055,6 +1071,14 @@ impl VoidRuntime {
                             bridge_evs.push(BridgeEvent::Bootstraps {
                                 addrs: g.void_bootstrap_strings.clone(),
                             });
+                            emit_snapshot = true;
+                        }
+                        NetworkEvent::RelayHopReady { relay } => {
+                            g.relay_hop_ready = true;
+                            g.add_status(format!(
+                                "Relay Hop OK ({})",
+                                &relay.to_string()[..12.min(relay.to_string().len())]
+                            ));
                             emit_snapshot = true;
                         }
                         NetworkEvent::MessageDelivered { peer, message_id } => {
