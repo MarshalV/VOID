@@ -507,6 +507,76 @@ fn dial_unconnected_contacts(
     }
 }
 
+/// listen_on(/p2p-circuit) for each live bootstrap that has no confirmed Hop yet.
+/// `relay_circuit_reserved` = ReservationReqAccepted only (not listen_on Ok).
+fn ensure_bootstrap_relay_listens(
+    swarm: &mut libp2p::Swarm<ChatBehaviour>,
+    bootstrap_peer_ids: &HashSet<PeerId>,
+    void_bootstraps: &[Multiaddr],
+    reconnect_targets: &HashMap<PeerId, Vec<Multiaddr>>,
+    relay_circuit_reserved: &HashSet<PeerId>,
+    relay_listen_attempt_at: &mut HashMap<PeerId, Instant>,
+    min_retry: Duration,
+) {
+    let now = Instant::now();
+    for &relay_pid in bootstrap_peer_ids {
+        if !swarm.is_connected(&relay_pid) || relay_circuit_reserved.contains(&relay_pid) {
+            continue;
+        }
+        if relay_listen_attempt_at
+            .get(&relay_pid)
+            .is_some_and(|t| now.duration_since(*t) < min_retry)
+        {
+            continue;
+        }
+        relay_listen_attempt_at.insert(relay_pid, now);
+        let relay_src: Vec<Multiaddr> = reconnect_targets
+            .get(&relay_pid)
+            .cloned()
+            .unwrap_or_else(|| {
+                void_bootstraps
+                    .iter()
+                    .filter(|ma| peer_id_from_multiaddr(ma) == Some(relay_pid))
+                    .cloned()
+                    .collect()
+            });
+        for ma in relay_circuit_listen_addrs(&relay_src) {
+            if let Err(e) = swarm.listen_on(ma.clone()) {
+                debug!("relay circuit listen retry {}: {:?}", ma, e);
+            } else {
+                debug!("📡 relay circuit listen (pending Hop Ack): {}", ma);
+            }
+        }
+    }
+}
+
+/// Force circuit + LAN redial after zombie / RR failure.
+fn redial_contact_hard(
+    swarm: &mut libp2p::Swarm<ChatBehaviour>,
+    peer: PeerId,
+    reconnect_targets: &HashMap<PeerId, Vec<Multiaddr>>,
+    void_bootstraps: &[Multiaddr],
+) {
+    dial_peer_live_circuits(swarm, peer, void_bootstraps, true);
+    if let Some(addrs) = reconnect_targets.get(&peer) {
+        let lan: Vec<Multiaddr> = addrs
+            .iter()
+            .filter(|a| is_usable_contact_redial_addr(a) && !is_circuit_addr(a))
+            .cloned()
+            .collect();
+        if !lan.is_empty() {
+            dial_peer_with_condition(
+                swarm,
+                peer,
+                lan,
+                void_bootstraps,
+                libp2p::swarm::dial_opts::PeerCondition::Always,
+                false,
+            );
+        }
+    }
+}
+
 pub(crate) enum NetworkEvent {
     NewListenAddr(Multiaddr),
     MdnsDiscovered(PeerId, Multiaddr),
@@ -2075,10 +2145,12 @@ pub async fn run_chat_network(
         // ─── Файловый sub-протокол ──────────────────────────────────────────
         // Пиры, подключённые через relay (p2p-circuit). К ним применяется rate-limit.
         let mut relay_peers: HashSet<PeerId> = HashSet::new();
-        // Bootstrap peer_ids for which we already called listen_on(/p2p-circuit).
-        // Re-listen on every ConnectionEstablished storms the relay (new reservation
-        // each time) and kills peer↔peer circuits — contacts look offline forever.
+        // Bootstrap peers with confirmed Hop ReservationReqAccepted only.
+        // listen_on Ok is NOT enough — without Hop Ack Mac is undialable via circuit.
         let mut relay_circuit_reserved: HashSet<PeerId> = HashSet::new();
+        let mut relay_listen_attempt_at: HashMap<PeerId, Instant> = HashMap::new();
+        // Consecutive ping failures for chat peers → drop zombie after threshold.
+        let mut peer_ping_fail_streak: HashMap<PeerId, u32> = HashMap::new();
         // Throttle contact dials when chasing via bootstrap circuit.
         let mut contact_dial_at: HashMap<PeerId, Instant> = HashMap::new();
         let mut outgoing_transfers: HashMap<[u8; 16], file_transfer::OutgoingTransfer> =
@@ -2210,25 +2282,33 @@ pub async fn run_chat_network(
                         .collect();
 
                     for (pid, addrs) in to_dial {
-                        let clean: Vec<Multiaddr> = addrs
-                            .into_iter()
-                            .filter(|a| !is_junk_addr(a))
-                            .collect();
-                        if clean.is_empty() {
-                            continue;
-                        }
+                        let _ = addrs;
                         let attempt = reconnect_queue
                             .get(&pid)
                             .map(|(_, a)| *a)
                             .unwrap_or(1);
                         debug!(
-                            "🔄 Автореконнект: {} ({} адр., попытка {}).",
+                            "🔄 Автореконнект: {} (circuit+LAN, попытка {}).",
                             &pid.to_string()[..8],
-                            clean.len(),
                             attempt
                         );
-                        dial_peer_best_effort(&mut swarm, pid, clean, &void_bootstraps);
+                        redial_contact_hard(
+                            &mut swarm,
+                            pid,
+                            &reconnect_targets,
+                            &void_bootstraps,
+                        );
                     }
+                    // Hop reservation: retry listen until ReservationReqAccepted.
+                    ensure_bootstrap_relay_listens(
+                        &mut swarm,
+                        &bootstrap_peer_ids,
+                        &void_bootstraps,
+                        &reconnect_targets,
+                        &relay_circuit_reserved,
+                        &mut relay_listen_attempt_at,
+                        Duration::from_secs(20),
+                    );
                     // Пока хоть один bootstrap жив — набираем контакты через VOID circuit
                     // (LAN не требуется: путь relay/p2p-circuit/p2p/<peer>).
                     dial_unconnected_contacts(
@@ -2481,7 +2561,7 @@ pub async fn run_chat_network(
                                         &mut swarm,
                                         peer_id,
                                         &void_bootstraps,
-                                        false,
+                                        true,
                                     );
                                     if let Some(addrs) = kad_local_addrs_for_peer(
                                         &mut swarm.behaviour_mut().kad,
@@ -4918,21 +4998,12 @@ pub async fn run_chat_network(
                             match error {
                                 libp2p::request_response::OutboundFailure::DialFailure => {
                                     if !is_dup {
-                                        // Circuit-only first — avoid hanging on stale NAT.
-                                        dial_peer_best_effort(
+                                        redial_contact_hard(
                                             &mut swarm,
                                             peer,
-                                            Vec::new(),
+                                            &reconnect_targets,
                                             &void_bootstraps,
                                         );
-                                        if let Some(addrs) = reconnect_targets.get(&peer) {
-                                            dial_peer_best_effort(
-                                                &mut swarm,
-                                                peer,
-                                                addrs.clone(),
-                                                &void_bootstraps,
-                                            );
-                                        }
                                         swarm
                                             .behaviour_mut()
                                             .kad
@@ -4944,20 +5015,13 @@ pub async fn run_chat_network(
                                 | libp2p::request_response::OutboundFailure::Timeout => {
                                     // Zombie connection: one side still "connected".
                                     let _ = swarm.disconnect_peer_id(peer);
-                                    dial_peer_best_effort(
+                                    peer_ping_fail_streak.remove(&peer);
+                                    redial_contact_hard(
                                         &mut swarm,
                                         peer,
-                                        Vec::new(),
+                                        &reconnect_targets,
                                         &void_bootstraps,
                                     );
-                                    if let Some(addrs) = reconnect_targets.get(&peer) {
-                                        dial_peer_best_effort(
-                                            &mut swarm,
-                                            peer,
-                                            addrs.clone(),
-                                            &void_bootstraps,
-                                        );
-                                    }
                                 }
                                 libp2p::request_response::OutboundFailure::UnsupportedProtocols => {
                                     if !is_dup {
@@ -4996,6 +5060,7 @@ pub async fn run_chat_network(
                             // Соединение установлено — снимаем задание на реконнект.
                             reconnect_queue.remove(&peer_id);
                             bootstrap_fail_streak.remove(&peer_id);
+                            peer_ping_fail_streak.remove(&peer_id);
                             flush_pending_relay_for_peer(
                                 &mut swarm,
                                 &mut pending_relay,
@@ -5028,38 +5093,16 @@ pub async fn run_chat_network(
                                  // Резервируем слот на bootstrap-relay, чтобы другие пиры
                                  // могли дозвониться через NAT (circuit relay v2).
                                  if bootstrap_peer_ids.contains(&peer_id) {
-                                     // One reservation per bootstrap peer — repeating
-                                     // listen_on on every reconnect storms the node.
-                                     if !relay_circuit_reserved.contains(&peer_id) {
-                                         let relay_src: Vec<Multiaddr> = reconnect_targets
-                                             .get(&peer_id)
-                                             .cloned()
-                                             .unwrap_or_else(|| {
-                                                 void_bootstraps
-                                                     .iter()
-                                                     .filter(|ma| {
-                                                         peer_id_from_multiaddr(ma) == Some(peer_id)
-                                                     })
-                                                     .cloned()
-                                                     .collect()
-                                             });
-                                         let mut reserved_ok = false;
-                                         for ma in relay_circuit_listen_addrs(&relay_src) {
-                                             if let Err(e) = swarm.listen_on(ma.clone()) {
-                                                 debug!(
-                                                     "relay circuit listen {}: {:?}",
-                                                     ma, e
-                                                 );
-                                             } else {
-                                                 reserved_ok = true;
-                                                 debug!("📡 relay circuit listen: {}", ma);
-                                             }
-                                         }
-                                         if reserved_ok {
-                                             relay_circuit_reserved.insert(peer_id);
-                                         }
-                                     }
-                                     // Now that relay is up, dial contacts through it.
+                                     // Request Hop; confirmed only on ReservationReqAccepted.
+                                     ensure_bootstrap_relay_listens(
+                                         &mut swarm,
+                                         &bootstrap_peer_ids,
+                                         &void_bootstraps,
+                                         &reconnect_targets,
+                                         &relay_circuit_reserved,
+                                         &mut relay_listen_attempt_at,
+                                         Duration::from_secs(5),
+                                     );
                                      dial_unconnected_contacts(
                                          &mut swarm,
                                          &reconnect_targets,
@@ -5134,14 +5177,11 @@ pub async fn run_chat_network(
                                      }
                                  };
                                  if let Some((ref addr, prefer)) = learned {
-                                     // Не сохраняем public ephemeral NAT с Listener —
-                                     // следующий исходящий dial к ним зависает.
-                                     let usable = prefer || is_usable_contact_redial_addr(addr);
+                                     // Только LAN / circuit — public NAT (даже Dialer) яд для reverse dial.
+                                     let usable = is_usable_contact_redial_addr(addr);
                                      if usable {
                                          let list = reconnect_targets.entry(peer_id).or_default();
-                                         if !prefer {
-                                             list.retain(is_usable_contact_redial_addr);
-                                         }
+                                         list.retain(is_usable_contact_redial_addr);
                                          list.retain(|a| a != addr);
                                          if prefer || is_circuit_addr(addr) {
                                              list.insert(0, addr.clone());
@@ -5220,6 +5260,8 @@ pub async fn run_chat_network(
 
                             relay_peers.remove(&peer_id);
                             relay_circuit_reserved.remove(&peer_id);
+                            relay_listen_attempt_at.remove(&peer_id);
+                            peer_ping_fail_streak.remove(&peer_id);
 
                             // E2EE: при обрыве TCP/QUIC сбрасываем криптосостояние с пиром.
                             // Иначе после рестарта одного клиента второй держит «старый» ratchet
@@ -5501,9 +5543,10 @@ pub async fn run_chat_network(
                             },
                         )) => {
                             debug!(
-                                "📡 Relay: резервация на {} (renewal={renewal})",
+                                "📡 Relay: Hop Ack на {} (renewal={renewal})",
                                 &relay_peer_id.to_string()[..8]
                             );
+                            relay_circuit_reserved.insert(relay_peer_id);
                             publish_self_in_dht(
                                 &mut swarm.behaviour_mut().kad,
                                 local_peer_id,
@@ -5544,29 +5587,42 @@ pub async fn run_chat_network(
                             );
                         }
                         SwarmEvent::Behaviour(ChatBehaviourEvent::Ping(ev)) => {
-                            if let Err(e) = ev.result {
-                                let peer = ev.peer;
-                                debug!(
-                                    "⚠️ Ping fail {}: {:?}",
-                                    &peer.to_string()[..8.min(peer.to_string().len())],
-                                    e
-                                );
-                                // Bootstrap: жёстко дропаем зомби.
-                                // Чат-пиры: НЕ disconnect на первый fail — на relay
-                                // RTT-спайки обычны, а после drop обратный dial к Mac
-                                // без его reservation не поднимается → «у него я в
-                                // сети, у меня он офлайн».
-                                if bootstrap_peer_ids.contains(&peer) {
-                                    let _ = swarm.disconnect_peer_id(peer);
-                                } else if reconnect_targets.contains_key(&peer)
-                                    || !swarm.is_connected(&peer)
-                                {
-                                    dial_peer_live_circuits(
-                                        &mut swarm,
-                                        peer,
-                                        &void_bootstraps,
-                                        true,
+                            match ev.result {
+                                Ok(_) => {
+                                    peer_ping_fail_streak.remove(&ev.peer);
+                                }
+                                Err(e) => {
+                                    let peer = ev.peer;
+                                    let streak = peer_ping_fail_streak
+                                        .entry(peer)
+                                        .and_modify(|n| *n = n.saturating_add(1))
+                                        .or_insert(1);
+                                    debug!(
+                                        "⚠️ Ping fail {} (#{streak}): {:?}",
+                                        &peer.to_string()[..8.min(peer.to_string().len())],
+                                        e
                                     );
+                                    if bootstrap_peer_ids.contains(&peer) {
+                                        let _ = swarm.disconnect_peer_id(peer);
+                                        peer_ping_fail_streak.remove(&peer);
+                                    } else if *streak >= 2 {
+                                        // Zombie: Mac «в сети», Windows нет / RR мёртв.
+                                        peer_ping_fail_streak.remove(&peer);
+                                        let _ = swarm.disconnect_peer_id(peer);
+                                        redial_contact_hard(
+                                            &mut swarm,
+                                            peer,
+                                            &reconnect_targets,
+                                            &void_bootstraps,
+                                        );
+                                    } else if reconnect_targets.contains_key(&peer) {
+                                        dial_peer_live_circuits(
+                                            &mut swarm,
+                                            peer,
+                                            &void_bootstraps,
+                                            true,
+                                        );
+                                    }
                                 }
                             }
                         }
