@@ -3747,9 +3747,12 @@ pub async fn run_chat_network(
                                     signal_publish_done(&shared_gate, false);
                                 }
                                 for (recipient, batch) in by_recipient {
-                                    let recip_done = shared_gate
+                                    // Always track Store→MessageDelivered, even when
+                                    // exit-ack channel is absent (normal UI send).
+                                    let recip_done: PublishDone = shared_gate
                                         .as_ref()
-                                        .map(|g| once_publish_gate(g.clone()));
+                                        .map(|g| once_publish_gate(g.clone()))
+                                        .unwrap_or_else(|| Arc::new(|_| {}) as PublishDone);
                                     let mut sealed: Vec<OfflineEnvelope> = Vec::new();
                                     let mut need_prekey: Vec<OfflineOutboxItem> = Vec::new();
                                     if let Some(pk_bytes) = peer_prekeys.get(&recipient) {
@@ -3771,7 +3774,7 @@ pub async fn run_chat_network(
                                         need_prekey = batch;
                                     }
                                     if sealed.is_empty() && need_prekey.is_empty() {
-                                        signal_publish_done(&recip_done, false);
+                                        recip_done(false);
                                         continue;
                                     }
                                     if !sealed.is_empty() {
@@ -3785,13 +3788,11 @@ pub async fn run_chat_network(
                                         // Почта только через bootstrap-ноды (Store Ack).
                                         // DHT-ящик отключён — нода = единственный store-and-forward.
                                         let allow_dht = bootstrap_peer_ids.is_empty();
-                                        let handoff = recip_done.as_ref().map(|d| {
-                                            ActiveHandoff::new(
-                                                &sealed,
-                                                d.clone(),
-                                                allow_dht,
-                                            )
-                                        });
+                                        let handoff = Some(ActiveHandoff::new(
+                                            &sealed,
+                                            recip_done.clone(),
+                                            allow_dht,
+                                        ));
                                         publish_relay_mail(
                                             &mut swarm,
                                             &bootstrap_peer_ids,
@@ -3821,6 +3822,11 @@ pub async fn run_chat_network(
                                                 warn!(
                                                     "VOID: нет подключенной bootstrap-ноды для offline-почты"
                                                 );
+                                                let _ = event_tx
+                                                    .send(NetworkEvent::Status(
+                                                        "❌ Нет связи с bootstrap — офлайн-почта не сдана".into(),
+                                                    ))
+                                                    .await;
                                                 h.note_fail();
                                             }
                                         }
@@ -3862,7 +3868,7 @@ pub async fn run_chat_network(
                                             MailboxKadOp::PrekeyForPublish {
                                                 recipient,
                                                 items: need_prekey,
-                                                done: recip_done,
+                                                done: Some(recip_done),
                                                 prekey_bytes: None,
                                             },
                                         );
@@ -5893,13 +5899,15 @@ pub async fn run_chat_network(
                                                         }
                                                         let allow_dht =
                                                             bootstrap_peer_ids.is_empty();
-                                                        let handoff = done.as_ref().map(|d| {
-                                                            ActiveHandoff::new(
-                                                                &sealed,
-                                                                d.clone(),
-                                                                allow_dht,
-                                                            )
-                                                        });
+                                                        let done_cb: PublishDone = done
+                                                            .unwrap_or_else(
+                                                                || Arc::new(|_| {}) as PublishDone,
+                                                            );
+                                                        let handoff = Some(ActiveHandoff::new(
+                                                            &sealed,
+                                                            done_cb,
+                                                            allow_dht,
+                                                        ));
                                                         publish_relay_mail(
                                                             &mut swarm,
                                                             &bootstrap_peer_ids,
@@ -5929,6 +5937,11 @@ pub async fn run_chat_network(
                                                                 warn!(
                                                                     "VOID: нет bootstrap-ноды для offline (после prekey)"
                                                                 );
+                                                                let _ = event_tx
+                                                                    .send(NetworkEvent::Status(
+                                                                        "❌ Нет связи с bootstrap — офлайн-почта не сдана".into(),
+                                                                    ))
+                                                                    .await;
                                                                 h.note_fail();
                                                             }
                                                         }
@@ -5952,6 +5965,12 @@ pub async fn run_chat_network(
                                                                 for_dht,
                                                                 dht_done,
                                                             );
+                                                        } else {
+                                                            let _ = event_tx
+                                                                .send(NetworkEvent::Status(
+                                                                    "📤 Офлайн → bootstrap-нода (без DHT)".into(),
+                                                                ))
+                                                                .await;
                                                         }
                                                     } else {
                                                         signal_publish_done(&done, false);
