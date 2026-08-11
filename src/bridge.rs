@@ -311,6 +311,10 @@ impl Inner {
             .count()
     }
 
+    fn is_bootstrap_peer(&self, peer: &PeerId) -> bool {
+        bootstrap_peer_ids(&self.void_bootstrap_strings).contains(peer)
+    }
+
     fn schedule_offline_publish(&mut self) {
         if self.outbox_entries.is_empty() {
             return;
@@ -1297,13 +1301,21 @@ impl VoidRuntime {
                         }
                         NetworkEvent::PeerIsNotVoidChat(pid)
                         | NetworkEvent::SendFailedUnsupported(pid) => {
-                            g.known_peers.remove(&pid);
-                            g.contact_addrs.remove(&pid);
-                            g.pending_sends.retain(|p| p.peer != pid);
-                            g.pending_file_sends.retain(|p| p.peer != pid);
-                            g.pending_voice_sends.retain(|p| p.peer != pid);
-                            g.persist_vault();
-                            emit_snapshot = true;
+                            // Bootstrap-нода без /void/chat — не трогаем контакты.
+                            if g.is_bootstrap_peer(&pid) {
+                                g.add_status(
+                                    "❌ Bootstrap без /void/chat — обновите void-bootstrap-node"
+                                        .into(),
+                                );
+                            } else {
+                                g.known_peers.remove(&pid);
+                                g.contact_addrs.remove(&pid);
+                                g.pending_sends.retain(|p| p.peer != pid);
+                                g.pending_file_sends.retain(|p| p.peer != pid);
+                                g.pending_voice_sends.retain(|p| p.peer != pid);
+                                g.persist_vault();
+                                emit_snapshot = true;
+                            }
                         }
                         NetworkEvent::GroupSync {
                             group_id,

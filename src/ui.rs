@@ -15,6 +15,7 @@ use crate::{
     FileTransferProgress, NetworkEvent, OutgoingDeliveryStatus, PendingGroupSend, PendingSend, UICommand,
     RESEND_GRACE,
 };
+use crate::bootstrap::peer_id_from_multiaddr;
 use crate::group::{
     extract_invite_links, group_thread_key, is_group_thread, parse_invite_link, GroupChat,
 };
@@ -2109,26 +2110,41 @@ impl eframe::App for App {
                 NetworkEvent::SendFailedUnsupported(peer) => {
                     // Пир физически не поддерживает чат. Ретраить бессмысленно —
                     // снимаем все ожидания ему и удаляем из контактов.
-                    self.pending_sends.retain(|p| p.peer != peer);
-                    self.pending_voice_sends.retain(|p| p.peer != peer);
-                    let removed_name = self.known_peers.remove(&peer);
-                    self.contact_addrs.remove(&peer);
-                    self.messages.lock().remove(&peer.to_string());
-                    if self.selected_chat == peer.to_string() {
-                        self.selected_chat.clear();
+                    // Bootstrap без /void/chat — не контакт, только статус.
+                    let is_boot = self
+                        .void_bootstrap_strings
+                        .iter()
+                        .filter_map(|s| s.parse::<libp2p::Multiaddr>().ok())
+                        .filter_map(|ma| peer_id_from_multiaddr(&ma))
+                        .any(|p| p == peer);
+                    if is_boot {
+                        self.push_toast(
+                            "✖ Bootstrap без /void/chat — обновите void-bootstrap-node".into(),
+                            ToastKind::Error,
+                            TOAST_TTL_LONG,
+                        );
+                    } else {
+                        self.pending_sends.retain(|p| p.peer != peer);
+                        self.pending_voice_sends.retain(|p| p.peer != peer);
+                        let removed_name = self.known_peers.remove(&peer);
+                        self.contact_addrs.remove(&peer);
+                        self.messages.lock().remove(&peer.to_string());
+                        if self.selected_chat == peer.to_string() {
+                            self.selected_chat.clear();
+                        }
+                        self.persist_vault();
+                        self.mark_chat_journal_dirty();
+                        let label = removed_name
+                            .unwrap_or_else(|| format!("{}…", &peer.to_string()[..10]));
+                        self.push_toast(
+                            format!(
+                                "✖ {} — не VOID-чат (bootstrap/другая версия). Удалён из контактов.",
+                                label
+                            ),
+                            ToastKind::Error,
+                            TOAST_TTL_LONG,
+                        );
                     }
-                    self.persist_vault();
-                    self.mark_chat_journal_dirty();
-                    let label = removed_name
-                        .unwrap_or_else(|| format!("{}…", &peer.to_string()[..10]));
-                    self.push_toast(
-                        format!(
-                            "✖ {} — не VOID-чат (bootstrap/другая версия). Удалён из контактов.",
-                            label
-                        ),
-                        ToastKind::Error,
-                        TOAST_TTL_LONG,
-                    );
                 }
                 NetworkEvent::PeerIsNotVoidChat(peer) => {
                     // Identify показал, что у пира нет /void/chat/1.0.0.

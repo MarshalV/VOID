@@ -1,16 +1,14 @@
-//! Offline outbox publish policy: durable handoff.
+//! Offline outbox publish policy: durable handoff **только через VOID bootstrap-ноды**.
 //!
-//! When VOID bootstrap nodes are configured, durable handoff requires a
-//! Store Ack from a bootstrap (voice chunks always do — DHT mailbox is too small).
-//! DHT Put Ok / Ack from ephemeral peers is only a fallback when there are no
-//! bootstraps (LAN-only mode).
+//! Store Ack от bootstrap по `/void/chat/1.0.0` = ✓. DHT-почта не используется
+//! как durable path (нода — единственный store-and-forward).
 
 use std::collections::{HashMap, HashSet};
 use libp2p::PeerId;
 use crate::offline_mail::{OfflineEnvelope, OFFLINE_VOICE_CHUNK_KIND};
 
-/// DHT Put Ok may settle handoff only for text-only batches in LAN-only mode
-/// (no bootstrap nodes). With bootstraps configured, DHT is best-effort only.
+/// DHT Put Ok как full handoff — только LAN без bootstrap (аварийный режим).
+/// С bootstrap-нодами всегда `false`: почта только через ноды.
 pub(crate) fn accept_dht_as_full_handoff(
     envelopes: &[OfflineEnvelope],
     allow_dht_fallback: bool,
