@@ -526,6 +526,10 @@ impl Inner {
                 continue;
             }
             let Ok(plaintext) = open_envelope(secret, &env) else {
+                warn!(
+                    "VOID: offline mail {} не расшифровался (чужой ключ/битый конверт)",
+                    &env.message_id[..8.min(env.message_id.len())]
+                );
                 continue;
             };
             match env.kind.as_str() {
@@ -1830,8 +1834,10 @@ impl VoidRuntime {
             g.persist_outbox();
             g.push_pending_send(peer, text.clone(), mid.clone());
             g.ensure_peer_routed(peer);
-            g.schedule_offline_publish();
-            g.publish_outbox_to_dht();
+            if !g.connected_peer_ids.contains(&peer) {
+                g.schedule_offline_publish();
+                g.publish_outbox_to_dht();
+            }
             if let Some(tx) = &g.command_tx {
                 if let Err(e) = tx.try_send(UICommand::SendMessage {
                     sender_name: nick,

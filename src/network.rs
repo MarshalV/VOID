@@ -540,9 +540,9 @@ fn dial_unconnected_contacts(
         }
         contact_dial_at.insert(*pid, now);
         if boot_live {
-            // Always: иначе залипший dial к ядовитому NAT держит NotDialing
-            // и Windows «не находит» Mac через relay.
-            dial_peer_live_circuits(swarm, *pid, void_bootstraps, true);
+            // Не Always: каждый лишний circuit открывает HOP-стрим на
+            // bootstrap (лимит 10/соединение) и душит живой чат.
+            dial_peer_live_circuits(swarm, *pid, void_bootstraps, false);
         }
         // LAN/mDNS (без public ephemeral) — вторым заходом.
         let lan: Vec<Multiaddr> = addrs
@@ -606,7 +606,7 @@ fn redial_contact_hard(
     reconnect_targets: &HashMap<PeerId, Vec<Multiaddr>>,
     void_bootstraps: &[Multiaddr],
 ) {
-    dial_peer_live_circuits(swarm, peer, void_bootstraps, true);
+    dial_peer_live_circuits(swarm, peer, void_bootstraps, false);
     if let Some(addrs) = reconnect_targets.get(&peer) {
         let lan: Vec<Multiaddr> = addrs
             .iter()
@@ -2661,7 +2661,7 @@ pub async fn run_chat_network(
                                         &mut swarm,
                                         peer_id,
                                         &void_bootstraps,
-                                        true,
+                                        false,
                                     );
                                     if let Some(addrs) = kad_local_addrs_for_peer(
                                         &mut swarm.behaviour_mut().kad,
@@ -2738,7 +2738,7 @@ pub async fn run_chat_network(
                                         &mut swarm,
                                         peer_id,
                                         &void_bootstraps,
-                                        true,
+                                        false,
                                     );
                                     let lan: Vec<Multiaddr> = peer_addrs
                                         .get(&peer_id)
@@ -2820,7 +2820,7 @@ pub async fn run_chat_network(
                                      &mut swarm,
                                      peer_id,
                                      &void_bootstraps,
-                                     true,
+                                     false,
                                  );
                                  if !lan.is_empty() {
                                      dial_peer_best_effort(
@@ -3021,7 +3021,7 @@ pub async fn run_chat_network(
                                             &mut swarm,
                                             peer_id,
                                             &void_bootstraps,
-                                            true,
+                                            false,
                                         );
                                         let lan: Vec<Multiaddr> = peer_addrs
                                             .get(&peer_id)
@@ -4157,7 +4157,7 @@ pub async fn run_chat_network(
                                                 &mut swarm,
                                                 peer,
                                                 &void_bootstraps,
-                                                true,
+                                                false,
                                             );
                                             let _ = swarm
                                                 .behaviour_mut()
@@ -5201,9 +5201,9 @@ pub async fn run_chat_network(
                                 let _ = event_tx.send(NetworkEvent::PublicIpConfirmed(ip)).await;
                             }
                         }
-                        SwarmEvent::ConnectionEstablished { peer_id, ref endpoint, .. } => {
+                        SwarmEvent::ConnectionEstablished { peer_id, ref endpoint, num_established, .. } => {
                             let connected_count = swarm.connected_peers().count();
-                            debug!("✅ СОЕДИНЕНО: {}. Endpoint: {:?}. Всего пиров: {}", peer_id, endpoint, connected_count);
+                            debug!("✅ СОЕДИНЕНО: {}. Endpoint: {:?}. Всего пиров: {} (conn #{})", peer_id, endpoint, connected_count, num_established);
                             pending_dials.remove(&peer_id);
                             // Соединение установлено — снимаем задание на реконнект.
                             reconnect_queue.remove(&peer_id);
@@ -5216,6 +5216,11 @@ pub async fn run_chat_network(
                                 &mut outbound_mailbox_stores,
                                 peer_id,
                             );
+                            if u32::from(num_established) > 1 {
+                                // Доп. TCP/QUIC к тому же пиру — не шлём второй Hello
+                                // и не дёргаем mailbox/circuit заново.
+                                continue;
+                            }
                             publish_self_in_dht(&mut swarm.behaviour_mut().kad, local_peer_id);
 
                             // Определяем, идёт ли соединение через relay.
@@ -5779,7 +5784,7 @@ pub async fn run_chat_network(
                                             &mut swarm,
                                             peer,
                                             &void_bootstraps,
-                                            true,
+                                            false,
                                         );
                                     }
                                 }
