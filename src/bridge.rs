@@ -141,6 +141,8 @@ pub struct MessageDto {
     pub outgoing: bool,
     pub voice_transfer_id: Option<String>,
     pub voice_duration_secs: Option<f32>,
+    /// Absolute path to local WAV when available (for in-chat playback).
+    pub voice_path: Option<String>,
     pub group_id: Option<String>,
 }
 
@@ -248,6 +250,8 @@ struct Inner {
     pending_sends: Vec<PendingSend>,
     pending_file_sends: Vec<PendingFileSend>,
     pending_voice_sends: Vec<PendingVoiceSend>,
+    /// transfer_id hex → absolute WAV path for in-chat playback.
+    voice_audio_paths: HashMap<String, String>,
     offline_dht_publish_after: Option<Instant>,
     offline_mail_processed: HashSet<String>,
     snapshot_dirty: bool,
@@ -287,6 +291,7 @@ impl Inner {
             pending_sends: Vec::new(),
             pending_file_sends: Vec::new(),
             pending_voice_sends: Vec::new(),
+            voice_audio_paths: HashMap::new(),
             offline_dht_publish_after: None,
             offline_mail_processed: HashSet::new(),
             snapshot_dirty: false,
@@ -487,6 +492,75 @@ impl Inner {
         if let Some(tx) = &self.command_tx {
             let _ = tx.try_send(UICommand::WatchContacts(vec![peer]));
             let _ = tx.try_send(UICommand::EnsureChatSession(peer));
+        }
+    }
+
+    fn register_voice_path(&mut self, transfer_id_hex: &str, path: String) {
+        let tid = transfer_id_hex.to_ascii_lowercase();
+        if std::path::Path::new(&path).is_file() {
+            self.voice_audio_paths.insert(tid, path);
+        }
+    }
+
+    fn lookup_voice_path(&self, transfer_id_hex: &str) -> Option<String> {
+        let tid = transfer_id_hex.to_ascii_lowercase();
+        if let Some(p) = self.voice_audio_paths.get(&tid) {
+            if std::path::Path::new(p).is_file() {
+                return Some(p.clone());
+            }
+        }
+        for pending in &self.pending_voice_sends {
+            let hex: String = pending
+                .transfer_id
+                .iter()
+                .map(|b| format!("{b:02x}"))
+                .collect();
+            if hex == tid {
+                let path = std::path::PathBuf::from(&pending.path);
+                if path.is_file() {
+                    return Some(path.display().to_string());
+                }
+            }
+        }
+        let name = format!(
+            "{}{}.wav",
+            file_transfer::VOICE_FILENAME_PREFIX,
+            tid
+        );
+        let prefix = format!("{}{}", file_transfer::VOICE_FILENAME_PREFIX, tid);
+        for dir in file_transfer::voice_search_dirs() {
+            let direct = dir.join(&name);
+            if direct.is_file() {
+                return Some(direct.display().to_string());
+            }
+            if let Ok(entries) = std::fs::read_dir(&dir) {
+                for entry in entries.flatten() {
+                    let fname = entry.file_name().to_string_lossy().into_owned();
+                    if fname.starts_with(&prefix) && fname.ends_with(".wav") && entry.path().is_file()
+                    {
+                        return Some(entry.path().display().to_string());
+                    }
+                }
+            }
+        }
+        None
+    }
+
+    fn stage_outgoing_voice_wav(&mut self, transfer_id: &[u8; 16], src: &std::path::Path) -> String {
+        match file_transfer::stage_voice_wav(src, transfer_id) {
+            Ok(dest) => {
+                let path = dest.display().to_string();
+                let tid = transfer_id
+                    .iter()
+                    .map(|b| format!("{b:02x}"))
+                    .collect::<String>();
+                self.register_voice_path(&tid, path.clone());
+                path
+            }
+            Err(e) => {
+                warn!("VOID: stage voice wav: {e}");
+                src.display().to_string()
+            }
         }
     }
 
@@ -949,6 +1023,10 @@ impl Inner {
                         OutgoingDeliveryStatus::Delivered => "delivered".into(),
                         OutgoingDeliveryStatus::Read => "read".into(),
                     },
+                    voice_path: m
+                        .voice
+                        .as_ref()
+                        .and_then(|v| self.lookup_voice_path(&v.transfer_id)),
                     voice_transfer_id: m.voice.as_ref().map(|v| v.transfer_id.clone()),
                     voice_duration_secs: m.voice.as_ref().map(|v| v.duration_secs),
                     group_id: m.group_id.clone(),
@@ -1253,16 +1331,21 @@ impl VoidRuntime {
                             total_size,
                             kind,
                         } => {
-                            let dto = FileOfferDto {
-                                transfer_id: hex::encode(transfer_id),
-                                from: from.to_string(),
-                                filename,
-                                total_size,
-                                kind: format!("{kind:?}"),
-                            };
-                            g.incoming_file_offers.push(dto.clone());
-                            bridge_evs.push(BridgeEvent::FileOffer(dto));
-                            emit_snapshot = true;
+                            // Голосовые принимаются сетью автоматически — не как «файл» в UI.
+                            if file_transfer::is_voice_filename(&filename) {
+                                emit_snapshot = true;
+                            } else {
+                                let dto = FileOfferDto {
+                                    transfer_id: hex::encode(transfer_id),
+                                    from: from.to_string(),
+                                    filename,
+                                    total_size,
+                                    kind: format!("{kind:?}"),
+                                };
+                                g.incoming_file_offers.push(dto.clone());
+                                bridge_evs.push(BridgeEvent::FileOffer(dto));
+                                emit_snapshot = true;
+                            }
                         }
                         NetworkEvent::FileProgress {
                             transfer_id,
@@ -1288,20 +1371,34 @@ impl VoidRuntime {
                             let tid = hex::encode(transfer_id);
                             g.incoming_file_offers
                                 .retain(|f| f.transfer_id != tid);
-                            if is_outgoing {
+                            let is_voice = file_transfer::is_voice_filename(&filename);
+                            if is_voice {
+                                if !saved_to.is_empty() {
+                                    g.register_voice_path(&tid, saved_to.clone());
+                                } else if let Some(hex_from_name) =
+                                    file_transfer::voice_transfer_hex_from_filename(&filename)
+                                {
+                                    if let Some(p) = g.lookup_voice_path(&hex_from_name) {
+                                        g.register_voice_path(&tid, p);
+                                    }
+                                }
+                                if !is_outgoing {
+                                    g.add_status("🎤 Голосовое получено".into());
+                                }
+                            } else if is_outgoing {
                                 g.pending_file_sends.retain(|p| p.peer != peer);
                                 g.add_status(format!("✅ Файл «{filename}» доставлен"));
                             } else if !saved_to.is_empty() {
                                 g.add_status(format!("✅ Файл «{filename}» сохранён: {saved_to}"));
                             }
-                            // E2EE с этим пиром точно жив (чанки прошли) —
-                            // немедленно досылаем зависшие ○-сообщения.
                             g.kick_pending_for_peer(peer);
-                            bridge_evs.push(BridgeEvent::FileComplete {
-                                transfer_id: tid,
-                                filename,
-                                saved_to,
-                            });
+                            if !is_voice {
+                                bridge_evs.push(BridgeEvent::FileComplete {
+                                    transfer_id: tid,
+                                    filename,
+                                    saved_to,
+                                });
+                            }
                             emit_snapshot = true;
                         }
                         NetworkEvent::FileError { reason, .. } => {
@@ -1828,7 +1925,24 @@ impl VoidRuntime {
             g.selected_chat = chat_id.clone();
             if group::parse_group_thread_key(&chat_id).is_none() {
                 if let Ok(pid) = chat_id.parse::<PeerId>() {
-                    g.ensure_peer_routed(pid);
+                    if !g.known_peers.contains_key(&pid) {
+                        let label = g
+                            .messages
+                            .lock()
+                            .get(&chat_id)
+                            .and_then(|msgs| msgs.last())
+                            .map(|m| {
+                                if m.sender_id == chat_id {
+                                    m.sender_name.clone()
+                                } else {
+                                    chat_id.chars().take(12).collect()
+                                }
+                            })
+                            .unwrap_or_else(|| chat_id.chars().take(12).collect());
+                        g.note_inbound_peer(pid, &label);
+                    } else {
+                        g.ensure_peer_routed(pid);
+                    }
                 }
             }
         }
@@ -1995,12 +2109,36 @@ impl VoidRuntime {
     pub fn rename_contact(&self, peer_id: String, name: String) -> Result<SnapshotDto, String> {
         let mut g = self.inner.lock().unwrap_or_else(|p| p.into_inner());
         let pid: PeerId = peer_id.parse().map_err(|_| "Неверный PeerId")?;
-        if let Some(n) = g.known_peers.get_mut(&pid) {
-            *n = name.trim().to_string();
-            g.persist_vault();
-        } else {
-            return Err("Контакт не найден".into());
+        let trimmed = name.trim().to_string();
+        if trimmed.is_empty() {
+            return Err("Имя пустое".into());
         }
+        g.known_peers.insert(pid, trimmed);
+        g.persist_vault();
+        g.ensure_peer_routed(pid);
+        drop(g);
+        self.emit_snapshot();
+        Ok(self.get_snapshot())
+    }
+
+    pub fn clear_chat(&self, peer_id: String) -> Result<SnapshotDto, String> {
+        let mut g = self.inner.lock().unwrap_or_else(|p| p.into_inner());
+        let pid: PeerId = peer_id.parse().map_err(|_| "Неверный PeerId")?;
+        let peer_str = pid.to_string();
+        let ids: Vec<String> = g
+            .messages
+            .lock()
+            .get(&peer_str)
+            .map(|v| v.iter().map(|m| m.id.clone()).collect())
+            .unwrap_or_default();
+        g.messages.lock().remove(&peer_str);
+        g.messages.mark_deleted(ids);
+        g.messages.mark_dirty();
+        g.persist_journal();
+        g.pending_sends.retain(|p| p.peer != pid);
+        g.pending_file_sends.retain(|p| p.peer != pid);
+        g.pending_voice_sends.retain(|p| p.peer != pid);
+        g.add_status("Переписка очищена (контакт сохранён)".into());
         drop(g);
         self.emit_snapshot();
         Ok(self.get_snapshot())
@@ -2196,6 +2334,7 @@ impl VoidRuntime {
         let mut tid = [0u8; 16];
         rand::thread_rng().fill_bytes(&mut tid);
         let tid_hex = tid.iter().map(|b| format!("{:02x}", b)).collect::<String>();
+        let staged = g.stage_outgoing_voice_wav(&tid, &path);
         let msg = ChatMessage {
             id: mid.clone(),
             sender_id: local.to_string(),
@@ -2219,7 +2358,7 @@ impl VoidRuntime {
             let _ = tx.try_send(UICommand::SendVoiceMessage {
                 sender_name: nick,
                 recipient: peer,
-                path: path.display().to_string(),
+                path: staged,
                 duration_secs: duration,
                 message_id: mid,
                 transfer_id: tid,

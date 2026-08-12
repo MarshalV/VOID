@@ -1,7 +1,6 @@
 (() => {
   const asset = (name) => {
     const encoded = name.split("/").map(encodeURIComponent).join("/");
-    // cache-bust cropped icons (old padded PNGs were cached by WebView)
     return `static/${encoded}?v=7`;
   };
 
@@ -18,6 +17,12 @@
     return null;
   }
 
+  function convertFileSrc(path) {
+    const c = window.__TAURI__?.core?.convertFileSrc;
+    if (c && path) return c(path);
+    return path || "";
+  }
+
   const els = {
     unlockScreen: document.getElementById("unlock-screen"),
     mainScreen: document.getElementById("main-screen"),
@@ -30,6 +35,9 @@
     unlockError: document.getElementById("unlock-error"),
     unlockBtn: document.getElementById("unlock-btn"),
     chatList: document.getElementById("chat-list"),
+    chatPeerBtn: document.getElementById("chat-peer-btn"),
+    chatHeaderEmpty: document.getElementById("chat-header-empty"),
+    chatAvatar: document.getElementById("chat-avatar"),
     chatTitle: document.getElementById("chat-title"),
     chatSub: document.getElementById("chat-sub"),
     messages: document.getElementById("messages"),
@@ -47,6 +55,7 @@
     fileOffers: document.getElementById("file-offers"),
     toast: document.getElementById("toast"),
     sidebar: document.getElementById("sidebar"),
+    ctxMenu: document.getElementById("ctx-menu"),
   };
 
   let invoke = null;
@@ -58,17 +67,22 @@
   let lastContactSig = "";
   let snapTimer = null;
   let pendingSnap = null;
+  let activeAudio = null;
+  let menuSection = "contacts";
 
   function messagesSig(s) {
     const msgs = s?.messages || [];
     return msgs
-      .map((m) => `${m.id}:${m.delivery}:${m.text?.length || 0}:${m.voice_transfer_id || ""}`)
+      .map(
+        (m) =>
+          `${m.id}:${m.delivery}:${m.text?.length || 0}:${m.voice_transfer_id || ""}:${m.voice_path || ""}`
+      )
       .join("|");
   }
 
   function contactsSig(s) {
     return (s?.contacts || [])
-      .map((c) => `${c.peer_id}:${c.online}:${c.last_preview || ""}`)
+      .map((c) => `${c.peer_id}:${c.online}:${c.display_name}:${c.last_preview || ""}`)
       .join("|");
   }
 
@@ -82,7 +96,6 @@
   function showToast(text) {
     const msg = String(text ?? "").trim();
     if (!msg) return;
-    // Never toast raw network chatter (bootstrap failover, dial noise, etc.).
     const noise =
       /bootstrap|пробую|недоступен|переключ|дозваниваюсь|seed|dht|подключ|ошибка подключ|мdns|kad|dial/i.test(
         msg
@@ -108,6 +121,11 @@
     els.modalBody.innerHTML = "";
   }
 
+  function hideCtx() {
+    els.ctxMenu.hidden = true;
+    els.ctxMenu.innerHTML = "";
+  }
+
   function deliveryMark(d) {
     if (d === "read") return "✓✓";
     if (d === "delivered") return "✓";
@@ -118,6 +136,16 @@
     let h = 0;
     for (let i = 0; i < seed.length; i++) h = (h * 31 + seed.charCodeAt(i)) >>> 0;
     return `hsl(${h % 360} 32% 38%)`;
+  }
+
+  function escapeHtml(s) {
+    return String(s)
+      .replace(/&/g, "&amp;")
+      .replace(/</g, "&lt;")
+      .replace(/>/g, "&gt;");
+  }
+  function escapeAttr(s) {
+    return escapeHtml(s).replace(/"/g, "&quot;");
   }
 
   function applySnapshotNow(s) {
@@ -132,16 +160,21 @@
     const live = (s.bootstrap_connected || 0) + (s.connected_peers || 0);
     const relay = s.relay_reserved ? " · relay Hop OK" : " · нет Hop (NAT закрыт)";
     const netLabel = s.network_ok
-      ? (s.bootstrap_connected > 0 ? "в сети" : "есть соединения")
-      : (s.bootstraps?.length ? "нет связи с bootstrap" : "bootstrap не задан");
-    els.connStatus.textContent =
-      `${netLabel}${relay} · ${pidShort}… · live ${live} · контакты ${s.connected_peers} · bootstrap ${s.bootstrap_connected}/${s.bootstraps?.length || 0}`;
+      ? s.bootstrap_connected > 0
+        ? "в сети"
+        : "есть соединения"
+      : s.bootstraps?.length
+        ? "нет связи с bootstrap"
+        : "bootstrap не задан";
+    els.connStatus.textContent = `${netLabel}${relay} · ${pidShort}… · live ${live} · контакты ${s.connected_peers} · bootstrap ${s.bootstrap_connected}/${s.bootstraps?.length || 0}`;
     els.connStatus.title = [s.peer_id || "", ...(s.bootstraps || []).slice(0, 4)]
       .filter(Boolean)
       .join("\n");
     els.connStatus.style.color = s.relay_reserved
       ? "var(--accent)"
-      : (s.network_ok ? "#c9a227" : "var(--danger)");
+      : s.network_ok
+        ? "#c9a227"
+        : "var(--danger)";
 
     const cSig = contactsSig(s);
     if (cSig !== lastContactSig) {
@@ -160,24 +193,35 @@
     const enabled = !!s.selected_chat;
     els.messageInput.disabled = !enabled;
     els.sendBtn.disabled = !enabled;
-    if (s.selected_chat) {
-      const c = (s.contacts || []).find((x) => x.peer_id === s.selected_chat);
-      els.chatTitle.textContent = c?.display_name || s.selected_chat.slice(0, 16);
-      if (c?.is_group) {
-        els.chatSub.textContent = "Группа";
-      } else if (c?.online) {
-        els.chatSub.textContent = "в сети · " + (c.peer_id || "").slice(0, 16) + "…";
-      } else {
-        els.chatSub.textContent =
-          "не в сети · PeerId " + (c?.peer_id || s.selected_chat || "").slice(0, 20) + "…";
-        els.chatSub.title = c?.peer_id || s.selected_chat || "";
-      }
-    } else {
-      els.chatTitle.textContent = "Выберите чат";
-      els.chatSub.textContent = "";
-    }
+    updateChatHeader(s);
     recording = !!s.voice_recording;
     els.composer.classList.toggle("recording", recording);
+  }
+
+  function updateChatHeader(s) {
+    if (!s.selected_chat) {
+      els.chatPeerBtn.hidden = true;
+      els.chatHeaderEmpty.hidden = false;
+      return;
+    }
+    els.chatHeaderEmpty.hidden = true;
+    els.chatPeerBtn.hidden = false;
+    const c = (s.contacts || []).find((x) => x.peer_id === s.selected_chat);
+    const name = c?.display_name || s.selected_chat.slice(0, 16);
+    const letter = (name || "?").trim().charAt(0).toUpperCase();
+    els.chatAvatar.textContent = letter;
+    els.chatAvatar.style.background = avatarColor(s.selected_chat);
+    els.chatAvatar.classList.toggle("online", !!c?.online);
+    els.chatTitle.textContent = name;
+    if (c?.is_group) {
+      els.chatSub.textContent = "Группа";
+    } else if (c?.online) {
+      els.chatSub.textContent = "в сети · " + (c.peer_id || "").slice(0, 16) + "…";
+    } else {
+      els.chatSub.textContent =
+        "не в сети · PeerId " + (c?.peer_id || s.selected_chat || "").slice(0, 20) + "…";
+      els.chatSub.title = c?.peer_id || s.selected_chat || "";
+    }
   }
 
   function applySnapshot(s) {
@@ -214,6 +258,7 @@
         ? "в сети"
         : c.last_preview || (c.is_group ? "Группа" : c.peer_id.slice(0, 20));
       item.addEventListener("click", async () => {
+        hideCtx();
         const next = await invoke("select_chat", { chatId: c.peer_id });
         applySnapshot(next);
         if (window.matchMedia("(max-width: 820px)").matches) {
@@ -221,7 +266,51 @@
         }
         els.sidebar.classList.remove("open");
       });
+      item.addEventListener("contextmenu", (e) => {
+        e.preventDefault();
+        if (c.is_group) return;
+        showContactContextMenu(e.clientX, e.clientY, c);
+      });
       els.chatList.appendChild(item);
+    });
+  }
+
+  function showContactContextMenu(x, y, c) {
+    els.ctxMenu.innerHTML = `
+      <button type="button" data-act="rename">Переименовать контакт</button>
+      <button type="button" data-act="clear">Очистить чат</button>
+      <button type="button" data-act="copy">Копировать Peer ID</button>
+      <button type="button" data-act="delete" class="danger">Удалить пир</button>`;
+    els.ctxMenu.hidden = false;
+    const pad = 8;
+    const rect = els.ctxMenu.getBoundingClientRect();
+    const w = rect.width || 220;
+    const h = rect.height || 160;
+    els.ctxMenu.style.left = `${Math.min(x, window.innerWidth - w - pad)}px`;
+    els.ctxMenu.style.top = `${Math.min(y, window.innerHeight - h - pad)}px`;
+    els.ctxMenu.querySelectorAll("button").forEach((btn) => {
+      btn.onclick = async () => {
+        hideCtx();
+        const act = btn.getAttribute("data-act");
+        try {
+          if (act === "copy") {
+            await navigator.clipboard.writeText(c.peer_id);
+            showToast("Peer ID скопирован");
+          } else if (act === "rename") {
+            const name = window.prompt("Новое имя контакта", c.display_name || "");
+            if (name == null || !name.trim()) return;
+            applySnapshot(await invoke("rename_contact", { peerId: c.peer_id, name: name.trim() }));
+          } else if (act === "clear") {
+            if (!window.confirm("Очистить переписку с этим контактом?")) return;
+            applySnapshot(await invoke("clear_chat", { peerId: c.peer_id }));
+          } else if (act === "delete") {
+            if (!window.confirm("Удалить контакт из книги?")) return;
+            applySnapshot(await invoke("remove_contact", { peerId: c.peer_id }));
+          }
+        } catch (err) {
+          showToast(String(err));
+        }
+      };
     });
   }
 
@@ -233,25 +322,97 @@
     msgs.forEach((m) => {
       const div = document.createElement("div");
       div.className = `message ${m.outgoing ? "sent" : "received"}`;
-      const body = m.voice_transfer_id
-        ? `🎤 Голосовое (${(m.voice_duration_secs || 0).toFixed(1)} с)`
-        : m.text;
-      div.innerHTML = `<div class="body"></div><div class="meta"><span></span><span></span></div>`;
-      div.querySelector(".body").textContent = body;
-      const meta = div.querySelectorAll(".meta span");
-      meta[0].textContent = m.timestamp || "";
-      meta[1].textContent = m.outgoing ? deliveryMark(m.delivery) : "";
+      if (m.voice_transfer_id) {
+        div.classList.add("voice-msg");
+        const dur = (m.voice_duration_secs || 0).toFixed(1);
+        const ready = !!m.voice_path;
+        div.innerHTML = `
+          <div class="voice-player" data-tid="${escapeAttr(m.voice_transfer_id)}">
+            <button type="button" class="voice-play" ${ready ? "" : "disabled"} title="${ready ? "Play/Pause" : "Ещё загружается…"}">${ready ? "▶" : "…"}</button>
+            <input type="range" class="voice-seek" min="0" max="1000" value="0" ${ready ? "" : "disabled"} />
+            <span class="voice-time">0:00 / ${fmtTime(m.voice_duration_secs || 0)}</span>
+          </div>
+          <div class="meta"><span></span><span></span></div>`;
+        const meta = div.querySelectorAll(".meta span");
+        meta[0].textContent = m.timestamp || "";
+        meta[1].textContent = m.outgoing ? deliveryMark(m.delivery) : "";
+        if (ready) wireVoiceControls(div, m);
+      } else {
+        div.innerHTML = `<div class="body"></div><div class="meta"><span></span><span></span></div>`;
+        div.querySelector(".body").textContent = m.text;
+        const meta = div.querySelectorAll(".meta span");
+        meta[0].textContent = m.timestamp || "";
+        meta[1].textContent = m.outgoing ? deliveryMark(m.delivery) : "";
+      }
       els.messages.appendChild(div);
     });
-    // Keep position unless caller scrolls to bottom.
     if (els.messages.scrollHeight === prevHeight) {
       els.messages.scrollTop = prevScroll;
     }
   }
 
+  function fmtTime(sec) {
+    const s = Math.max(0, Math.floor(sec || 0));
+    const m = Math.floor(s / 60);
+    const r = s % 60;
+    return `${m}:${String(r).padStart(2, "0")}`;
+  }
+
+  function wireVoiceControls(div, m) {
+    const root = div.querySelector(".voice-player");
+    const playBtn = root.querySelector(".voice-play");
+    const seek = root.querySelector(".voice-seek");
+    const timeEl = root.querySelector(".voice-time");
+    const src = convertFileSrc(m.voice_path);
+    let audio = null;
+
+    const ensureAudio = () => {
+      if (audio) return audio;
+      audio = new Audio(src);
+      audio.preload = "metadata";
+      audio.addEventListener("timeupdate", () => {
+        if (!audio.duration) return;
+        seek.value = String(Math.floor((audio.currentTime / audio.duration) * 1000));
+        timeEl.textContent = `${fmtTime(audio.currentTime)} / ${fmtTime(audio.duration || m.voice_duration_secs || 0)}`;
+      });
+      audio.addEventListener("ended", () => {
+        playBtn.textContent = "▶";
+        seek.value = "0";
+      });
+      audio.addEventListener("play", () => {
+        playBtn.textContent = "❚❚";
+      });
+      audio.addEventListener("pause", () => {
+        playBtn.textContent = "▶";
+      });
+      return audio;
+    };
+
+    playBtn.onclick = async () => {
+      try {
+        const a = ensureAudio();
+        if (activeAudio && activeAudio !== a) {
+          activeAudio.pause();
+        }
+        activeAudio = a;
+        if (a.paused) await a.play();
+        else a.pause();
+      } catch (e) {
+        showToast("Не удалось воспроизвести: " + e);
+      }
+    };
+
+    seek.oninput = () => {
+      const a = ensureAudio();
+      if (!a.duration) return;
+      a.currentTime = (Number(seek.value) / 1000) * a.duration;
+    };
+  }
+
   function renderFileOffers() {
     els.fileOffers.innerHTML = "";
     (snapshot?.incoming_files || []).forEach((f) => {
+      if (/^void_voice_/i.test(f.filename || "")) return;
       const row = document.createElement("div");
       row.className = "offer";
       row.innerHTML = `<span></span>`;
@@ -269,12 +430,8 @@
               multiple: false,
               title: "Куда сохранить файл",
             });
-            if (picked === null) {
-              // Отмена диалога → папка по умолчанию VOID/void_downloads
-              saveDir = null;
-            } else {
-              saveDir = Array.isArray(picked) ? picked[0] : picked;
-            }
+            if (picked === null) saveDir = null;
+            else saveDir = Array.isArray(picked) ? picked[0] : picked;
           }
           await invoke("accept_file", { transferId: f.transfer_id, saveDir });
           showToast("Принято — ждём передачу…");
@@ -295,68 +452,54 @@
     });
   }
 
-  function menuModal() {
-    openModal(`
-      <h3>Меню</h3>
-      <div class="stack">
+  function menuNav(active) {
+    return `
+      <div class="menu-nav">
+        <button type="button" class="menu-tab ${active === "contacts" ? "active" : ""}" data-sec="contacts">Контакты</button>
+        <button type="button" class="menu-tab ${active === "groups" ? "active" : ""}" data-sec="groups">Группы</button>
+        <button type="button" class="menu-tab ${active === "network" ? "active" : ""}" data-sec="network">Сеть</button>
+        <button type="button" class="menu-tab ${active === "settings" ? "active" : ""}" data-sec="settings">Настройки</button>
+      </div>`;
+  }
+
+  function wireMenuTabs() {
+    els.modalBody.querySelectorAll(".menu-tab").forEach((btn) => {
+      btn.onclick = () => {
+        menuSection = btn.getAttribute("data-sec");
+        mainMenuModal();
+      };
+    });
+  }
+
+  function mainMenuModal() {
+    const sec = menuSection || "contacts";
+    let body = "";
+    if (sec === "contacts") {
+      body = `
+        <h4 class="menu-h">Контакты</h4>
         <label class="field"><span>PeerId / multiaddr / IP</span><input id="m-peer" /></label>
         <label class="field"><span>Имя</span><input id="m-name" placeholder="Необязательно" /></label>
         <button class="btn primary" id="m-add">Добавить контакт</button>
-        <hr style="border-color:var(--line)" />
+        <p class="muted">ПКМ по контакту в списке: переименовать / очистить чат / удалить.</p>`;
+    } else if (sec === "groups") {
+      body = `
+        <h4 class="menu-h">Группы</h4>
         <label class="field"><span>Название группы</span><input id="m-gname" /></label>
         <label class="field"><span>Участники (PeerId через запятую)</span><input id="m-gmembers" /></label>
-        <button class="btn" id="m-gcreate">Создать группу</button>
+        <button class="btn primary" id="m-gcreate">Создать группу</button>
+        <hr class="menu-hr" />
         <label class="field"><span>Ссылка void://group/…</span><input id="m-glink" /></label>
-        <button class="btn" id="m-gjoin">Войти в группу</button>
-      </div>`);
-    document.getElementById("m-add").onclick = async () => {
-      try {
-        const snap = await invoke("add_contact", {
-          peerOrAddr: document.getElementById("m-peer").value,
-          name: document.getElementById("m-name").value,
-        });
-        applySnapshot(snap);
-        closeModal();
-      } catch (e) {
-        showToast(String(e));
-      }
-    };
-    document.getElementById("m-gcreate").onclick = async () => {
-      try {
-        const members = document
-          .getElementById("m-gmembers")
-          .value.split(",")
-          .map((s) => s.trim())
-          .filter(Boolean);
-        const snap = await invoke("create_group", {
-          name: document.getElementById("m-gname").value,
-          memberPeerIds: members,
-        });
-        applySnapshot(snap);
-        closeModal();
-      } catch (e) {
-        showToast(String(e));
-      }
-    };
-    document.getElementById("m-gjoin").onclick = async () => {
-      try {
-        const snap = await invoke("join_group", {
-          link: document.getElementById("m-glink").value,
-        });
-        applySnapshot(snap);
-        closeModal();
-      } catch (e) {
-        showToast(String(e));
-      }
-    };
-  }
-
-  function networkModal() {
-    const boots = (snapshot?.bootstraps || []).map((b) => `<div>${escapeHtml(b)}</div>`).join("") || "<div>Пока пусто — войдите через IP ноды</div>";
-    const dht = (snapshot?.dht_lines || []).slice(0, 40).map((l) => `<div>${escapeHtml(l)}</div>`).join("");
-    openModal(`
-      <h3>Сеть VOID</h3>
-      <div class="stack">
+        <button class="btn" id="m-gjoin">Войти в группу</button>`;
+    } else if (sec === "network") {
+      const boots =
+        (snapshot?.bootstraps || []).map((b) => `<div>${escapeHtml(b)}</div>`).join("") ||
+        "<div>Пока пусто — войдите через IP ноды</div>";
+      const dht = (snapshot?.dht_lines || [])
+        .slice(0, 40)
+        .map((l) => `<div>${escapeHtml(l)}</div>`)
+        .join("");
+      body = `
+        <h4 class="menu-h">Сеть VOID</h4>
         <p class="muted">Ваш PeerId:</p>
         <div class="bootstrap-list" style="user-select:all">${escapeHtml(snapshot?.peer_id || "—")}</div>
         <p class="muted">Статус: ${
@@ -367,7 +510,7 @@
         <p class="muted">${
           snapshot?.relay_reserved
             ? "Relay-резервация есть — вас можно набрать из‑за NAT."
-            : "Нет relay-резервации — собеседники за NAT до вас не дозвонятся. Подключите bootstrap и дождитесь «СВЯЗЬ ЧЕРЕЗ RELAY»."
+            : "Нет relay-резервации — собеседники за NAT до вас не дозвонятся."
         }</p>
         <p class="muted">Сейчас online: ${
           (snapshot?.contacts || [])
@@ -375,86 +518,177 @@
             .map((c) => escapeHtml(c.display_name || c.peer_id.slice(0, 12)))
             .join(", ") || "—"
         }</p>
-        <p class="muted">Bootstrap-адреса хранятся в vault.bin и дополняются при подключении новых нод.</p>
         <label class="field"><span>IP / IP:PORT / multiaddr</span><input id="n-join" placeholder="например 1.2.3.4:50001" /></label>
         <button class="btn primary" id="n-go">Войти в VOID</button>
         <button class="btn" id="n-reload">Переподключить bootstrap</button>
         <button class="btn" id="n-dht">Снимок DHT</button>
         <div><strong>Bootstrap (${snapshot?.bootstraps?.length || 0})</strong><div class="bootstrap-list">${boots}</div></div>
-        <div><strong>DHT (${snapshot?.dht_total || 0})</strong><div class="bootstrap-list">${dht}</div></div>
-      </div>`);
-    document.getElementById("n-go").onclick = async () => {
-      try {
-        applySnapshot(await invoke("join_via_node", { input: document.getElementById("n-join").value }));
-        showToast("Подключение…");
-      } catch (e) {
-        showToast(String(e));
-      }
-    };
-    document.getElementById("n-reload").onclick = async () => {
-      applySnapshot(await invoke("reload_bootstraps"));
-      showToast("Bootstrap перезагружены");
-    };
-    document.getElementById("n-dht").onclick = async () => {
-      applySnapshot(await invoke("snapshot_dht"));
-      networkModal();
-    };
-  }
-
-  function settingsModal() {
-    openModal(`
-      <h3>Настройки</h3>
-      <div class="stack">
+        <div><strong>DHT (${snapshot?.dht_total || 0})</strong><div class="bootstrap-list">${dht}</div></div>`;
+    } else {
+      body = `
+        <h4 class="menu-h">Настройки</h4>
         <label class="field"><span>Ник</span><input id="s-nick" value="${escapeAttr(snapshot?.nickname || "")}" /></label>
         <label class="field"><span>Ваш Peer ID</span><input id="s-peer" readonly value="${escapeAttr(snapshot?.peer_id || "")}" /></label>
         <p class="muted">Публичный IP: ${escapeHtml(snapshot?.public_ip || "—")}</p>
         <button class="btn primary" id="s-save">Сохранить ник</button>
         <button class="btn" id="s-copy">Копировать Peer ID</button>
         <button class="btn" id="s-downloads">Открыть папку загрузок</button>
-        <button class="btn" id="s-quit">Полный выход</button>
-      </div>`);
-    document.getElementById("s-save").onclick = async () => {
-      try {
-        applySnapshot(await invoke("set_nickname", { nickname: document.getElementById("s-nick").value }));
-        closeModal();
-      } catch (e) {
-        showToast(String(e));
-      }
-    };
-    document.getElementById("s-copy").onclick = async () => {
-      try {
-        await navigator.clipboard.writeText(snapshot?.peer_id || "");
-        showToast("Peer ID скопирован");
-      } catch {
-        showToast("Не удалось скопировать");
-      }
-    };
-    document.getElementById("s-downloads").onclick = async () => {
-      try {
-        const path = await invoke("downloads_path");
-        await invoke("open_downloads");
-        showToast(path);
-      } catch (e) {
-        showToast(String(e));
-      }
-    };
-    document.getElementById("s-quit").onclick = () => invoke("quit_application");
+        <button class="btn" id="s-quit">Полный выход</button>`;
+    }
+
+    openModal(`
+      <h3>Меню</h3>
+      ${menuNav(sec)}
+      <div class="stack menu-section">${body}</div>`);
+    wireMenuTabs();
+
+    if (sec === "contacts") {
+      document.getElementById("m-add").onclick = async () => {
+        try {
+          const snap = await invoke("add_contact", {
+            peerOrAddr: document.getElementById("m-peer").value,
+            name: document.getElementById("m-name").value,
+          });
+          applySnapshot(snap);
+          closeModal();
+        } catch (e) {
+          showToast(String(e));
+        }
+      };
+    } else if (sec === "groups") {
+      document.getElementById("m-gcreate").onclick = async () => {
+        try {
+          const members = document
+            .getElementById("m-gmembers")
+            .value.split(",")
+            .map((x) => x.trim())
+            .filter(Boolean);
+          applySnapshot(
+            await invoke("create_group", {
+              name: document.getElementById("m-gname").value,
+              memberPeerIds: members,
+            })
+          );
+          closeModal();
+        } catch (e) {
+          showToast(String(e));
+        }
+      };
+      document.getElementById("m-gjoin").onclick = async () => {
+        try {
+          applySnapshot(
+            await invoke("join_group", { link: document.getElementById("m-glink").value })
+          );
+          closeModal();
+        } catch (e) {
+          showToast(String(e));
+        }
+      };
+    } else if (sec === "network") {
+      document.getElementById("n-go").onclick = async () => {
+        try {
+          applySnapshot(
+            await invoke("join_via_node", { input: document.getElementById("n-join").value })
+          );
+          showToast("Подключение…");
+        } catch (e) {
+          showToast(String(e));
+        }
+      };
+      document.getElementById("n-reload").onclick = async () => {
+        applySnapshot(await invoke("reload_bootstraps"));
+        showToast("Bootstrap перезагружены");
+      };
+      document.getElementById("n-dht").onclick = async () => {
+        applySnapshot(await invoke("snapshot_dht"));
+        mainMenuModal();
+      };
+    } else if (sec === "settings") {
+      document.getElementById("s-save").onclick = async () => {
+        try {
+          applySnapshot(
+            await invoke("set_nickname", { nickname: document.getElementById("s-nick").value })
+          );
+          closeModal();
+        } catch (e) {
+          showToast(String(e));
+        }
+      };
+      document.getElementById("s-copy").onclick = async () => {
+        try {
+          await navigator.clipboard.writeText(snapshot?.peer_id || "");
+          showToast("Peer ID скопирован");
+        } catch {
+          showToast("Не удалось скопировать");
+        }
+      };
+      document.getElementById("s-downloads").onclick = async () => {
+        try {
+          const path = await invoke("downloads_path");
+          await invoke("open_downloads");
+          showToast(path);
+        } catch (e) {
+          showToast(String(e));
+        }
+      };
+      document.getElementById("s-quit").onclick = () => invoke("quit_application");
+    }
   }
 
-  function escapeHtml(s) {
-    return String(s)
-      .replace(/&/g, "&amp;")
-      .replace(/</g, "&lt;")
-      .replace(/>/g, "&gt;");
-  }
-  function escapeAttr(s) {
-    return escapeHtml(s).replace(/"/g, "&quot;");
+  function peerInfoModal() {
+    const chat = snapshot?.selected_chat;
+    if (!chat) return;
+    const c = (snapshot?.contacts || []).find((x) => x.peer_id === chat);
+    if (c?.is_group) {
+      openModal(`
+        <h3>Группа</h3>
+        <div class="stack">
+          <p><strong>${escapeHtml(c.display_name)}</strong></p>
+          <p class="muted">${escapeHtml(chat)}</p>
+        </div>`);
+      return;
+    }
+    openModal(`
+      <h3>Собеседник</h3>
+      <div class="stack">
+        <div class="peer-info-avatar" style="background:${avatarColor(chat)}">${escapeHtml(
+          (c?.display_name || "?").trim().charAt(0).toUpperCase()
+        )}</div>
+        <p><strong>${escapeHtml(c?.display_name || chat.slice(0, 16))}</strong></p>
+        <p class="muted">${c?.online ? "в сети" : "не в сети"}</p>
+        <p class="muted">Peer ID</p>
+        <div class="bootstrap-list" style="user-select:all">${escapeHtml(chat)}</div>
+        <button class="btn" id="pi-copy">Копировать Peer ID</button>
+        <button class="btn" id="pi-rename">Переименовать</button>
+        <button class="btn" id="pi-clear">Очистить чат</button>
+        <button class="btn danger-outline" id="pi-del">Удалить пир</button>
+      </div>`);
+    document.getElementById("pi-copy").onclick = async () => {
+      await navigator.clipboard.writeText(chat);
+      showToast("Peer ID скопирован");
+    };
+    document.getElementById("pi-rename").onclick = async () => {
+      const name = window.prompt("Новое имя", c?.display_name || "");
+      if (name == null || !name.trim()) return;
+      applySnapshot(await invoke("rename_contact", { peerId: chat, name: name.trim() }));
+      peerInfoModal();
+    };
+    document.getElementById("pi-clear").onclick = async () => {
+      if (!window.confirm("Очистить переписку?")) return;
+      applySnapshot(await invoke("clear_chat", { peerId: chat }));
+      closeModal();
+    };
+    document.getElementById("pi-del").onclick = async () => {
+      if (!window.confirm("Удалить контакт?")) return;
+      applySnapshot(await invoke("remove_contact", { peerId: chat }));
+      closeModal();
+    };
   }
 
   async function boot() {
     wireIcons();
-    // Ensure blockers are off before any async work.
     closeModal();
+    hideCtx();
     els.toast.hidden = true;
     els.toast.textContent = "";
 
@@ -489,7 +723,7 @@
       await listen("void://snapshot", (e) => applySnapshot(e.payload));
       await listen("void://status", (e) => {
         const msg = String(e?.payload ?? "");
-        if (/файл|голос|доставл|сохран|очеред|ошибка записи|микрофон/i.test(msg)) {
+        if (/файл|голос|доставл|сохран|очеред|ошибка записи|микрофон|контакт/i.test(msg)) {
           showToast(msg);
         }
       });
@@ -502,7 +736,7 @@
       });
       await listen("void://file-complete", async (e) => {
         const p = e?.payload || {};
-        if (p.saved_to) {
+        if (p.saved_to && !/^void_voice_/i.test(p.filename || "")) {
           showToast(`Сохранено:\n${p.saved_to}`);
           try {
             await invoke("reveal_path", { path: p.saved_to });
@@ -511,7 +745,7 @@
               await invoke("open_downloads");
             } catch (_) {}
           }
-        } else if (p.filename) {
+        } else if (p.filename && !/^void_voice_/i.test(p.filename || "")) {
           showToast(`Файл доставлен: ${p.filename}`);
         }
         applySnapshot(await invoke("get_snapshot"));
@@ -548,13 +782,17 @@
       }
     });
 
-    document.getElementById("menu-btn").onclick = menuModal;
-    document.getElementById("network-btn").onclick = networkModal;
-    document.getElementById("settings-btn").onclick = settingsModal;
-    document.getElementById("header-settings-btn").onclick = settingsModal;
+    document.getElementById("menu-btn").onclick = () => {
+      menuSection = "contacts";
+      mainMenuModal();
+    };
+    els.chatPeerBtn.onclick = () => peerInfoModal();
     els.modalClose.onclick = closeModal;
     els.overlay.addEventListener("click", (e) => {
       if (e.target === els.overlay) closeModal();
+    });
+    document.addEventListener("click", (e) => {
+      if (!els.ctxMenu.hidden && !els.ctxMenu.contains(e.target)) hideCtx();
     });
     document.getElementById("toggle-sidebar").onclick = () => {
       els.mainScreen.classList.toggle("sidebar-collapsed");

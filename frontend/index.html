@@ -4,7 +4,7 @@
   <meta charset="UTF-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0" />
   <title>VOID P2P Messenger</title>
-  <link rel="stylesheet" href="style.css?v=8" />
+  <link rel="stylesheet" href="style.css?v=9" />
   <link rel="preconnect" href="https://fonts.googleapis.com" />
   <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
   <link href="https://fonts.googleapis.com/css2?family=Orbitron:wght@500;700&family=IBM+Plex+Sans:wght@400;500;600&display=swap" rel="stylesheet" />
@@ -42,12 +42,6 @@
           <img data-icon="Image_programm.png" alt="" class="brand-mini-img" />
           <span>VOID</span>
         </div>
-        <button type="button" id="network-btn" class="icon-btn" title="Сеть">
-          <img data-icon="star.png" alt="" />
-        </button>
-        <button type="button" id="settings-btn" class="icon-btn" title="Настройки">
-          <img data-icon="setings.png" alt="" />
-        </button>
       </div>
       <div id="beacon-banner" class="beacon" hidden>Маяк активен — сеть в фоне</div>
       <div class="search-row">
@@ -64,13 +58,17 @@
         <button type="button" id="toggle-sidebar" class="icon-btn sidebar-toggle" title="Показать / скрыть панель">
           <img data-icon="scip_panele.png" alt="" />
         </button>
-        <div class="chat-header-text">
-          <h2 id="chat-title">Выберите чат</h2>
-          <p id="chat-sub" class="muted"></p>
-        </div>
-        <button type="button" id="header-settings-btn" class="icon-btn" title="Настройки">
-          <img data-icon="setings.png" alt="" />
+        <button type="button" id="chat-peer-btn" class="chat-peer-btn" title="Информация о собеседнике" hidden>
+          <div id="chat-avatar" class="avatar header-avatar">?</div>
+          <div class="chat-header-text">
+            <h2 id="chat-title">Выберите чат</h2>
+            <p id="chat-sub" class="muted"></p>
+          </div>
         </button>
+        <div id="chat-header-empty" class="chat-header-text">
+          <h2>Выберите чат</h2>
+          <p class="muted"></p>
+        </div>
       </header>
       <div id="messages" class="messages"></div>
       <div id="file-offers" class="file-offers"></div>
@@ -89,6 +87,8 @@
     </main>
   </div>
 
+  <div id="ctx-menu" class="ctx-menu" hidden role="menu"></div>
+
   <div id="overlay" class="overlay" hidden aria-hidden="true">
     <div class="modal" id="modal-panel" role="dialog" aria-modal="true">
       <button type="button" class="modal-close" id="modal-close" aria-label="Закрыть">×</button>
@@ -97,6 +97,6 @@
   </div>
 
   <div id="toast" class="toast" hidden role="status" aria-live="polite"></div>
-  <script src="app.js?v=12"></script>
+  <script src="app.js?v=13"></script>
 </body>
 </html>

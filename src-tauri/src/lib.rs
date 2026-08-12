@@ -141,6 +141,18 @@ fn rename_contact(
 }
 
 #[tauri::command]
+fn clear_chat(
+    state: State<'_, Mutex<AppState>>,
+    peer_id: String,
+) -> Result<SnapshotDto, String> {
+    state
+        .lock()
+        .map_err(|e| e.to_string())?
+        .runtime
+        .clear_chat(peer_id)
+}
+
+#[tauri::command]
 fn join_via_node(
     state: State<'_, Mutex<AppState>>,
     input: String,
@@ -490,6 +502,7 @@ pub fn run() {
             add_contact,
             remove_contact,
             rename_contact,
+            clear_chat,
             join_via_node,
             reload_bootstraps,
             snapshot_dht,
