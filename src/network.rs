@@ -566,6 +566,7 @@ fn ensure_bootstrap_relay_listens(
     relay_circuit_reserved: &HashSet<PeerId>,
     relay_listen_attempt_at: &mut HashMap<PeerId, Instant>,
     min_retry: Duration,
+    event_tx: Option<&mpsc::Sender<NetworkEvent>>,
 ) {
     let now = Instant::now();
     for &relay_pid in bootstrap_peer_ids {
@@ -579,21 +580,51 @@ fn ensure_bootstrap_relay_listens(
             continue;
         }
         relay_listen_attempt_at.insert(relay_pid, now);
-        let relay_src: Vec<Multiaddr> = reconnect_targets
-            .get(&relay_pid)
+        // Всегда берём void_bootstraps. Раньше пустой `reconnect_targets[relay]`
+        // (Some([])) блокировал fallback → listen_on не вызывался → «нет Hop».
+        let mut relay_src: Vec<Multiaddr> = void_bootstraps
+            .iter()
+            .filter(|ma| peer_id_from_multiaddr(ma) == Some(relay_pid))
             .cloned()
-            .unwrap_or_else(|| {
-                void_bootstraps
-                    .iter()
-                    .filter(|ma| peer_id_from_multiaddr(ma) == Some(relay_pid))
-                    .cloned()
-                    .collect()
-            });
+            .collect();
+        if let Some(extra) = reconnect_targets.get(&relay_pid) {
+            for a in extra {
+                if peer_id_from_multiaddr(a).is_none() {
+                    continue;
+                }
+                if a.to_string().contains("p2p-circuit") || is_junk_addr(a) {
+                    continue;
+                }
+                if !relay_src.contains(a) {
+                    relay_src.push(a.clone());
+                }
+            }
+        }
+        if relay_src.is_empty() {
+            debug!(
+                "📡 relay Hop: нет multiaddr для {} — пропуск",
+                &relay_pid.to_string()[..8.min(relay_pid.to_string().len())]
+            );
+            continue;
+        }
+        let mut any_ok = false;
         for ma in relay_circuit_listen_addrs(&relay_src) {
-            if let Err(e) = swarm.listen_on(ma.clone()) {
-                debug!("relay circuit listen retry {}: {:?}", ma, e);
-            } else {
-                debug!("📡 relay circuit listen (pending Hop Ack): {}", ma);
+            match swarm.listen_on(ma.clone()) {
+                Ok(_) => {
+                    any_ok = true;
+                    debug!("📡 relay circuit listen (pending Hop Ack): {}", ma);
+                }
+                Err(e) => {
+                    debug!("relay circuit listen retry {}: {:?}", ma, e);
+                }
+            }
+        }
+        if !any_ok {
+            if let Some(tx) = event_tx {
+                let _ = tx.try_send(NetworkEvent::Status(format!(
+                    "⚠ Hop listen не стартовал на {} — проверьте bootstrap multiaddr (/p2p/…)",
+                    &relay_pid.to_string()[..8.min(relay_pid.to_string().len())]
+                )));
             }
         }
     }
@@ -2399,6 +2430,7 @@ pub async fn run_chat_network(
                         &relay_circuit_reserved,
                         &mut relay_listen_attempt_at,
                         Duration::from_secs(20),
+                        Some(&event_tx),
                     );
                     // Пока хоть один bootstrap жив — набираем контакты через VOID circuit
                     // (LAN не требуется: путь relay/p2p-circuit/p2p/<peer>).
@@ -5216,12 +5248,6 @@ pub async fn run_chat_network(
                                 &mut outbound_mailbox_stores,
                                 peer_id,
                             );
-                            if u32::from(num_established) > 1 {
-                                // Доп. TCP/QUIC к тому же пиру — не шлём второй Hello
-                                // и не дёргаем mailbox/circuit заново.
-                                continue;
-                            }
-                            publish_self_in_dht(&mut swarm.behaviour_mut().kad, local_peer_id);
 
                             // Определяем, идёт ли соединение через relay.
                             let is_relay_conn = match endpoint {
@@ -5234,28 +5260,52 @@ pub async fn run_chat_network(
                             };
                             if is_relay_conn {
                                 relay_peers.insert(peer_id);
-                                debug!(
-                                    "📡 FILE rate-limit: {} подключён через relay.",
-                                    &peer_id.to_string()[..8]
-                                );
                             } else {
-                                relay_peers.remove(&peer_id);
+                                // Не сбрасываем relay_peers при доп. прямом conn к тому же пиру.
+                                if u32::from(num_established) <= 1 {
+                                    relay_peers.remove(&peer_id);
+                                }
                             }
 
+                            // Живой dialer-адрес bootstrap нужен для Hop listen
+                            // (публичный IP раньше отбрасывался → пустой relay_src).
+                            if bootstrap_peer_ids.contains(&peer_id) {
+                                if let libp2p::core::ConnectedPoint::Dialer { address, .. } =
+                                    endpoint
+                                {
+                                    if !is_junk_addr(address)
+                                        && !address.to_string().contains("p2p-circuit")
+                                    {
+                                        let list =
+                                            reconnect_targets.entry(peer_id).or_default();
+                                        if !list.contains(address) {
+                                            list.insert(0, address.clone());
+                                        }
+                                    }
+                                }
+                                // Hop на КАЖДОМ коннекте, пока нет ReservationReqAccepted —
+                                // early-continue раньше пропускал повтор после сбоя.
+                                ensure_bootstrap_relay_listens(
+                                    &mut swarm,
+                                    &bootstrap_peer_ids,
+                                    &void_bootstraps,
+                                    &reconnect_targets,
+                                    &relay_circuit_reserved,
+                                    &mut relay_listen_attempt_at,
+                                    Duration::from_secs(5),
+                                    Some(&event_tx),
+                                );
+                            }
+
+                            if u32::from(num_established) > 1 {
+                                // Доп. TCP/QUIC к тому же пиру — не шлём второй Hello
+                                // и не дёргаем mailbox заново.
+                                continue;
+                            }
+                            publish_self_in_dht(&mut swarm.behaviour_mut().kad, local_peer_id);
+
                              if peer_id != local_peer_id {
-                                 // Резервируем слот на bootstrap-relay, чтобы другие пиры
-                                 // могли дозвониться через NAT (circuit relay v2).
                                  if bootstrap_peer_ids.contains(&peer_id) {
-                                     // Request Hop; confirmed only on ReservationReqAccepted.
-                                     ensure_bootstrap_relay_listens(
-                                         &mut swarm,
-                                         &bootstrap_peer_ids,
-                                         &void_bootstraps,
-                                         &reconnect_targets,
-                                         &relay_circuit_reserved,
-                                         &mut relay_listen_attempt_at,
-                                         Duration::from_secs(5),
-                                     );
                                      dial_unconnected_contacts(
                                          &mut swarm,
                                          &reconnect_targets,
@@ -5332,6 +5382,7 @@ pub async fn run_chat_network(
                                  };
                                  if let Some((ref addr, prefer)) = learned {
                                      // Только LAN / circuit — public NAT (даже Dialer) яд для reverse dial.
+                                     // Bootstrap-адреса уже сохранены выше.
                                      let usable = is_usable_contact_redial_addr(addr);
                                      if usable {
                                          let list = reconnect_targets.entry(peer_id).or_default();
