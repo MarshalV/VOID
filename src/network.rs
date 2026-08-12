@@ -1202,6 +1202,148 @@ fn publish_self_prekey(
         .put_record(record, kad::Quorum::One);
 }
 
+/// Put X25519 prekey on connected bootstrap nodes (offline seal without DHT/Hello).
+fn publish_self_prekey_to_bootstraps(
+    swarm: &mut libp2p::Swarm<ChatBehaviour>,
+    local_peer_id: PeerId,
+    public_key: &[u8; 32],
+    bootstrap_peer_ids: &HashSet<PeerId>,
+) {
+    if bootstrap_peer_ids.is_empty() {
+        return;
+    }
+    let packet = V1Packet::PrekeyPut {
+        peer_id: local_peer_id.to_string(),
+        public_key: *public_key,
+    };
+    for peer in swarm.connected_peers().copied().collect::<Vec<_>>() {
+        if !bootstrap_peer_ids.contains(&peer) {
+            continue;
+        }
+        let _ = swarm
+            .behaviour_mut()
+            .request_response
+            .send_request(&peer, packet.clone());
+    }
+}
+
+type OutboundPrekeyGets = HashMap<
+    libp2p::request_response::OutboundRequestId,
+    (PeerId, Vec<OfflineOutboxItem>, Option<PublishDone>),
+>;
+
+fn request_prekey_from_bootstraps(
+    swarm: &mut libp2p::Swarm<ChatBehaviour>,
+    bootstrap_peer_ids: &HashSet<PeerId>,
+    void_bootstraps: &[Multiaddr],
+    recipient: PeerId,
+    items: Vec<OfflineOutboxItem>,
+    done: Option<PublishDone>,
+    track: &mut OutboundPrekeyGets,
+) -> bool {
+    dial_missing_bootstraps(swarm, bootstrap_peer_ids, void_bootstraps);
+    let packet = V1Packet::PrekeyGet {
+        peer_id: recipient.to_string(),
+    };
+    let mut sent = false;
+    for peer in swarm.connected_peers().copied().collect::<Vec<_>>() {
+        if !bootstrap_peer_ids.contains(&peer) {
+            continue;
+        }
+        let rid = swarm
+            .behaviour_mut()
+            .request_response
+            .send_request(&peer, packet.clone());
+        track.insert(rid, (recipient, items.clone(), done.clone()));
+        sent = true;
+    }
+    sent
+}
+
+fn seal_and_publish_offline_batch(
+    swarm: &mut libp2p::Swarm<ChatBehaviour>,
+    peer_prekeys: &mut HashMap<PeerId, [u8; 32]>,
+    relay_mail_store: &mut HashMap<String, Vec<OfflineEnvelope>>,
+    bootstrap_peer_ids: &HashSet<PeerId>,
+    void_bootstraps: &[Multiaddr],
+    local_peer_id: PeerId,
+    my_public_key_bytes: &[u8; 32],
+    pending_relay: &mut PendingRelayQueue,
+    pending_relay_gates: &mut HashMap<(PeerId, PeerId), Arc<ActiveHandoff>>,
+    outbound_mailbox_stores: &mut MailboxStoreTrack,
+    pending_kad_mail: &mut HashMap<kad::QueryId, MailboxKadOp>,
+    recipient: PeerId,
+    pk_bytes: [u8; 32],
+    items: Vec<OfflineOutboxItem>,
+    done: Option<PublishDone>,
+) -> bool {
+    peer_prekeys.insert(recipient, pk_bytes);
+    let pk = crypto::PublicKey::from(pk_bytes);
+    let mut sealed = Vec::new();
+    for item in items {
+        if let Ok(env) = seal_for_recipient(
+            &pk,
+            &local_peer_id,
+            my_public_key_bytes,
+            &item.message_id,
+            &item.kind,
+            &item.payload,
+        ) {
+            sealed.push(env);
+        }
+    }
+    if sealed.is_empty() {
+        signal_publish_done(&done, false);
+        return false;
+    }
+    if RelayMailbox::merge(
+        relay_mail_store,
+        &recipient.to_string(),
+        sealed.clone(),
+    ) {
+        let _ = RelayMailbox::save(relay_mail_store);
+    }
+    let allow_dht = bootstrap_peer_ids.is_empty();
+    let done_cb: PublishDone = done.unwrap_or_else(|| Arc::new(|_| {}) as PublishDone);
+    let handoff = Some(ActiveHandoff::new(&sealed, done_cb, allow_dht));
+    publish_relay_mail(
+        swarm,
+        bootstrap_peer_ids,
+        void_bootstraps,
+        local_peer_id,
+        recipient,
+        &sealed,
+        pending_relay,
+        pending_relay_gates,
+        outbound_mailbox_stores,
+        &handoff,
+    );
+    if let Some(h) = &handoff {
+        let tracked = outbound_mailbox_stores
+            .values()
+            .any(|(g, _, _)| Arc::ptr_eq(g, h));
+        let queued = pending_relay_gates.values().any(|g| Arc::ptr_eq(g, h));
+        if !tracked && !queued && !accept_dht_as_full_handoff(&sealed, allow_dht) {
+            warn!("VOID: нет bootstrap-ноды для offline (после prekey)");
+            h.note_fail();
+            return false;
+        }
+    }
+    if allow_dht {
+        let for_dht = dht_eligible_envelopes(&sealed);
+        let dht_done: Option<PublishDone> = handoff.as_ref().map(|h| {
+            let h = h.clone();
+            Arc::new(move |ok: bool| {
+                if ok {
+                    h.note_dht_ok();
+                }
+            }) as PublishDone
+        });
+        start_mailbox_merge_put(swarm, pending_kad_mail, recipient, for_dht, dht_done);
+    }
+    true
+}
+
 fn start_mailbox_merge_put(
     swarm: &mut libp2p::Swarm<ChatBehaviour>,
     pending_kad_mail: &mut HashMap<kad::QueryId, MailboxKadOp>,
@@ -1464,14 +1606,25 @@ fn flush_pending_relay_for_peer(
 fn query_relay_mailbox(
     swarm: &mut libp2p::Swarm<ChatBehaviour>,
     local_peer_id: PeerId,
+    bootstrap_peer_ids: &HashSet<PeerId>,
 ) {
     let packet = V1Packet::OfflineMailboxQuery {
         recipient: local_peer_id.to_string(),
     };
-    for peer in swarm.connected_peers().copied().collect::<Vec<_>>() {
-        if peer == local_peer_id {
-            continue;
-        }
+    let peers: Vec<PeerId> = if !bootstrap_peer_ids.is_empty() {
+        swarm
+            .connected_peers()
+            .copied()
+            .filter(|p| bootstrap_peer_ids.contains(p))
+            .collect()
+    } else {
+        swarm
+            .connected_peers()
+            .copied()
+            .filter(|p| *p != local_peer_id)
+            .collect()
+    };
+    for peer in peers {
         let _ = swarm
             .behaviour_mut()
             .request_response
@@ -1486,7 +1639,7 @@ fn query_relay_mailbox_with_bootstraps(
     void_bootstraps: &[Multiaddr],
 ) {
     dial_missing_bootstraps(swarm, bootstrap_peer_ids, void_bootstraps);
-    query_relay_mailbox(swarm, local_peer_id);
+    query_relay_mailbox(swarm, local_peer_id, bootstrap_peer_ids);
 }
 
 async fn remember_peer_prekey(
@@ -2349,6 +2502,7 @@ pub async fn run_chat_network(
             (PeerId, [u8; 16], u32),
         > = HashMap::new();
         let mut outbound_mailbox_stores: MailboxStoreTrack = HashMap::new();
+        let mut outbound_prekey_gets: OutboundPrekeyGets = HashMap::new();
         let mut pending_relay = PendingRelayQueue::default();
         let mut pending_relay_gates: HashMap<(PeerId, PeerId), Arc<ActiveHandoff>> = HashMap::new();
         let mut dial_backoff: HashMap<PeerId, Instant> = HashMap::new();
@@ -2569,6 +2723,12 @@ pub async fn run_chat_network(
                 _ = provider_tick.tick() => {
                     publish_self_in_dht(&mut swarm.behaviour_mut().kad, local_peer_id);
                     publish_self_prekey(&mut swarm, local_peer_id, &my_public_key_bytes);
+                    publish_self_prekey_to_bootstraps(
+                        &mut swarm,
+                        local_peer_id,
+                        &my_public_key_bytes,
+                        &bootstrap_peer_ids,
+                    );
                 }
                 // ─── Tick: отправка очередных чанков с rate-limit ───────────
                 _ = chunk_tick.tick() => {
@@ -4009,6 +4169,24 @@ pub async fn run_chat_network(
                                         }
                                     }
                                     if !need_prekey.is_empty() {
+                                        let got_bs = request_prekey_from_bootstraps(
+                                            &mut swarm,
+                                            &bootstrap_peer_ids,
+                                            &void_bootstraps,
+                                            recipient,
+                                            need_prekey.clone(),
+                                            Some(recip_done.clone()),
+                                            &mut outbound_prekey_gets,
+                                        );
+                                        if !got_bs {
+                                            let _ = event_tx
+                                                .send(NetworkEvent::Status(format!(
+                                                    "⚠ Нет prekey {} — ждём DHT/контакт online",
+                                                    &recipient.to_string()
+                                                        [..8.min(recipient.to_string().len())]
+                                                )))
+                                                .await;
+                                        }
                                         let qid = swarm
                                             .behaviour_mut()
                                             .kad
@@ -4067,6 +4245,15 @@ pub async fn run_chat_network(
                                 let _ = event_tx.send(NetworkEvent::Status(
                                     "✨ СВЯЗЬ ЧЕРЕЗ RELAY: Вы доступны через посредника (за NAT)!".into()
                                 )).await;
+                                if let Some(relay) = relay_peer_id_from_circuit_addr(&address) {
+                                    if relay_circuit_reserved.insert(relay) {
+                                        relay_hop_pending.remove(&relay);
+                                        hop_listen_after.remove(&relay);
+                                        let _ = event_tx
+                                            .send(NetworkEvent::RelayHopReady { relay })
+                                            .await;
+                                    }
+                                }
                             }
                         },
 
@@ -4208,6 +4395,15 @@ pub async fn run_chat_network(
                                                 .send_response(channel, response);
                                         }
                                         V1Packet::OfflineMailboxDeliver { .. } => {
+                                            let _ = swarm
+                                                .behaviour_mut()
+                                                .request_response
+                                                .send_response(channel, V1Packet::Ack);
+                                        }
+                                        V1Packet::PrekeyPut { .. }
+                                        | V1Packet::PrekeyGet { .. }
+                                        | V1Packet::PrekeyOffer { .. } => {
+                                            // Prekey directory lives on bootstrap; peers Ack.
                                             let _ = swarm
                                                 .behaviour_mut()
                                                 .request_response
@@ -4724,6 +4920,81 @@ pub async fn run_chat_network(
                                                     now,
                                                     &peer.to_string()[..8]
                                                 );
+                                            } else if let Some((recipient, _items, _done)) =
+                                                outbound_prekey_gets.remove(&request_id)
+                                            {
+                                                // PrekeyGet → Ack = miss on this bootstrap.
+                                                // Не закрываем gate: DHT PrekeyForPublish /
+                                                // другой bootstrap ещё могут ответить Offer.
+                                                debug!(
+                                                    "[{}] prekey miss on bootstrap for {}",
+                                                    now,
+                                                    &recipient.to_string()
+                                                        [..8.min(recipient.to_string().len())]
+                                                );
+                                            }
+                                        }
+                                        V1Packet::PrekeyOffer {
+                                            peer_id,
+                                            public_key,
+                                        } => {
+                                            if let Some((recipient, items, done)) =
+                                                outbound_prekey_gets.remove(&request_id)
+                                            {
+                                                let parsed_ok = peer_id
+                                                    .parse::<PeerId>()
+                                                    .ok()
+                                                    .filter(|p| *p == recipient)
+                                                    .is_some();
+                                                if parsed_ok && public_key != [0u8; 32] {
+                                                    // Drop sibling PrekeyGets for same recipient.
+                                                    outbound_prekey_gets
+                                                        .retain(|_, (r, _, _)| *r != recipient);
+                                                    remember_peer_prekey(
+                                                        &mut peer_prekeys,
+                                                        &event_tx,
+                                                        recipient,
+                                                        public_key,
+                                                    )
+                                                    .await;
+                                                    let ok = seal_and_publish_offline_batch(
+                                                        &mut swarm,
+                                                        &mut peer_prekeys,
+                                                        &mut relay_mail_store,
+                                                        &bootstrap_peer_ids,
+                                                        &void_bootstraps,
+                                                        local_peer_id,
+                                                        &my_public_key_bytes,
+                                                        &mut pending_relay,
+                                                        &mut pending_relay_gates,
+                                                        &mut outbound_mailbox_stores,
+                                                        &mut pending_kad_mail,
+                                                        recipient,
+                                                        public_key,
+                                                        items,
+                                                        done,
+                                                    );
+                                                    if ok {
+                                                        let _ = event_tx
+                                                            .send(NetworkEvent::Status(
+                                                                "📤 Офлайн → bootstrap (prekey с ноды)"
+                                                                    .into(),
+                                                            ))
+                                                            .await;
+                                                    }
+                                                } else {
+                                                    signal_publish_done(&done, false);
+                                                }
+                                            } else if let Ok(pid) = peer_id.parse::<PeerId>() {
+                                                if public_key != [0u8; 32] {
+                                                    remember_peer_prekey(
+                                                        &mut peer_prekeys,
+                                                        &event_tx,
+                                                        pid,
+                                                        public_key,
+                                                    )
+                                                    .await;
+                                                }
                                             }
                                         }
                                         V1Packet::OfflineMailboxDeliver { envelopes } => {
@@ -4733,7 +5004,11 @@ pub async fn run_chat_network(
                                                     .await;
                                                 // take_batch отдаёт порциями — сразу
                                                 // запрашиваем остаток ящика.
-                                                query_relay_mailbox(&mut swarm, local_peer_id);
+                                                query_relay_mailbox(
+                                                    &mut swarm,
+                                                    local_peer_id,
+                                                    &bootstrap_peer_ids,
+                                                );
                                             }
                                         }
                                         V1Packet::Hello {
@@ -5075,7 +5350,9 @@ pub async fn run_chat_network(
                                         V1Packet::BootstrapGossip { .. } => {}
                                         V1Packet::DialBack { .. } => {}
                                         V1Packet::OfflineMailboxStore { .. }
-                                        | V1Packet::OfflineMailboxQuery { .. } => {}
+                                        | V1Packet::OfflineMailboxQuery { .. }
+                                        | V1Packet::PrekeyPut { .. }
+                                        | V1Packet::PrekeyGet { .. } => {}
                                     }
                                 }
                             }
@@ -5086,6 +5363,7 @@ pub async fn run_chat_network(
                             // никогда не собирал файл целиком. Перематываем next_chunk назад,
                             // чтобы chunk_tick повторил отправку именно этого чанка.
                             let mail_store = outbound_mailbox_stores.remove(&request_id);
+                            let _ = outbound_prekey_gets.remove(&request_id);
                             let was_chunk = outbound_chunk_requests.remove(&request_id);
                             if let Some((_, tid, chunk_idx)) = was_chunk {
                                 if let Some(t) = outgoing_transfers.get_mut(&tid) {
@@ -5413,8 +5691,18 @@ pub async fn run_chat_network(
                                  let _ = event_tx.send(NetworkEvent::Connected(peer_id)).await;
                                  let _ = event_tx.send(NetworkEvent::Status(format!("✅ СОЕДИНЕНО: {}", &peer_id.to_string()[..8]))).await;
                                  // Запрашиваем офлайн-почту у всех пиров (включая bootstrap-relay).
-                                 query_relay_mailbox(&mut swarm, local_peer_id);
+                                 query_relay_mailbox(
+                                     &mut swarm,
+                                     local_peer_id,
+                                     &bootstrap_peer_ids,
+                                 );
                                  if bootstrap_peer_ids.contains(&peer_id) {
+                                     publish_self_prekey_to_bootstraps(
+                                         &mut swarm,
+                                         local_peer_id,
+                                         &my_public_key_bytes,
+                                         &bootstrap_peer_ids,
+                                     );
                                      let _ = event_tx
                                          .send(NetworkEvent::Status(
                                              "📬 Запрос офлайн-почты у bootstrap-ноды".into(),

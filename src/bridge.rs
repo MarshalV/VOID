@@ -1834,9 +1834,12 @@ impl VoidRuntime {
             g.persist_outbox();
             g.push_pending_send(peer, text.clone(), mid.clone());
             g.ensure_peer_routed(peer);
+            // Всегда резервная офлайн-почта: «connected» может быть только к
+            // bootstrap без живого circuit к контакту (NAT) — live Encrypted
+            // тогда не доходит, а Store всё равно спасёт доставку.
+            g.schedule_offline_publish();
+            g.publish_outbox_to_dht();
             if !g.connected_peer_ids.contains(&peer) {
-                g.schedule_offline_publish();
-                g.publish_outbox_to_dht();
                 g.add_status(format!(
                     "Офлайн-почта → {}… (пир не в сети; сверьте PeerId с Mac)",
                     &peer.to_string()[..12.min(peer.to_string().len())]

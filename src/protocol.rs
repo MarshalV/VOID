@@ -589,6 +589,20 @@ pub(crate) enum V1Packet {
     OfflineMailboxDeliver {
         envelopes: Vec<crate::offline_mail::OfflineEnvelope>,
     },
+    /// Опубликовать X25519 prekey на bootstrap (для офлайн-seal без DHT/Hello).
+    PrekeyPut {
+        peer_id: String,
+        public_key: [u8; 32],
+    },
+    /// Запросить prekey контакта у bootstrap.
+    PrekeyGet {
+        peer_id: String,
+    },
+    /// Ответ на PrekeyGet (или push после Put соседу через gossip — не используется).
+    PrekeyOffer {
+        peer_id: String,
+        public_key: [u8; 32],
+    },
     Encrypted {
         header: crypto::MessageHeader,
         ciphertext: Vec<u8>,
