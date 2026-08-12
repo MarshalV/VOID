@@ -565,13 +565,26 @@ fn ensure_bootstrap_relay_listens(
     reconnect_targets: &HashMap<PeerId, Vec<Multiaddr>>,
     relay_circuit_reserved: &HashSet<PeerId>,
     relay_listen_attempt_at: &mut HashMap<PeerId, Instant>,
+    relay_hop_pending: &mut HashSet<PeerId>,
     min_retry: Duration,
     event_tx: Option<&mpsc::Sender<NetworkEvent>>,
 ) {
     let now = Instant::now();
     for &relay_pid in bootstrap_peer_ids {
         if !swarm.is_connected(&relay_pid) || relay_circuit_reserved.contains(&relay_pid) {
+            relay_hop_pending.remove(&relay_pid);
             continue;
+        }
+        // Один pending listen_on на relay: повторные Reserve забивают
+        // MAX_CONCURRENT_STREAMS(10) → Dropping inbound stream / нет Hop.
+        if relay_hop_pending.contains(&relay_pid) {
+            if relay_listen_attempt_at
+                .get(&relay_pid)
+                .is_some_and(|t| t.elapsed() < Duration::from_secs(45))
+            {
+                continue;
+            }
+            relay_hop_pending.remove(&relay_pid);
         }
         if relay_listen_attempt_at
             .get(&relay_pid)
@@ -580,8 +593,7 @@ fn ensure_bootstrap_relay_listens(
             continue;
         }
         relay_listen_attempt_at.insert(relay_pid, now);
-        // Всегда берём void_bootstraps. Раньше пустой `reconnect_targets[relay]`
-        // (Some([])) блокировал fallback → listen_on не вызывался → «нет Hop».
+        // Всегда берём void_bootstraps + живые dialer-адреса.
         let mut relay_src: Vec<Multiaddr> = void_bootstraps
             .iter()
             .filter(|ma| peer_id_from_multiaddr(ma) == Some(relay_pid))
@@ -596,7 +608,7 @@ fn ensure_bootstrap_relay_listens(
                     continue;
                 }
                 if !relay_src.contains(a) {
-                    relay_src.push(a.clone());
+                    relay_src.insert(0, a.clone());
                 }
             }
         }
@@ -605,6 +617,12 @@ fn ensure_bootstrap_relay_listens(
                 "📡 relay Hop: нет multiaddr для {} — пропуск",
                 &relay_pid.to_string()[..8.min(relay_pid.to_string().len())]
             );
+            if let Some(tx) = event_tx {
+                let _ = tx.try_send(NetworkEvent::Status(format!(
+                    "⚠ Hop: нет адреса bootstrap {} в vault",
+                    &relay_pid.to_string()[..8.min(relay_pid.to_string().len())]
+                )));
+            }
             continue;
         }
         let mut any_ok = false;
@@ -619,15 +637,38 @@ fn ensure_bootstrap_relay_listens(
                 }
             }
         }
-        if !any_ok {
+        if any_ok {
+            relay_hop_pending.insert(relay_pid);
             if let Some(tx) = event_tx {
                 let _ = tx.try_send(NetworkEvent::Status(format!(
-                    "⚠ Hop listen не стартовал на {} — проверьте bootstrap multiaddr (/p2p/…)",
+                    "📡 Запрос Hop на {}…",
                     &relay_pid.to_string()[..8.min(relay_pid.to_string().len())]
                 )));
             }
+        } else if let Some(tx) = event_tx {
+            let _ = tx.try_send(NetworkEvent::Status(format!(
+                "⚠ Hop listen не стартовал на {} — проверьте bootstrap multiaddr (/ip4/…/p2p/…)",
+                &relay_pid.to_string()[..8.min(relay_pid.to_string().len())]
+            )));
         }
     }
+}
+
+fn relay_peer_id_from_circuit_addr(addr: &Multiaddr) -> Option<PeerId> {
+    let s = addr.to_string();
+    if !s.contains("p2p-circuit") {
+        return None;
+    }
+    // …/p2p/<relay>/p2p-circuit[/p2p/<self>]
+    let mut last_before_circuit: Option<PeerId> = None;
+    for p in addr.iter() {
+        match p {
+            libp2p::multiaddr::Protocol::P2pCircuit => break,
+            libp2p::multiaddr::Protocol::P2p(pid) => last_before_circuit = Some(pid),
+            _ => {}
+        }
+    }
+    last_before_circuit
 }
 
 /// Force circuit + LAN redial after zombie / RR failure.
@@ -2271,6 +2312,10 @@ pub async fn run_chat_network(
         // listen_on Ok is NOT enough — without Hop Ack Mac is undialable via circuit.
         let mut relay_circuit_reserved: HashSet<PeerId> = HashSet::new();
         let mut relay_listen_attempt_at: HashMap<PeerId, Instant> = HashMap::new();
+        // listen_on уже вызван, ждём ReservationReqAccepted (не спамим Reserve).
+        let mut relay_hop_pending: HashSet<PeerId> = HashSet::new();
+        // Отложенный Hop: даём relay behaviour зарегистрировать direct conn.
+        let mut hop_listen_after: HashMap<PeerId, Instant> = HashMap::new();
         // Consecutive ping failures for chat peers → drop zombie after threshold.
         let mut peer_ping_fail_streak: HashMap<PeerId, u32> = HashMap::new();
         // Throttle contact dials when chasing via bootstrap circuit.
@@ -2422,16 +2467,34 @@ pub async fn run_chat_network(
                         );
                     }
                     // Hop reservation: retry listen until ReservationReqAccepted.
-                    ensure_bootstrap_relay_listens(
-                        &mut swarm,
-                        &bootstrap_peer_ids,
-                        &void_bootstraps,
-                        &reconnect_targets,
-                        &relay_circuit_reserved,
-                        &mut relay_listen_attempt_at,
-                        Duration::from_secs(20),
-                        Some(&event_tx),
-                    );
+                    // Hop reservation: отложенные + редкий retry (не чаще 30 с).
+                    {
+                        let now_h = Instant::now();
+                        let due: Vec<PeerId> = hop_listen_after
+                            .iter()
+                            .filter(|(_, t)| now_h >= **t)
+                            .map(|(p, _)| *p)
+                            .collect();
+                        for p in &due {
+                            hop_listen_after.remove(p);
+                        }
+                        let need_hop = bootstrap_peer_ids.iter().any(|b| {
+                            swarm.is_connected(b) && !relay_circuit_reserved.contains(b)
+                        });
+                        if !due.is_empty() || need_hop {
+                            ensure_bootstrap_relay_listens(
+                                &mut swarm,
+                                &bootstrap_peer_ids,
+                                &void_bootstraps,
+                                &reconnect_targets,
+                                &relay_circuit_reserved,
+                                &mut relay_listen_attempt_at,
+                                &mut relay_hop_pending,
+                                Duration::from_secs(30),
+                                Some(&event_tx),
+                            );
+                        }
+                    }
                     // Пока хоть один bootstrap жив — набираем контакты через VOID circuit
                     // (LAN не требуется: путь relay/p2p-circuit/p2p/<peer>).
                     dial_unconnected_contacts(
@@ -5220,9 +5283,28 @@ pub async fn run_chat_network(
                             debug!("🌍 ВНЕШНИЙ АДРЕС ПОДТВЕРЖДЕН: {}", address);
                             publish_self_in_dht(&mut swarm.behaviour_mut().kad, local_peer_id);
                             let _ = swarm.behaviour_mut().kad.bootstrap();
-                            let _ = event_tx.send(NetworkEvent::Status(
-                                format!("🌍 ГЛОБАЛЬНЫЙ АДРЕС: Вы доступны из интернета!")
-                            )).await;
+                            if let Some(relay) = relay_peer_id_from_circuit_addr(&address) {
+                                // Дубль сигнала Hop (на случай если Event::ReservationReqAccepted
+                                // не дошёл до match из-за версии).
+                                if relay_circuit_reserved.insert(relay) {
+                                    relay_hop_pending.remove(&relay);
+                                    hop_listen_after.remove(&relay);
+                                    let _ = event_tx
+                                        .send(NetworkEvent::RelayHopReady { relay })
+                                        .await;
+                                    let _ = event_tx
+                                        .send(NetworkEvent::Status(
+                                            "СВЯЗЬ ЧЕРЕЗ RELAY — Hop OK".into(),
+                                        ))
+                                        .await;
+                                }
+                            } else {
+                                let _ = event_tx
+                                    .send(NetworkEvent::Status(
+                                        "🌍 ГЛОБАЛЬНЫЙ АДРЕС: Вы доступны из интернета!".into(),
+                                    ))
+                                    .await;
+                            }
 
                             let extracted_ip = address.iter().find_map(|p| match p {
                                 libp2p::multiaddr::Protocol::Ip4(ip) => Some(ip.to_string()),
@@ -5283,18 +5365,12 @@ pub async fn run_chat_network(
                                         }
                                     }
                                 }
-                                // Hop на КАЖДОМ коннекте, пока нет ReservationReqAccepted —
-                                // early-continue раньше пропускал повтор после сбоя.
-                                ensure_bootstrap_relay_listens(
-                                    &mut swarm,
-                                    &bootstrap_peer_ids,
-                                    &void_bootstraps,
-                                    &reconnect_targets,
-                                    &relay_circuit_reserved,
-                                    &mut relay_listen_attempt_at,
-                                    Duration::from_secs(5),
-                                    Some(&event_tx),
-                                );
+                                // Не сразу: relay behaviour должен успеть
+                                // зарегистрировать direct connection, иначе
+                                // ListenReq делает лишний Dial → шторм соединений.
+                                hop_listen_after
+                                    .entry(peer_id)
+                                    .or_insert_with(|| Instant::now() + Duration::from_millis(800));
                             }
 
                             if u32::from(num_established) > 1 {
@@ -5466,6 +5542,8 @@ pub async fn run_chat_network(
                             relay_peers.remove(&peer_id);
                             relay_circuit_reserved.remove(&peer_id);
                             relay_listen_attempt_at.remove(&peer_id);
+                            relay_hop_pending.remove(&peer_id);
+                            hop_listen_after.remove(&peer_id);
                             peer_ping_fail_streak.remove(&peer_id);
 
                             // E2EE: при обрыве TCP/QUIC сбрасываем криптосостояние с пиром.
@@ -5757,6 +5835,8 @@ pub async fn run_chat_network(
                                 &relay_peer_id.to_string()[..8]
                             );
                             relay_circuit_reserved.insert(relay_peer_id);
+                            relay_hop_pending.remove(&relay_peer_id);
+                            hop_listen_after.remove(&relay_peer_id);
                             let _ = event_tx
                                 .send(NetworkEvent::RelayHopReady {
                                     relay: relay_peer_id,

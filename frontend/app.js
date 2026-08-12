@@ -166,9 +166,11 @@
       if (c?.is_group) {
         els.chatSub.textContent = "Группа";
       } else if (c?.online) {
-        els.chatSub.textContent = "в сети";
+        els.chatSub.textContent = "в сети · " + (c.peer_id || "").slice(0, 16) + "…";
       } else {
-        els.chatSub.textContent = "не в сети";
+        els.chatSub.textContent =
+          "не в сети · PeerId " + (c?.peer_id || s.selected_chat || "").slice(0, 20) + "…";
+        els.chatSub.title = c?.peer_id || s.selected_chat || "";
       }
     } else {
       els.chatTitle.textContent = "Выберите чат";

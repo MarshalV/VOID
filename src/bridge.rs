@@ -1837,6 +1837,10 @@ impl VoidRuntime {
             if !g.connected_peer_ids.contains(&peer) {
                 g.schedule_offline_publish();
                 g.publish_outbox_to_dht();
+                g.add_status(format!(
+                    "Офлайн-почта → {}… (пир не в сети; сверьте PeerId с Mac)",
+                    &peer.to_string()[..12.min(peer.to_string().len())]
+                ));
             }
             if let Some(tx) = &g.command_tx {
                 if let Err(e) = tx.try_send(UICommand::SendMessage {
