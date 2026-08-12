@@ -955,37 +955,41 @@ impl Inner {
             })
             .collect();
         // Чаты из journal без записи в address book (старые входящие до auto-add).
-        {
+        // preview_for тоже берёт messages.lock — нельзя вызывать, держа этот lock
+        // (std::Mutex не реентерабельный → зависание при удалении контакта).
+        let orphan_chats: Vec<(String, PeerId, String)> = {
             let map = self.messages.lock();
-            for key in map.keys() {
-                if group::is_group_thread(key) {
-                    continue;
-                }
-                let Ok(pid) = key.parse::<PeerId>() else {
-                    continue;
-                };
-                if self.known_peers.contains_key(&pid) {
-                    continue;
-                }
-                let label = map
-                    .get(key)
-                    .and_then(|msgs| msgs.last())
-                    .map(|m| {
-                        if m.sender_id == *key {
-                            m.sender_name.clone()
-                        } else {
-                            key.chars().take(12).collect()
-                        }
-                    })
-                    .unwrap_or_else(|| key.chars().take(12).collect());
-                contacts.push(ContactDto {
-                    peer_id: key.clone(),
-                    display_name: label,
-                    online: self.connected_peer_ids.contains(&pid),
-                    last_preview: self.preview_for(key),
-                    is_group: false,
-                });
-            }
+            map.iter()
+                .filter_map(|(key, msgs)| {
+                    if group::is_group_thread(key) {
+                        return None;
+                    }
+                    let pid = key.parse::<PeerId>().ok()?;
+                    if self.known_peers.contains_key(&pid) {
+                        return None;
+                    }
+                    let label = msgs
+                        .last()
+                        .map(|m| {
+                            if m.sender_id == *key {
+                                m.sender_name.clone()
+                            } else {
+                                key.chars().take(12).collect()
+                            }
+                        })
+                        .unwrap_or_else(|| key.chars().take(12).collect());
+                    Some((key.clone(), pid, label))
+                })
+                .collect()
+        };
+        for (key, pid, label) in orphan_chats {
+            contacts.push(ContactDto {
+                peer_id: key.clone(),
+                display_name: label,
+                online: self.connected_peer_ids.contains(&pid),
+                last_preview: self.preview_for(&key),
+                is_group: false,
+            });
         }
         for g in self.groups.values() {
             let key = group_thread_key(&g.id);
@@ -2091,15 +2095,37 @@ impl VoidRuntime {
 
     pub fn remove_contact(&self, peer_id: String) -> Result<SnapshotDto, String> {
         let mut g = self.inner.lock().unwrap_or_else(|p| p.into_inner());
-        if let Ok(pid) = peer_id.parse::<PeerId>() {
-            g.known_peers.remove(&pid);
-            g.contact_addrs.remove(&pid);
-            if g.selected_chat == peer_id {
-                g.selected_chat.clear();
-            }
-            g.persist_vault();
-        } else {
-            return Err("Неверный PeerId".into());
+        let pid: PeerId = peer_id.parse().map_err(|_| "Неверный PeerId")?;
+        g.known_peers.remove(&pid);
+        g.contact_addrs.remove(&pid);
+        g.peer_prekeys.remove(&pid);
+        g.connected_peer_ids.remove(&pid);
+        g.recount_connected();
+        if g.selected_chat == peer_id {
+            g.selected_chat.clear();
+        }
+        let ids: Vec<String> = g
+            .messages
+            .lock()
+            .get(&peer_id)
+            .map(|v| v.iter().map(|m| m.id.clone()).collect())
+            .unwrap_or_default();
+        g.messages.lock().remove(&peer_id);
+        g.messages.mark_deleted(ids);
+        g.messages.mark_dirty();
+        g.persist_journal();
+        g.pending_sends.retain(|p| p.peer != pid);
+        g.pending_file_sends.retain(|p| p.peer != pid);
+        g.pending_voice_sends.retain(|p| p.peer != pid);
+        g.outbox_entries.retain(|e| match e {
+            OutboxEntry::DirectMessage { peer, .. }
+            | OutboxEntry::DirectVoice { peer, .. } => peer != &peer_id,
+            _ => true,
+        });
+        g.persist_outbox();
+        g.persist_vault();
+        if let Some(tx) = &g.command_tx {
+            let _ = tx.try_send(UICommand::ForgetContact(pid));
         }
         drop(g);
         self.emit_snapshot();

@@ -954,6 +954,8 @@ pub(crate) enum UICommand {
     EnsureChatSession(PeerId),
     /// Зарегистрировать контакты для авто-дозвона (в т.ч. без multiaddr → relay).
     WatchContacts(Vec<PeerId>),
+    /// Убрать контакт из авто-дозвона и разорвать соединение.
+    ForgetContact(PeerId),
     /// Перечитать bootstrap из vault + глобальные источники и переподключиться.
     ReloadBootstraps(Vec<String>),
     /// Войти в сеть через один узел: IP, IP:PORT или полный multiaddr; после коннекта — kad.bootstrap.
@@ -2958,6 +2960,15 @@ pub async fn run_chat_network(
                                     &mut contact_dial_at,
                                     Duration::from_secs(2),
                                 );
+                            }
+                            UICommand::ForgetContact(peer_id) => {
+                                reconnect_targets.remove(&peer_id);
+                                reconnect_queue.remove(&peer_id);
+                                contact_dial_at.remove(&peer_id);
+                                pending_dials.remove(&peer_id);
+                                if !bootstrap_peer_ids.contains(&peer_id) {
+                                    let _ = swarm.disconnect_peer_id(peer_id);
+                                }
                             }
                             UICommand::EnsureChatSession(peer_id) => {
                                 if peer_id == local_peer_id
