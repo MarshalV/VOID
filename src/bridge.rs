@@ -463,6 +463,33 @@ impl Inner {
         }
     }
 
+    /// Входящий DM без контакта в книге — иначе чат есть в journal, но не в UI,
+    /// и нет Watch/Dial к отправителю (кажется, что «нужны взаимные контакты»).
+    fn note_inbound_peer(&mut self, peer: PeerId, display_name: &str) {
+        let name = {
+            let t = display_name.trim();
+            if t.is_empty() {
+                peer.to_string().chars().take(12).collect()
+            } else {
+                t.to_string()
+            }
+        };
+        let is_new = !self.known_peers.contains_key(&peer);
+        if is_new {
+            self.known_peers.insert(peer, name);
+            self.persist_vault();
+            self.add_status(format!(
+                "Контакт добавлен из входящего: {}…",
+                &peer.to_string()[..12.min(peer.to_string().len())]
+            ));
+        }
+        self.ensure_peer_routed(peer);
+        if let Some(tx) = &self.command_tx {
+            let _ = tx.try_send(UICommand::WatchContacts(vec![peer]));
+            let _ = tx.try_send(UICommand::EnsureChatSession(peer));
+        }
+    }
+
     /// После успешного file/E2EE — сразу ретраим текст этому пиру (не ждём backoff).
     fn kick_pending_for_peer(&mut self, peer: PeerId) {
         let nick = self.local_nickname.clone();
@@ -517,54 +544,67 @@ impl Inner {
     }
 
     fn ingest_offline_mailbox(&mut self, envelopes: Vec<crate::offline_mail::OfflineEnvelope>) {
-        let Some(ref secret) = self.local_static else {
-            return;
-        };
         let mut any = false;
-        for env in envelopes {
-            if self.offline_mail_processed.contains(&env.message_id) {
-                continue;
-            }
-            let Ok(plaintext) = open_envelope(secret, &env) else {
-                warn!(
-                    "VOID: offline mail {} не расшифровался (чужой ключ/битый конверт)",
-                    &env.message_id[..8.min(env.message_id.len())]
-                );
-                continue;
+        let mut inbound: Vec<(PeerId, String)> = Vec::new();
+        {
+            let Some(ref secret) = self.local_static else {
+                return;
             };
-            match env.kind.as_str() {
-                "dm" | "group" => {
-                    let Ok(msg) = serde_json::from_slice::<ChatMessage>(&plaintext) else {
-                        continue;
-                    };
-                    let chat_id = msg
-                        .group_id
-                        .as_ref()
-                        .map(|id| group_thread_key(id))
-                        .or_else(|| {
-                            let local = self.local_peer_id.map(|p| p.to_string())?;
-                            if msg.sender_id == local {
-                                msg.recipient_id.clone()
-                            } else {
-                                Some(msg.sender_id.clone())
-                            }
-                        })
-                        .unwrap_or_else(|| msg.sender_id.clone());
-                    if !self.messages.is_deleted(&msg.id) {
-                        let mut map = self.messages.lock();
-                        let list = map.entry(chat_id).or_default();
-                        if !list.iter().any(|m| m.id == msg.id) {
-                            list.push(msg);
-                            drop(map);
-                            self.messages.mark_dirty();
-                            self.persist_journal();
-                            any = true;
-                        }
-                    }
-                    self.offline_mail_processed.insert(env.message_id);
+            for env in envelopes {
+                if self.offline_mail_processed.contains(&env.message_id) {
+                    continue;
                 }
-                _ => {}
+                let Ok(plaintext) = open_envelope(secret, &env) else {
+                    warn!(
+                        "VOID: offline mail {} не расшифровался (чужой ключ/битый конверт)",
+                        &env.message_id[..8.min(env.message_id.len())]
+                    );
+                    continue;
+                };
+                match env.kind.as_str() {
+                    "dm" | "group" => {
+                        let Ok(msg) = serde_json::from_slice::<ChatMessage>(&plaintext) else {
+                            continue;
+                        };
+                        let chat_id = msg
+                            .group_id
+                            .as_ref()
+                            .map(|id| group_thread_key(id))
+                            .or_else(|| {
+                                let local = self.local_peer_id.map(|p| p.to_string())?;
+                                if msg.sender_id == local {
+                                    msg.recipient_id.clone()
+                                } else {
+                                    Some(msg.sender_id.clone())
+                                }
+                            })
+                            .unwrap_or_else(|| msg.sender_id.clone());
+                        if !self.messages.is_deleted(&msg.id) {
+                            let mut map = self.messages.lock();
+                            let list = map.entry(chat_id).or_default();
+                            if !list.iter().any(|m| m.id == msg.id) {
+                                if msg.group_id.is_none() {
+                                    if let Ok(pid) = msg.sender_id.parse::<PeerId>() {
+                                        if self.local_peer_id != Some(pid) {
+                                            inbound.push((pid, msg.sender_name.clone()));
+                                        }
+                                    }
+                                }
+                                list.push(msg);
+                                drop(map);
+                                self.messages.mark_dirty();
+                                self.persist_journal();
+                                any = true;
+                            }
+                        }
+                        self.offline_mail_processed.insert(env.message_id);
+                    }
+                    _ => {}
+                }
             }
+        }
+        for (pid, name) in inbound {
+            self.note_inbound_peer(pid, &name);
         }
         if any {
             self.add_status("Получена офлайн-почта".into());
@@ -840,6 +880,39 @@ impl Inner {
                 }
             })
             .collect();
+        // Чаты из journal без записи в address book (старые входящие до auto-add).
+        {
+            let map = self.messages.lock();
+            for key in map.keys() {
+                if group::is_group_thread(key) {
+                    continue;
+                }
+                let Ok(pid) = key.parse::<PeerId>() else {
+                    continue;
+                };
+                if self.known_peers.contains_key(&pid) {
+                    continue;
+                }
+                let label = map
+                    .get(key)
+                    .and_then(|msgs| msgs.last())
+                    .map(|m| {
+                        if m.sender_id == *key {
+                            m.sender_name.clone()
+                        } else {
+                            key.chars().take(12).collect()
+                        }
+                    })
+                    .unwrap_or_else(|| key.chars().take(12).collect());
+                contacts.push(ContactDto {
+                    peer_id: key.clone(),
+                    display_name: label,
+                    online: self.connected_peer_ids.contains(&pid),
+                    last_preview: self.preview_for(key),
+                    is_group: false,
+                });
+            }
+        }
         for g in self.groups.values() {
             let key = group_thread_key(&g.id);
             contacts.push(ContactDto {
@@ -993,7 +1066,9 @@ impl VoidRuntime {
                                 peer_id: pid.to_string(),
                                 online: true,
                             });
-                            if g.known_peers.contains_key(&pid) {
+                            let want_session = g.known_peers.contains_key(&pid)
+                                || g.pending_sends.iter().any(|p| p.peer == pid);
+                            if want_session {
                                 if let Some(tx) = &g.command_tx {
                                     let _ = tx.try_send(UICommand::EnsureChatSession(pid));
                                 }
@@ -1023,6 +1098,9 @@ impl VoidRuntime {
                                         peer_id: pid.to_string(),
                                         online: true,
                                     });
+                                }
+                                if msg.group_id.is_none() && g.local_peer_id != Some(pid) {
+                                    g.note_inbound_peer(pid, &msg.sender_name);
                                 }
                             }
                             let chat_id = msg

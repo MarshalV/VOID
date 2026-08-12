@@ -2566,16 +2566,14 @@ pub async fn run_chat_network(
                                 &bootstrap_peer_ids,
                                 &void_bootstraps,
                             );
-                            if mailbox_fetch_attempts < MAX_MAILBOX_FETCH_ATTEMPTS {
-                                fetch_mailbox_after =
-                                    Some(Instant::now() + Duration::from_secs(10));
+                            // Частый poll: без живого circuit доставка только через
+                            // ящик; 10–30 с выглядели как «сообщения идут очень долго».
+                            let gap = if mailbox_fetch_attempts < MAX_MAILBOX_FETCH_ATTEMPTS {
+                                Duration::from_secs(2)
                             } else {
-                                // Пир мог быть online, когда мы уже перестали
-                                // опрашивать ящик — редкий poll, чтобы текст
-                                // всё же дошёл офлайн-путём.
-                                fetch_mailbox_after =
-                                    Some(Instant::now() + Duration::from_secs(30));
-                            }
+                                Duration::from_secs(5)
+                            };
+                            fetch_mailbox_after = Some(Instant::now() + gap);
                         }
                     }
                 }
