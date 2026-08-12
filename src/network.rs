@@ -1676,19 +1676,51 @@ async fn flush_pending_encrypted_messages(
         return;
     };
     for data in buffered {
-        let _ = send_encrypted_chat_payload(
+        let sent = send_encrypted_chat_payload(
             swarm,
             sessions,
             outbound_msg_requests,
             outbound_delete_requests,
             event_tx,
             peer,
-            data,
+            data.clone(),
             None,
             now,
         )
         .await;
+        if !sent {
+            requeue_pending_chat_json(pending_messages, peer, data);
+        }
     }
+}
+
+fn put_e2ee_session(
+    sessions: &mut HashMap<PeerId, crypto::SecureSession>,
+    session_established_at: &mut HashMap<PeerId, Instant>,
+    peer: PeerId,
+    session: crypto::SecureSession,
+) {
+    sessions.insert(peer, session);
+    session_established_at.insert(peer, Instant::now());
+}
+
+fn drop_e2ee_session(
+    sessions: &mut HashMap<PeerId, crypto::SecureSession>,
+    session_established_at: &mut HashMap<PeerId, Instant>,
+    peer: PeerId,
+) {
+    sessions.remove(&peer);
+    session_established_at.remove(&peer);
+}
+
+fn e2ee_session_is_fresh(
+    session_established_at: &HashMap<PeerId, Instant>,
+    peer: PeerId,
+) -> bool {
+    session_established_at
+        .get(&peer)
+        .map(|t| t.elapsed() < Duration::from_secs(2))
+        .unwrap_or(false)
 }
 
 fn voice_transfer_stale(t: &file_transfer::OutgoingTransfer) -> Duration {
@@ -1923,6 +1955,11 @@ async fn flush_pending_read_receipts(
 /// pending-handshake (например после DialFailure, когда пир был офлайн).
 /// Без force повтор разрешён только если Hello «завис» дольше ~20 с —
 /// иначе новый ephemeral ломает ответ на старый Hello.
+///
+/// Hello шлёт только сторона с меньшим PeerId. Если оба шлют сразу, responder
+/// создаёт *новый* ephemeral в ответе, а initiator уже взял ephemeral из
+/// входящего Hello — ratchet не сходится. Текст уходит в мёртвую сессию,
+/// а file Offer (без ratchet) всё равно доходит.
 async fn ensure_e2ee_handshake_started(
     swarm: &mut libp2p::Swarm<ChatBehaviour>,
     local_key: &libp2p::identity::Keypair,
@@ -1936,6 +1973,11 @@ async fn ensure_e2ee_handshake_started(
     force: bool,
 ) -> bool {
     if sessions.contains_key(&peer_id) {
+        return false;
+    }
+    // Responder ждёт входящий Hello. `force` — только если initiator молчит
+    // (decrypt fail / Hello-вместо-Ack), иначе снова simultaneous Hello.
+    if local_peer_id > peer_id && !force {
         return false;
     }
     const STALE_HELLO: Duration = Duration::from_secs(20);
@@ -2012,6 +2054,7 @@ pub async fn run_chat_network(
 ) {
         let mut void_bootstraps = void_bootstraps;
         let mut sessions: HashMap<PeerId, crypto::SecureSession> = HashMap::new();
+        let mut session_established_at: HashMap<PeerId, Instant> = HashMap::new();
         let mut pending_handshakes: HashMap<PeerId, crypto::StaticSecret> = HashMap::new();
         let mut handshake_started: HashMap<PeerId, Instant> = HashMap::new();
         let mut pending_messages: HashMap<PeerId, Vec<Vec<u8>>> = HashMap::new();
@@ -2297,7 +2340,11 @@ pub async fn run_chat_network(
                                 fetch_mailbox_after =
                                     Some(Instant::now() + Duration::from_secs(10));
                             } else {
-                                fetch_mailbox_after = None;
+                                // Пир мог быть online, когда мы уже перестали
+                                // опрашивать ящик — редкий poll, чтобы текст
+                                // всё же дошёл офлайн-путём.
+                                fetch_mailbox_after =
+                                    Some(Instant::now() + Duration::from_secs(30));
                             }
                         }
                     }
@@ -2391,9 +2438,18 @@ pub async fn run_chat_network(
                         }
                     }
                     // Сообщения, застрявшие в pending при живой E2EE (файлы уже ходят).
+                    // Не раньше ~800 мс после Hello: иначе Encrypted прилетает
+                    // initiator'у до его сессии → Hello-вместо-Ack → сброс ratchet.
                     let flush_peers: Vec<PeerId> = pending_messages
                         .iter()
-                        .filter(|(p, q)| !q.is_empty() && sessions.contains_key(p))
+                        .filter(|(p, q)| {
+                            !q.is_empty()
+                                && sessions.contains_key(p)
+                                && session_established_at
+                                    .get(p)
+                                    .map(|t| t.elapsed() >= Duration::from_millis(800))
+                                    .unwrap_or(false)
+                        })
                         .map(|(p, _)| *p)
                         .collect();
                     if !flush_peers.is_empty() {
@@ -3747,8 +3803,7 @@ pub async fn run_chat_network(
                                     signal_publish_done(&shared_gate, false);
                                 }
                                 for (recipient, batch) in by_recipient {
-                                    // Always track Store→MessageDelivered, even when
-                                    // exit-ack channel is absent (normal UI send).
+                                    // Track Store for exit-flush / handoff, not for UI ✓.
                                     let recip_done: PublishDone = shared_gate
                                         .as_ref()
                                         .map(|g| once_publish_gate(g.clone()))
@@ -4139,22 +4194,23 @@ pub async fn run_chat_network(
                                                         .request_response
                                                         .send_response(channel, V1Packet::Ack);
                                                 } else {
-                                                let is_initiator = local_peer_id < peer;
-                                                let _role_str = if is_initiator { "Initiator" } else { "Responder" };
-
-                                                // Новый Hello всегда перезапускает согласование: иначе после рестарта
-                                                // пира мы бы оставили старый ratchet и только вернули Ack.
+                                                // Входящий Hello Request: всегда responder.
+                                                // Не flush'аем pending — initiator ещё без сессии,
+                                                // Encrypted прилетит ему раньше Hello-ответа и
+                                                // снесёт ratchet (текст теряется, файлы живут).
                                                 if sessions.contains_key(&peer) {
                                                     debug!(
                                                         "[{}] 🔄 E2EE: сброс сессии с {} (новый Hello)",
                                                         now,
                                                         &peer.to_string()[..8]
                                                     );
-                                                    sessions.remove(&peer);
+                                                    drop_e2ee_session(
+                                                        &mut sessions,
+                                                        &mut session_established_at,
+                                                        peer,
+                                                    );
                                                 }
-                                                // Наш незавершённый Hello (если был) — одно значение; либо дополняем им
-                                                // рукопожатие, либо уступаем ответом как responder.
-                                                let took_outgoing = pending_handshakes.remove(&peer);
+                                                pending_handshakes.remove(&peer);
                                                 handshake_started.remove(&peer);
 
                                                 let remote_static_pub = crypto::PublicKey::from(public_key);
@@ -4166,144 +4222,36 @@ pub async fn run_chat_network(
                                                 )
                                                 .await;
                                                 let remote_ephem_pub = crypto::PublicKey::from(ephemeral_key);
-
-                                                if is_initiator {
-                                                    // По PeerId мы «инициатор»; если уже посылали Hello — закрываем пару.
-                                                    if let Some(local_ephem_secret) = took_outgoing {
-                                                        let session = crypto::SecureSession::new_initiator(&local_static, &remote_static_pub, local_ephem_secret, &remote_ephem_pub);
-                                                        sessions.insert(peer, session);
-                                                        debug!("[{}] 🤝 E2EE: Сессия (Alice/Req) создана с {}", now, &peer.to_string()[..8]);
-                                                        flush_pending_encrypted_messages(
-                                                            &mut swarm,
-                                                            &mut sessions,
-                                                            &mut outbound_msg_requests,
-                                                            &mut outbound_delete_requests,
-                                                            &event_tx,
-                                                            peer,
-                                                            &mut pending_messages,
-                                                            &now,
-                                                        )
-                                                        .await;
-                                                        flush_pending_read_receipts(
-                                                            &mut swarm,
-                                                            &mut sessions,
-                                                            &mut outbound_msg_requests,
-                                                            &mut outbound_delete_requests,
-                                                            &event_tx,
-                                                            peer,
-                                                            &mut pending_read_receipts,
-                                                            &now,
-                                                        )
-                                                        .await;
-                                                        flush_pending_voice_transfers(
-                                                            &mut swarm,
-                                                            &mut outgoing_transfers,
-                                                            &relay_peers,
-                                                            &event_tx,
-                                                            peer,
-                                                            &mut pending_voice_transfers,
-                                                        )
-                                                        .await;
-                                                        let _ = swarm.behaviour_mut().request_response.send_response(channel, V1Packet::Ack);
-                                                    } else {
-                                                        // Инициатор по ID, но свой Hello мы ещё не слали — завершаем как responder.
-                                                        let local_ephem_secret = crypto::StaticSecret::random_from_rng(&mut rand::rngs::OsRng);
-                                                        let local_ephem_pub = crypto::PublicKey::from(&local_ephem_secret);
-
-                                                        let session = crypto::SecureSession::new_responder(&local_static, &remote_static_pub, &remote_ephem_pub, local_ephem_secret);
-                                                        sessions.insert(peer, session);
-                                                        debug!("[{}] 🤝 E2EE: Сессия (fallback Res после Hello пира) с {}", now, &peer.to_string()[..8]);
-                                                        flush_pending_encrypted_messages(
-                                                            &mut swarm,
-                                                            &mut sessions,
-                                                            &mut outbound_msg_requests,
-                                                            &mut outbound_delete_requests,
-                                                            &event_tx,
-                                                            peer,
-                                                            &mut pending_messages,
-                                                            &now,
-                                                        )
-                                                        .await;
-                                                        flush_pending_read_receipts(
-                                                            &mut swarm,
-                                                            &mut sessions,
-                                                            &mut outbound_msg_requests,
-                                                            &mut outbound_delete_requests,
-                                                            &event_tx,
-                                                            peer,
-                                                            &mut pending_read_receipts,
-                                                            &now,
-                                                        )
-                                                        .await;
-                                                        flush_pending_voice_transfers(
-                                                            &mut swarm,
-                                                            &mut outgoing_transfers,
-                                                            &relay_peers,
-                                                            &event_tx,
-                                                            peer,
-                                                            &mut pending_voice_transfers,
-                                                        )
-                                                        .await;
-
-                                                    if let Some(my_hello) = build_v1_hello(
-                                                        &local_key,
-                                                        local_peer_id,
-                                                        peer,
-                                                        my_public_key,
-                                                        local_ephem_pub,
-                                                    ) {
-                                                        let _ = swarm.behaviour_mut().request_response.send_response(channel, my_hello);
-                                                    }
-                                                    }
-                                                } else {
-                                                    // Боб получил Hello от Алисы
-                                                    let local_ephem_secret = crypto::StaticSecret::random_from_rng(&mut rand::rngs::OsRng);
-                                                    let local_ephem_pub = crypto::PublicKey::from(&local_ephem_secret);
-
-                                                    let session = crypto::SecureSession::new_responder(&local_static, &remote_static_pub, &remote_ephem_pub, local_ephem_secret);
-                                                    sessions.insert(peer, session);
-                                                    debug!("[{}] 🤝 E2EE: Сессия (Bob/Res) создана с {}", now, &peer.to_string()[..8]);
-                                                    flush_pending_encrypted_messages(
-                                                        &mut swarm,
-                                                        &mut sessions,
-                                                        &mut outbound_msg_requests,
-                                                        &mut outbound_delete_requests,
-                                                        &event_tx,
-                                                        peer,
-                                                        &mut pending_messages,
-                                                        &now,
-                                                    )
-                                                    .await;
-                                                    flush_pending_read_receipts(
-                                                        &mut swarm,
-                                                        &mut sessions,
-                                                        &mut outbound_msg_requests,
-                                                        &mut outbound_delete_requests,
-                                                        &event_tx,
-                                                        peer,
-                                                        &mut pending_read_receipts,
-                                                        &now,
-                                                    )
-                                                    .await;
-                                                    flush_pending_voice_transfers(
-                                                        &mut swarm,
-                                                        &mut outgoing_transfers,
-                                                        &relay_peers,
-                                                        &event_tx,
-                                                        peer,
-                                                        &mut pending_voice_transfers,
-                                                    )
-                                                    .await;
-
-                                                    if let Some(my_hello) = build_v1_hello(
-                                                        &local_key,
-                                                        local_peer_id,
-                                                        peer,
-                                                        my_public_key,
-                                                        local_ephem_pub,
-                                                    ) {
-                                                        let _ = swarm.behaviour_mut().request_response.send_response(channel, my_hello);
-                                                    }
+                                                let local_ephem_secret = crypto::StaticSecret::random_from_rng(&mut rand::rngs::OsRng);
+                                                let local_ephem_pub = crypto::PublicKey::from(&local_ephem_secret);
+                                                let session = crypto::SecureSession::new_responder(
+                                                    &local_static,
+                                                    &remote_static_pub,
+                                                    &remote_ephem_pub,
+                                                    local_ephem_secret,
+                                                );
+                                                put_e2ee_session(
+                                                    &mut sessions,
+                                                    &mut session_established_at,
+                                                    peer,
+                                                    session,
+                                                );
+                                                debug!(
+                                                    "[{}] 🤝 E2EE: Сессия (responder) создана с {}",
+                                                    now,
+                                                    &peer.to_string()[..8]
+                                                );
+                                                if let Some(my_hello) = build_v1_hello(
+                                                    &local_key,
+                                                    local_peer_id,
+                                                    peer,
+                                                    my_public_key,
+                                                    local_ephem_pub,
+                                                ) {
+                                                    let _ = swarm
+                                                        .behaviour_mut()
+                                                        .request_response
+                                                        .send_response(channel, my_hello);
                                                 }
                                                 }
                                             }
@@ -4475,7 +4423,11 @@ pub async fn run_chat_network(
                                                             now,
                                                             &peer.to_string()[..8]
                                                         );
-                                                        sessions.remove(&peer);
+                                                        drop_e2ee_session(
+                                                            &mut sessions,
+                                                            &mut session_established_at,
+                                                            peer,
+                                                        );
                                                         // Signal peer to re-handshake (same as no-session).
                                                         let ephem_secret =
                                                             crypto::StaticSecret::random_from_rng(
@@ -4563,6 +4515,30 @@ pub async fn run_chat_network(
                                                         .request_response
                                                         .send_response(ch, V1Packet::Ack);
                                                 }
+                                                // Пир точно умеет расшифровывать — можно
+                                                // слить буфер, который ждал конца Hello.
+                                                flush_pending_encrypted_messages(
+                                                    &mut swarm,
+                                                    &mut sessions,
+                                                    &mut outbound_msg_requests,
+                                                    &mut outbound_delete_requests,
+                                                    &event_tx,
+                                                    peer,
+                                                    &mut pending_messages,
+                                                    &now,
+                                                )
+                                                .await;
+                                                flush_pending_read_receipts(
+                                                    &mut swarm,
+                                                    &mut sessions,
+                                                    &mut outbound_msg_requests,
+                                                    &mut outbound_delete_requests,
+                                                    &event_tx,
+                                                    peer,
+                                                    &mut pending_read_receipts,
+                                                    &now,
+                                                )
+                                                .await;
                                             }
                                         }
                                         V1Packet::Ack => {
@@ -4573,7 +4549,7 @@ pub async fn run_chat_network(
                                 libp2p::request_response::Message::Response { request_id, response } => {
                                     match response {
                                         V1Packet::Ack => {
-                                            if let Some((handoff, recip, message_id)) =
+                                            if let Some((handoff, _recip, message_id)) =
                                                 outbound_mailbox_stores.remove(&request_id)
                                             {
                                                 debug!(
@@ -4582,22 +4558,10 @@ pub async fn run_chat_network(
                                                     &message_id[..8.min(message_id.len())]
                                                 );
                                                 handoff.note_store_ack(&message_id);
-                                                // One ✓ = accepted by bootstrap/relay (or live peer path).
-                                                if !message_id.starts_with("vchunk:")
-                                                    && !message_id.starts_with("gsync:")
-                                                {
-                                                    let mid = message_id
-                                                        .split(':')
-                                                        .next()
-                                                        .unwrap_or(message_id.as_str())
-                                                        .to_string();
-                                                    let _ = event_tx
-                                                        .send(NetworkEvent::MessageDelivered {
-                                                            peer: recip,
-                                                            message_id: mid,
-                                                        })
-                                                        .await;
-                                                }
+                                                // Ящик принял конверт — это НЕ доставка
+                                                // собеседнику. ✓ только с live Encrypted Ack,
+                                                // иначе pending_sends снимается, а пир online
+                                                // так и не видит текст (файлы ящик не используют).
                                             } else if let Some((chunk_peer, tid, chunk_idx)) =
                                                 outbound_chunk_requests.remove(&request_id)
                                             {
@@ -4690,10 +4654,18 @@ pub async fn run_chat_network(
                                                 outbound_msg_requests.remove(&request_id)
                                             {
                                                 debug!(
-                                                    "[{}] ↻ RR: {} ответил Hello вместо Ack (msg {}) — реqueue + Handshake",
+                                                    "[{}] ↻ RR: {} ответил Hello вместо Ack (msg {}) — реqueue{}",
                                                     now,
                                                     &peer.to_string()[..8],
-                                                    &retry_id[..8.min(retry_id.len())]
+                                                    &retry_id[..8.min(retry_id.len())],
+                                                    if e2ee_session_is_fresh(
+                                                        &session_established_at,
+                                                        retry_peer,
+                                                    ) {
+                                                        " (сессия свежая — не сбрасываю)"
+                                                    } else {
+                                                        " + Handshake"
+                                                    }
                                                 );
                                                 let _ = retry_id;
                                                 requeue_pending_chat_json(
@@ -4701,31 +4673,44 @@ pub async fn run_chat_network(
                                                     retry_peer,
                                                     json,
                                                 );
-                                                sessions.remove(&retry_peer);
-                                                pending_handshakes.remove(&retry_peer);
-                                                handshake_started.remove(&retry_peer);
-                                                let _ = event_tx
-                                                    .send(NetworkEvent::MessageAwaitingSession(
+                                                if e2ee_session_is_fresh(
+                                                    &session_established_at,
+                                                    retry_peer,
+                                                ) {
+                                                    // Responder уже ответил Hello; наш Encrypted
+                                                    // просто пришёл раньше. Сброс сессии ломает
+                                                    // ratchet, который initiator как раз создаёт.
+                                                } else {
+                                                    drop_e2ee_session(
+                                                        &mut sessions,
+                                                        &mut session_established_at,
                                                         retry_peer,
-                                                    ))
-                                                    .await;
-                                                if swarm.is_connected(&retry_peer) {
-                                                    let now_hs = chrono::Local::now()
-                                                        .format("%H:%M:%S")
-                                                        .to_string();
-                                                    let _ = ensure_e2ee_handshake_started(
-                                                        &mut swarm,
-                                                        &local_key,
-                                                        local_peer_id,
-                                                        my_public_key,
-                                                        retry_peer,
-                                                        &sessions,
-                                                        &mut pending_handshakes,
-                                                        &mut handshake_started,
-                                                        &now_hs,
-                                                        true,
-                                                    )
-                                                    .await;
+                                                    );
+                                                    pending_handshakes.remove(&retry_peer);
+                                                    handshake_started.remove(&retry_peer);
+                                                    let _ = event_tx
+                                                        .send(NetworkEvent::MessageAwaitingSession(
+                                                            retry_peer,
+                                                        ))
+                                                        .await;
+                                                    if swarm.is_connected(&retry_peer) {
+                                                        let now_hs = chrono::Local::now()
+                                                            .format("%H:%M:%S")
+                                                            .to_string();
+                                                        let _ = ensure_e2ee_handshake_started(
+                                                            &mut swarm,
+                                                            &local_key,
+                                                            local_peer_id,
+                                                            my_public_key,
+                                                            retry_peer,
+                                                            &sessions,
+                                                            &mut pending_handshakes,
+                                                            &mut handshake_started,
+                                                            &now_hs,
+                                                            true,
+                                                        )
+                                                        .await;
+                                                    }
                                                 }
                                             } else if let Some((chunk_peer, tid, chunk_idx)) =
                                                 outbound_chunk_requests.remove(&request_id)
@@ -4752,26 +4737,35 @@ pub async fn run_chat_network(
                                                     &chunk_peer.to_string()[..8],
                                                     chunk_idx
                                                 );
-                                                sessions.remove(&chunk_peer);
-                                                pending_handshakes.remove(&chunk_peer);
-                                                handshake_started.remove(&chunk_peer);
-                                                if swarm.is_connected(&chunk_peer) {
-                                                    let now_hs = chrono::Local::now()
-                                                        .format("%H:%M:%S")
-                                                        .to_string();
-                                                    let _ = ensure_e2ee_handshake_started(
-                                                        &mut swarm,
-                                                        &local_key,
-                                                        local_peer_id,
-                                                        my_public_key,
+                                                if !e2ee_session_is_fresh(
+                                                    &session_established_at,
+                                                    chunk_peer,
+                                                ) {
+                                                    drop_e2ee_session(
+                                                        &mut sessions,
+                                                        &mut session_established_at,
                                                         chunk_peer,
-                                                        &sessions,
-                                                        &mut pending_handshakes,
-                                                        &mut handshake_started,
-                                                        &now_hs,
-                                                        true,
-                                                    )
-                                                    .await;
+                                                    );
+                                                    pending_handshakes.remove(&chunk_peer);
+                                                    handshake_started.remove(&chunk_peer);
+                                                    if swarm.is_connected(&chunk_peer) {
+                                                        let now_hs = chrono::Local::now()
+                                                            .format("%H:%M:%S")
+                                                            .to_string();
+                                                        let _ = ensure_e2ee_handshake_started(
+                                                            &mut swarm,
+                                                            &local_key,
+                                                            local_peer_id,
+                                                            my_public_key,
+                                                            chunk_peer,
+                                                            &sessions,
+                                                            &mut pending_handshakes,
+                                                            &mut handshake_started,
+                                                            &now_hs,
+                                                            true,
+                                                        )
+                                                        .await;
+                                                    }
                                                 }
                                             } else if peer != local_peer_id {
                                                 if !verify_hello_transport_binding(
@@ -4789,20 +4783,21 @@ pub async fn run_chat_network(
                                                     );
                                                 } else {
                                                 let is_initiator = local_peer_id < peer;
-                                                if sessions.contains_key(&peer) {
-                                                    debug!(
-                                                        "[{}] 🔄 E2EE: сброс сессии с {} (Hello в ответе)",
-                                                        now,
-                                                        &peer.to_string()[..8]
+                                                // Сессию из ответа Hello строим только если
+                                                // наш исходящий Hello ещё жив. Иначе это
+                                                // disposable Hello (нет сессии у пира) —
+                                                // сброс уже рабочей сессии убивает чат.
+                                                if let Some(local_ephem_secret) =
+                                                    pending_handshakes.remove(&peer)
+                                                {
+                                                    handshake_started.remove(&peer);
+                                                    drop_e2ee_session(
+                                                        &mut sessions,
+                                                        &mut session_established_at,
+                                                        peer,
                                                     );
-                                                    sessions.remove(&peer);
-                                                }
-                                                let session_exists = sessions.contains_key(&peer);
-                                                // Завершение стороны, которая первая послала Hello (есть наш ephem в pending).
-                                                // Раньше требовался is_initiator (меньший PeerId) — тогда пир с большим ID,
-                                                // написавший первым, никогда не создавал сессию по Hello в ответе.
-                                                if !session_exists {
-                                                    let remote_static_pub = crypto::PublicKey::from(public_key);
+                                                    let remote_static_pub =
+                                                        crypto::PublicKey::from(public_key);
                                                     remember_peer_prekey(
                                                         &mut peer_prekeys,
                                                         &event_tx,
@@ -4810,49 +4805,57 @@ pub async fn run_chat_network(
                                                         public_key,
                                                     )
                                                     .await;
-                                                    let remote_ephem_pub = crypto::PublicKey::from(ephemeral_key);
-                                                    if let Some(local_ephem_secret) = pending_handshakes.remove(&peer) {
-                                                        handshake_started.remove(&peer);
-                                                        let session = crypto::SecureSession::new_initiator(&local_static, &remote_static_pub, local_ephem_secret, &remote_ephem_pub);
-                                                        sessions.insert(peer, session);
-                                                        debug!(
-                                                            "[{}] 🤝 E2EE: Сессия (ответ Hello) создана с {}{}",
-                                                            now,
-                                                            &peer.to_string()[..8],
-                                                            if is_initiator { " [initiator по ID]" } else { "" }
-                                                        );
-                                                        flush_pending_encrypted_messages(
-                                                            &mut swarm,
-                                                            &mut sessions,
-                                                            &mut outbound_msg_requests,
-                                                            &mut outbound_delete_requests,
-                                                            &event_tx,
-                                                            peer,
-                                                            &mut pending_messages,
-                                                            &now,
-                                                        )
-                                                        .await;
-                                                        flush_pending_read_receipts(
-                                                            &mut swarm,
-                                                            &mut sessions,
-                                                            &mut outbound_msg_requests,
-                                                            &mut outbound_delete_requests,
-                                                            &event_tx,
-                                                            peer,
-                                                            &mut pending_read_receipts,
-                                                            &now,
-                                                        )
-                                                        .await;
-                                                        flush_pending_voice_transfers(
-                                                            &mut swarm,
-                                                            &mut outgoing_transfers,
-                                                            &relay_peers,
-                                                            &event_tx,
-                                                            peer,
-                                                            &mut pending_voice_transfers,
-                                                        )
-                                                        .await;
-                                                    }
+                                                    let remote_ephem_pub =
+                                                        crypto::PublicKey::from(ephemeral_key);
+                                                    let session = crypto::SecureSession::new_initiator(
+                                                        &local_static,
+                                                        &remote_static_pub,
+                                                        local_ephem_secret,
+                                                        &remote_ephem_pub,
+                                                    );
+                                                    put_e2ee_session(
+                                                        &mut sessions,
+                                                        &mut session_established_at,
+                                                        peer,
+                                                        session,
+                                                    );
+                                                    debug!(
+                                                        "[{}] 🤝 E2EE: Сессия (ответ Hello) создана с {}{}",
+                                                        now,
+                                                        &peer.to_string()[..8],
+                                                        if is_initiator { " [initiator по ID]" } else { "" }
+                                                    );
+                                                    flush_pending_encrypted_messages(
+                                                        &mut swarm,
+                                                        &mut sessions,
+                                                        &mut outbound_msg_requests,
+                                                        &mut outbound_delete_requests,
+                                                        &event_tx,
+                                                        peer,
+                                                        &mut pending_messages,
+                                                        &now,
+                                                    )
+                                                    .await;
+                                                    flush_pending_read_receipts(
+                                                        &mut swarm,
+                                                        &mut sessions,
+                                                        &mut outbound_msg_requests,
+                                                        &mut outbound_delete_requests,
+                                                        &event_tx,
+                                                        peer,
+                                                        &mut pending_read_receipts,
+                                                        &now,
+                                                    )
+                                                    .await;
+                                                    flush_pending_voice_transfers(
+                                                        &mut swarm,
+                                                        &mut outgoing_transfers,
+                                                        &relay_peers,
+                                                        &event_tx,
+                                                        peer,
+                                                        &mut pending_voice_transfers,
+                                                    )
+                                                    .await;
                                                 }
                                                 }
                                             }
@@ -5412,7 +5415,11 @@ pub async fn run_chat_network(
                             // E2EE: при обрыве TCP/QUIC сбрасываем криптосостояние с пиром.
                             // Иначе после рестарта одного клиента второй держит «старый» ratchet
                             // и новые Hello игнорируются (отправлялся только Ack → чат мёртв).
-                            sessions.remove(&peer_id);
+                            drop_e2ee_session(
+                                &mut sessions,
+                                &mut session_established_at,
+                                peer_id,
+                            );
                             pending_handshakes.remove(&peer_id);
                             handshake_started.remove(&peer_id);
                             // pending_messages сохраняем — UI/ретрай переотправит после реконнекта.
@@ -5574,6 +5581,7 @@ pub async fn run_chat_network(
                                     .await;
                             }
                             if has_chat
+                                && !is_bootstrap
                                 && !sessions.contains_key(&peer_id)
                                 && swarm.is_connected(&peer_id)
                                 && peer_id != local_peer_id
