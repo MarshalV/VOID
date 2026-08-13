@@ -2486,6 +2486,82 @@ impl VoidRuntime {
         Ok(self.get_snapshot())
     }
 
+    pub fn invite_to_group(
+        &self,
+        group_id: String,
+        member_peer_ids: Vec<String>,
+    ) -> Result<SnapshotDto, String> {
+        let mut g = self.inner.lock().unwrap_or_else(|p| p.into_inner());
+        let local = g.local_peer_id.ok_or("нет peer")?;
+        let gid = group_id
+            .strip_prefix("group:")
+            .unwrap_or(group_id.as_str())
+            .to_string();
+        if g.left_groups.contains(&gid) {
+            return Err("Вы не в этой группе".into());
+        }
+        let already: HashSet<String> = g
+            .groups
+            .get(&gid)
+            .ok_or("Группа не найдена")?
+            .members
+            .iter()
+            .map(|m| m.peer_id.clone())
+            .collect();
+        let mut newcomers: Vec<GroupMember> = Vec::new();
+        for pid_str in member_peer_ids {
+            let pid: PeerId = pid_str.parse().map_err(|_| "Неверный PeerId контакта")?;
+            if pid == local || already.contains(&pid_str) {
+                continue;
+            }
+            if newcomers.iter().any(|m| m.peer_id == pid_str) {
+                continue;
+            }
+            let display = g
+                .known_peers
+                .get(&pid)
+                .cloned()
+                .unwrap_or_else(|| pid_str.chars().take(12).collect());
+            newcomers.push(GroupMember {
+                peer_id: pid_str,
+                display_name: display,
+            });
+        }
+        if newcomers.is_empty() {
+            return Err("Выберите контакты, которых ещё нет в группе".into());
+        }
+        let added = newcomers.len();
+        let group = {
+            let group = g.groups.get_mut(&gid).ok_or("Группа не найдена")?;
+            group.members.extend(newcomers);
+            group.members = dedupe_members(std::mem::take(&mut group.members));
+            group.clone()
+        };
+        let recipients: Vec<PeerId> = group
+            .members
+            .iter()
+            .filter_map(|m| m.peer_id.parse().ok())
+            .filter(|p| *p != local)
+            .collect();
+        if let Some(tx) = &g.command_tx {
+            let _ = tx.try_send(UICommand::SendGroupSync {
+                group_id: group.id.clone(),
+                group_name: group.name.clone(),
+                creator_id: group.creator_id.clone(),
+                members: group.members.clone(),
+                recipients,
+            });
+        }
+        g.add_status(format!(
+            "В группу «{}» приглашено: {added}",
+            group.name
+        ));
+        g.persist_vault();
+        drop(g);
+        self.emit_snapshot();
+        Ok(self.get_snapshot())
+    }
+
     pub fn prepare_quit(&self) {
         let (items, tx_opt) = {
             let g = self.inner.lock().unwrap_or_else(|p| p.into_inner());

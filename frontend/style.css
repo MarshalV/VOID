@@ -558,6 +558,23 @@ button.icon-btn img {
   align-self: center;
 }
 
+.contact-pick {
+  max-height: 220px;
+  overflow: auto;
+  display: flex;
+  flex-direction: column;
+  gap: 0.2rem;
+  border: 1px solid var(--line);
+  border-radius: 12px;
+  padding: 0.35rem;
+  background: var(--bg0);
+}
+.pick-row {
+  padding: 0.45rem 0.55rem;
+  border-radius: 8px;
+}
+.pick-row:hover { background: rgba(255, 255, 255, 0.04); }
+
 @media (max-width: 820px) {
   :root {
     --sidebar-w: min(100%, 360px);

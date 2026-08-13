@@ -479,13 +479,14 @@
         <h4 class="menu-h">Контакты</h4>
         <label class="field"><span>PeerId / multiaddr / IP</span><input id="m-peer" /></label>
         <label class="field"><span>Имя</span><input id="m-name" placeholder="Необязательно" /></label>
-        <button class="btn primary" id="m-add">Добавить контакт</button>
-        <p class="muted">ПКМ по контакту в списке: переименовать / очистить чат / удалить.</p>`;
+        <button class="btn primary" id="m-add">Добавить контакт</button>`;
     } else if (sec === "groups") {
+      const pick = contactPickerHtml([], snapshot?.peer_id);
       body = `
         <h4 class="menu-h">Группы</h4>
         <label class="field"><span>Название группы</span><input id="m-gname" /></label>
-        <label class="field"><span>Участники (PeerId через запятую)</span><input id="m-gmembers" /></label>
+        <p class="muted">Участники из контактов</p>
+        ${pick}
         <button class="btn primary" id="m-gcreate">Создать группу</button>
         <hr class="menu-hr" />
         <label class="field"><span>Ссылка void://group/…</span><input id="m-glink" /></label>
@@ -494,10 +495,6 @@
       const boots =
         (snapshot?.bootstraps || []).map((b) => `<div>${escapeHtml(b)}</div>`).join("") ||
         "<div>Пока пусто — войдите через IP ноды</div>";
-      const dht = (snapshot?.dht_lines || [])
-        .slice(0, 40)
-        .map((l) => `<div>${escapeHtml(l)}</div>`)
-        .join("");
       body = `
         <h4 class="menu-h">Сеть VOID</h4>
         <p class="muted">Ваш PeerId:</p>
@@ -521,9 +518,7 @@
         <label class="field"><span>IP / IP:PORT / multiaddr</span><input id="n-join" placeholder="например 1.2.3.4:50001" /></label>
         <button class="btn primary" id="n-go">Войти в VOID</button>
         <button class="btn" id="n-reload">Переподключить bootstrap</button>
-        <button class="btn" id="n-dht">Снимок DHT</button>
-        <div><strong>Bootstrap (${snapshot?.bootstraps?.length || 0})</strong><div class="bootstrap-list">${boots}</div></div>
-        <div><strong>DHT (${snapshot?.dht_total || 0})</strong><div class="bootstrap-list">${dht}</div></div>`;
+        <div><strong>Bootstrap (${snapshot?.bootstraps?.length || 0})</strong><div class="bootstrap-list">${boots}</div></div>`;
     } else {
       body = `
         <h4 class="menu-h">Настройки</h4>
@@ -558,11 +553,7 @@
     } else if (sec === "groups") {
       document.getElementById("m-gcreate").onclick = async () => {
         try {
-          const members = document
-            .getElementById("m-gmembers")
-            .value.split(",")
-            .map((x) => x.trim())
-            .filter(Boolean);
+          const members = selectedPickerPeers(els.modalBody);
           applySnapshot(
             await invoke("create_group", {
               name: document.getElementById("m-gname").value,
@@ -599,10 +590,6 @@
         applySnapshot(await invoke("reload_bootstraps"));
         showToast("Bootstrap перезагружены");
       };
-      document.getElementById("n-dht").onclick = async () => {
-        applySnapshot(await invoke("snapshot_dht"));
-        mainMenuModal();
-      };
     } else if (sec === "settings") {
       document.getElementById("s-save").onclick = async () => {
         try {
@@ -635,17 +622,90 @@
     }
   }
 
+  function personContacts() {
+    return (snapshot?.contacts || []).filter((c) => !c.is_group);
+  }
+
+  function contactPickerHtml(excludePeerIds, alsoExclude) {
+    const exclude = new Set(excludePeerIds || []);
+    if (alsoExclude) exclude.add(alsoExclude);
+    const list = personContacts().filter((c) => !exclude.has(c.peer_id));
+    if (!list.length) {
+      return `<p class="muted">Нет контактов для выбора — сначала добавьте людей в книгу.</p>`;
+    }
+    return `<div class="contact-pick">${list
+      .map(
+        (c) => `
+      <label class="check pick-row">
+        <input type="checkbox" data-peer="${escapeAttr(c.peer_id)}" />
+        <span>${escapeHtml(c.display_name || c.peer_id.slice(0, 12))}${
+          c.online ? " · в сети" : ""
+        }</span>
+      </label>`
+      )
+      .join("")}</div>`;
+  }
+
+  function selectedPickerPeers(root) {
+    return [...(root || document).querySelectorAll(".contact-pick input[type=checkbox]:checked")]
+      .map((el) => el.getAttribute("data-peer"))
+      .filter(Boolean);
+  }
+
   function peerInfoModal() {
     const chat = snapshot?.selected_chat;
     if (!chat) return;
     const c = (snapshot?.contacts || []).find((x) => x.peer_id === chat);
     if (c?.is_group) {
+      const gid = chat.startsWith("group:") ? chat.slice(6) : chat;
+      const group = (snapshot?.groups || []).find((x) => x.id === gid);
+      const memberIds = (group?.members || []).map((m) => m.peer_id);
+      const membersHtml = (group?.members || [])
+        .map((m) => `<div>${escapeHtml(m.display_name || m.peer_id.slice(0, 12))}</div>`)
+        .join("") || "<div class=\"muted\">Нет участников</div>";
       openModal(`
         <h3>Группа</h3>
         <div class="stack">
-          <p><strong>${escapeHtml(c.display_name)}</strong></p>
-          <p class="muted">${escapeHtml(chat)}</p>
+          <p><strong>${escapeHtml(group?.name || c.display_name)}</strong></p>
+          <p class="muted">Участники (${group?.members?.length || 0})</p>
+          <div class="bootstrap-list">${membersHtml}</div>
+          <button class="btn" id="gi-copy">Копировать invite-ссылку</button>
+          <p class="muted">Пригласить из контактов</p>
+          ${contactPickerHtml(memberIds, snapshot?.peer_id)}
+          <button class="btn primary" id="gi-invite">Пригласить выбранных</button>
         </div>`);
+      document.getElementById("gi-copy").onclick = async () => {
+        const link = group?.invite_link || "";
+        if (!link) {
+          showToast("Нет ссылки");
+          return;
+        }
+        try {
+          await navigator.clipboard.writeText(link);
+          showToast("Ссылка скопирована");
+        } catch {
+          showToast("Не удалось скопировать");
+        }
+      };
+      document.getElementById("gi-invite").onclick = async () => {
+        try {
+          const members = selectedPickerPeers(els.modalBody);
+          if (!members.length) {
+            showToast("Отметьте контакты");
+            return;
+          }
+          applySnapshot(
+            await invoke("invite_to_group", {
+              groupId: gid,
+              memberPeerIds: members,
+            })
+          );
+          showToast("Приглашения отправлены");
+          peerInfoModal();
+        } catch (e) {
+          showToast(String(e));
+        }
+      };
       return;
     }
     openModal(`

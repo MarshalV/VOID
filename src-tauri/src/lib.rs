@@ -317,6 +317,19 @@ fn join_group(state: State<'_, Mutex<AppState>>, link: String) -> Result<Snapsho
 }
 
 #[tauri::command]
+fn invite_to_group(
+    state: State<'_, Mutex<AppState>>,
+    group_id: String,
+    member_peer_ids: Vec<String>,
+) -> Result<SnapshotDto, String> {
+    state
+        .lock()
+        .map_err(|e| e.to_string())?
+        .runtime
+        .invite_to_group(group_id, member_peer_ids)
+}
+
+#[tauri::command]
 fn quit_application(app: AppHandle) {
     quit_app(&app);
 }
@@ -517,6 +530,7 @@ pub fn run() {
             stop_voice_send,
             create_group,
             join_group,
+            invite_to_group,
             quit_application,
             show_window,
         ])
