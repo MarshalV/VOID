@@ -277,9 +277,9 @@ pub(crate) fn auto_join_from_invite_message() -> bool {
     false
 }
 
-/// `group_sync` must not create a group the local user never joined.
-pub(crate) fn may_install_group_from_sync(already_have_group: bool) -> bool {
-    already_have_group
+/// Invite-from-contacts: group_sync installs the group if the local peer is listed.
+pub(crate) fn may_install_group_from_sync(_already_have_group: bool) -> bool {
+    true
 }
 
 /// Creator accepting a non-creator sync: only allow `from` to add/remove self.
@@ -349,8 +349,8 @@ mod tests {
     }
 
     #[test]
-    fn sync_does_not_install_unknown_group() {
-        assert!(!may_install_group_from_sync(false));
+    fn sync_installs_listed_member() {
+        assert!(may_install_group_from_sync(false));
         assert!(may_install_group_from_sync(true));
     }
 

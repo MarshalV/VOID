@@ -817,7 +817,7 @@
       await listen("void://snapshot", (e) => applySnapshot(e.payload));
       await listen("void://status", (e) => {
         const msg = String(e?.payload ?? "");
-        if (/файл|голос|доставл|сохран|очеред|ошибка записи|микрофон|контакт/i.test(msg)) {
+        if (/файл|голос|доставл|сохран|очеред|ошибка записи|микрофон|контакт|групп/i.test(msg)) {
           showToast(msg);
         }
       });

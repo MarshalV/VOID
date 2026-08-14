@@ -29,7 +29,10 @@ use crate::group::{
 use crate::network::{run_chat_network, NetworkEvent, OfflineOutboxItem, UICommand};
 use crate::offline_mail::open_envelope;
 use crate::outbox::{Outbox, OutboxEntry};
-use crate::protocol::{new_message_id, ChatMessage, OutgoingDeliveryStatus};
+use crate::protocol::{
+    build_group_sync_json, new_message_id, parse_decrypted_chat_frame, ChatMessage,
+    DecryptedChatFrame, OutgoingDeliveryStatus,
+};
 use crate::shared_chat::SharedChatMessages;
 use crate::vault::{
     clear_remembered_password, detect_vault_unlock_kind, load_remembered_password,
@@ -256,6 +259,7 @@ struct Inner {
     /// transfer_id hex → absolute WAV path for in-chat playback.
     voice_audio_paths: HashMap<String, String>,
     offline_dht_publish_after: Option<Instant>,
+    last_group_sync_retry: Option<Instant>,
     offline_mail_processed: HashSet<String>,
     snapshot_dirty: bool,
     snapshot_rev: u64,
@@ -297,6 +301,7 @@ impl Inner {
             pending_voice_sends: Vec::new(),
             voice_audio_paths: HashMap::new(),
             offline_dht_publish_after: None,
+            last_group_sync_retry: None,
             offline_mail_processed: HashSet::new(),
             snapshot_dirty: false,
             snapshot_rev: 0,
@@ -427,6 +432,30 @@ impl Inner {
                                 payload,
                             });
                         }
+                    }
+                }
+                OutboxEntry::GroupSync {
+                    group_id,
+                    group_name,
+                    creator_id,
+                    members,
+                    recipient,
+                } => {
+                    let Ok(pid) = recipient.parse::<PeerId>() else {
+                        continue;
+                    };
+                    if pid == me {
+                        continue;
+                    }
+                    if let Some(payload) =
+                        build_group_sync_json(group_id, group_name, creator_id, members)
+                    {
+                        items.push(OfflineOutboxItem {
+                            recipient: pid,
+                            message_id: format!("gsync:{group_id}:{recipient}"),
+                            kind: "group_sync".into(),
+                            payload,
+                        });
                     }
                 }
                 _ => {}
@@ -625,6 +654,7 @@ impl Inner {
     fn ingest_offline_mailbox(&mut self, envelopes: Vec<crate::offline_mail::OfflineEnvelope>) {
         let mut any = false;
         let mut inbound: Vec<(PeerId, String)> = Vec::new();
+        let mut group_syncs: Vec<(PeerId, String, String, String, Vec<GroupMember>)> = Vec::new();
         {
             let Some(ref secret) = self.local_static else {
                 return;
@@ -678,9 +708,33 @@ impl Inner {
                         }
                         self.offline_mail_processed.insert(env.message_id);
                     }
+                    "group_sync" => {
+                        if let Some(DecryptedChatFrame::GroupSync {
+                            group_id,
+                            group_name,
+                            creator_id,
+                            members,
+                        }) = parse_decrypted_chat_frame(&plaintext)
+                        {
+                            if let Ok(from) = env.sender.parse::<PeerId>() {
+                                group_syncs.push((
+                                    from,
+                                    group_id,
+                                    group_name,
+                                    creator_id,
+                                    members,
+                                ));
+                            }
+                            self.offline_mail_processed.insert(env.message_id);
+                        }
+                    }
                     _ => {}
                 }
             }
+        }
+        for (from, group_id, group_name, creator_id, members) in group_syncs {
+            self.merge_incoming_group_sync(from, group_id, group_name, creator_id, members);
+            any = true;
         }
         for (pid, name) in inbound {
             self.note_inbound_peer(pid, &name);
@@ -913,6 +967,226 @@ impl Inner {
         }
     }
 
+    fn queue_outbox_group_sync(&mut self, group: &GroupChat, recipient: PeerId) {
+        let rec = recipient.to_string();
+        self.outbox_entries.retain(|e| {
+            !matches!(
+                e,
+                OutboxEntry::GroupSync { group_id, recipient, .. }
+                    if group_id == &group.id && recipient == &rec
+            )
+        });
+        self.outbox_entries.push(OutboxEntry::GroupSync {
+            group_id: group.id.clone(),
+            group_name: group.name.clone(),
+            creator_id: group.creator_id.clone(),
+            members: group.members.clone(),
+            recipient: rec,
+        });
+        self.persist_outbox();
+    }
+
+    fn broadcast_group_sync(&mut self, group: &GroupChat) {
+        let Some(local) = self.local_peer_id else {
+            return;
+        };
+        if self.left_groups.contains(&group.id) {
+            return;
+        }
+        let recipients: Vec<PeerId> = group
+            .member_peer_ids()
+            .into_iter()
+            .filter(|p| *p != local)
+            .collect();
+        if recipients.is_empty() {
+            return;
+        }
+        for pid in &recipients {
+            self.queue_outbox_group_sync(group, *pid);
+            self.ensure_peer_routed(*pid);
+        }
+        self.accelerate_offline_publish();
+        if let Some(tx) = &self.command_tx {
+            let _ = tx.try_send(UICommand::SendGroupSync {
+                group_id: group.id.clone(),
+                group_name: group.name.clone(),
+                creator_id: group.creator_id.clone(),
+                members: group.members.clone(),
+                recipients,
+            });
+        }
+    }
+
+    fn sync_groups_to_peer(&mut self, peer: PeerId) {
+        let Some(local) = self.local_peer_id else {
+            return;
+        };
+        if peer == local {
+            return;
+        }
+        let peer_str = peer.to_string();
+        let groups: Vec<GroupChat> = self
+            .groups
+            .values()
+            .filter(|g| {
+                !self.left_groups.contains(&g.id)
+                    && g.members.iter().any(|m| m.peer_id == peer_str)
+            })
+            .cloned()
+            .collect();
+        for group in groups {
+            self.queue_outbox_group_sync(&group, peer);
+            self.ensure_peer_routed(peer);
+            if let Some(tx) = &self.command_tx {
+                let _ = tx.try_send(UICommand::SendGroupSync {
+                    group_id: group.id.clone(),
+                    group_name: group.name.clone(),
+                    creator_id: group.creator_id.clone(),
+                    members: group.members.clone(),
+                    recipients: vec![peer],
+                });
+            }
+        }
+        if !self
+            .outbox_entries
+            .iter()
+            .any(|e| matches!(e, OutboxEntry::GroupSync { recipient, .. } if recipient == &peer_str))
+        {
+            return;
+        }
+        self.accelerate_offline_publish();
+    }
+
+    fn merge_incoming_group_sync(
+        &mut self,
+        from: PeerId,
+        group_id: String,
+        group_name: String,
+        creator_id: String,
+        members: Vec<GroupMember>,
+    ) {
+        if self.left_groups.contains(&group_id) || !group::validate_group_id(&group_id) {
+            return;
+        }
+        let Some(local) = self.local_peer_id else {
+            return;
+        };
+        let me = local.to_string();
+        let mut members = dedupe_members(members);
+        if !members.iter().any(|m| m.peer_id == me) {
+            return;
+        }
+        for m in &mut members {
+            if m.display_name.trim().is_empty() {
+                m.display_name = m
+                    .peer_id
+                    .parse::<PeerId>()
+                    .ok()
+                    .and_then(|pid| self.known_peers.get(&pid).cloned())
+                    .unwrap_or_else(|| m.peer_id.chars().take(12).collect());
+            }
+        }
+        let creator_id = if creator_id.is_empty() {
+            from.to_string()
+        } else {
+            creator_id
+        };
+        let created_at = self
+            .groups
+            .get(&group_id)
+            .map(|g| g.created_at.clone())
+            .unwrap_or_else(|| {
+                chrono::Local::now()
+                    .format("%Y-%m-%d %H:%M:%S")
+                    .to_string()
+            });
+        let name = if group_name.trim().is_empty() {
+            self.groups
+                .get(&group_id)
+                .map(|g| g.name.clone())
+                .unwrap_or_else(|| "Группа".into())
+        } else {
+            group_name
+        };
+        let is_new = !self.groups.contains_key(&group_id);
+        self.groups.insert(
+            group_id.clone(),
+            GroupChat {
+                id: group_id,
+                name: name.clone(),
+                creator_id,
+                members: members.clone(),
+                created_at,
+            },
+        );
+        for m in &members {
+            if let Ok(pid) = m.peer_id.parse::<PeerId>() {
+                if pid != local && !self.known_peers.contains_key(&pid) {
+                    self.known_peers.insert(pid, m.display_name.clone());
+                }
+            }
+        }
+        self.persist_vault();
+        if is_new {
+            self.add_status(format!("Вас добавили в группу «{name}»"));
+        }
+    }
+
+    fn tick_group_sync_outbox(&mut self) {
+        const RETRY: Duration = Duration::from_secs(8);
+        let now = Instant::now();
+        let due = match self.last_group_sync_retry {
+            None => !self.outbox_entries.is_empty(),
+            Some(t) => now.duration_since(t) >= RETRY,
+        };
+        if !due {
+            return;
+        }
+        let jobs: Vec<(String, String, String, Vec<GroupMember>, PeerId)> = self
+            .outbox_entries
+            .iter()
+            .filter_map(|e| {
+                let OutboxEntry::GroupSync {
+                    group_id,
+                    group_name,
+                    creator_id,
+                    members,
+                    recipient,
+                } = e
+                else {
+                    return None;
+                };
+                if self.left_groups.contains(group_id) {
+                    return None;
+                }
+                let pid = recipient.parse().ok()?;
+                Some((
+                    group_id.clone(),
+                    group_name.clone(),
+                    creator_id.clone(),
+                    members.clone(),
+                    pid,
+                ))
+            })
+            .collect();
+        if jobs.is_empty() {
+            return;
+        }
+        self.last_group_sync_retry = Some(now);
+        for (group_id, group_name, creator_id, members, pid) in jobs {
+            self.ensure_peer_routed(pid);
+            if let Some(tx) = &self.command_tx {
+                let _ = tx.try_send(UICommand::SendGroupSync {
+                    group_id,
+                    group_name,
+                    creator_id,
+                    members,
+                    recipients: vec![pid],
+                });
+            }
+        }
+    }
+
     fn merge_learned_bootstraps(&mut self, learned: Vec<String>) {
         let before = self.void_bootstrap_strings.len();
         let merged = merge_bootstrap_string_lists(&self.void_bootstrap_strings, &learned);
@@ -1001,6 +1275,35 @@ impl Inner {
             contacts.push(ContactDto {
                 peer_id: key.clone(),
                 display_name: g.name.clone(),
+                online: false,
+                last_preview: self.preview_for(&key),
+                is_group: true,
+            });
+        }
+        let known_group_keys: HashSet<String> = self
+            .groups
+            .keys()
+            .map(|id| group_thread_key(id))
+            .collect();
+        let orphan_groups: Vec<(String, String)> = {
+            let map = self.messages.lock();
+            map.keys()
+                .filter_map(|key| {
+                    let gid = group::parse_group_thread_key(key)?;
+                    if known_group_keys.contains(key) || self.left_groups.contains(gid) {
+                        return None;
+                    }
+                    Some((
+                        key.clone(),
+                        format!("Группа {}", &gid[..8.min(gid.len())]),
+                    ))
+                })
+                .collect()
+        };
+        for (key, label) in orphan_groups {
+            contacts.push(ContactDto {
+                peer_id: key.clone(),
+                display_name: label,
                 online: false,
                 last_preview: self.preview_for(&key),
                 is_group: true,
@@ -1158,12 +1461,16 @@ impl VoidRuntime {
                                 online: true,
                             });
                             let want_session = g.known_peers.contains_key(&pid)
-                                || g.pending_sends.iter().any(|p| p.peer == pid);
+                                || g.pending_sends.iter().any(|p| p.peer == pid)
+                                || g.groups.values().any(|gr| {
+                                    gr.members.iter().any(|m| m.peer_id == pid.to_string())
+                                });
                             if want_session {
                                 if let Some(tx) = &g.command_tx {
                                     let _ = tx.try_send(UICommand::EnsureChatSession(pid));
                                 }
                             }
+                            g.sync_groups_to_peer(pid);
                             emit_snapshot = true;
                         }
                         NetworkEvent::Disconnected(pid) | NetworkEvent::MdnsExpired(pid) => {
@@ -1510,28 +1817,23 @@ impl VoidRuntime {
                             }
                         }
                         NetworkEvent::GroupSync {
+                            from,
                             group_id,
                             group_name,
                             creator_id,
                             members,
-                            ..
                         } => {
-                            if !g.left_groups.contains(&group_id) {
-                                g.groups.insert(
-                                    group_id.clone(),
-                                    GroupChat {
-                                        id: group_id,
-                                        name: group_name,
-                                        creator_id,
-                                        members,
-                                        created_at: chrono::Local::now()
-                                            .format("%Y-%m-%d %H:%M:%S")
-                                            .to_string(),
-                                    },
-                                );
-                                g.persist_vault();
-                                emit_snapshot = true;
+                            let had = g.groups.contains_key(&group_id);
+                            let toast_name = group_name.clone();
+                            g.merge_incoming_group_sync(
+                                from, group_id.clone(), group_name, creator_id, members,
+                            );
+                            if !had && g.groups.contains_key(&group_id) {
+                                bridge_evs.push(BridgeEvent::Status {
+                                    text: format!("Вас добавили в группу «{toast_name}»"),
+                                });
                             }
+                            emit_snapshot = true;
                         }
                         NetworkEvent::GroupLeave { group_id, peer_id, .. } => {
                             if let Some(gchat) = g.groups.get_mut(&group_id) {
@@ -1595,6 +1897,7 @@ impl VoidRuntime {
                     g.tick_pending_file_sends();
                     g.tick_pending_voice_sends();
                     g.tick_voice_recorder();
+                    g.tick_group_sync_outbox();
                 }
             }
         });
@@ -1818,16 +2121,41 @@ impl VoidRuntime {
                     g.schedule_offline_publish();
                     // Restore live-retry queue from durable outbox.
                     for entry in g.outbox_entries.clone() {
-                        if let OutboxEntry::DirectMessage {
-                            peer,
-                            message_id,
-                            text,
-                        } = entry
-                        {
-                            if let Ok(pid) = peer.parse::<PeerId>() {
-                                g.push_pending_send(pid, text, message_id);
-                                g.ensure_peer_routed(pid);
+                        match entry {
+                            OutboxEntry::DirectMessage {
+                                peer,
+                                message_id,
+                                text,
+                            } => {
+                                if let Ok(pid) = peer.parse::<PeerId>() {
+                                    g.push_pending_send(pid, text, message_id);
+                                    g.ensure_peer_routed(pid);
+                                }
                             }
+                            OutboxEntry::GroupSync {
+                                group_id,
+                                group_name,
+                                creator_id,
+                                members,
+                                recipient,
+                            } => {
+                                if g.left_groups.contains(&group_id) {
+                                    continue;
+                                }
+                                if let Ok(pid) = recipient.parse::<PeerId>() {
+                                    g.ensure_peer_routed(pid);
+                                    if let Some(tx) = &g.command_tx {
+                                        let _ = tx.try_send(UICommand::SendGroupSync {
+                                            group_id,
+                                            group_name,
+                                            creator_id,
+                                            members,
+                                            recipients: vec![pid],
+                                        });
+                                    }
+                                }
+                            }
+                            _ => {}
                         }
                     }
                     // Vault entries without /p2p/ never enter kad dial list —
@@ -2461,23 +2789,10 @@ impl VoidRuntime {
                 .format("%Y-%m-%d %H:%M:%S")
                 .to_string(),
         };
-        let recipients: Vec<PeerId> = members
-            .iter()
-            .filter_map(|m| m.peer_id.parse().ok())
-            .filter(|p| *p != local)
-            .collect();
-        if let Some(tx) = &g.command_tx {
-            let _ = tx.try_send(UICommand::SendGroupSync {
-                group_id: id.clone(),
-                group_name: group.name.clone(),
-                creator_id: group.creator_id.clone(),
-                members: members.clone(),
-                recipients,
-            });
-        }
-        g.groups.insert(id.clone(), group);
+        g.groups.insert(id.clone(), group.clone());
         g.selected_chat = group_thread_key(&id);
         g.persist_vault();
+        g.broadcast_group_sync(&group);
         drop(g);
         self.emit_snapshot();
         Ok(self.get_snapshot())
@@ -2495,24 +2810,10 @@ impl VoidRuntime {
         }
         group.members = dedupe_members(group.members);
         g.left_groups.remove(&group.id);
-        let recipients: Vec<PeerId> = group
-            .members
-            .iter()
-            .filter_map(|m| m.peer_id.parse().ok())
-            .filter(|p| *p != local)
-            .collect();
-        if let Some(tx) = &g.command_tx {
-            let _ = tx.try_send(UICommand::SendGroupSync {
-                group_id: group.id.clone(),
-                group_name: group.name.clone(),
-                creator_id: group.creator_id.clone(),
-                members: group.members.clone(),
-                recipients,
-            });
-        }
         g.selected_chat = group_thread_key(&group.id);
-        g.groups.insert(group.id.clone(), group);
+        g.groups.insert(group.id.clone(), group.clone());
         g.persist_vault();
+        g.broadcast_group_sync(&group);
         drop(g);
         self.emit_snapshot();
         Ok(self.get_snapshot())
@@ -2571,26 +2872,12 @@ impl VoidRuntime {
             group.members = dedupe_members(std::mem::take(&mut group.members));
             group.clone()
         };
-        let recipients: Vec<PeerId> = group
-            .members
-            .iter()
-            .filter_map(|m| m.peer_id.parse().ok())
-            .filter(|p| *p != local)
-            .collect();
-        if let Some(tx) = &g.command_tx {
-            let _ = tx.try_send(UICommand::SendGroupSync {
-                group_id: group.id.clone(),
-                group_name: group.name.clone(),
-                creator_id: group.creator_id.clone(),
-                members: group.members.clone(),
-                recipients,
-            });
-        }
         g.add_status(format!(
             "В группу «{}» приглашено: {added}",
             group.name
         ));
         g.persist_vault();
+        g.broadcast_group_sync(&group);
         drop(g);
         self.emit_snapshot();
         Ok(self.get_snapshot())

@@ -3651,6 +3651,19 @@ pub async fn run_chat_network(
                                                 false,
                                             )
                                             .await;
+                                        } else {
+                                            watch_contact_peer(
+                                                &mut reconnect_targets,
+                                                peer_id,
+                                                &bootstrap_peer_ids,
+                                                local_peer_id,
+                                            );
+                                            dial_peer_live_circuits(
+                                                &mut swarm,
+                                                peer_id,
+                                                &void_bootstraps,
+                                                false,
+                                            );
                                         }
                                         pending_messages
                                             .entry(peer_id)
