@@ -188,6 +188,7 @@ impl VoiceRecorder {
     }
 
     /// Микрофон занят (запись или обработка), в т.ч. если дочерний процесс ещё жив.
+    #[cfg(feature = "egui-ui")]
     pub(crate) fn mic_active(&self) -> bool {
         self.on_air() || self.is_processing()
     }
@@ -221,6 +222,7 @@ impl VoiceRecorder {
         }
     }
 
+    #[cfg(feature = "egui-ui")]
     pub(crate) fn ready_duration(&self) -> Option<f32> {
         match &self.state {
             VoiceRecorderState::Ready { duration_secs, .. } => Some(*duration_secs),
@@ -915,6 +917,7 @@ fn wav_duration(path: &Path) -> Result<f32, String> {
     Ok(reader.len() as f32 / spec.sample_rate as f32)
 }
 
+#[cfg(feature = "egui-ui")]
 fn playback_pcm_frames(path: &Path) -> Result<usize, String> {
     let (mono, src_rate) = read_wav_mono_f32(path)?;
     Ok(if src_rate == VOICE_SAMPLE_RATE {
@@ -1032,6 +1035,7 @@ fn write_wav_mono(path: &Path, samples: &[f32], sample_rate: u32) -> Result<(), 
 
 // ─── Воспроизведение ─────────────────────────────────────────────────────────
 
+#[cfg(feature = "egui-ui")]
 pub(crate) struct VoicePlayer {
     done_rx: Option<mpsc::Receiver<Result<(), String>>>,
     pub(crate) playing_id: Option<String>,
@@ -1046,6 +1050,7 @@ pub(crate) struct VoicePlayer {
     play_start_ratio: f32,
 }
 
+#[cfg(feature = "egui-ui")]
 impl VoicePlayer {
     pub(crate) fn new() -> Self {
         Self {

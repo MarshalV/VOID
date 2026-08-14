@@ -43,6 +43,7 @@ impl FileKind {
     }
 
     /// Эмодзи-иконка для UI.
+    #[cfg(feature = "egui-ui")]
     pub fn icon(self) -> &'static str {
         match self {
             FileKind::Image => "🖼",
@@ -61,6 +62,7 @@ impl FileKind {
     }
 
     /// Расширения для фильтра диалога выбора.
+    #[cfg(feature = "egui-ui")]
     pub fn extensions(self) -> &'static [&'static str] {
         match self {
             FileKind::Image => &[
@@ -417,6 +419,7 @@ impl IncomingTransfer {
 
 // ─── Ожидающее предложение файла (UI ещё не ответил) ─────────────────────────
 
+#[cfg(feature = "egui-ui")]
 #[derive(Clone)]
 pub struct PendingFileOffer {
     pub transfer_id: [u8; 16],
@@ -528,6 +531,7 @@ pub fn stage_voice_wav(
 }
 
 /// Форматирует размер в байтах в читаемую строку (КБ/МБ/ГБ).
+#[cfg(feature = "egui-ui")]
 pub fn fmt_size(bytes: u64) -> String {
     const KB: u64 = 1024;
     const MB: u64 = 1024 * KB;

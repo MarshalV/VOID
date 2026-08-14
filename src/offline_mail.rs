@@ -19,14 +19,17 @@ pub(crate) const MAILBOX_TTL_SECS: u64 = 60 * 60 * 24 * 7;
 /// Offline-доставка голосовых: аудио режется на кусочки и уходит через тот же
 /// relay/bootstrap store-and-forward канал, что и офлайн-почта для текста
 /// (DHT-запись мимо — там жёсткий лимит 64 КБ на весь ящик, см. mailbox_record_key).
+#[cfg(any(feature = "egui-ui", test))]
 pub(crate) const OFFLINE_VOICE_CHUNK_SIZE: usize = 24 * 1024;
 /// Максимальный размер WAV, который мы согласны прогонять через offline-очередь
 /// целиком (иначе — только метаданные, аудио дождётся живой передачи).
+#[cfg(any(feature = "egui-ui", test))]
 pub(crate) const OFFLINE_VOICE_MAX_BYTES: u64 = 3 * 1024 * 1024;
 pub(crate) const OFFLINE_VOICE_CHUNK_KIND: &str = "voice_chunk";
 
 /// Плейнтекст одного чанка (до шифрования в `seal_for_recipient`):
 /// `[transfer_id:16][index:u32 LE][total:u32 LE][total_size:u32 LE][bytes...]`.
+#[cfg(any(feature = "egui-ui", test))]
 pub(crate) fn encode_voice_chunk_payload(
     transfer_id: &[u8; 16],
     index: u32,
@@ -43,6 +46,7 @@ pub(crate) fn encode_voice_chunk_payload(
     out
 }
 
+#[cfg(any(feature = "egui-ui", test))]
 pub(crate) struct VoiceChunk {
     pub(crate) transfer_id: [u8; 16],
     pub(crate) index: u32,
@@ -51,6 +55,7 @@ pub(crate) struct VoiceChunk {
     pub(crate) data: Vec<u8>,
 }
 
+#[cfg(any(feature = "egui-ui", test))]
 pub(crate) fn decode_voice_chunk_payload(bytes: &[u8]) -> Option<VoiceChunk> {
     if bytes.len() < 28 {
         return None;
@@ -74,6 +79,7 @@ pub(crate) fn decode_voice_chunk_payload(bytes: &[u8]) -> Option<VoiceChunk> {
 
 /// Режет байты WAV на чанки для offline-доставки. Возвращает `None`, если файл
 /// больше `OFFLINE_VOICE_MAX_BYTES` — в этом случае аудио дождётся живой передачи.
+#[cfg(any(feature = "egui-ui", test))]
 pub(crate) fn split_voice_for_offline(
     transfer_id: &[u8; 16],
     bytes: &[u8],
@@ -101,6 +107,7 @@ pub(crate) fn split_voice_for_offline(
 
 /// Собирает WAV из набора чанков (индекс → данные). `None`, если набор неполный
 /// или суммарный размер не совпал с `total_size`.
+#[cfg(any(feature = "egui-ui", test))]
 pub(crate) fn assemble_voice_chunks(
     total: u32,
     total_size: u32,

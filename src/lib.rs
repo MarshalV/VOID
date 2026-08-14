@@ -29,8 +29,11 @@ pub(crate) mod ui;
 
 #[cfg(feature = "egui-ui")]
 pub(crate) use app::{App, PendingGroupSend, PendingSend, RESEND_GRACE};
+#[cfg(feature = "egui-ui")]
 pub(crate) use bootstrap::parse_seed_input;
+#[cfg(feature = "egui-ui")]
 pub(crate) use network::{NetworkEvent, UICommand};
+#[cfg(feature = "egui-ui")]
 pub(crate) use protocol::{new_message_id, FileTransferProgress, OutgoingDeliveryStatus};
 
 /// Initialize data directory (vault, journal, outbox).

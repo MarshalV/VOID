@@ -31,6 +31,7 @@ impl GroupChat {
             .collect()
     }
 
+    #[cfg(any(feature = "egui-ui", test))]
     pub(crate) fn includes_peer(&self, peer_id: &libp2p::PeerId) -> bool {
         let s = peer_id.to_string();
         self.members.iter().any(|m| m.peer_id == s)
@@ -87,6 +88,7 @@ pub(crate) fn validate_group_chat(g: &GroupChat) -> bool {
 }
 
 /// Извлекает все invite-ссылки из текста сообщения.
+#[cfg(any(feature = "egui-ui", test))]
 pub(crate) fn extract_invite_links(text: &str) -> Vec<String> {
     let mut links = Vec::new();
     let mut search_from = 0usize;
@@ -260,6 +262,7 @@ fn hex_nibble(c: u8) -> Option<u8> {
 
 /// Members right after create: creator only. Invitees join only via explicit
 /// `join_group_from_invite` (click / paste), never from DM text or sync.
+#[cfg(any(feature = "egui-ui", test))]
 pub(crate) fn members_on_group_create(
     creator_id: &str,
     creator_name: &str,
@@ -278,11 +281,13 @@ pub(crate) fn auto_join_from_invite_message() -> bool {
 }
 
 /// Invite-from-contacts: group_sync installs the group if the local peer is listed.
+#[cfg(any(feature = "egui-ui", test))]
 pub(crate) fn may_install_group_from_sync(_already_have_group: bool) -> bool {
     true
 }
 
 /// Creator accepting a non-creator sync: only allow `from` to add/remove self.
+#[cfg(any(feature = "egui-ui", test))]
 pub(crate) fn sanitize_sync_members_for_creator(
     existing: &[GroupMember],
     from_peer_id: &str,

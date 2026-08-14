@@ -698,6 +698,7 @@ fn redial_contact_hard(
     }
 }
 
+#[cfg_attr(not(feature = "egui-ui"), allow(dead_code))]
 pub(crate) enum NetworkEvent {
     NewListenAddr(Multiaddr),
     MdnsDiscovered(PeerId, Multiaddr),
@@ -946,6 +947,7 @@ async fn apply_incoming_file_chunk(
     voice_outcome
 }
 
+#[cfg_attr(not(feature = "egui-ui"), allow(dead_code))]
 pub(crate) enum UICommand {
     Dial(String),
     DialPeer(PeerId, Vec<Multiaddr>),
@@ -2640,9 +2642,9 @@ pub async fn run_chat_network(
         let mut pending_relay = PendingRelayQueue::default();
         let mut pending_relay_gates: HashMap<(PeerId, PeerId), Arc<ActiveHandoff>> = HashMap::new();
         let mut dial_backoff: HashMap<PeerId, Instant> = HashMap::new();
-        /// Bootstrap PeerId → consecutive dial failures (for failover rotation).
+        // Bootstrap PeerId → consecutive dial failures (for failover rotation).
         let mut bootstrap_fail_streak: HashMap<PeerId, u32> = HashMap::new();
-        /// Round-robin cursor into `void_bootstraps` after a bootstrap dial failure.
+        // Round-robin cursor into `void_bootstraps` after a bootstrap dial failure.
         let mut bootstrap_failover_idx: usize = 0;
         // Схлопываем подряд идущие `OutFailure` одному пиру: при отправке
         // сообщения без сессии мы шлём Hello + packet, и на DialFailure
@@ -7144,6 +7146,7 @@ pub async fn run_chat_network(
         }
 }
 
+#[cfg(feature = "egui-ui")]
 pub fn env_flag_true(name: &str) -> bool {
     std::env::var(name)
         .map(|v| v == "1" || v.eq_ignore_ascii_case("true") || v.eq_ignore_ascii_case("yes"))

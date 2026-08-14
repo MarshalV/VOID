@@ -667,6 +667,7 @@ pub(crate) fn build_v1_hello(
 }
 
 /// Прогресс активной передачи файла (для UI).
+#[cfg(feature = "egui-ui")]
 pub(crate) struct FileTransferProgress {
     pub filename: String,
     pub total_size: u64,

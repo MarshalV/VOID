@@ -415,6 +415,7 @@ pub(crate) enum VaultUnlockKind {
     MigratePlainMaster(Zeroizing<[u8; 32]>),
 }
 
+#[cfg(feature = "egui-ui")]
 pub(crate) struct VaultUnlockState {
     pub kind: VaultUnlockKind,
     pub password: String,
@@ -426,6 +427,7 @@ pub(crate) struct VaultUnlockState {
     pub try_auto_unlock: bool,
 }
 
+#[cfg(feature = "egui-ui")]
 impl VaultUnlockState {
     pub(crate) fn new(kind: VaultUnlockKind) -> Self {
         Self {
