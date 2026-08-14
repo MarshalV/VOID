@@ -201,10 +201,75 @@ button.icon-btn img {
   pointer-events: none;
 }
 
+.composer .icon-btn:disabled {
+  opacity: 0.35;
+  pointer-events: none;
+}
+
 .composer.recording #voice-btn {
   opacity: 1;
   filter: drop-shadow(0 0 6px rgba(255, 107, 122, 0.7));
 }
+
+.rec-bar {
+  display: flex;
+  align-items: center;
+  gap: 0.65rem;
+  margin: 0 0.9rem 0.35rem;
+  padding: 0.55rem 0.8rem;
+  border-radius: 12px;
+  background: rgba(255, 107, 122, 0.12);
+  color: #ff8a96;
+  font-size: 0.92rem;
+  font-weight: 600;
+}
+.rec-bar[hidden] { display: none; }
+.rec-dot {
+  width: 10px;
+  height: 10px;
+  border-radius: 50%;
+  background: #ff6b7a;
+  animation: recPulse 1s ease-in-out infinite;
+}
+@keyframes recPulse {
+  0%, 100% { opacity: 1; transform: scale(1); }
+  50% { opacity: 0.35; transform: scale(0.85); }
+}
+.rec-bar .btn { margin-left: auto; padding: 0.35rem 0.8rem; }
+
+.voice-preview {
+  display: flex;
+  align-items: center;
+  gap: 0.55rem;
+  margin: 0 0.9rem 0.35rem;
+  padding: 0.5rem 0.7rem;
+  border-radius: 12px;
+  background: var(--accent-dim);
+  border: 1px solid rgba(62, 207, 142, 0.25);
+}
+.voice-preview[hidden] { display: none; }
+.voice-preview .voice-player { flex: 1; min-width: 0; }
+
+.file-card {
+  display: grid;
+  grid-template-columns: auto 1fr auto;
+  gap: 0.7rem;
+  align-items: center;
+  min-width: 220px;
+  cursor: pointer;
+}
+.file-icon {
+  width: 2.2rem;
+  height: 2.2rem;
+  border-radius: 10px;
+  display: grid;
+  place-items: center;
+  background: rgba(62, 207, 142, 0.18);
+  font-size: 1.05rem;
+}
+.file-name { font-weight: 600; word-break: break-all; }
+.file-size { font-size: 0.82rem; color: var(--muted); }
+.file-card.pending { opacity: 0.65; }
 
 .beacon {
   margin: 0.65rem 0.9rem 0;

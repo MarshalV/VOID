@@ -998,7 +998,8 @@ impl App {
                         timestamp: chrono::Local::now().format("%H:%M").to_string(),
                         delivery: OutgoingDeliveryStatus::Pending,
                         voice: None,
-                        group_id: None,
+                        file: None,
+            group_id: None,
                     };
                     if let Ok(payload) = serde_json::to_vec(&msg) {
                         items.push(OfflineOutboxItem {
@@ -1044,7 +1045,8 @@ impl App {
                             transfer_id: transfer_id.clone(),
                             duration_secs: *duration_secs,
                         }),
-                        group_id: None,
+                        file: None,
+            group_id: None,
                     };
                     if let Ok(payload) = serde_json::to_vec(&msg) {
                         items.push(OfflineOutboxItem {
@@ -1077,6 +1079,7 @@ impl App {
                             timestamp: chrono::Local::now().format("%H:%M").to_string(),
                             delivery: OutgoingDeliveryStatus::Pending,
                             voice: None,
+                            file: None,
                             group_id: Some(group_id.clone()),
                         };
                         if let Ok(payload) = serde_json::to_vec(&msg) {
@@ -1129,6 +1132,7 @@ impl App {
                                 transfer_id: transfer_id_to_hex(&peer_tid),
                                 duration_secs: *duration_secs,
                             }),
+                            file: None,
                             group_id: Some(group_id.clone()),
                         };
                         if let Ok(payload) = serde_json::to_vec(&msg) {
@@ -1797,6 +1801,7 @@ impl App {
                 transfer_id: transfer_hex.to_string(),
                 duration_secs: duration_secs.max(0.1),
             }),
+            file: None,
             group_id,
         }
     }
@@ -1817,8 +1822,8 @@ impl App {
             if group::validate_group_id(gid) {
                 if self.is_active_group_member(gid) {
                     Some(group_thread_key(gid))
-                } else if msg.voice.is_some() {
-                    // Голосовое может прийти до group_sync — сохраняем в поток группы.
+                } else if msg.voice.is_some() || msg.file.is_some() {
+                    // Голос/файл могут прийти до group_sync — сохраняем в поток группы.
                     Some(group_thread_key(gid))
                 } else {
                     None
@@ -2247,6 +2252,9 @@ impl App {
                 recipient: peer,
                 path,
                 kind,
+                message_id: None,
+                transfer_id: None,
+                sender_name: String::new(),
             });
         }
     }
@@ -3085,6 +3093,7 @@ impl App {
             timestamp: chrono::Local::now().format("%H:%M").to_string(),
             delivery: OutgoingDeliveryStatus::Pending,
             voice: None,
+            file: None,
             group_id: None,
         });
         self.outbox_track_direct(peer, message_id.clone(), text.clone());

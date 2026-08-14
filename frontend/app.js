@@ -53,6 +53,15 @@
     modalBody: document.getElementById("modal-body"),
     modalClose: document.getElementById("modal-close"),
     fileOffers: document.getElementById("file-offers"),
+    recBar: document.getElementById("rec-bar"),
+    recTime: document.getElementById("rec-time"),
+    recStop: document.getElementById("rec-stop"),
+    voicePreview: document.getElementById("voice-preview"),
+    previewPlay: document.getElementById("preview-play"),
+    previewSeek: document.getElementById("preview-seek"),
+    previewTime: document.getElementById("preview-time"),
+    previewCancel: document.getElementById("preview-cancel"),
+    previewSend: document.getElementById("preview-send"),
     toast: document.getElementById("toast"),
     sidebar: document.getElementById("sidebar"),
     ctxMenu: document.getElementById("ctx-menu"),
@@ -62,6 +71,10 @@
   let snapshot = null;
   let vaultKind = "open_wrapped_key";
   let recording = false;
+  let recTimer = null;
+  let recStartedAt = 0;
+  let previewAudio = null;
+  let lastPreviewPath = "";
   let filter = "";
   let lastMsgSig = "";
   let lastContactSig = "";
@@ -76,7 +89,7 @@
     return msgs
       .map(
         (m) =>
-          `${m.id}:${m.delivery}:${m.text?.length || 0}:${m.voice_transfer_id || ""}:${m.voice_path || ""}`
+          `${m.id}:${m.delivery}:${m.text?.length || 0}:${m.voice_transfer_id || ""}:${m.voice_path || ""}:${m.file_transfer_id || ""}:${m.file_path || ""}`
       )
       .join("|");
   }
@@ -192,12 +205,17 @@
       if (nearBottom) els.messages.scrollTop = els.messages.scrollHeight;
     }
     renderFileOffers();
+    recording = !!s.voice_recording;
     const enabled = !!s.selected_chat;
+    const previewing = !!s.voice_preview_path;
     els.messageInput.disabled = !enabled;
     els.sendBtn.disabled = !enabled;
+    if (els.attachBtn) els.attachBtn.disabled = !enabled || recording || previewing;
+    if (els.voiceBtn) els.voiceBtn.disabled = !enabled || previewing;
     updateChatHeader(s);
-    recording = !!s.voice_recording;
     els.composer.classList.toggle("recording", recording);
+    updateRecBar(s);
+    updateVoicePreview(s);
   }
 
   function updateChatHeader(s) {
@@ -345,7 +363,6 @@
       div.className = `message ${m.outgoing ? "sent" : "received"}`;
       if (m.voice_transfer_id) {
         div.classList.add("voice-msg");
-        const dur = (m.voice_duration_secs || 0).toFixed(1);
         const ready = !!m.voice_path;
         div.innerHTML = `
           <div class="voice-player" data-tid="${escapeAttr(m.voice_transfer_id)}">
@@ -358,6 +375,31 @@
         meta[0].textContent = m.timestamp || "";
         meta[1].textContent = m.outgoing ? deliveryMark(m.delivery) : "";
         if (ready) wireVoiceControls(div, m);
+      } else if (m.file_transfer_id) {
+        div.classList.add("file-msg");
+        const ready = !!m.file_path;
+        div.innerHTML = `
+          <div class="file-card ${ready ? "" : "pending"}" data-path="${escapeAttr(m.file_path || "")}">
+            <div class="file-icon">📄</div>
+            <div>
+              <div class="file-name"></div>
+              <div class="file-size">${ready ? fmtSize(m.file_size) : "загрузка…"}</div>
+            </div>
+          </div>
+          <div class="meta"><span></span><span></span></div>`;
+        div.querySelector(".file-name").textContent = m.file_name || "Файл";
+        const meta = div.querySelectorAll(".meta span");
+        meta[0].textContent = m.timestamp || "";
+        meta[1].textContent = m.outgoing ? deliveryMark(m.delivery) : "";
+        if (ready) {
+          div.querySelector(".file-card").onclick = async () => {
+            try {
+              await invoke("reveal_path", { path: m.file_path });
+            } catch (e) {
+              showToast(String(e));
+            }
+          };
+        }
       } else {
         div.innerHTML = `<div class="body"></div><div class="meta"><span></span><span></span></div>`;
         div.querySelector(".body").textContent = m.text;
@@ -377,6 +419,98 @@
     const m = Math.floor(s / 60);
     const r = s % 60;
     return `${m}:${String(r).padStart(2, "0")}`;
+  }
+
+  function fmtSize(n) {
+    const b = Number(n) || 0;
+    if (b < 1024) return `${b} Б`;
+    if (b < 1024 * 1024) return `${(b / 1024).toFixed(1)} КБ`;
+    return `${(b / (1024 * 1024)).toFixed(1)} МБ`;
+  }
+
+  function stopRecTimer() {
+    if (recTimer) {
+      clearInterval(recTimer);
+      recTimer = null;
+    }
+  }
+
+  function updateRecBar(s) {
+    const on = !!s?.voice_recording;
+    els.recBar.hidden = !on;
+    if (on) {
+      if (!recTimer) {
+        recStartedAt = Date.now() - Math.floor((s.voice_recording_secs || 0) * 1000);
+        recTimer = setInterval(() => {
+          els.recTime.textContent = fmtTime((Date.now() - recStartedAt) / 1000);
+        }, 200);
+      }
+    } else {
+      stopRecTimer();
+      els.recTime.textContent = "0:00";
+    }
+  }
+
+  function stopPreviewAudio() {
+    if (previewAudio) {
+      previewAudio.pause();
+      previewAudio = null;
+    }
+    if (els.previewPlay) els.previewPlay.textContent = "▶";
+  }
+
+  function updateVoicePreview(s) {
+    const path = s?.voice_preview_path;
+    const dur = s?.voice_preview_duration || 0;
+    if (!path) {
+      els.voicePreview.hidden = true;
+      lastPreviewPath = "";
+      stopPreviewAudio();
+      return;
+    }
+    els.voicePreview.hidden = false;
+    if (path === lastPreviewPath) {
+      return;
+    }
+    lastPreviewPath = path;
+    stopPreviewAudio();
+    els.previewTime.textContent = `0:00 / ${fmtTime(dur)}`;
+    els.previewSeek.value = "0";
+    const src = convertFileSrc(path);
+    els.previewPlay.onclick = async () => {
+      try {
+        if (!previewAudio || previewAudio.src !== src) {
+          stopPreviewAudio();
+          previewAudio = new Audio(src);
+          previewAudio.addEventListener("timeupdate", () => {
+            if (!previewAudio?.duration) return;
+            els.previewSeek.value = String(
+              Math.floor((previewAudio.currentTime / previewAudio.duration) * 1000)
+            );
+            els.previewTime.textContent = `${fmtTime(previewAudio.currentTime)} / ${fmtTime(
+              previewAudio.duration || dur
+            )}`;
+          });
+          previewAudio.addEventListener("ended", () => {
+            els.previewPlay.textContent = "▶";
+            els.previewSeek.value = "0";
+          });
+        }
+        if (previewAudio.paused) {
+          await previewAudio.play();
+          els.previewPlay.textContent = "❚❚";
+        } else {
+          previewAudio.pause();
+          els.previewPlay.textContent = "▶";
+        }
+      } catch (e) {
+        showToast(String(e));
+      }
+    };
+    els.previewSeek.oninput = () => {
+      if (!previewAudio?.duration) return;
+      previewAudio.currentTime = (Number(els.previewSeek.value) / 1000) * previewAudio.duration;
+    };
   }
 
   function wireVoiceControls(div, m) {
@@ -915,16 +1049,28 @@
 
     els.voiceBtn.onclick = async () => {
       try {
-        if (!recording) {
-          await invoke("start_voice");
-          recording = true;
-          els.composer.classList.add("recording");
-          showToast("Запись… нажмите ещё раз чтобы отправить");
+        if (recording) {
+          applySnapshot(await invoke("stop_voice_preview"), true);
         } else {
-          applySnapshot(await invoke("stop_voice_send"));
-          recording = false;
-          els.composer.classList.remove("recording");
+          applySnapshot(await invoke("start_voice"), true);
         }
+      } catch (e) {
+        showToast(String(e));
+      }
+    };
+    els.recStop.onclick = els.voiceBtn.onclick;
+    els.previewCancel.onclick = async () => {
+      try {
+        stopPreviewAudio();
+        applySnapshot(await invoke("cancel_voice_preview"), true);
+      } catch (e) {
+        showToast(String(e));
+      }
+    };
+    els.previewSend.onclick = async () => {
+      try {
+        stopPreviewAudio();
+        applySnapshot(await invoke("send_voice_preview"), true);
       } catch (e) {
         showToast(String(e));
       }

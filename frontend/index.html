@@ -4,7 +4,7 @@
   <meta charset="UTF-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0" />
   <title>VOID P2P Messenger</title>
-  <link rel="stylesheet" href="style.css?v=10" />
+  <link rel="stylesheet" href="style.css?v=12" />
   <link rel="preconnect" href="https://fonts.googleapis.com" />
   <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
   <link href="https://fonts.googleapis.com/css2?family=Orbitron:wght@500;700&family=IBM+Plex+Sans:wght@400;500;600&display=swap" rel="stylesheet" />
@@ -72,6 +72,21 @@
       </header>
       <div id="messages" class="messages"></div>
       <div id="file-offers" class="file-offers"></div>
+      <div id="rec-bar" class="rec-bar" hidden>
+        <span class="rec-dot"></span>
+        <span>Запись</span>
+        <span id="rec-time">0:00</span>
+        <button type="button" id="rec-stop" class="btn">Стоп</button>
+      </div>
+      <div id="voice-preview" class="voice-preview" hidden>
+        <div class="voice-player" id="preview-player">
+          <button type="button" class="voice-play" id="preview-play" title="Прослушать">▶</button>
+          <input type="range" class="voice-seek" id="preview-seek" min="0" max="1000" value="0" />
+          <span class="voice-time" id="preview-time">0:00</span>
+        </div>
+        <button type="button" id="preview-cancel" class="btn">Отмена</button>
+        <button type="button" id="preview-send" class="btn primary">Отправить</button>
+      </div>
       <form id="composer" class="composer">
         <button type="button" id="attach-btn" class="icon-btn" title="Файл">
           <img data-icon="send file.png" alt="" />
@@ -97,6 +112,6 @@
   </div>
 
   <div id="toast" class="toast" hidden role="status" aria-live="polite"></div>
-  <script src="app.js?v=16"></script>
+  <script src="app.js?v=18"></script>
 </body>
 </html>

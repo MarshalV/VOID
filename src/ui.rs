@@ -1842,6 +1842,9 @@ impl eframe::App for App {
                             recipient: peer,
                             path,
                             kind,
+                            message_id: None,
+                            transfer_id: None,
+                            sender_name: String::new(),
                         });
                     }
                     let voices = self
@@ -3345,6 +3348,9 @@ impl eframe::App for App {
                                                                             .display()
                                                                             .to_string(),
                                                                         kind,
+                                                                        message_id: None,
+                                                                        transfer_id: None,
+                                                                        sender_name: String::new(),
                                                                     },
                                                                 );
                                                             }
@@ -3491,6 +3497,7 @@ impl eframe::App for App {
                                                 .to_string(),
                                             delivery: OutgoingDeliveryStatus::Pending,
                                             voice: None,
+                                            file: None,
                                             group_id: Some(gid.clone()),
                                         });
                                         self.outbox_track_group_message(
@@ -3549,6 +3556,7 @@ impl eframe::App for App {
                                             .to_string(),
                                         delivery: OutgoingDeliveryStatus::Pending,
                                         voice: None,
+                                        file: None,
                                         group_id: None,
                                     });
                                     self.outbox_track_direct(
@@ -3775,6 +3783,15 @@ impl eframe::App for App {
                                                         has_audio,
                                                         is_playing,
                                                     ));
+                                                } else if let Some(ref file) = msg.file {
+                                                    ui.label(
+                                                        egui::RichText::new(format!(
+                                                            "📄 {}",
+                                                            file.filename
+                                                        ))
+                                                        .size(14.5)
+                                                        .color(palette::TEXT),
+                                                    );
                                                 } else if !msg.text.is_empty() {
                                                     if invite_links.is_empty() {
                                                         ui.label(

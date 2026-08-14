@@ -277,12 +277,39 @@ fn open_in_file_manager(dir: &std::path::Path) -> Result<(), String> {
 }
 
 #[tauri::command]
-fn start_voice(state: State<'_, Mutex<AppState>>) -> Result<(), String> {
+fn start_voice(state: State<'_, Mutex<AppState>>) -> Result<SnapshotDto, String> {
     state
         .lock()
         .map_err(|e| e.to_string())?
         .runtime
         .start_voice()
+}
+
+#[tauri::command]
+fn stop_voice_preview(state: State<'_, Mutex<AppState>>) -> Result<SnapshotDto, String> {
+    state
+        .lock()
+        .map_err(|e| e.to_string())?
+        .runtime
+        .stop_voice_preview()
+}
+
+#[tauri::command]
+fn send_voice_preview(state: State<'_, Mutex<AppState>>) -> Result<SnapshotDto, String> {
+    state
+        .lock()
+        .map_err(|e| e.to_string())?
+        .runtime
+        .send_voice_preview()
+}
+
+#[tauri::command]
+fn cancel_voice_preview(state: State<'_, Mutex<AppState>>) -> Result<SnapshotDto, String> {
+    state
+        .lock()
+        .map_err(|e| e.to_string())?
+        .runtime
+        .cancel_voice_preview()
 }
 
 #[tauri::command]
@@ -527,6 +554,9 @@ pub fn run() {
             open_downloads,
             reveal_path,
             start_voice,
+            stop_voice_preview,
+            send_voice_preview,
+            cancel_voice_preview,
             stop_voice_send,
             create_group,
             join_group,

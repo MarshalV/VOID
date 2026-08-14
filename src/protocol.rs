@@ -30,6 +30,14 @@ pub(crate) struct VoiceMeta {
     pub(crate) duration_secs: f32,
 }
 
+/// Файл в чате (байты идут file-transfer, в пузырьке — имя и локальный путь).
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub(crate) struct FileMeta {
+    pub(crate) transfer_id: String,
+    pub(crate) filename: String,
+    pub(crate) size: u64,
+}
+
 pub(crate) fn transfer_id_to_hex(tid: &[u8; 16]) -> String {
     tid.iter().map(|b| format!("{:02x}", b)).collect()
 }
@@ -59,6 +67,17 @@ pub(crate) fn per_peer_voice_transfer_id(base: &[u8; 16], peer: PeerId) -> [u8; 
     h.finalize_fixed().into()
 }
 
+fn validate_file_meta(f: &FileMeta) -> bool {
+    f.transfer_id.len() == 32
+        && f.transfer_id.chars().all(|c| c.is_ascii_hexdigit())
+        && !f.filename.is_empty()
+        && f.filename.len() <= 256
+        && !f.filename.contains('/')
+        && !f.filename.contains('\\')
+        && f.size > 0
+        && f.size <= file_transfer::MAX_FILE_SIZE
+}
+
 fn validate_voice_meta(v: &VoiceMeta) -> bool {
     v.transfer_id.len() == 32
         && v.transfer_id.chars().all(|c| c.is_ascii_hexdigit())
@@ -82,6 +101,9 @@ pub(crate) struct ChatMessage {
     /// Голосовое сообщение: аудио по `transfer_id` в file sub-протоколе.
     #[serde(default)]
     pub(crate) voice: Option<VoiceMeta>,
+    /// Файл в ленте чата (как голосовое: пузырёк + file-transfer).
+    #[serde(default)]
+    pub(crate) file: Option<FileMeta>,
     /// Групповой чат: 32 hex-символа id группы.
     #[serde(default)]
     pub(crate) group_id: Option<String>,
@@ -509,7 +531,12 @@ pub(crate) fn parse_decrypted_chat_json(plaintext: &[u8]) -> Option<ChatMessage>
             return None;
         }
     }
-    if msg.text.is_empty() && msg.voice.is_none() {
+    if let Some(ref file) = msg.file {
+        if !validate_file_meta(file) {
+            return None;
+        }
+    }
+    if msg.text.is_empty() && msg.voice.is_none() && msg.file.is_none() {
         return None;
     }
     if let Some(ref r) = msg.recipient_id {

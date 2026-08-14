@@ -40,7 +40,7 @@ use crate::protocol::{
     read_command_message_ids, verify_hello_transport_binding, validate_bootstrap_gossip_addrs,
     build_group_sync_json, build_group_leave_json, build_group_delete_json,
     transfer_id_to_hex, transfer_id_from_hex, per_peer_voice_transfer_id, ChatMessage,
-    DecryptedChatFrame, OutgoingDeliveryStatus, VoiceMeta, V1Packet,
+    DecryptedChatFrame, FileMeta, OutgoingDeliveryStatus, VoiceMeta, V1Packet,
 };
 
 fn is_junk_addr(ma: &Multiaddr) -> bool {
@@ -1011,6 +1011,9 @@ pub(crate) enum UICommand {
         recipient: PeerId,
         path: String,
         kind: file_transfer::FileKind,
+        message_id: Option<String>,
+        transfer_id: Option<[u8; 16]>,
+        sender_name: String,
     },
     /// Голосовое сообщение: ChatMessage + file-transfer с фиксированным transfer_id.
     SendVoiceMessage {
@@ -1018,6 +1021,16 @@ pub(crate) enum UICommand {
         recipient: PeerId,
         path: String,
         duration_secs: f32,
+        message_id: String,
+        transfer_id: [u8; 16],
+        is_retry: bool,
+    },
+    /// Файл в группу: ChatMessage + file-transfer каждому участнику.
+    SendGroupFile {
+        sender_name: String,
+        group_id: String,
+        members: Vec<PeerId>,
+        path: String,
         message_id: String,
         transfer_id: [u8; 16],
         is_retry: bool,
@@ -1883,6 +1896,13 @@ struct PendingVoiceTransfer {
     transfer_id: [u8; 16],
 }
 
+struct PendingNamedFileTransfer {
+    path: String,
+    transfer_id: [u8; 16],
+    filename: String,
+    kind: file_transfer::FileKind,
+}
+
 async fn flush_pending_encrypted_messages(
     swarm: &mut libp2p::Swarm<ChatBehaviour>,
     sessions: &mut HashMap<PeerId, crypto::SecureSession>,
@@ -2112,6 +2132,89 @@ async fn start_voice_file_transfer(
     }
 }
 
+async fn start_named_file_transfer(
+    swarm: &mut libp2p::Swarm<ChatBehaviour>,
+    outgoing_transfers: &mut HashMap<[u8; 16], file_transfer::OutgoingTransfer>,
+    relay_peers: &HashSet<PeerId>,
+    event_tx: &mpsc::Sender<NetworkEvent>,
+    recipient: PeerId,
+    path: &str,
+    transfer_id: [u8; 16],
+    filename: String,
+    file_kind: file_transfer::FileKind,
+) {
+    if outgoing_transfers.contains_key(&transfer_id) {
+        return;
+    }
+    match std::fs::read(path) {
+        Err(e) => {
+            let _ = event_tx
+                .send(NetworkEvent::Status(format!(
+                    "❌ Не удалось прочитать файл «{filename}»: {e}"
+                )))
+                .await;
+        }
+        Ok(data) => {
+            let data = crate::metadata_strip::strip_metadata_for_send(&filename, file_kind, data);
+            if data.len() as u64 > file_transfer::MAX_FILE_SIZE {
+                let _ = event_tx
+                    .send(NetworkEvent::Status(format!(
+                        "❌ Файл слишком большой (> {} МБ)",
+                        file_transfer::MAX_FILE_SIZE / 1024 / 1024
+                    )))
+                    .await;
+                return;
+            }
+            let sha256 = file_transfer::hash_file(&data);
+            let chunks = file_transfer::split_into_chunks(&data);
+            let total_chunks = chunks.len() as u32;
+            let total_size = data.len() as u64;
+            let is_relay = relay_peers.contains(&recipient);
+            let offer = file_transfer::FilePacket::Offer {
+                transfer_id,
+                filename: filename.clone(),
+                total_size,
+                total_chunks,
+                sha256,
+                kind: file_kind,
+            };
+            swarm
+                .behaviour_mut()
+                .file_rr
+                .send_request(&recipient, offer);
+            outgoing_transfers.insert(
+                transfer_id,
+                file_transfer::OutgoingTransfer {
+                    peer: recipient,
+                    transfer_id,
+                    filename: filename.clone(),
+                    chunks,
+                    next_chunk: 0,
+                    total_size,
+                    is_relay,
+                    last_chunk_at: Instant::now(),
+                    accepted: false,
+                    chunk_inflight: false,
+                    sha256,
+                    kind: file_kind,
+                },
+            );
+            let _ = event_tx
+                .send(NetworkEvent::FileProgress {
+                    transfer_id,
+                    sent_chunks: 0,
+                    total_chunks,
+                    filename,
+                    total_size,
+                    is_outgoing: true,
+                    peer: recipient,
+                    kind: file_kind,
+                })
+                .await;
+        }
+    }
+}
+
 async fn flush_pending_voice_transfers(
     swarm: &mut libp2p::Swarm<ChatBehaviour>,
     outgoing_transfers: &mut HashMap<[u8; 16], file_transfer::OutgoingTransfer>,
@@ -2132,6 +2235,33 @@ async fn flush_pending_voice_transfers(
             peer,
             &item.path,
             item.transfer_id,
+        )
+        .await;
+    }
+}
+
+async fn flush_pending_named_files(
+    swarm: &mut libp2p::Swarm<ChatBehaviour>,
+    outgoing_transfers: &mut HashMap<[u8; 16], file_transfer::OutgoingTransfer>,
+    relay_peers: &HashSet<PeerId>,
+    event_tx: &mpsc::Sender<NetworkEvent>,
+    peer: PeerId,
+    pending_named_files: &mut HashMap<PeerId, Vec<PendingNamedFileTransfer>>,
+) {
+    let Some(queue) = pending_named_files.remove(&peer) else {
+        return;
+    };
+    for item in queue {
+        start_named_file_transfer(
+            swarm,
+            outgoing_transfers,
+            relay_peers,
+            event_tx,
+            peer,
+            &item.path,
+            item.transfer_id,
+            item.filename,
+            item.kind,
         )
         .await;
     }
@@ -2286,6 +2416,8 @@ pub async fn run_chat_network(
         let mut handshake_started: HashMap<PeerId, Instant> = HashMap::new();
         let mut pending_messages: HashMap<PeerId, Vec<Vec<u8>>> = HashMap::new();
         let mut pending_voice_transfers: HashMap<PeerId, Vec<PendingVoiceTransfer>> =
+            HashMap::new();
+        let mut pending_named_files: HashMap<PeerId, Vec<PendingNamedFileTransfer>> =
             HashMap::new();
         let mut pending_read_receipts: HashMap<PeerId, Vec<Vec<String>>> = HashMap::new();
         let my_public_key = crypto::PublicKey::from(&local_static);
@@ -3237,6 +3369,7 @@ pub async fn run_chat_network(
                                     timestamp: chrono::Local::now().format("%H:%M").to_string(),
                                     delivery: OutgoingDeliveryStatus::Pending,
                                     voice: None,
+                                    file: None,
                                     group_id: None,
                                 };
 
@@ -3478,6 +3611,7 @@ pub async fn run_chat_network(
                                     } else {
                                         None
                                     },
+                                    file: None,
                                     group_id: Some(group_id.clone()),
                                 };
                                 for peer_id in members {
@@ -3772,114 +3906,210 @@ pub async fn run_chat_network(
                                 }
                             }
                             // ─── Файловый sub-протокол ──────────────────────
-                            UICommand::SendFile { recipient, path, kind } => {
+                            UICommand::SendFile {
+                                recipient,
+                                path,
+                                kind,
+                                message_id,
+                                transfer_id,
+                                sender_name,
+                            } => {
                                 let now = chrono::Local::now().format("%H:%M:%S").to_string();
+                                let filename = file_transfer::safe_filename(&path);
+                                let file_kind = if kind == file_transfer::FileKind::Other {
+                                    file_transfer::FileKind::from_filename(&filename)
+                                } else {
+                                    kind
+                                };
+                                let tid = transfer_id.unwrap_or_else(|| {
+                                    let mut t = [0u8; 16];
+                                    rand::RngCore::fill_bytes(&mut rand::thread_rng(), &mut t);
+                                    t
+                                });
+                                let size = std::fs::metadata(&path).map(|m| m.len()).unwrap_or(0);
+                                if let Some(mid) = message_id.clone() {
+                                    if size > 0 {
+                                        let msg = ChatMessage {
+                                            id: mid,
+                                            sender_id: local_peer_id.to_string(),
+                                            sender_name: sender_name.clone(),
+                                            recipient_id: Some(recipient.to_string()),
+                                            text: String::new(),
+                                            timestamp: chrono::Local::now().format("%H:%M").to_string(),
+                                            delivery: OutgoingDeliveryStatus::Pending,
+                                            voice: None,
+                                            file: Some(FileMeta {
+                                                transfer_id: transfer_id_to_hex(&tid),
+                                                filename: filename.clone(),
+                                                size,
+                                            }),
+                                            group_id: None,
+                                        };
+                                        if let Ok(json_data) = serde_json::to_vec(&msg) {
+                                            if sessions.contains_key(&recipient) {
+                                                let _ = send_encrypted_chat_payload(
+                                                    &mut swarm,
+                                                    &mut sessions,
+                                                    &mut outbound_msg_requests,
+                                                    &mut outbound_delete_requests,
+                                                    &event_tx,
+                                                    recipient,
+                                                    json_data,
+                                                    None,
+                                                    &now,
+                                                )
+                                                .await;
+                                            } else {
+                                                requeue_pending_chat_json(
+                                                    &mut pending_messages,
+                                                    recipient,
+                                                    json_data,
+                                                );
+                                            }
+                                        }
+                                    }
+                                }
                                 if !sessions.contains_key(&recipient) {
+                                    let q = pending_named_files.entry(recipient).or_default();
+                                    if !q.iter().any(|f| f.transfer_id == tid) {
+                                        q.push(PendingNamedFileTransfer {
+                                            path: path.clone(),
+                                            transfer_id: tid,
+                                            filename: filename.clone(),
+                                            kind: file_kind,
+                                        });
+                                    }
                                     let _ = event_tx
                                         .send(NetworkEvent::FileSendDeferred {
                                             recipient,
                                             path,
-                                            kind,
+                                            kind: file_kind,
                                         })
                                         .await;
                                     continue;
                                 }
-                                match std::fs::read(&path) {
-                                    Err(e) => {
+                                start_named_file_transfer(
+                                    &mut swarm,
+                                    &mut outgoing_transfers,
+                                    &relay_peers,
+                                    &event_tx,
+                                    recipient,
+                                    &path,
+                                    tid,
+                                    filename,
+                                    file_kind,
+                                )
+                                .await;
+                            }
+                            UICommand::SendGroupFile {
+                                sender_name,
+                                group_id,
+                                members,
+                                path,
+                                message_id,
+                                transfer_id,
+                                is_retry,
+                            } => {
+                                let now = chrono::Local::now().format("%H:%M:%S").to_string();
+                                let filename = file_transfer::safe_filename(&path);
+                                let file_kind = file_transfer::FileKind::from_filename(&filename);
+                                let size = std::fs::metadata(&path).map(|m| m.len()).unwrap_or(0);
+                                let msg = ChatMessage {
+                                    id: message_id.clone(),
+                                    sender_id: local_peer_id.to_string(),
+                                    sender_name: sender_name.clone(),
+                                    recipient_id: None,
+                                    text: String::new(),
+                                    timestamp: chrono::Local::now().format("%H:%M").to_string(),
+                                    delivery: OutgoingDeliveryStatus::Pending,
+                                    voice: None,
+                                    file: Some(FileMeta {
+                                        transfer_id: transfer_id_to_hex(&transfer_id),
+                                        filename: filename.clone(),
+                                        size,
+                                    }),
+                                    group_id: Some(group_id.clone()),
+                                };
+                                for peer_id in members {
+                                    if peer_id == local_peer_id {
+                                        continue;
+                                    }
+                                    let peer_tid =
+                                        per_peer_voice_transfer_id(&transfer_id, peer_id);
+                                    let mut per_peer_msg = msg.clone();
+                                    if let Some(ref mut f) = per_peer_msg.file {
+                                        f.transfer_id = transfer_id_to_hex(&peer_tid);
+                                    }
+                                    let per_json = match serde_json::to_vec(&per_peer_msg) {
+                                        Ok(v) => v,
+                                        Err(_) => continue,
+                                    };
+                                    if sessions.contains_key(&peer_id) {
+                                        let _ = send_encrypted_chat_payload(
+                                            &mut swarm,
+                                            &mut sessions,
+                                            &mut outbound_msg_requests,
+                                            &mut outbound_delete_requests,
+                                            &event_tx,
+                                            peer_id,
+                                            per_json,
+                                            None,
+                                            &now,
+                                        )
+                                        .await;
+                                        start_named_file_transfer(
+                                            &mut swarm,
+                                            &mut outgoing_transfers,
+                                            &relay_peers,
+                                            &event_tx,
+                                            peer_id,
+                                            &path,
+                                            peer_tid,
+                                            filename.clone(),
+                                            file_kind,
+                                        )
+                                        .await;
+                                    } else {
+                                        if swarm.is_connected(&peer_id) {
+                                            let _ = ensure_e2ee_handshake_started(
+                                                &mut swarm,
+                                                &local_key,
+                                                local_peer_id,
+                                                my_public_key,
+                                                peer_id,
+                                                &sessions,
+                                                &mut pending_handshakes,
+                                                &mut handshake_started,
+                                                &now,
+                                                false,
+                                            )
+                                            .await;
+                                        }
+                                        requeue_pending_chat_json(
+                                            &mut pending_messages,
+                                            peer_id,
+                                            per_json,
+                                        );
+                                        let q = pending_named_files.entry(peer_id).or_default();
+                                        if !q.iter().any(|f| f.transfer_id == peer_tid) {
+                                            q.push(PendingNamedFileTransfer {
+                                                path: path.clone(),
+                                                transfer_id: peer_tid,
+                                                filename: filename.clone(),
+                                                kind: file_kind,
+                                            });
+                                        }
                                         let _ = event_tx
-                                            .send(NetworkEvent::Status(format!(
-                                                "❌ Не удалось прочитать файл «{}»: {}",
-                                                path, e
-                                            )))
+                                            .send(NetworkEvent::FileSendDeferred {
+                                                recipient: peer_id,
+                                                path: path.clone(),
+                                                kind: file_kind,
+                                            })
                                             .await;
                                     }
-                                    Ok(data) => {
-                                        let filename = file_transfer::safe_filename(&path);
-                                        // Уточняем тип по реальному расширению файла
-                                        let file_kind = if kind == file_transfer::FileKind::Other {
-                                            file_transfer::FileKind::from_filename(&filename)
-                                        } else {
-                                            kind
-                                        };
-                                        let data = crate::metadata_strip::strip_metadata_for_send(
-                                            &filename,
-                                            file_kind,
-                                            data,
-                                        );
-                                        if data.len() as u64 > file_transfer::MAX_FILE_SIZE {
-                                            let _ = event_tx
-                                                .send(NetworkEvent::Status(format!(
-                                                    "❌ Файл слишком большой (> {} МБ)",
-                                                    file_transfer::MAX_FILE_SIZE / 1024 / 1024
-                                                )))
-                                                .await;
-                                        } else if !sessions.contains_key(&recipient) {
-                                            let _ = event_tx
-                                                .send(NetworkEvent::FileSendDeferred {
-                                                    recipient,
-                                                    path,
-                                                    kind,
-                                                })
-                                                .await;
-                                        } else {
-                                            let sha256 = file_transfer::hash_file(&data);
-                                            let chunks = file_transfer::split_into_chunks(&data);
-                                            let total_chunks = chunks.len() as u32;
-                                            let total_size = data.len() as u64;
-
-                                            let mut tid = [0u8; 16];
-                                            rand::RngCore::fill_bytes(&mut rand::thread_rng(), &mut tid);
-
-                                            let is_relay = relay_peers.contains(&recipient);
-                                            let offer = file_transfer::FilePacket::Offer {
-                                                transfer_id: tid,
-                                                filename: filename.clone(),
-                                                total_size,
-                                                total_chunks,
-                                                sha256,
-                                                kind: file_kind,
-                                            };
-                                            swarm.behaviour_mut().file_rr.send_request(&recipient, offer);
-
-                                            let transfer = file_transfer::OutgoingTransfer {
-                                                peer: recipient,
-                                                transfer_id: tid,
-                                                filename: filename.clone(),
-                                                chunks,
-                                                next_chunk: 0,
-                                                total_size,
-                                                is_relay,
-                                                last_chunk_at: Instant::now(),
-                                                accepted: false,
-                                                chunk_inflight: false,
-                                                sha256,
-                                                kind: file_kind,
-                                            };
-                                            outgoing_transfers.insert(tid, transfer);
-
-                                            debug!(
-                                                "[{}] 📤 FILE[{}]: Offer «{}» → {} ({} чанков{})",
-                                                now,
-                                                file_kind.label(),
-                                                filename,
-                                                &recipient.to_string()[..8],
-                                                total_chunks,
-                                                if is_relay { ", relay rate-limit" } else { "" }
-                                            );
-                                            let _ = event_tx
-                                                .send(NetworkEvent::FileProgress {
-                                                    transfer_id: tid,
-                                                    sent_chunks: 0,
-                                                    total_chunks,
-                                                    filename,
-                                                    total_size,
-                                                    is_outgoing: true,
-                                                    peer: recipient,
-                                                    kind: file_kind,
-                                                })
-                                                .await;
-                                        }
-                                    }
+                                }
+                                if !is_retry {
+                                    let _ = event_tx.send(NetworkEvent::ChatMessage(msg)).await;
                                 }
                             }
                             UICommand::SendVoiceMessage {
@@ -3904,6 +4134,7 @@ pub async fn run_chat_network(
                                         transfer_id: transfer_id_to_hex(&transfer_id),
                                         duration_secs,
                                     }),
+                                    file: None,
                                     group_id: None,
                                 };
 
@@ -5246,6 +5477,15 @@ pub async fn run_chat_network(
                                                         &event_tx,
                                                         peer,
                                                         &mut pending_voice_transfers,
+                                                    )
+                                                    .await;
+                                                    flush_pending_named_files(
+                                                        &mut swarm,
+                                                        &mut outgoing_transfers,
+                                                        &relay_peers,
+                                                        &event_tx,
+                                                        peer,
+                                                        &mut pending_named_files,
                                                     )
                                                     .await;
                                                 }
@@ -6732,7 +6972,6 @@ pub async fn run_chat_network(
                                                 .send_response(channel, FilePacket::Ack);
 
                                             if file_transfer::is_voice_filename(&safe) {
-                                                // Голосовые принимаем сразу в сети — без roundtrip через UI.
                                                 if let Some(inc) =
                                                     incoming_transfers.get_mut(&transfer_id)
                                                 {
@@ -6742,19 +6981,13 @@ pub async fn run_chat_network(
                                                             .to_string(),
                                                     );
                                                 }
-                                                let accept =
-                                                    FilePacket::Accept { transfer_id };
-                                                swarm
-                                                    .behaviour_mut()
-                                                    .file_rr
-                                                    .send_request(&peer, accept);
-                                                debug!(
-                                                    "[{}] 🔊 FILE: auto-Accept голосового {:x?} от {}",
-                                                    now,
-                                                    &transfer_id[..4],
-                                                    &peer.to_string()[..8]
-                                                );
                                             }
+                                            // Файлы в чате — как голосовые: принимаем сразу, без баннера.
+                                            let accept = FilePacket::Accept { transfer_id };
+                                            swarm
+                                                .behaviour_mut()
+                                                .file_rr
+                                                .send_request(&peer, accept);
 
                                             let _ = event_tx
                                                 .send(NetworkEvent::FileOffer {

@@ -30,8 +30,8 @@ use crate::network::{run_chat_network, NetworkEvent, OfflineOutboxItem, UIComman
 use crate::offline_mail::open_envelope;
 use crate::outbox::{Outbox, OutboxEntry};
 use crate::protocol::{
-    build_group_sync_json, new_message_id, parse_decrypted_chat_frame, ChatMessage,
-    DecryptedChatFrame, OutgoingDeliveryStatus,
+    build_group_sync_json, new_message_id, parse_decrypted_chat_frame, transfer_id_to_hex,
+    ChatMessage, DecryptedChatFrame, FileMeta, OutgoingDeliveryStatus,
 };
 use crate::shared_chat::SharedChatMessages;
 use crate::vault::{
@@ -89,6 +89,9 @@ struct PendingFileSend {
     path: String,
     kind: file_transfer::FileKind,
     last_attempt: Instant,
+    message_id: Option<String>,
+    transfer_id: Option<[u8; 16]>,
+    sender_name: String,
 }
 
 struct PendingVoiceSend {
@@ -146,6 +149,10 @@ pub struct MessageDto {
     pub voice_duration_secs: Option<f32>,
     /// Absolute path to local WAV when available (for in-chat playback).
     pub voice_path: Option<String>,
+    pub file_transfer_id: Option<String>,
+    pub file_name: Option<String>,
+    pub file_size: Option<u64>,
+    pub file_path: Option<String>,
     pub group_id: Option<String>,
 }
 
@@ -199,6 +206,12 @@ pub struct SnapshotDto {
     pub beacon_active: bool,
     pub incoming_files: Vec<FileOfferDto>,
     pub voice_recording: bool,
+    #[serde(default)]
+    pub voice_recording_secs: f32,
+    #[serde(default)]
+    pub voice_preview_path: Option<String>,
+    #[serde(default)]
+    pub voice_preview_duration: Option<f32>,
     /// Монотонный номер снимка — UI отбрасывает запоздалые старые события.
     #[serde(default)]
     pub revision: u64,
@@ -258,6 +271,10 @@ struct Inner {
     pending_voice_sends: Vec<PendingVoiceSend>,
     /// transfer_id hex → absolute WAV path for in-chat playback.
     voice_audio_paths: HashMap<String, String>,
+    /// transfer_id hex → local file path for in-chat download/open.
+    file_paths: HashMap<String, String>,
+    voice_preview_path: Option<String>,
+    voice_preview_duration: Option<f32>,
     offline_dht_publish_after: Option<Instant>,
     last_group_sync_retry: Option<Instant>,
     offline_mail_processed: HashSet<String>,
@@ -300,6 +317,9 @@ impl Inner {
             pending_file_sends: Vec::new(),
             pending_voice_sends: Vec::new(),
             voice_audio_paths: HashMap::new(),
+            file_paths: HashMap::new(),
+            voice_preview_path: None,
+            voice_preview_duration: None,
             offline_dht_publish_after: None,
             last_group_sync_retry: None,
             offline_mail_processed: HashSet::new(),
@@ -389,7 +409,8 @@ impl Inner {
                         timestamp: chrono::Local::now().format("%H:%M").to_string(),
                         delivery: OutgoingDeliveryStatus::Pending,
                         voice: None,
-                        group_id: None,
+                        file: None,
+            group_id: None,
                     };
                     if let Ok(payload) = serde_json::to_vec(&msg) {
                         items.push(OfflineOutboxItem {
@@ -422,7 +443,8 @@ impl Inner {
                             timestamp: chrono::Local::now().format("%H:%M").to_string(),
                             delivery: OutgoingDeliveryStatus::Pending,
                             voice: None,
-                            group_id: Some(group_id.clone()),
+                            file: None,
+            group_id: Some(group_id.clone()),
                         };
                         if let Ok(payload) = serde_json::to_vec(&msg) {
                             items.push(OfflineOutboxItem {
@@ -534,6 +556,67 @@ impl Inner {
         if std::path::Path::new(&path).is_file() {
             self.voice_audio_paths.insert(tid, path);
         }
+    }
+
+    fn register_file_path(&mut self, transfer_id_hex: &str, path: String) {
+        let tid = transfer_id_hex.to_ascii_lowercase();
+        if std::path::Path::new(&path).is_file() {
+            self.file_paths.insert(tid, path);
+        }
+    }
+
+    fn lookup_file_path(&self, transfer_id_hex: &str) -> Option<String> {
+        let tid = transfer_id_hex.to_ascii_lowercase();
+        self.file_paths.get(&tid).cloned().filter(|p| std::path::Path::new(p).is_file())
+    }
+
+    fn file_message_exists(&self, tid_hex: &str) -> bool {
+        let tid = tid_hex.to_ascii_lowercase();
+        let map = self.messages.lock();
+        map.values().any(|msgs| {
+            msgs.iter().any(|m| {
+                m.file
+                    .as_ref()
+                    .is_some_and(|f| f.transfer_id.eq_ignore_ascii_case(&tid))
+            })
+        })
+    }
+
+    fn ensure_file_chat_message(
+        &mut self,
+        peer: PeerId,
+        tid_hex: &str,
+        filename: &str,
+        size: u64,
+        is_outgoing: bool,
+    ) {
+        if self.file_message_exists(tid_hex) || is_outgoing {
+            return;
+        }
+        let chat = peer.to_string();
+        let msg = ChatMessage {
+            id: new_message_id(),
+            sender_id: peer.to_string(),
+            sender_name: self
+                .known_peers
+                .get(&peer)
+                .cloned()
+                .unwrap_or_else(|| peer.to_string().chars().take(12).collect()),
+            recipient_id: self.local_peer_id.map(|p| p.to_string()),
+            text: String::new(),
+            timestamp: chrono::Local::now().format("%H:%M:%S").to_string(),
+            delivery: OutgoingDeliveryStatus::Delivered,
+            voice: None,
+            file: Some(FileMeta {
+                transfer_id: tid_hex.to_ascii_lowercase(),
+                filename: filename.to_string(),
+                size: size.max(1),
+            }),
+            group_id: None,
+        };
+        self.messages.lock().entry(chat).or_default().push(msg);
+        self.messages.mark_dirty();
+        self.persist_journal();
     }
 
     fn lookup_voice_path(&self, transfer_id_hex: &str) -> Option<String> {
@@ -813,13 +896,29 @@ impl Inner {
     fn tick_pending_file_sends(&mut self) {
         const RETRY: Duration = Duration::from_secs(8);
         let now = Instant::now();
-        let due: Vec<(PeerId, String, file_transfer::FileKind)> = self
+        let due: Vec<(
+            PeerId,
+            String,
+            file_transfer::FileKind,
+            Option<String>,
+            Option<[u8; 16]>,
+            String,
+        )> = self
             .pending_file_sends
             .iter()
             .filter(|p| now.duration_since(p.last_attempt) >= RETRY)
-            .map(|p| (p.peer, p.path.clone(), p.kind))
+            .map(|p| {
+                (
+                    p.peer,
+                    p.path.clone(),
+                    p.kind,
+                    p.message_id.clone(),
+                    p.transfer_id,
+                    p.sender_name.clone(),
+                )
+            })
             .collect();
-        for (peer, path, kind) in due {
+        for (peer, path, kind, message_id, transfer_id, sender_name) in due {
             if let Some(slot) = self
                 .pending_file_sends
                 .iter_mut()
@@ -834,6 +933,9 @@ impl Inner {
                     recipient: peer,
                     path,
                     kind,
+                    message_id,
+                    transfer_id,
+                    sender_name,
                 });
             }
         }
@@ -1208,6 +1310,8 @@ impl Inner {
             .map(|m| {
                 if m.voice.is_some() {
                     "Голосовое сообщение".into()
+                } else if let Some(ref f) = m.file {
+                    format!("📄 {}", f.filename)
                 } else if m.text.chars().count() > 48 {
                     let t: String = m.text.chars().take(48).collect();
                     format!("{t}…")
@@ -1341,6 +1445,13 @@ impl Inner {
                         .and_then(|v| self.lookup_voice_path(&v.transfer_id)),
                     voice_transfer_id: m.voice.as_ref().map(|v| v.transfer_id.clone()),
                     voice_duration_secs: m.voice.as_ref().map(|v| v.duration_secs),
+                    file_path: m
+                        .file
+                        .as_ref()
+                        .and_then(|f| self.lookup_file_path(&f.transfer_id)),
+                    file_transfer_id: m.file.as_ref().map(|f| f.transfer_id.clone()),
+                    file_name: m.file.as_ref().map(|f| f.filename.clone()),
+                    file_size: m.file.as_ref().map(|f| f.size),
                     group_id: m.group_id.clone(),
                     id: m.id,
                     sender_id: m.sender_id,
@@ -1398,6 +1509,12 @@ impl Inner {
             beacon_active: self.beacon_active,
             incoming_files: self.incoming_file_offers.clone(),
             voice_recording: self.voice_recording,
+            voice_recording_secs: self
+                .voice_recorder
+                .recording_elapsed()
+                .unwrap_or(0.0),
+            voice_preview_path: self.voice_preview_path.clone(),
+            voice_preview_duration: self.voice_preview_duration,
             revision: {
                 self.snapshot_rev = self.snapshot_rev.saturating_add(1);
                 self.snapshot_rev
@@ -1644,28 +1761,10 @@ impl VoidRuntime {
                             g.peer_prekeys.insert(peer, public_key);
                             g.persist_vault();
                         }
-                        NetworkEvent::FileOffer {
-                            transfer_id,
-                            from,
-                            filename,
-                            total_size,
-                            kind,
-                        } => {
-                            // Голосовые принимаются сетью автоматически — не как «файл» в UI.
-                            if file_transfer::is_voice_filename(&filename) {
-                                emit_snapshot = true;
-                            } else {
-                                let dto = FileOfferDto {
-                                    transfer_id: hex::encode(transfer_id),
-                                    from: from.to_string(),
-                                    filename,
-                                    total_size,
-                                    kind: format!("{kind:?}"),
-                                };
-                                g.incoming_file_offers.push(dto.clone());
-                                bridge_evs.push(BridgeEvent::FileOffer(dto));
-                                emit_snapshot = true;
-                            }
+                        NetworkEvent::FileOffer { filename, .. } => {
+                            // Голос и обычные файлы принимаются сетью автоматически.
+                            let _ = filename;
+                            emit_snapshot = true;
                         }
                         NetworkEvent::FileProgress {
                             transfer_id,
@@ -1705,20 +1804,28 @@ impl VoidRuntime {
                                 if !is_outgoing {
                                     g.add_status("🎤 Голосовое получено".into());
                                 }
-                            } else if is_outgoing {
+                            } else {
+                                if !saved_to.is_empty() {
+                                    g.register_file_path(&tid, saved_to.clone());
+                                }
+                                g.ensure_file_chat_message(
+                                    peer,
+                                    &tid,
+                                    &filename,
+                                    std::fs::metadata(&saved_to).map(|m| m.len()).unwrap_or(0),
+                                    is_outgoing,
+                                );
                                 g.pending_file_sends.retain(|p| p.peer != peer);
-                                g.add_status(format!("✅ Файл «{filename}» доставлен"));
-                            } else if !saved_to.is_empty() {
-                                g.add_status(format!("✅ Файл «{filename}» сохранён: {saved_to}"));
-                            }
-                            g.kick_pending_for_peer(peer);
-                            if !is_voice {
+                                if is_outgoing {
+                                    g.add_status(format!("✅ Файл «{filename}» доставлен"));
+                                }
                                 bridge_evs.push(BridgeEvent::FileComplete {
                                     transfer_id: tid,
                                     filename,
                                     saved_to,
                                 });
                             }
+                            g.kick_pending_for_peer(peer);
                             emit_snapshot = true;
                         }
                         NetworkEvent::FileError { reason, .. } => {
@@ -1757,6 +1864,9 @@ impl VoidRuntime {
                                     path: path.clone(),
                                     kind,
                                     last_attempt: Instant::now(),
+                                    message_id: None,
+                                    transfer_id: None,
+                                    sender_name: String::new(),
                                 });
                             }
                             g.ensure_peer_routed(recipient);
@@ -2321,6 +2431,7 @@ impl VoidRuntime {
                 timestamp: ts,
                 delivery: OutgoingDeliveryStatus::Pending,
                 voice: None,
+                file: None,
                 group_id: Some(gid.clone()),
             };
             g.messages.lock().entry(chat).or_default().push(msg);
@@ -2351,7 +2462,8 @@ impl VoidRuntime {
                 timestamp: ts,
                 delivery: OutgoingDeliveryStatus::Pending,
                 voice: None,
-                group_id: None,
+                file: None,
+            group_id: None,
             };
             g.messages.lock().entry(chat).or_default().push(msg);
             g.messages.mark_dirty();
@@ -2581,16 +2693,99 @@ impl VoidRuntime {
     pub fn send_file(&self, path: String) -> Result<SnapshotDto, String> {
         let mut g = self.inner.lock().unwrap_or_else(|p| p.into_inner());
         let chat = g.selected_chat.clone();
-        let peer: PeerId = chat.parse().map_err(|_| "Выберите личный чат")?;
-        let kind = file_transfer::FileKind::Other;
-        g.ensure_peer_routed(peer);
-        if let Some(tx) = &g.command_tx {
-            let _ = tx.try_send(UICommand::EnsureChatSession(peer));
-            let _ = tx.try_send(UICommand::SendFile {
-                recipient: peer,
-                path: path.clone(),
-                kind,
-            });
+        if chat.is_empty() {
+            return Err("Выберите чат".into());
+        }
+        let local = g.local_peer_id.ok_or("нет peer")?;
+        let nick = g.local_nickname.clone();
+        let filename = file_transfer::safe_filename(&path);
+        let size = std::fs::metadata(&path).map(|m| m.len()).unwrap_or(0);
+        if size == 0 {
+            return Err("Файл пустой или недоступен".into());
+        }
+        if size > file_transfer::MAX_FILE_SIZE {
+            return Err(format!(
+                "Файл слишком большой (> {} МБ)",
+                file_transfer::MAX_FILE_SIZE / 1024 / 1024
+            ));
+        }
+        let mid = new_message_id();
+        let mut tid = [0u8; 16];
+        rand::thread_rng().fill_bytes(&mut tid);
+        let tid_hex = transfer_id_to_hex(&tid);
+        g.register_file_path(&tid_hex, path.clone());
+        let kind = file_transfer::FileKind::from_filename(&filename);
+        let file_meta = FileMeta {
+            transfer_id: tid_hex.clone(),
+            filename: filename.clone(),
+            size,
+        };
+        if let Some(gid) = group::parse_group_thread_key(&chat) {
+            let gid = gid.to_string();
+            let Some(group) = g.groups.get(&gid).cloned() else {
+                return Err("Группа не найдена".into());
+            };
+            let members = group.member_peer_ids();
+            let msg = ChatMessage {
+                id: mid.clone(),
+                sender_id: local.to_string(),
+                sender_name: nick.clone(),
+                recipient_id: None,
+                text: String::new(),
+                timestamp: chrono::Local::now().format("%H:%M:%S").to_string(),
+                delivery: OutgoingDeliveryStatus::Pending,
+                voice: None,
+                file: Some(file_meta),
+                group_id: Some(gid.clone()),
+            };
+            g.messages.lock().entry(chat).or_default().push(msg);
+            g.messages.mark_dirty();
+            g.persist_journal();
+            for pid in &members {
+                if *pid != local {
+                    g.ensure_peer_routed(*pid);
+                }
+            }
+            if let Some(tx) = &g.command_tx {
+                let _ = tx.try_send(UICommand::SendGroupFile {
+                    sender_name: nick,
+                    group_id: gid,
+                    members,
+                    path: path.clone(),
+                    message_id: mid,
+                    transfer_id: tid,
+                    is_retry: false,
+                });
+            }
+        } else {
+            let peer: PeerId = chat.parse().map_err(|_| "Выберите чат")?;
+            let msg = ChatMessage {
+                id: mid.clone(),
+                sender_id: local.to_string(),
+                sender_name: nick.clone(),
+                recipient_id: Some(chat.clone()),
+                text: String::new(),
+                timestamp: chrono::Local::now().format("%H:%M:%S").to_string(),
+                delivery: OutgoingDeliveryStatus::Pending,
+                voice: None,
+                file: Some(file_meta),
+                group_id: None,
+            };
+            g.messages.lock().entry(chat).or_default().push(msg);
+            g.messages.mark_dirty();
+            g.persist_journal();
+            g.ensure_peer_routed(peer);
+            if let Some(tx) = &g.command_tx {
+                let _ = tx.try_send(UICommand::EnsureChatSession(peer));
+                let _ = tx.try_send(UICommand::SendFile {
+                    recipient: peer,
+                    path: path.clone(),
+                    kind,
+                    message_id: Some(mid.clone()),
+                    transfer_id: Some(tid),
+                    sender_name: nick.clone(),
+                });
+            }
             if !g
                 .pending_file_sends
                 .iter()
@@ -2601,11 +2796,14 @@ impl VoidRuntime {
                     path,
                     kind,
                     last_attempt: Instant::now(),
+                    message_id: Some(mid),
+                    transfer_id: Some(tid),
+                    sender_name: nick,
                 });
             }
-            g.add_status("Отправка файла…".into());
         }
         drop(g);
+        self.emit_snapshot();
         Ok(self.get_snapshot())
     }
 
@@ -2652,24 +2850,37 @@ impl VoidRuntime {
         Ok(())
     }
 
-    pub fn start_voice(&self) -> Result<(), String> {
+    pub fn start_voice(&self) -> Result<SnapshotDto, String> {
         let mut g = self.inner.lock().unwrap_or_else(|p| p.into_inner());
+        if g.selected_chat.is_empty() {
+            return Err("Выберите чат".into());
+        }
+        g.voice_preview_path = None;
+        g.voice_preview_duration = None;
+        g.voice_recorder.discard_ready();
+        if g.voice_recorder.on_air() {
+            g.voice_recording = true;
+            drop(g);
+            self.emit_snapshot();
+            return Ok(self.get_snapshot());
+        }
         match g.voice_recorder.handle_mic_click() {
             crate::voice::MicClick::Started => {
                 g.voice_recording = true;
-                Ok(())
             }
-            crate::voice::MicClick::Error(e) => Err(e),
-            crate::voice::MicClick::Busy => Err("Микрофон занят".into()),
+            crate::voice::MicClick::Error(e) => return Err(e),
+            crate::voice::MicClick::Busy => return Err("Микрофон занят".into()),
             other => {
                 g.voice_recording = g.voice_recorder.on_air();
                 let _ = other;
-                Ok(())
             }
         }
+        drop(g);
+        self.emit_snapshot();
+        Ok(self.get_snapshot())
     }
 
-    pub fn stop_voice_send(&self) -> Result<SnapshotDto, String> {
+    pub fn stop_voice_preview(&self) -> Result<SnapshotDto, String> {
         {
             let mut g = self.inner.lock().unwrap_or_else(|p| p.into_inner());
             if g.voice_recorder.on_air() {
@@ -2677,8 +2888,6 @@ impl VoidRuntime {
             }
             g.voice_recording = false;
         }
-        // Не держим Mutex Inner во время ожидания WAV — иначе event pump
-        // (сообщения/файлы) встанет на несколько секунд.
         for _ in 0..80 {
             {
                 let mut g = self.inner.lock().unwrap_or_else(|p| p.into_inner());
@@ -2697,48 +2906,139 @@ impl VoidRuntime {
             .voice_recorder
             .take_ready()
             .ok_or_else(|| "Запись не готова".to_string())?;
+        g.voice_preview_path = Some(path.display().to_string());
+        g.voice_preview_duration = Some(duration);
+        drop(g);
+        self.emit_snapshot();
+        Ok(self.get_snapshot())
+    }
+
+    pub fn cancel_voice_preview(&self) -> Result<SnapshotDto, String> {
+        let mut g = self.inner.lock().unwrap_or_else(|p| p.into_inner());
+        if let Some(p) = g.voice_preview_path.take() {
+            let _ = std::fs::remove_file(p);
+        }
+        g.voice_preview_duration = None;
+        drop(g);
+        self.emit_snapshot();
+        Ok(self.get_snapshot())
+    }
+
+    pub fn send_voice_preview(&self) -> Result<SnapshotDto, String> {
+        let mut g = self.inner.lock().unwrap_or_else(|p| p.into_inner());
+        let path = g
+            .voice_preview_path
+            .take()
+            .ok_or_else(|| "Нет записи для отправки".to_string())?;
+        let duration = g.voice_preview_duration.take().unwrap_or(1.0);
+        self.dispatch_voice_locked(&mut g, path, duration)?;
+        drop(g);
+        self.emit_snapshot();
+        Ok(self.get_snapshot())
+    }
+
+    pub fn stop_voice_send(&self) -> Result<SnapshotDto, String> {
+        let snap = self.stop_voice_preview()?;
+        if snap.voice_preview_path.is_some() {
+            self.send_voice_preview()
+        } else {
+            Ok(snap)
+        }
+    }
+
+    fn dispatch_voice_locked(
+        &self,
+        g: &mut Inner,
+        path: String,
+        duration: f32,
+    ) -> Result<(), String> {
         let chat = g.selected_chat.clone();
-        let peer: PeerId = chat.parse().map_err(|_| "Выберите личный чат")?;
+        if chat.is_empty() {
+            return Err("Выберите чат".into());
+        }
         let local = g.local_peer_id.ok_or("нет peer")?;
         let nick = g.local_nickname.clone();
         let mid = new_message_id();
         let mut tid = [0u8; 16];
         rand::thread_rng().fill_bytes(&mut tid);
-        let tid_hex = tid.iter().map(|b| format!("{:02x}", b)).collect::<String>();
-        let staged = g.stage_outgoing_voice_wav(&tid, &path);
-        let msg = ChatMessage {
-            id: mid.clone(),
-            sender_id: local.to_string(),
-            sender_name: nick.clone(),
-            recipient_id: Some(chat.clone()),
-            text: String::new(),
-            timestamp: chrono::Local::now().format("%H:%M:%S").to_string(),
-            delivery: OutgoingDeliveryStatus::Pending,
-            voice: Some(crate::protocol::VoiceMeta {
-                transfer_id: tid_hex,
-                duration_secs: duration,
-            }),
-            group_id: None,
+        let tid_hex = transfer_id_to_hex(&tid);
+        let staged = g.stage_outgoing_voice_wav(&tid, std::path::Path::new(&path));
+        let msg_voice = crate::protocol::VoiceMeta {
+            transfer_id: tid_hex,
+            duration_secs: duration,
         };
-        g.messages.lock().entry(chat).or_default().push(msg);
-        g.messages.mark_dirty();
-        g.persist_journal();
-        g.ensure_peer_routed(peer);
-        if let Some(tx) = &g.command_tx {
-            let _ = tx.try_send(UICommand::EnsureChatSession(peer));
-            let _ = tx.try_send(UICommand::SendVoiceMessage {
-                sender_name: nick,
-                recipient: peer,
-                path: staged,
-                duration_secs: duration,
-                message_id: mid,
-                transfer_id: tid,
-                is_retry: false,
-            });
+        if let Some(gid) = group::parse_group_thread_key(&chat) {
+            let gid = gid.to_string();
+            let Some(group) = g.groups.get(&gid).cloned() else {
+                return Err("Группа не найдена".into());
+            };
+            let members = group.member_peer_ids();
+            let msg = ChatMessage {
+                id: mid.clone(),
+                sender_id: local.to_string(),
+                sender_name: nick.clone(),
+                recipient_id: None,
+                text: String::new(),
+                timestamp: chrono::Local::now().format("%H:%M:%S").to_string(),
+                delivery: OutgoingDeliveryStatus::Pending,
+                voice: Some(msg_voice),
+                file: None,
+                group_id: Some(gid.clone()),
+            };
+            g.messages.lock().entry(chat).or_default().push(msg);
+            g.messages.mark_dirty();
+            g.persist_journal();
+            for pid in &members {
+                if *pid != local {
+                    g.ensure_peer_routed(*pid);
+                }
+            }
+            if let Some(tx) = &g.command_tx {
+                let _ = tx.try_send(UICommand::SendGroupMessage {
+                    sender_name: nick,
+                    text: String::new(),
+                    group_id: gid,
+                    members,
+                    message_id: Some(mid),
+                    is_retry: false,
+                    voice_path: Some(staged),
+                    voice_duration_secs: duration,
+                    voice_transfer_id: Some(tid),
+                    voice_only_members: Vec::new(),
+                });
+            }
+        } else {
+            let peer: PeerId = chat.parse().map_err(|_| "Выберите чат")?;
+            let msg = ChatMessage {
+                id: mid.clone(),
+                sender_id: local.to_string(),
+                sender_name: nick.clone(),
+                recipient_id: Some(chat.clone()),
+                text: String::new(),
+                timestamp: chrono::Local::now().format("%H:%M:%S").to_string(),
+                delivery: OutgoingDeliveryStatus::Pending,
+                voice: Some(msg_voice),
+                file: None,
+                group_id: None,
+            };
+            g.messages.lock().entry(chat).or_default().push(msg);
+            g.messages.mark_dirty();
+            g.persist_journal();
+            g.ensure_peer_routed(peer);
+            if let Some(tx) = &g.command_tx {
+                let _ = tx.try_send(UICommand::EnsureChatSession(peer));
+                let _ = tx.try_send(UICommand::SendVoiceMessage {
+                    sender_name: nick,
+                    recipient: peer,
+                    path: staged,
+                    duration_secs: duration,
+                    message_id: mid,
+                    transfer_id: tid,
+                    is_retry: false,
+                });
+            }
         }
-        drop(g);
-        self.emit_snapshot();
-        Ok(self.get_snapshot())
+        Ok(())
     }
 
     pub fn create_group(
