@@ -65,6 +65,7 @@
   let filter = "";
   let lastMsgSig = "";
   let lastContactSig = "";
+  let lastSnapRev = 0;
   let snapTimer = null;
   let pendingSnap = null;
   let activeAudio = null;
@@ -150,6 +151,9 @@
 
   function applySnapshotNow(s) {
     if (!s) return;
+    const rev = Number(s.revision || 0);
+    if (lastSnapRev && (!rev || rev < lastSnapRev)) return;
+    if (rev) lastSnapRev = Math.max(lastSnapRev, rev);
     snapshot = s;
     if (s.unlocked) {
       els.unlockScreen.hidden = true;
@@ -177,10 +181,8 @@
         : "var(--danger)";
 
     const cSig = contactsSig(s);
-    if (cSig !== lastContactSig) {
-      lastContactSig = cSig;
-      renderContacts();
-    }
+    lastContactSig = cSig;
+    renderContacts();
     const mSig = messagesSig(s);
     if (mSig !== lastMsgSig) {
       lastMsgSig = mSig;
@@ -224,8 +226,19 @@
     }
   }
 
-  function applySnapshot(s) {
+  function applySnapshot(s, immediate) {
     if (!s) return;
+    const rev = Number(s.revision || 0);
+    if (lastSnapRev && (!rev || rev < lastSnapRev)) return;
+    if (immediate) {
+      if (snapTimer) {
+        clearTimeout(snapTimer);
+        snapTimer = null;
+      }
+      pendingSnap = null;
+      applySnapshotNow(s);
+      return;
+    }
     pendingSnap = s;
     if (snapTimer) return;
     snapTimer = setTimeout(() => {
@@ -234,6 +247,14 @@
       pendingSnap = null;
       applySnapshotNow(next);
     }, 80);
+  }
+
+  function sanitizePeerInput(raw) {
+    return String(raw || "")
+      .replace(/[\u200b-\u200d\ufeff\u00a0]/g, "")
+      .trim()
+      .replace(/^["'`«»“”‹›]+|["'`«»“”‹›]+$/g, "")
+      .trim();
   }
 
   function renderContacts() {
@@ -540,12 +561,20 @@
     if (sec === "contacts") {
       document.getElementById("m-add").onclick = async () => {
         try {
+          const peer = sanitizePeerInput(document.getElementById("m-peer").value);
+          const name = document.getElementById("m-name").value;
+          if (!peer) {
+            showToast("Вставьте Peer ID собеседника");
+            return;
+          }
           const snap = await invoke("add_contact", {
-            peerOrAddr: document.getElementById("m-peer").value,
-            name: document.getElementById("m-name").value,
+            peerOrAddr: peer,
+            peer_or_addr: peer,
+            name,
           });
-          applySnapshot(snap);
+          applySnapshot(snap, true);
           closeModal();
+          showToast("Контакт добавлен");
         } catch (e) {
           showToast(String(e));
         }
@@ -558,7 +587,9 @@
             await invoke("create_group", {
               name: document.getElementById("m-gname").value,
               memberPeerIds: members,
-            })
+              member_peer_ids: members,
+            }),
+            true
           );
           closeModal();
         } catch (e) {
@@ -697,8 +728,11 @@
           applySnapshot(
             await invoke("invite_to_group", {
               groupId: gid,
+              group_id: gid,
               memberPeerIds: members,
-            })
+              member_peer_ids: members,
+            }),
+            true
           );
           showToast("Приглашения отправлены");
           peerInfoModal();

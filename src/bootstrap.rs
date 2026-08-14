@@ -200,6 +200,39 @@ pub(crate) fn parse_seed_input(raw: &str) -> Option<(Multiaddr, Option<PeerId>)>
     Some((addrs.into_iter().next()?, pid))
 }
 
+/// PeerId из вставки: голый id, multiaddr `/p2p/…`, кавычки, невидимые символы.
+pub(crate) fn parse_peer_id_loose(raw: &str) -> Option<PeerId> {
+    let mut t = raw.trim().to_string();
+    for ch in ['\u{200b}', '\u{200c}', '\u{200d}', '\u{feff}', '\u{00a0}'] {
+        t = t.replace(ch, "");
+    }
+    let t = t
+        .trim()
+        .trim_matches(|c: char| {
+            matches!(c, '"' | '\'' | '`' | '«' | '»' | '“' | '”' | '‹' | '›')
+        })
+        .trim();
+    if t.is_empty() {
+        return None;
+    }
+    if let Ok(pid) = t.parse::<PeerId>() {
+        return Some(pid);
+    }
+    if let Some((_, Some(pid))) = parse_seed_input(t) {
+        return Some(pid);
+    }
+    if let Some(idx) = t.find("12D3KooW").or_else(|| t.find("Qm")) {
+        let token: String = t[idx..]
+            .chars()
+            .take_while(|c| c.is_ascii_alphanumeric())
+            .collect();
+        if let Ok(pid) = token.parse::<PeerId>() {
+            return Some(pid);
+        }
+    }
+    None
+}
+
 /// Как [`parse_seed_input`], но для `IP`/`IP:PORT` отдаёт и QUIC, и TCP
 /// (VOID bootstrap обычно на `/udp/…/quic-v1`, не на голом TCP).
 pub(crate) fn parse_seed_dial_addrs(raw: &str) -> Option<(Vec<Multiaddr>, Option<PeerId>)> {
@@ -608,5 +641,27 @@ fn append_global_bootstraps_body(out: &mut Vec<Multiaddr>) {
 
     if let Ok(s) = std::env::var("VOID_BOOTSTRAP") {
         append_bootstraps_from_comma_separated(out, &s, "VOID_BOOTSTRAP");
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::parse_peer_id_loose;
+    use libp2p::identity::Keypair;
+    use libp2p::PeerId;
+
+    #[test]
+    fn parse_peer_id_loose_accepts_paste_noise() {
+        let pid = PeerId::from(Keypair::generate_ed25519().public());
+        let raw = pid.to_string();
+        assert_eq!(parse_peer_id_loose(&raw), Some(pid));
+        assert_eq!(parse_peer_id_loose(&format!("  {raw}  ")), Some(pid));
+        assert_eq!(parse_peer_id_loose(&format!("\"{raw}\"")), Some(pid));
+        assert_eq!(parse_peer_id_loose(&format!("/p2p/{raw}")), Some(pid));
+        assert_eq!(
+            parse_peer_id_loose(&format!("Peer ID:\n{raw}")),
+            Some(pid)
+        );
+        assert!(parse_peer_id_loose("1.2.3.4:4001").is_none());
     }
 }

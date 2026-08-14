@@ -16,8 +16,8 @@ use tracing::{info, warn};
 use zeroize::{Zeroize, Zeroizing};
 
 use crate::bootstrap::{
-    merge_bootstrap_string_lists, migrate_void_bootstrap_txt, parse_seed_input,
-    peer_id_from_multiaddr, void_bootstrap_multiaddrs,
+    merge_bootstrap_string_lists, migrate_void_bootstrap_txt, parse_peer_id_loose,
+    parse_seed_dial_addrs, peer_id_from_multiaddr, void_bootstrap_multiaddrs,
 };
 use crate::chat_store::ChatJournal;
 use crate::crypto;
@@ -196,6 +196,9 @@ pub struct SnapshotDto {
     pub beacon_active: bool,
     pub incoming_files: Vec<FileOfferDto>,
     pub voice_recording: bool,
+    /// Монотонный номер снимка — UI отбрасывает запоздалые старые события.
+    #[serde(default)]
+    pub revision: u64,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -255,6 +258,7 @@ struct Inner {
     offline_dht_publish_after: Option<Instant>,
     offline_mail_processed: HashSet<String>,
     snapshot_dirty: bool,
+    snapshot_rev: u64,
     /// Confirmed Circuit Relay Hop (ReservationReqAccepted).
     relay_hop_ready: bool,
 }
@@ -295,6 +299,7 @@ impl Inner {
             offline_dht_publish_after: None,
             offline_mail_processed: HashSet::new(),
             snapshot_dirty: false,
+            snapshot_rev: 0,
             relay_hop_ready: false,
         }
     }
@@ -939,7 +944,7 @@ impl Inner {
             .unwrap_or_default()
     }
 
-    fn snapshot(&self) -> SnapshotDto {
+    fn snapshot(&mut self) -> SnapshotDto {
         let mut contacts: Vec<ContactDto> = self
             .known_peers
             .iter()
@@ -1090,6 +1095,10 @@ impl Inner {
             beacon_active: self.beacon_active,
             incoming_files: self.incoming_file_offers.clone(),
             voice_recording: self.voice_recording,
+            revision: {
+                self.snapshot_rev = self.snapshot_rev.saturating_add(1);
+                self.snapshot_rev
+            },
         }
     }
 }
@@ -1594,11 +1603,10 @@ impl VoidRuntime {
     }
 
     fn emit_snapshot(&self) {
-        let snap = self
-            .inner
-            .lock()
-            .unwrap_or_else(|p| p.into_inner())
-            .snapshot();
+        let snap = {
+            let mut g = self.inner.lock().unwrap_or_else(|p| p.into_inner());
+            g.snapshot()
+        };
         let _ = self.bridge_tx.send(BridgeEvent::Snapshot(snap));
     }
 
@@ -1635,10 +1643,8 @@ impl VoidRuntime {
     }
 
     pub fn get_snapshot(&self) -> SnapshotDto {
-        self.inner
-            .lock()
-            .unwrap_or_else(|p| p.into_inner())
-            .snapshot()
+        let mut g = self.inner.lock().unwrap_or_else(|p| p.into_inner());
+        g.snapshot()
     }
 
     pub fn unlock(
@@ -2061,33 +2067,44 @@ impl VoidRuntime {
     pub fn add_contact(&self, peer_or_addr: String, name: String) -> Result<SnapshotDto, String> {
         let mut g = self.inner.lock().unwrap_or_else(|p| p.into_inner());
         let input = peer_or_addr.trim().to_string();
+        if input.is_empty() {
+            return Err("Укажите PeerId собеседника (Меню → Настройки → Ваш Peer ID)".into());
+        }
+        let pid = parse_peer_id_loose(&input).ok_or_else(|| {
+            "Нужен PeerId. Один IP без /p2p/<PeerId> контакт не создаёт — скопируйте Peer ID из Настроек у собеседника.".to_string()
+        })?;
+        if g.local_peer_id == Some(pid) {
+            return Err("Это ваш собственный PeerId".into());
+        }
         let display = if name.trim().is_empty() {
-            input.chars().take(12).collect()
+            pid.to_string().chars().take(12).collect()
         } else {
             name.trim().to_string()
         };
-
-        if let Ok(pid) = input.parse::<PeerId>() {
-            g.known_peers.insert(pid, display);
-            g.persist_vault();
-            g.watch_all_contacts();
-            g.ensure_peer_routed(pid);
-        } else if let Some((ma, pid_opt)) = parse_seed_input(&input) {
-            if let Some(pid) = pid_opt {
-                g.known_peers.insert(pid, display);
-                g.contact_addrs.entry(pid).or_default().push(ma.clone());
-                g.persist_vault();
-                g.watch_all_contacts();
-                if let Some(tx) = &g.command_tx {
-                    let _ = tx.try_send(UICommand::DialPeer(pid, vec![ma]));
+        g.known_peers.insert(pid, display.clone());
+        if let Some((addrs, _)) = parse_seed_dial_addrs(&input) {
+            let slot = g.contact_addrs.entry(pid).or_default();
+            for ma in &addrs {
+                if peer_id_from_multiaddr(ma).is_some() && !slot.iter().any(|a| a == ma) {
+                    slot.push(ma.clone());
                 }
-            } else if let Some(tx) = &g.command_tx {
-                let _ = tx.try_send(UICommand::Dial(ma.to_string()));
-                g.add_status(format!("Звоним {input}…"));
             }
-        } else {
-            return Err("Укажите PeerId или multiaddr/IP".into());
+            let with_pid: Vec<Multiaddr> = slot
+                .iter()
+                .filter(|a| peer_id_from_multiaddr(a).is_some())
+                .cloned()
+                .collect();
+            if let Some(tx) = &g.command_tx {
+                if !with_pid.is_empty() {
+                    let _ = tx.try_send(UICommand::DialPeer(pid, with_pid));
+                }
+            }
         }
+        g.selected_chat = pid.to_string();
+        g.persist_vault();
+        g.watch_all_contacts();
+        g.ensure_peer_routed(pid);
+        g.add_status(format!("Контакт добавлен: {display}"));
         drop(g);
         self.emit_snapshot();
         Ok(self.get_snapshot())
@@ -2403,26 +2420,41 @@ impl VoidRuntime {
     ) -> Result<SnapshotDto, String> {
         let mut g = self.inner.lock().unwrap_or_else(|p| p.into_inner());
         let local = g.local_peer_id.ok_or("нет peer")?;
+        let name = name.trim().to_string();
+        if name.is_empty() {
+            return Err("Укажите название группы".into());
+        }
         let mut members = vec![GroupMember {
             peer_id: local.to_string(),
             display_name: g.local_nickname.clone(),
         }];
-        for pid in member_peer_ids {
-            let name = pid
-                .parse::<PeerId>()
-                .ok()
-                .and_then(|p| g.known_peers.get(&p).cloned())
-                .unwrap_or_else(|| pid.chars().take(8).collect());
+        let mut extra: Vec<PeerId> = Vec::new();
+        for raw in member_peer_ids {
+            let Some(pid) = parse_peer_id_loose(&raw) else {
+                return Err(format!("Неверный PeerId: {raw}"));
+            };
+            if pid == local || extra.contains(&pid) {
+                continue;
+            }
+            extra.push(pid);
+            let display = g
+                .known_peers
+                .get(&pid)
+                .cloned()
+                .unwrap_or_else(|| pid.to_string().chars().take(12).collect());
             members.push(GroupMember {
-                peer_id: pid,
-                display_name: name,
+                peer_id: pid.to_string(),
+                display_name: display,
             });
+        }
+        for pid in &extra {
+            g.ensure_peer_routed(*pid);
         }
         members = dedupe_members(members);
         let id = group::new_group_id();
         let group = GroupChat {
             id: id.clone(),
-            name: name.trim().to_string(),
+            name,
             creator_id: local.to_string(),
             members: members.clone(),
             created_at: chrono::Local::now()
@@ -2510,22 +2542,24 @@ impl VoidRuntime {
             .collect();
         let mut newcomers: Vec<GroupMember> = Vec::new();
         for pid_str in member_peer_ids {
-            let pid: PeerId = pid_str.parse().map_err(|_| "Неверный PeerId контакта")?;
-            if pid == local || already.contains(&pid_str) {
+            let pid = parse_peer_id_loose(&pid_str).ok_or("Неверный PeerId контакта")?;
+            let canonical = pid.to_string();
+            if pid == local || already.contains(&canonical) {
                 continue;
             }
-            if newcomers.iter().any(|m| m.peer_id == pid_str) {
+            if newcomers.iter().any(|m| m.peer_id == canonical) {
                 continue;
             }
             let display = g
                 .known_peers
                 .get(&pid)
                 .cloned()
-                .unwrap_or_else(|| pid_str.chars().take(12).collect());
+                .unwrap_or_else(|| canonical.chars().take(12).collect());
             newcomers.push(GroupMember {
-                peer_id: pid_str,
+                peer_id: canonical,
                 display_name: display,
             });
+            g.ensure_peer_routed(pid);
         }
         if newcomers.is_empty() {
             return Err("Выберите контакты, которых ещё нет в группе".into());
