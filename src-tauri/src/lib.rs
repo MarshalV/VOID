@@ -261,9 +261,14 @@ fn open_downloads() -> Result<(), String> {
 #[tauri::command]
 fn reveal_path(path: String) -> Result<(), String> {
     let p = std::path::PathBuf::from(path.trim());
+    if p2p_messenger::is_file_cache_path(&p) {
+        return Err("внутренний кэш не открывается".into());
+    }
     if p.is_file() {
         if let Some(parent) = p.parent() {
-            // Открываем папку (надёжнее, чем /select на путях с пробелами).
+            if p2p_messenger::is_file_cache_path(parent) {
+                return Err("внутренний кэш не открывается".into());
+            }
             return open_in_file_manager(parent);
         }
     }

@@ -985,17 +985,8 @@
       });
       await listen("void://file-complete", async (e) => {
         const p = e?.payload || {};
-        if (p.saved_to && !/^void_voice_/i.test(p.filename || "")) {
-          showToast(`Сохранено:\n${p.saved_to}`);
-          try {
-            await invoke("reveal_path", { path: p.saved_to });
-          } catch (_) {
-            try {
-              await invoke("open_downloads");
-            } catch (_) {}
-          }
-        } else if (p.filename && !/^void_voice_/i.test(p.filename || "")) {
-          showToast(`Файл доставлен: ${p.filename}`);
+        if (p.filename && !/^void_voice_/i.test(p.filename || "")) {
+          showToast(`Файл получен: ${p.filename}`);
         }
         applySnapshot(await invoke("get_snapshot"));
       });

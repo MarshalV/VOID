@@ -46,6 +46,11 @@ pub fn downloads_dir() -> std::path::PathBuf {
     file_transfer::user_file_downloads_dir()
 }
 
+/// Encrypted attachment cache — never open this in Explorer.
+pub fn is_file_cache_path(path: &std::path::Path) -> bool {
+    file_transfer::is_under_file_cache(path)
+}
+
 /// Handle `--voice-record` / `--voice-probe` CLI before starting any UI.
 /// Returns `Some(exit_code)` if the process should exit.
 pub fn run_cli_if_requested() -> Option<i32> {
