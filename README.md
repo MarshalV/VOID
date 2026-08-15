@@ -4,19 +4,20 @@
 
 # VOID — P2P Messenger
 
-**Децентрализованный, сквозно-шифрованный мессенджер без серверов.**
-Без регистрации. Без телефонов. Без облаков. Только вы, собеседник и немного математики.
+**Децентрализованный, сквозно-шифрованный мессенджер.**
+Без регистрации и облачного аккаунта. Содержимое чата читают только собеседники.
+Поиск в сети и прохождение NAT идут через публичные bootstrap/relay-узлы — это не сервер чата, но и не анонимайзер.
 
 <p>
   <img alt="Rust"         src="https://img.shields.io/badge/Rust-2021-CE422B?logo=rust&logoColor=white">
   <img alt="libp2p"       src="https://img.shields.io/badge/libp2p-0.56-4E8EE9?logo=ipfs&logoColor=white">
-  <img alt="egui"         src="https://img.shields.io/badge/UI-egui%200.29-111111">
+  <img alt="Tauri"        src="https://img.shields.io/badge/UI-Tauri%202-FFC131?logo=tauri&logoColor=black">
   <img alt="E2EE"         src="https://img.shields.io/badge/E2EE-Double%20Ratchet-16a34a">
   <img alt="Platform"     src="https://img.shields.io/badge/platform-Windows%20%7C%20Linux%20%7C%20macOS-blue">
   <img alt="Status"       src="https://img.shields.io/badge/status-alpha-orange">
 </p>
 
-<img src="static/preview.png" alt="VOID Preview" width="85%" />
+<img src="static/preview_1.png" alt="VOID Preview" width="85%" />
 
 </div>
 
@@ -24,28 +25,29 @@
 
 ## Что это
 
-**VOID** (Verified Open Independent Dispatcher) — это P2P-мессенджер на Rust, который отправляет сообщения **напрямую между пирами** по протоколу `libp2p`, минуя какие-либо центральные чат-сервера. Вся переписка шифруется end-to-end по схеме **Double Ratchet** (как в Signal/WhatsApp), а локальная записная книга и ключи лежат в зашифрованном `vault.bin`.
+**VOID** (Verified Open Independent Dispatcher) — P2P-мессенджер на Rust. Живой чат идёт **напрямую между пирами** (или через Circuit Relay, если оба за NAT) по `libp2p`. Текст, голос и содержимое файлов шифруются **Double Ratchet** (как в Signal). Идентичность — `PeerId` из локального vault, без телефона и почты.
 
-> «Void» — потому что между вами и собеседником — пустота. Ни серверов, ни посредников, ни логов.
+Bootstrap-нода нужна, чтобы **найти** собеседника и **пробросить NAT**. Она не расшифровывает сообщения, но **видит метаданные**: IP подключения, PeerId, кто с кем строит circuit, конверты офлайн-почты (отправитель/получатель/тип, не текст). Подробнее — в разделе [Приватность](#приватность-и-модель-угроз).
+
+Основной десктоп — **Tauri 2** (`frontend/` + `src-tauri/`). Опционально собирается нативный UI на **egui** (`cargo run --release` с feature `egui-ui`).
 
 ---
 
 ## Ключевые возможности
 
-- **Полностью P2P** — сообщения доставляются напрямую по `/void/chat/1.0.0` (request-response).
-- **E2EE из коробки** — транспорт **Noise**, затем слой приложения: обмен X25519-ключами в `Hello`, **подпись Ed25519** (libp2p identity) привязки к `PeerId`, далее **Double Ratchet** (Forward Secrecy + Post-Compromise Security). В чат принимается только зашифрованный полезный груз (без «plain» JSON).
-- **Свой DHT** — отдельный Kademlia-рой `/void/kad/1.0.0`, не пересекающийся с публичным IPFS.
-- **NAT Traversal** — Relay v2, DCUtR (hole-punching), AutoNAT, UPnP.
-- **Транспорты** — TCP и QUIC, мультиплексирование Yamux, шифрование канала Noise.
-- **Локальная сеть** — автодискавери соседей через mDNS (без интернета).
-- **Зашифрованный vault** — ник, приватные ключи и контакты хранятся в `vault.bin` (AES-256-GCM); мастер-ключ vault лежит в `void.key` в обёртке **Argon2id + AES-256-GCM** от вашего пароля (пароль задаётся при первом запуске и запрашивается при каждом старте).
-- **Умный ретрай** — если прямой dial не удался, клиент запускает DHT-lookup пира и повторяет отправку.
-- **Устойчивое P2P-соединение** — регистрация себя в DHT как provider, параллельный поиск (`get_providers` + `get_closest_peers`), автопереподключение с backoff, периодический KAD bootstrap.
-- **Статусы доставки** — исходящие сообщения показывают ○ / ✓ / ✓✓ (отправлено → доставлено → прочитано); read receipt уходит автоматически при открытом чате.
-- **Голосовые сообщения** — запись с микрофона, передача WAV по E2EE, воспроизведение в чате с перемоткой по шкале.
-- **Красивый UI** — тёмная «cosmic» тема с неон-глассморфизмом на `egui`, эмодзи-шрифт, аватары-идентиконы.
-- **Глобальный и приватные чаты** — отдельная «комната» GLOBAL и 1-на-1 переписка с каждым контактом.
-- **Передача файлов** — изображения, аудио и любые файлы до 512 МБ по `/void/file/1.0.0`; чанкинг 32 КБ, BLAKE2b целостность, автоматический rate-limit через relay.
+- **P2P-чат** — `/void/chat/1.0.0` (request-response). Полезная нагрузка только E2EE (`V1Packet::Encrypted`).
+- **E2EE** — транспорт **Noise**, затем `Hello` (X25519 + подпись Ed25519 к `PeerId`), далее **Double Ratchet** (Forward Secrecy + Post-Compromise Security).
+- **1-на-1 и группы** — группы с invite-ссылкой `void://group/…`, рассылка каждому участнику.
+- **Голос** — запись с микрофона, предпрослушивание, отправка WAV по E2EE; в чате — плеер с перемоткой. Автоприём, без баннера «принять файл».
+- **Файлы** — до 512 МБ. Чанки по E2EE-чату; оффер (имя, размер, хэш) по `/void/file/1.0.0`. В чате — карточка; **Скачать** копирует расшифрованный файл в `Загрузки/VOID Messenger`. Локальный кэш — AES-256-GCM в каталоге данных (`files/`), не в Загрузках.
+- **Офлайн-почта** — если пир недоступен, сообщение кладётся на bootstrap (зашифрованный `ct`, открытые поля `sender` / `recipient` / `kind`, TTL 7 суток). Короткие голосовые тоже могут уйти чанками через тот же канал.
+- **Свой DHT** — Kademlia `/void/kad/1.0.0`, не IPFS. В DHT не пишется текст чата.
+- **NAT** — Relay v2 (сначала circuit), DCUtR (hole-punch → прямое соединение), AutoNAT, UPnP.
+- **Транспорты** — TCP и QUIC, Yamux, Noise.
+- **LAN** — mDNS (отключается `VOID_DISABLE_MDNS`).
+- **Vault** — ник, ключи, контакты, группы в `vault.bin` (AES-256-GCM); мастер-ключ в `void.key` (Argon2id + AES-GCM от пароля). Журнал чата — `chat_journal.bin`, недоставленное — `outbox.bin`.
+- **Доставка** — ○ / ✓ / ✓✓; read receipt при открытом чате.
+- **Beacon** — закрытие окна прячет в трей, не завершает процесс (как Telegram Desktop).
 
 ---
 
@@ -58,462 +60,309 @@
 | Транспорт | TCP, QUIC |
 | Мультиплексор | Yamux |
 | Шифрование канала | Noise |
-| Чат-протокол | `request-response` по `/void/chat/1.0.0` |
-| Файловый протокол | `request-response` по `/void/file/1.0.0` |
-| DHT | Kademlia `/void/kad/1.0.0` (свой, не IPFS) |
-| Discovery | mDNS (локальная сеть) + Kademlia (глобально) |
+| Чат | `request-response` `/void/chat/1.0.0` |
+| Файлы (оффер/ack) | `request-response` `/void/file/1.0.0` |
+| Полезные чанки файлов/голоса | E2EE-кадры внутри `/void/chat` |
+| DHT | Kademlia `/void/kad/1.0.0` |
+| Discovery | mDNS (LAN) + Kademlia + bootstrap |
 | NAT | Relay v2, DCUtR, AutoNAT, UPnP |
 
-Каждый узел — **одновременно и клиент, и часть DHT**. Выделенных чат-серверов не существует. Сообщения никогда не пишутся в DHT — DHT нужен только чтобы найти `multiaddr` пира по его `PeerId`.
+Каждый клиент — участник DHT. **Выделенного сервера переписки нет:** живой текст bootstrap не форвардит и не читает. Relay **пересылает непрозрачные байты** circuit-а; офлайн-конверты **хранятся** на ноде до TTL.
 
-Клиент дополнительно **регистрирует свой `PeerId` в DHT как provider** (`start_providing`) — при старте, при появлении listen-адреса и при установке соединения. Это ускоряет обнаружение узла другими пирами.
+Клиент регистрирует `PeerId` в DHT как provider (`start_providing`). Dial к контакту: **сначала circuit через bootstrap**, затем прямые/LAN-адреса (чтобы зависший NAT-dial не блокировал relay).
 
-#### Надёжность соединения и доставки
+#### Надёжность
 
 | Механизм | Поведение |
 |----------|-----------|
-| Поиск пира (`SearchPeer`) | Параллельно `get_providers` + `get_closest_peers` по ключу `PeerId` |
-| Bootstrap при старте | Явный dial всех seed-адресов (сгруппированных по `PeerId`) |
-| Автопереподключение | Тик каждые **5 с**, backoff **2 → 5 → 15 → 60 с** |
-| KAD bootstrap | Периодически каждые **2 мин** |
-| E2EE Hello | Проактивный handshake для контактов из vault при `ConnectionEstablished` |
-| Ретрай сообщений | `RESEND_GRACE` **1 с**, базовая задержка **2 с** (экспоненциально до 300 с) |
-| Request-response | До **256** одновременных inbound-потоков на chat и file |
-| Ping | Таймаут **40 с** (согласован с bootstrap-нодой) |
-| Read receipt | Буферизуется до E2EE-сессии, сбрасывается после handshake |
-| Голосовые (WAV) | Метаданные и файл буферизуются до E2EE; WAV отправляется после установки сессии |
+| Поиск пира | Параллельно `get_providers` + `get_closest_peers` |
+| Автопереподключение | Тик ~5 с, backoff 2 → 5 → 15 → 60 с |
+| KAD bootstrap | Периодически |
+| E2EE Hello | При `ConnectionEstablished` с контактом из vault |
+| Ретрай | `RESEND_GRACE` 1 с, экспоненциально до 300 с |
+| Недоставленное | `outbox.bin` → офлайн-почта на bootstrap (Ack от ноды = durable handoff) |
+| Read receipt / голос / файл | Буфер до сессии |
 
-### 2. Поиск собеседника на разных континентах
+### 2. Поиск собеседника
 
-Чтобы два узла из разных сетей нашли друг друга, нужны **bootstrap-адреса** (точки входа в DHT, аналог torrent-tracker). Любой желающий может поднять свой bootstrap — это не «центральный сервер чата», а просто публичный `libp2p`-узел. Для VOID есть **референсная реализация** такого узла — [`MarshalV/bootstrap_node`](https://github.com/MarshalV/bootstrap_node) (см. раздел [«Развёртывание своей инфраструктуры»](#развёртывание-своей-инфраструктуры)).
+Чтобы два узла из разных сетей нашли друг друга, нужны **bootstrap-адреса** (вход в DHT + relay). Это не «центральный сервер чата». Референс: [`MarshalV/bootstrap_node`](https://github.com/MarshalV/bootstrap_node) (раздел [инфраструктура](#развёртывание-своей-инфраструктуры)).
 
-Источники bootstrap-адресов (все опциональны, склеиваются и дедуплицируются):
+Источники bootstrap (склеиваются, дедуплицируются):
 
-1. **Вшитые в бинарь** (`BUILTIN_VOID_BOOTSTRAP` в `src/main.rs`, или флагом сборки `VOID_BUILTIN_BOOTSTRAP`).
-2. **HTTP(S) список** (`VOID_BOOTSTRAP_URL` или `VOID_BOOTSTRAP_PUBLIC_LIST_URL`) — текстовый файл с одной multiaddr на строку; размер тела ответа ограничен (~256 KiB). Опционально: **`VOID_BOOTSTRAP_TRUSTED_HOSTS`** — через запятую имена хостов, с которых разрешена загрузка по URL. Для **HTTPS** можно задать **`VOID_BOOTSTRAP_TLS_LEAF_SHA256`**: через запятую **64 hex** (SHA-256 DER **листового** сертификата) — после проверки цепочки CA выполняется дополнительная проверка отпечатка.
-3. **Переменная окружения** `VOID_BOOTSTRAP` — адреса через запятую.
-4. **Файл `void-bootstrap.txt`** рядом с бинарём — одна multiaddr на строку, `#` — комментарий. Опционально: **`VOID_BOOTSTRAP_SIGNING_PUB_HEX`** + файл `<имя>.sig` (64 байта Ed25519) для проверки содержимого; для HTTP при том же ключе — **`VOID_BOOTSTRAP_URL_SIG_HEX`** (128 hex).
-5. **UI** — боковая панель **«VOID BOOTSTRAP (DHT)»** → правка текста → **«Сохранить и применить»** (без перезапуска).
+1. Вшитые в бинарь (`BUILTIN_VOID_BOOTSTRAP` / `VOID_BUILTIN_BOOTSTRAP`).
+2. HTTP(S) список (`VOID_BOOTSTRAP_URL` / `VOID_BOOTSTRAP_PUBLIC_LIST_URL`), лимит тела ~256 KiB. Опционально `VOID_BOOTSTRAP_TRUSTED_HOSTS`, pin листа `VOID_BOOTSTRAP_TLS_LEAF_SHA256`.
+3. `VOID_BOOTSTRAP` — multiaddr через запятую.
+4. `void-bootstrap.txt` рядом с бинарём. Опционально Ed25519-подпись (`VOID_BOOTSTRAP_SIGNING_PUB_HEX`).
+5. UI: настройки bootstrap → сохранить и применить.
 
 ```powershell
-# Пример PowerShell
 $env:VOID_BOOTSTRAP = "/dnsaddr/example.com/tcp/4001/p2p/12D3KooW..."
-cargo run
 ```
 
-Также можно подключиться напрямую: кнопка **«ПОДКЛЮЧИТЬ»** принимает полный `multiaddr`, `IP` или `IP:PORT` — удобно для первого запуска внутри доверенного круга.
+Прямой вход: поле подключения принимает `multiaddr`, `IP` или `IP:PORT`.
 
 ### 3. Сквозное шифрование (`src/crypto.rs`)
 
 | Этап | Алгоритм |
 |------|---------|
-| Транспорт | **Noise** — шифрование и аутентификация libp2p-канала |
-| Приложение | Обмен статическим и эфемерным **X25519** в `Hello` + **Ed25519**-подпись привязки к `PeerId` (для не-inline `PeerId` в `Hello` передаётся protobuf ключа — см. код) |
-| Ratchet | **Double Ratchet** (symmetric + DH ratchet) |
-| KDF в ratchet | **HKDF-SHA256** |
-| AEAD | **ChaCha20-Poly1305** |
-| DH | **X25519** (`x25519-dalek`) |
-| Целостность файлов (BLAKE2) | **BLAKE2b-512** (первые 32 байта на весь файл) |
-| Защита памяти | `zeroize` (затирание ключей в ОЗУ при Drop) |
-| Skipped keys | до **4096** out-of-order сообщений (P2P и relay дают переупорядочивание) |
+| Транспорт | **Noise** |
+| Handshake | Статический + эфемерный **X25519** в `Hello`, **Ed25519** к `PeerId` |
+| Ratchet | **Double Ratchet** |
+| KDF | **HKDF-SHA256** |
+| AEAD чата | **ChaCha20-Poly1305** |
+| Vault / журнал / кэш файлов | **AES-256-GCM** |
+| Целостность файла | **BLAKE2b-512** (первые 32 байта) |
+| Память ключей | `zeroize` |
+| Skipped keys | до **4096** out-of-order |
 
-Каждое сообщение зашифровано своим одноразовым `message_key`. Компрометация одного ключа **не раскрывает** ни прошлые, ни будущие сообщения.
+Каждое сообщение — свой `message_key`. Компрометация одного ключа не раскрывает прошлые и будущие.
 
-### 4. Передача файлов (`src/file_transfer.rs`)
+Офлайн-конверт: `ct` запечатан на X25519 prekey получателя (ChaCha20-Poly1305). Поля `sender`, `kind`, `message_id` на ноде **открыты**.
 
-Файлы передаются по отдельному sub-протоколу `/void/file/1.0.0`, независимо от чат-канала.
-
-#### Поддерживаемые типы (`FileKind`)
-
-| Тип | Расширения | Иконка |
-|-----|-----------|--------|
-| `Image` | png, jpg, jpeg, gif, webp, bmp, tiff, avif, ico, svg | 🖼 |
-| `Audio` | mp3, ogg, flac, wav, aac, m4a, opus, wma, aiff, ape, mid | 🎵 |
-| `Other` | всё остальное | 📄 |
-
-#### Параметры протокола
+### 4. Файлы (`src/file_transfer.rs`)
 
 | Параметр | Значение |
 |----------|---------|
-| Размер чанка | **32 КБ** |
-| Максимальный размер файла | **512 МБ** |
-| Макс. длина имени в оффере | **512** байт UTF-8 |
-| Макс. длина `Reject.reason` | **512** байт UTF-8 |
-| Устаревший plain-`Chunk` | данные чанка не больше **32 КБ** (совместимость со старыми пирами) |
-| Хэш целостности | **BLAKE2b-512** (первые 32 байта) |
-| Папка загрузок | `void_downloads/` рядом с исполняемым файлом |
-| Папка голосовых | `void_downloads/voice/` (автоприём WAV без диалога) |
+| Чанк | 32 КБ |
+| Макс. размер | 512 МБ |
+| Кэш чата | `%APPDATA%\VOID\files` (Windows) / аналог `dirs::data_dir()/VOID/files` — **AES-256-GCM**, имена `*.vfc` |
+| Ключ кэша | HKDF-SHA256 от мастер-ключа vault (`VOID_FILE_CACHE_v1`) |
+| «Скачать» | Расшифрованная копия в `Загрузки/VOID Messenger/` |
+| Удаление из чата | Стирает только кэш, не Загрузки |
+| Голос | `…/VOID/voice/` (не Загрузки) |
 
-#### Сценарий передачи (пакеты протокола)
+После `Accept` данные чанков идут по E2EE `/void/chat`. По `/void/file` — `Offer` / `Accept` / `Reject` / `Cancel` / `Ack` (имя файла на этом слое видит тот, кто терминирует соединение: пир или relay).
 
-Современный клиент после `Accept` шлёт **полезную нагрузку чанков по E2EE чату** (`/void/chat`), а не сырым `Chunk` по `/void/file`. По `/void/file` по-прежнему идут **метаданные оффера** (`Offer` / `Accept` / `Reject` / `Cancel`) и подтверждения `Ack`.
+Через Circuit Relay отправка чанков ограничена (~64 КБ/с), прямое соединение — короткая пауза между чанками.
 
-```
-Отправитель                              Получатель
-    |                                        |
-    |  Offer {id, filename, size, sha256}    |
-    | -------------------------------------> |
-    |                                        |
-    |  Accept {id}  /  Reject {id, reason}  |
-    | <------------------------------------- |
-    |                                        |
-    |  данные чанков по E2EE /void/chat …    |
-    |  (или устар.: Chunk по /void/file)     |
-    | -------------------------------------> |
-    |       (BLAKE2b проверяется по итогу)   |
-    |                                        |
-    |  Ack                                   |
-    | <------------------------------------- |
-```
+### 5. Голосовые (`src/voice.rs`)
 
-Любая из сторон может прервать передачу пакетом `Cancel {id}`.
+WAV mono 48 kHz 16-bit PCM, до 5 мин. Запись — дочерний процесс `--voice-record` (`cpal`). В чат уходит `VoiceMeta`; WAV — как файл с автоприёмом. Перед отправкой можно прослушать. Метаданные медиа по возможности снимаются (`metadata_strip`).
 
-#### Rate-limit на relay-соединениях
+### 6. Группы (`src/group.rs`)
 
-Если соединение идёт через **Circuit Relay** (а не напрямую), скорость отправки автоматически ограничивается:
+Группа — список участников в vault + отдельный тред журнала `group:<id>`. Сообщение/файл/голос рассылается каждому члену (у файла — свой `transfer_id` на пира). Invite: `void://group/…`. Это **не MLS**: нет общего группового ratchet на всех сразу, компрометация участника раскрывает то, что он получил.
 
-| Режим | Задержка между чанками |
-|-------|----------------------|
-| Прямое P2P | 5 мс (≈ 6 МБ/с при 32 КБ чанке) |
-| Через relay | `chunk_size / 64 КБ/с` ≈ **500 мс** на чанк |
+### 7. Локальное хранилище
 
-Это защищает relay-ноду от перегрузки и не мешает скорости прямых соединений.
+Каталог данных (переопределяется `VOID_DATA_DIR`):
 
-#### Безопасность имён файлов
+| ОС | Путь по умолчанию |
+|----|-------------------|
+| Windows | `%APPDATA%\VOID` |
+| Linux | `~/.local/share/VOID` |
+| macOS | `~/Library/Application Support/VOID` |
 
-Перед сохранением имя файла проходит санитизацию (`safe_filename`):
-- отрезается путь (только `file_name()`);
-- фильтруются управляющие символы и `/`, `\`;
-- обрезаются ведущие точки.
+| Файл / папка | Содержимое | Защита |
+|--------------|------------|--------|
+| `void.key` | Обёрнутый мастер-ключ (`VOIDKEY2`) | Пароль + Argon2id + AES-GCM |
+| `vault.bin` | Ник, ключи, контакты, группы, bootstrap | AES-256-GCM |
+| `chat_journal.bin` | Переписки | AES-256-GCM |
+| `outbox.bin` | Недоставленное | AES-256-GCM |
+| `files/` | Кэш вложений `*.vfc` | AES-256-GCM (отдельный HKDF-ключ) |
+| `voice/` | WAV голосовых | каталог данных приложения |
+| `void.pwd` | «Запомнить пароль» | Windows: Credential Manager + файл; macOS/Linux: файл |
 
-Если файл с таким именем уже существует в папке загрузок, к нему добавляется суффикс `_(1)`, `_(2)` и т.д. (функция `unique_download_path`).
+> Никогда не отдавайте пароль vault вместе с `void.key` и `vault.bin`.
 
 ---
 
-### 5. Голосовые сообщения (`src/voice.rs`)
+## Приватность и модель угроз
 
-Голосовые — отдельный тип сообщений в чате: в JSON уходит только `VoiceMeta` (transfer_id + длительность), сам WAV передаётся тем же file-transfer протоколом, что и обычные вложения, но с **автоприёмом** в `void_downloads/voice/` без диалога «Сохранить как…».
+VOID **скрывает содержимое** от сети и от bootstrap. VOID **не скрывает**, что вы вообще пользуетесь сетью и с какого IP подключились к ноде.
 
-#### Запись
+| Наблюдатель | Текст / файлы / голос | IP отправителя | Кто есть «вы» |
+|-------------|------------------------|----------------|----------------|
+| Собеседник | Да, это получатель | Да, если канал **прямой** (LAN, DCUtR). Через один только relay — обычно нет | PeerId + ник |
+| Владелец bootstrap/relay | Нет (E2EE / `ct`) | **Да** — вы сами коннектитесь к ноде | PeerId, circuit `src→dst`, офлайн `sender`/`recipient`/`kind` |
+| Другой пир в DHT | Нет | Нет (кроме mDNS в LAN) | Иногда publisher mailbox / prekey |
 
-| Параметр | Значение |
-|----------|----------|
-| Формат | WAV mono, **48 kHz**, 16-bit PCM |
-| Макс. длительность | **300 с** (5 мин) |
-| Мин. длительность | **0,25 с** |
-| Захват | `cpal` (системный микрофон) в отдельном дочернем процессе `--voice-record` |
-| UI | Кнопка 🎤 в поле ввода → повторный клик останавливает запись → ▶ отправить или ✖ отменить |
+Нет IMEI и серийника устройства. Стабильный идентификатор клиента — **PeerId** (пока живёт vault).
 
-При первом запуске клиент проверяет микрофон (`probe_microphone`). На Windows нужно разрешить доступ к микрофону для `p2p-messenger.exe` в параметрах конфиденциальности.
-
-#### Передача
-
-```
-Отправитель                                    Получатель
-    |                                              |
-    |  ChatMessage { voice: VoiceMeta }  (E2EE)    |
-    | -------------------------------------------> |
-    |  Offer / Accept (файл void_voice_<hex>.wav)  |
-    | -------------------------------------------> |
-    |  чанки WAV по E2EE /void/chat                |
-    | -------------------------------------------> |
-    |                                              | → void_downloads/voice/
-```
-
-Если E2EE-сессия с собеседником ещё не установлена, метаданные чата и WAV **буферизуются** и автоматически отправляются после успешного handshake. Повторная попытка передачи голосового — каждые **3 с**.
-
-#### Воспроизведение
-
-| Действие | Как |
-|----------|-----|
-| ▶ / ⏹ | Клик по bubble голосового сообщения |
-| Перемотка | Клик по шкале waveform внутри bubble |
-| Движок | `cpal` (выход по умолчанию); на Windows — fallback через **WinMM** `PlaySoundW` |
-| Прогресс | Полоска проигрывания и playhead на waveform во время воспроизведения |
-
-Локальные WAV привязываются к `transfer_id` (32 hex) и ищутся в `void_downloads/voice/` при открытии чата.
+Это **псевдонимный E2EE-мессенджер**, не Tor. Не используйте VOID, если модель угроз — «нода не должна знать, кто кому писал».
 
 ---
 
-### 6. Локальное хранилище
-
-| Файл | Что внутри | Защита |
-|------|-----------|--------|
-| `void.key` | Обёрнутый мастер-ключ vault (магия `VOIDKEY2` + salt + AES-GCM) | Пароль + Argon2id; офлайн без пароля содержимое не расшифровать |
-| `vault.bin` | `format_version`, nickname, ключи, адресная книга | AES-256-GCM (мастер из `void.key`) |
-
-После расшифровки plaintext JSON ограничен по размеру; дополнительно проверяются длины полей и число записей в `address_book` (см. `Storage` в `src/main.rs`). Запись — через `vault.bin.tmp` + атомарный `rename`, чтобы сбой посередине не оставил усечённый vault. Есть резервная копия `vault.bin.bak`.
-
-> ⚠️ **Никогда не передавайте пароль vault, `void.key` и `vault.bin` третьим лицам** — вместе это даёт полный доступ к идентичности и ключам.
-
-Старый `void.key` из 32 «сырых» байт при первом запуске после обновления нужно перевести в новый формат: задаёте пароль дважды, файл переписывается, `vault.bin` не затрагивается.
-
----
-
-## Стек технологий
+## Стек
 
 - **Язык:** Rust 2021
-- **Сеть:** [`libp2p`](https://libp2p.io/) 0.56 (TCP, QUIC, Noise, Yamux, mDNS, Kademlia, Relay, DCUtR, AutoNAT, UPnP, Identify, Ping, request-response)
-- **Аудио:** [`cpal`](https://github.com/RustAudio/cpal) + [`hound`](https://github.com/ruuda/hound) (WAV); WinMM на Windows
-- **Рантайм:** `tokio` 1.x
-- **UI:** [`eframe`/`egui`](https://github.com/emilk/egui) 0.29 — тёмная тема, glassmorphism, собственные идентиконы-аватары
-- **Криптография:** `x25519-dalek`, `chacha20poly1305`, `blake2`, `aes-gcm`, `zeroize`
-- **Сериализация:** `serde`, `serde_json`, `bincode`
-- **HTTP (bootstrap list):** `reqwest` (rustls); опционально кастомный `ClientConfig` с pin листового сертификата (`VOID_BOOTSTRAP_TLS_LEAF_SHA256`)
+- **Сеть:** libp2p 0.56
+- **Десктоп:** Tauri 2 + HTML/JS (`frontend/`); опционально egui 0.29
+- **Аудио:** cpal + hound; WinMM fallback на Windows
+- **Крипто:** x25519-dalek, chacha20poly1305, aes-gcm, argon2, hkdf, blake2, zeroize
 
 ---
 
 ## Установка и запуск
 
-### Требования
-- **Rust** ≥ 1.75 (`stable`), установленный через [`rustup`](https://rustup.rs/).
-- Для Linux дополнительно могут понадобиться системные библиотеки egui: `libxcb`, `libxkbcommon`, `libwayland-dev`.
+Нужен **Rust** ≥ 1.77.2 (`stable`) и [Tauri CLI](https://v2.tauri.app/start/prerequisites/) для основной оболочки.
 
-### Сборка из исходников
+### Tauri (основной клиент)
 
 ```bash
-git clone https://github.com/<you>/p2p-messenger.git
+git clone https://github.com/MarshalV/p2p-messenger.git
 cd p2p-messenger
-cargo run --release
+cargo tauri dev
+# релиз (MSI/NSIS/deb/dmg):
+cargo tauri build
 ```
 
-При первом запуске задаёте пароль vault (подтверждение дважды): создаются `void.key` (обёрнутый ключ) и `vault.bin`. Ник автоматически сгенерируется вида `User_1A2B`, после чего его можно поменять в UI.
+Скрипты сборки копируют установщики в корневой `target/`: `build.bat` (Windows), `./build.sh` (Linux), `./build_mac.sh` (macOS).
 
-### Подключение к существующей сети
+### egui (опционально)
 
-1. Получите у друга его `multiaddr` (в приложении он показан в панели «Свои адреса») — например:
-   ```
-   /ip4/157.22.192.234/tcp/4001/p2p/12D3KooWGQjWMK6Rqcoej4hdCNtcqyYwYzvEnyPdghxp6FtniUEU
-   ```
-2. Вставьте его в поле **«ПОДКЛЮЧИТЬ»** или в `void-bootstrap.txt`.
-3. После handshake он появится в списке контактов — пишите.
+```bash
+cargo run --release --features egui-ui
+```
+
+На Linux для egui могут понадобиться `libxcb`, `libxkbcommon`, `libwayland-dev`.
+
+При первом запуске задаёте пароль vault. Ник вида `User_1A2B` можно сменить в настройках.
+
+### Подключение
+
+1. Свой Peer ID — в настройках; у собеседника — тот же экран.
+2. Добавьте контакт по Peer ID (не по голому IP без `/p2p/<PeerId>`).
+3. Bootstrap-нода в списке seed — чтобы находить людей за NAT.
 
 ---
 
-## Конфигурация
-
-### Переменные окружения (клиент VOID)
+## Конфигурация клиента
 
 | Переменная | Назначение |
 |------------|-----------|
-| `VOID_BOOTSTRAP` | Список multiaddr через запятую |
-| `VOID_BOOTSTRAP_URL` | URL текстового файла со списком seed (HTTP/HTTPS) |
-| `VOID_BOOTSTRAP_PUBLIC_LIST_URL` | Публичный URL из кода (если задан в сборке); отключается вместе с `VOID_SKIP_PUBLIC_BOOTSTRAP_LIST` |
-| `VOID_SKIP_PUBLIC_BOOTSTRAP_LIST` | Не использовать вшитый публичный URL списка |
-| `VOID_BOOTSTRAP_TRUSTED_HOSTS` | Через запятую: разрешённые **имена хостов** для загрузки bootstrap по URL |
-| `VOID_BOOTSTRAP_TLS_LEAF_SHA256` | Для **HTTPS**: через запятую 64 hex = SHA-256 DER листового сертификата (после проверки CA) |
-| `VOID_BOOTSTRAP_SIGNING_PUB_HEX` | Опционально: Ed25519 публичный ключ (32 байта в hex) для проверки подписи `void-bootstrap.txt` / тела URL |
-| `VOID_BOOTSTRAP_URL_SIG_HEX` | 128 hex (64 байта подписи), если задан pubkey и грузите список по HTTPS |
-| `VOID_DISABLE_MDNS` | Задать (любое значение) — отключить mDNS в LAN |
-| `VOID_APPLY_FIREWALL_RULE` | `1` / `true` / `yes` — разрешить автоматическую настройку входящих правил файрвола (Windows/macOS) |
-| `VOID_SKIP_SUBNETS` | Доп. CIDR через запятую для фильтра «мусорных» listen-адресов (см. код) |
-| `VOID_BUILTIN_BOOTSTRAP` | При сборке: вшить seed в бинарь |
-| `RUST_LOG` | Фильтр `tracing` (например `void_net=debug`, `info`). Если не задан, подписчик по умолчанию — уровень **warn** |
+| `VOID_DATA_DIR` | Каталог данных вместо `%APPDATA%\VOID` |
+| `VOID_BOOTSTRAP` | multiaddr через запятую |
+| `VOID_BOOTSTRAP_URL` | URL текстового списка seed |
+| `VOID_BOOTSTRAP_PUBLIC_LIST_URL` | Публичный URL из сборки |
+| `VOID_SKIP_PUBLIC_BOOTSTRAP_LIST` | Не грузить вшитый публичный список |
+| `VOID_BOOTSTRAP_TRUSTED_HOSTS` | Разрешённые хосты для URL-списка |
+| `VOID_BOOTSTRAP_TLS_LEAF_SHA256` | Pin SHA-256 DER листа HTTPS |
+| `VOID_BOOTSTRAP_SIGNING_PUB_HEX` | Ed25519 для подписи списка |
+| `VOID_BOOTSTRAP_URL_SIG_HEX` | Подпись тела URL-списка |
+| `VOID_DISABLE_MDNS` | Выключить LAN-discovery |
+| `VOID_APPLY_FIREWALL_RULE` | Разрешить правку файрвола (Windows/macOS) |
+| `VOID_SKIP_SUBNETS` | Доп. CIDR «мусорных» listen-адресов |
+| `VOID_BUILTIN_BOOTSTRAP` | Вшить seed при сборке |
+| `RUST_LOG` | По умолчанию **warn**; `void_net=debug` — адреса в логах |
 
-Подробная инвентаризация рисков и контролей — в [`SECURITY_REVISION.md`](./SECURITY_REVISION.md).
+Инвентаризация рисков: [`SECURITY_REVISION.md`](./SECURITY_REVISION.md).
 
 ---
 
 ## Развёртывание своей инфраструктуры
 
-VOID работает без какой-либо инфраструктуры, но **собственные bootstrap/relay-узлы** сильно ускоряют поиск собеседников и прохождение NAT. Особенно хорошо для этого подходят **Raspberry Pi**: даже на Pi 3 роль Relay + Kademlia потребляет 5–10% CPU и ~150 МБ RAM, а 5–10 штук в разных сетях образуют отказоустойчивый кластер.
+Собственные bootstrap/relay ускоряют поиск и NAT. Даже Raspberry Pi тянет роль Relay + Kademlia. Разбор железа: [`info`](./info).
 
-Подробный разбор железа, пропускной способности и тонкостей — см. [`info`](./info).
-
-### Референсный bootstrap-узел: `void-bootstrap-node`
-
-Отдельный репозиторий с готовой реализацией серверной ноды:
+### Референс: `void-bootstrap-node`
 
 > 🔗 **[github.com/MarshalV/bootstrap_node](https://github.com/MarshalV/bootstrap_node)**
 
-Это **не «сервер чата»** — сообщения через него не проходят и не хранятся. Нода держит три роли одновременно:
-
 | Роль | Что делает |
 |------|-----------|
-| **libp2p bootstrap** | Точка входа в Kademlia `/void/kad/1.0.0` — новые клиенты через него находят остальных. |
-| **Circuit Relay v2** | `libp2p::relay::Behaviour` — пересылает служебные пакеты и служит точкой встречи для `DCUtR` hole-punching, когда оба собеседника за NAT. |
-| **DNS-Seed сервер** | Собственный зашифрованный протокол `/void-seed/v1` на отдельном TCP-порту — ноды обмениваются списками известных пиров **напрямую**, не доверяя публичному DHT. |
+| **Kademlia Server** | Вход в `/void/kad/1.0.0` |
+| **Circuit Relay v2** | Встреча за NAT, DCUtR; пересылает **зашифрованные** байты circuit-а |
+| **Офлайн-почта / prekey** | Store/query конвертов на `/void/chat`; `ct` нечитаем, метаданные на диске (`relay_mailbox.bin`) |
+| **VOID-SEED** | `/void-seed/v1` на отдельном TCP-порту — обмен списками **между нодами**, не чат клиентов |
 
-#### Libp2p-стек ноды
+Живой `V1Packet::Encrypted` нода **не форвардит** (чат не идёт «через сервер как у Telegram»). Circuit relay и mailbox — отдельные пути.
+
+#### Libp2p ноды
 
 | Компонент | Настройка |
 |-----------|-----------|
-| Транспорты | **TCP** (nodelay) + **QUIC** (UDP) на одном порту `LISTEN_PORT` (4001) |
-| Шифрование канала | **Noise** |
-| Мультиплексор | **Yamux**, `max_num_streams = 512` |
-| DNS | `with_dns()` — поддержка `/dnsaddr/` и `/dns4/` в multiaddr |
-| **Identify** | `protocol_version = "/void/v1"`, `agent = "void-bootstrap-node/0.3"`, `push_listen_addr_updates = true` — автоматически перетягивает listen-addrs пиров в Kademlia |
-| **Kademlia** | `/void/kad/1.0.0`, `Mode::Server`, `periodic_bootstrap_interval = None` (bootstrap только по запросу) |
-| **Relay** | Default `relay::Config` |
-| **AutoNAT** | Default — определяет свою NAT-доступность |
-| **Ping** | Default |
-| `idle_connection_timeout` | **300 секунд** (клиент держит `Duration::MAX`; ноде не нужно удерживать зависшие коннекты вечно) |
+| Транспорты | TCP + QUIC, порт `LISTEN_PORT` (4001) |
+| Identify | `/void/v1`, `void-bootstrap-node/0.3` |
+| Kademlia | `/void/kad/1.0.0`, **Mode::Server** |
+| Relay | Default + ослабленные лимиты под один NAT |
+| Ping / AutoNAT | Default |
+| Логи | `RUST_LOG` по умолчанию **info** — в т.ч. IP в `endpoint` соединений |
 
-Ключевое отличие от клиента: Kademlia работает в режиме **Server** — то есть нода хранит запись о пирах в DHT и отвечает на запросы, а не только ищет. Без серверных узлов в DHT найти никого невозможно.
+Без серверных узлов в DHT новичкам не к кому приземлиться.
 
-#### Протокол `/void-seed/v1` — полная картина
+#### Протокол `/void-seed/v1`
 
-```
-    Клиент (нода A)                                Сервер (нода B)
-        |                                               |
-        |  msg1 = e_c_pub (32 байта X25519)             |
-        | --------------------------------------------> |
-        |                                               |
-        |  msg2 = e_s_pub ‖ AEAD(k1, n=0, auth_s)       |
-        | <-------------------------------------------- |
-        |                                               |
-        |  msg3 = AEAD(k2, n=0, auth_c ‖ request)       |
-        | --------------------------------------------> |
-        |                                               |
-        |  msg4 = AEAD(k2, n=1, peer_list)              |
-        | <-------------------------------------------- |
-```
+Обмен списками bootstrap-нод (не клиентский чат): X25519 PFS, HKDF-SHA-512, ChaCha20-Poly1305, Ed25519 той же пары, что libp2p `PeerId`. На проводе — эфемерный ключ и шифротекст.
 
-| Слой | Реализация |
-|------|-----------|
-| Обмен ключами | **X25519** (`x25519-dalek`), эфемерные ключи уничтожаются после сессии → **Perfect Forward Secrecy** |
-| KDF | **HKDF-SHA-512** (`hkdf::Hkdf<sha2::Sha512>`), `salt = "/void-seed/v1" ‖ e_c ‖ e_s`, `ikm = DH(e_c, e_s)`, `info = "void-seed-session-keys"` → 64 байта, первые 32 = `k1`, следующие 32 = `k2` |
-| AEAD | **ChaCha20-Poly1305** (RFC 8439), `aad = "/void-seed/v1"`, 96-битный nonce = `0^{32} ‖ counter_le64` |
-| Статическая аутентификация | **Ed25519** тем же ключом, которым генерируется libp2p `PeerId` (`bootstrap_peer.key`) |
-| Подписываемый контекст | `"/void-seed/v1" | direction | e_c_pub ‖ e_s_pub` (direction `"c"` или `"s"`) |
-| Обёртка payload'а | `bincode`-сериализация `AuthPayload` / `SeedRequest` / `SeedResponse` |
+Сервер при offer запоминает **фактический IP** TCP-сокета (`touch(peer_id, remote_ip, …)`) в `known_nodes.json` — так задумано для mesh нод.
 
-Внутри каждого AEAD-конверта проверяются сразу **четыре** инварианта:
+#### Состояние ноды
 
-1. `protocol_version == "/void/v1"` — пир действительно клиент VOID, а не случайный libp2p-узел.
-2. `|now − auth.timestamp| ≤ 5 минут` — защита от replay.
-3. `libp2p_pubkey_proto → PeerId == claimed peer_id_bytes` — никто не выдаёт себя за чужой PeerId.
-4. `libp2p_ed25519_pub == static_ed_pub` — тот же ключ, что подписал Ed25519, сидит и в libp2p-идентити.
+| Файл | Что | Делиться |
+|------|-----|----------|
+| `bootstrap_peer.key` | Идентичность ноды | **нет** |
+| `known_nodes.json` | Другие bootstrap | да (публичные адреса) |
+| `relay_mailbox.bin` | Офлайн-конверты | **нет** (метаданные переписки) |
 
-Для пассивного наблюдателя на проводе видны только **32 «случайных» байта** (`msg1`) и дальше сплошной шифротекст — ни `PeerId`, ни список нод, ни маркер `/void/v1` в открытом виде не появляются.
-
-##### Anti-DoS лимиты
-
-| Параметр | Значение | Где проверяется |
-|----------|----------|-----------------|
-| `MAX_FRAME` | **1 MiB** | на любой кадр с длиной |
-| `HANDSHAKE_TIMEOUT` | **10 сек** | сервер, `server_handshake` |
-| `CONNECT_TIMEOUT` | **8 сек** | клиент, TCP-коннект |
-| `EXCHANGE_TIMEOUT` | **15 сек** | клиент, полный обмен |
-| `ANSWER_MAX` | **256** записей | серверный cap на длину ответа |
-| `want_max` в запросе | клиент просит до 256 | сервер усечёт до `ANSWER_MAX` |
-| Offer клиента | **128** записей максимум | плюс сам себя первой строкой |
-| Допустимый rewind timestamp'а | **5 минут** | `verify_auth` |
-
-#### Формат `SeedEntry` и обмен
-
-Каждая запись в списке — это:
-
-```rust
-struct SeedEntry {
-    host: String,         // IPv4 / IPv6 / DNS
-    seed_port: u16,       // /void-seed/v1 (обычно 4010)
-    libp2p_port: u16,     // TCP+QUIC libp2p (обычно 4001)
-    peer_id_b58: String,  // base58 PeerId
-    last_seen: u64,       // UNIX timestamp секунд
-}
-```
-
-При обмене:
-
-- Клиент всегда добавляет **себя** первой строкой offer'а (чтобы сервер узнал нового пира).
-- Сервер при получении offer'а делает `touch(peer_id, remote_ip, seed_port, libp2p_port)` — то есть запоминает **фактический IP** коннекта, даже если клиент соврал в поле `host`.
-- Если `PUBLIC_HOST` у клиента пуст, он честно шлёт пустой `host` — сервер всё равно запомнит его по IP TCP-сокета. Это работает и за CGNAT, если у клиента есть хоть один публичный адрес коннекта.
-- Сервер отвечает своим списком без запрашивающего пира и без самого себя-дубля.
-
-Multiaddr собирается налету: `/ip4/<host>/tcp/<libp2p_port>/p2p/<peer_id>` (или `/ip6/`, или `/dns4/` — в зависимости от формата `host`). Все полученные multiaddr'ы сразу идут в `kad.add_address()` + `swarm.dial()` и запускают `kad.bootstrap()`.
-
-#### Persistent state
-
-| Файл | Формат | Что внутри | Можно ли делиться |
-|------|--------|------------|-------------------|
-| `bootstrap_peer.key` | protobuf libp2p `Keypair` (Ed25519) | статический приватный ключ — определяет `PeerId` и Ed25519 для `/void-seed/v1` | **НЕТ**, утечка = угон ноды |
-| `known_nodes.json` | pretty-JSON, `{ "nodes": [SeedEntry, …] }` | адресная книга валидированных пиров | да, это уже публичные адреса |
-
-Запись `known_nodes.json` идёт **атомарно** через `.json.tmp` + `rename` (сбой посреди записи не оставит битого файла). Хранилище — in-memory HashMap по `peer_id_b58` с сортировкой по `last_seen DESC` перед сохранением. Merge-логика: более свежий `last_seen` перезаписывает старый, непустые `host`/`seed_port`/`libp2p_port` обновляют существующую запись.
-
-#### Поведение при старте
-
-1. Читает или генерирует `bootstrap_peer.key` (Ed25519).
-2. Загружает `known_nodes.json` в память.
-3. Спрашивает в stdin: `IP[:port]` другой ноды для join'а (Enter = изолированная сеть).
-4. Поднимает libp2p (TCP на `LISTEN_PORT`, QUIC там же — если QUIC не встал, падаем на чистый TCP).
-5. Если оператор указал адрес — делает зашифрованный `contact()` через `/void-seed/v1`, логирует отчёт (кого прислали, что нового), диалит всех полученных пиров по libp2p, запускает `kad.bootstrap()`.
-6. **Независимо от join'а** диалит всех пиров из `known_nodes.json` (авто-восстановление после рестарта).
-7. Запускает `seed_server::run(...)` на отдельном TCP-порту → параллельно обслуживает входящие seed-коннекты.
-8. Основной цикл: ждёт `Ctrl+C` (`tokio::signal::ctrl_c`) и обрабатывает `SwarmEvent`'ы.
-9. При `Identify::Received` автоматически перетягивает все `listen_addrs` пира в свой Kademlia.
-
-#### Переменные окружения
+#### Переменные ноды
 
 | Переменная | По умолчанию | Назначение |
 |-----------|-------------|-----------|
-| `LISTEN_PORT` | `4001` | порт libp2p (TCP + UDP/QUIC) |
-| `SEED_PORT` | `4010` | порт `/void-seed/v1` |
-| `SEED_BIND` | `0.0.0.0:$SEED_PORT` | bind-адрес seed-сервера (можно, например, `127.0.0.1:4010` + туннель) |
-| `PUBLIC_HOST` | `""` | публичный IP/DNS ноды; если пусто — другие узнают адрес из `remote_ip` TCP-коннекта |
-| `RUST_LOG` | `info` | уровень `tracing`-логов (`debug`, `trace`, …) |
+| `LISTEN_PORT` | `4001` | libp2p TCP+QUIC |
+| `SEED_PORT` | `4010` | `/void-seed/v1` |
+| `SEED_BIND` | `0.0.0.0:$SEED_PORT` | bind seed |
+| `PUBLIC_HOST` | пусто | рекламируемый хост; иначе `remote_ip` |
+| `RUST_LOG` | `info` | логи (IP коннектов на info) |
 
-#### Как использовать с клиентом
+#### Клиенты VOID
 
-1. Поднимите ноду (подробности в её [README](https://github.com/MarshalV/bootstrap_node/blob/main/README.md)):
-   ```bash
-   git clone https://github.com/MarshalV/bootstrap_node
-   cd bootstrap_node
-   cargo run --release
-   ```
-2. Пробросьте на роутере:
-   - **TCP 4001** и **UDP 4001** — для клиентского libp2p;
-   - **TCP 4010** — опционально, только если хотите, чтобы **другие ноды** получали от вас seed-списки по `/void-seed/v1`. Для обычных клиентов VOID он не нужен.
-3. Получите из лога ноды её `PeerId` и пропишите клиентам её `multiaddr`:
-   ```
-   /ip4/<ВАШ_ПУБЛИЧНЫЙ_IP>/tcp/4001/p2p/<PEER_ID>
-   /ip4/<ВАШ_ПУБЛИЧНЫЙ_IP>/udp/4001/quic-v1/p2p/<PEER_ID>
-   ```
-   Любую из этих строк добавьте в `void-bootstrap.txt`, в `VOID_BOOTSTRAP`, либо вставьте в UI-панель **«VOID BOOTSTRAP (DHT)»** → «Сохранить и применить».
+```bash
+git clone https://github.com/MarshalV/bootstrap_node
+cd bootstrap_node
+cargo run --release
+```
 
-Одна-единственная такая нода уже позволяет двум клиентам из разных сетей найти друг друга; **2–3 ноды в разных AS/странах** — рекомендованный минимум для боевой эксплуатации, чтобы падение любой одной не ломало discovery для новичков.
+Проброс: **TCP 4001**, **UDP 4001**; **TCP 4010** только для других bootstrap-нод.
+
+```
+/ip4/<ПУБЛИЧНЫЙ_IP>/tcp/4001/p2p/<PEER_ID>
+/ip4/<ПУБЛИЧНЫЙ_IP>/udp/4001/quic-v1/p2p/<PEER_ID>
+```
+
+Одна нода уже сводит двух клиентов за NAT; **2–3 в разных сетях** — разумный минимум.
 
 ---
 
-## Статус проекта
+## Статус
 
-**Alpha.** Ядро (P2P, E2EE, DHT, relay, UI) работает, но API и формат `vault.bin` ещё могут меняться без обратной совместимости. Идеи, issues и PR — приветствуются.
+**Alpha.** Формат vault/журнала ещё может меняться.
 
-### Что уже есть
-- [x] Прямой P2P обмен через `libp2p`
-- [x] Double Ratchet + Noise + привязка `Hello` к libp2p identity
-- [x] Kademlia DHT `/void/kad/1.0.0` + регистрация себя как provider
-- [x] NAT Traversal (Relay v2, DCUtR, UPnP, AutoNAT)
-- [x] Зашифрованный vault, адресная книга
-- [x] Приватные чаты + глобальная комната
-- [x] Умный ретрай через DHT-lookup + автопереподключение
-- [x] Статусы доставки и read receipt (○ / ✓ / ✓✓)
-- [x] Голосовые сообщения (запись, E2EE-передача WAV, воспроизведение с перемоткой)
-- [x] Тёмный UI на egui с аватарами-идентиконами
-- [x] Передача файлов (`/void/file/1.0.0`) с чанкингом, BLAKE2b-проверкой и rate-limit на relay
+### Есть
+
+- [x] P2P + Double Ratchet + Noise + привязка Hello к identity
+- [x] Kademlia `/void/kad/1.0.0` + provider
+- [x] Relay v2, DCUtR, UPnP, AutoNAT
+- [x] Vault, журнал, outbox
+- [x] Личные чаты и группы
+- [x] Офлайн-почта через bootstrap
+- [x] Доставка и read receipt
+- [x] Голос (запись, превью, E2EE, плеер)
+- [x] Файлы: E2EE-чанки, шифрованный кэш, выгрузка в Загрузки
+- [x] Tauri UI + опциональный egui
+- [x] Трей / beacon
 
 ### Планы
-- [ ] Группы с общим Double Ratchet (MLS-подобно)
+
+- [ ] Групповой ratchet (MLS-подобно) вместо fan-out
 - [ ] Мобильные сборки
 - [ ] Подписанные релизы + reproducible builds
-
+- [ ] Меньше метаданных на relay (офлайн-конверт без открытого `sender`, опционально relay-only без DCUtR)
 
 ---
 
 ## Безопасность
 
-Если вы нашли уязвимость — **не открывайте публичный issue**. Свяжитесь приватно (контакт в профиле автора) и дайте немного времени на фикс. Критические баги с доказательством эксплуатации — в приоритете.
+Уязвимости — **не в публичный issue**. Напишите автору приватно.
 
-⚠️ Проект в alpha и **не прошёл внешний аудит криптографии**. Не используйте VOID для защиты жизни или свободы людей.
+Проект **не проходил внешний аудит**. Не используйте VOID для защиты жизни или свободы людей.
 
-**Практика в коде (кратко):** только зашифрованные сообщения в чате; привязка `Hello` к libp2p-идентичности; лимиты JSON после E2EE; лимиты на bootstrap HTTP, опционально pin TLS и Ed25519-подпись списков; лимиты vault и файлового RR; логи через `tracing` (подробности — `RUST_LOG=void_net=debug`). Детали и остаточные риски — в [`SECURITY_REVISION.md`](./SECURITY_REVISION.md).
+Практика в коде: только E2EE в чате; Hello привязан к identity; лимиты JSON/HTTP/vault/файлов; кэш вложений под ключом vault. Остаточные риски (IP на ноде, PeerId, офлайн-метаданные, Identify, hole-punch) — выше и в [`SECURITY_REVISION.md`](./SECURITY_REVISION.md).
 
 ---
 
 ## Лицензия
 
-Уточняется. До появления `LICENSE` в корне репозитория исходники предоставляются «как есть», без каких-либо гарантий.
+[MIT](./LICENSE). Без гарантий.
 
 ---
 
