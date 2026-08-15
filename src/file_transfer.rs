@@ -246,11 +246,12 @@ fn harden_file_cache_dir(dir: &std::path::Path) {
     });
 }
 
-const FILE_CACHE_MAGIC: &[u8; 8] = b"VOIDFC01";
+const FILE_CACHE_MAGIC_V1: &[u8; 8] = b"VOIDFC01";
+const FILE_CACHE_MAGIC_V2: &[u8; 8] = b"VOIDFC02";
 const FILE_CACHE_NONCE_LEN: usize = 12;
 const FILE_CACHE_TAG_LEN: usize = 16;
 const FILE_CACHE_OVERHEAD: u64 =
-    (FILE_CACHE_MAGIC.len() + FILE_CACHE_NONCE_LEN + FILE_CACHE_TAG_LEN) as u64;
+    (FILE_CACHE_MAGIC_V2.len() + FILE_CACHE_NONCE_LEN + FILE_CACHE_TAG_LEN) as u64;
 
 /// Отдельный ключ кэша: HKDF-SHA256 от мастер-ключа vault (не сам master).
 pub fn derive_file_cache_key(vault_master: &[u8; 32]) -> [u8; 32] {
@@ -262,8 +263,95 @@ pub fn derive_file_cache_key(vault_master: &[u8; 32]) -> [u8; 32] {
 }
 
 pub fn is_encrypted_cache_blob(data: &[u8]) -> bool {
-    data.len() >= FILE_CACHE_MAGIC.len() + FILE_CACHE_NONCE_LEN + FILE_CACHE_TAG_LEN
-        && data.starts_with(FILE_CACHE_MAGIC)
+    data.len() >= FILE_CACHE_MAGIC_V1.len() + FILE_CACHE_NONCE_LEN + FILE_CACHE_TAG_LEN
+        && (data.starts_with(FILE_CACHE_MAGIC_V1) || data.starts_with(FILE_CACHE_MAGIC_V2))
+}
+
+/// Внутреннее имя кэша (`*.vfc`) нельзя показывать в чате и класть в Загрузки.
+pub fn is_cache_blob_filename(name: &str) -> bool {
+    std::path::Path::new(name)
+        .extension()
+        .and_then(|e| e.to_str())
+        .map(|e| e.eq_ignore_ascii_case("vfc"))
+        .unwrap_or(false)
+}
+
+/// Имя для оффера/UI: явное исходное имя, иначе имя пути, но не `*.vfc`.
+pub fn offer_filename(path: &str, explicit: &str) -> String {
+    let from_explicit = safe_filename(explicit);
+    if from_explicit != "file" && !is_cache_blob_filename(&from_explicit) {
+        return from_explicit;
+    }
+    let from_path = safe_filename(path);
+    if !is_cache_blob_filename(&from_path) {
+        return from_path;
+    }
+    "file".into()
+}
+
+/// Подпись в чате: не показываем хеш `.vfc`.
+pub fn display_filename(name: &str) -> String {
+    if name.trim().is_empty() || is_cache_blob_filename(name) {
+        "Файл".into()
+    } else {
+        name.to_string()
+    }
+}
+
+/// Если в метаданных осталось `.vfc`, угадываем расширение по сигнатуре.
+pub fn filename_from_bytes(preferred: &str, data: &[u8]) -> String {
+    let preferred = safe_filename(preferred);
+    if preferred != "file" && !is_cache_blob_filename(&preferred) {
+        return preferred;
+    }
+    let ext = sniff_extension(data).unwrap_or("bin");
+    format!("file.{ext}")
+}
+
+fn sniff_extension(data: &[u8]) -> Option<&'static str> {
+    if data.len() >= 12 && &data[4..8] == b"ftyp" {
+        return Some("mp4");
+    }
+    if data.len() >= 8 && &data[4..8] == b"moov" {
+        return Some("mov");
+    }
+    if data.starts_with(b"%PDF") {
+        return Some("pdf");
+    }
+    if data.starts_with(&[0x89, b'P', b'N', b'G']) {
+        return Some("png");
+    }
+    if data.starts_with(&[0xFF, 0xD8, 0xFF]) {
+        return Some("jpg");
+    }
+    if data.starts_with(b"GIF8") {
+        return Some("gif");
+    }
+    if data.len() >= 12 && data.starts_with(b"RIFF") && &data[8..12] == b"WEBP" {
+        return Some("webp");
+    }
+    if data.len() >= 12 && data.starts_with(b"RIFF") && &data[8..12] == b"WAVE" {
+        return Some("wav");
+    }
+    if data.starts_with(&[0x1A, 0x45, 0xDF, 0xA3]) {
+        return Some("webm");
+    }
+    if data.starts_with(b"PK\x03\x04") {
+        return Some("zip");
+    }
+    if data.starts_with(b"ID3") {
+        return Some("mp3");
+    }
+    if data.starts_with(b"OggS") {
+        return Some("ogg");
+    }
+    if data.starts_with(b"fLaC") {
+        return Some("flac");
+    }
+    if data.starts_with(&[0x1F, 0x8B]) {
+        return Some("gz");
+    }
+    None
 }
 
 /// Размер исходного файла (для UI/оффера). У шифротекста вычитается заголовок GCM.
@@ -275,7 +363,7 @@ pub fn advertised_plain_size(path: &std::path::Path) -> u64 {
         .and_then(|mut f| {
             use std::io::Read;
             f.read_exact(&mut hdr).ok()?;
-            Some(hdr == *FILE_CACHE_MAGIC)
+            Some(hdr == *FILE_CACHE_MAGIC_V1 || hdr == *FILE_CACHE_MAGIC_V2)
         })
         .unwrap_or(false);
     if encrypted {
@@ -285,45 +373,89 @@ pub fn advertised_plain_size(path: &std::path::Path) -> u64 {
     }
 }
 
-fn encrypt_cache_blob(key: &[u8; 32], plaintext: &[u8]) -> Result<Vec<u8>, String> {
+fn pack_named_plain(filename: &str, data: &[u8]) -> Vec<u8> {
+    let name = safe_filename(filename);
+    let name_bytes = name.as_bytes();
+    let n = name_bytes.len().min(u16::MAX as usize) as u16;
+    let mut v = Vec::with_capacity(2 + n as usize + data.len());
+    v.extend_from_slice(&n.to_le_bytes());
+    v.extend_from_slice(&name_bytes[..n as usize]);
+    v.extend_from_slice(data);
+    v
+}
+
+fn unpack_named_plain(plain: &[u8]) -> (Option<String>, &[u8]) {
+    if plain.len() < 2 {
+        return (None, plain);
+    }
+    let n = u16::from_le_bytes([plain[0], plain[1]]) as usize;
+    if 2 + n > plain.len() {
+        return (None, plain);
+    }
+    let name = String::from_utf8(plain[2..2 + n].to_vec()).ok();
+    let name = name.filter(|s| !s.is_empty() && !is_cache_blob_filename(s));
+    (name, &plain[2 + n..])
+}
+
+fn encrypt_cache_blob(key: &[u8; 32], filename: &str, plaintext: &[u8]) -> Result<Vec<u8>, String> {
+    let packed = pack_named_plain(filename, plaintext);
     let cipher = Aes256Gcm::new(Key::<Aes256Gcm>::from_slice(key));
     let mut nonce_bytes = [0u8; FILE_CACHE_NONCE_LEN];
     rand::thread_rng().fill_bytes(&mut nonce_bytes);
     let ct = cipher
-        .encrypt(Nonce::from_slice(&nonce_bytes), plaintext)
+        .encrypt(Nonce::from_slice(&nonce_bytes), packed.as_ref())
         .map_err(|e| format!("file cache encrypt: {e}"))?;
-    let mut out =
-        Vec::with_capacity(FILE_CACHE_MAGIC.len() + nonce_bytes.len() + ct.len());
-    out.extend_from_slice(FILE_CACHE_MAGIC);
+    let mut out = Vec::with_capacity(FILE_CACHE_MAGIC_V2.len() + nonce_bytes.len() + ct.len());
+    out.extend_from_slice(FILE_CACHE_MAGIC_V2);
     out.extend_from_slice(&nonce_bytes);
     out.extend_from_slice(&ct);
     Ok(out)
 }
 
-fn decrypt_cache_blob(key: &[u8; 32], blob: &[u8]) -> Result<Vec<u8>, String> {
+struct CachePlain {
+    filename: Option<String>,
+    data: Vec<u8>,
+}
+
+fn decrypt_cache_blob(key: &[u8; 32], blob: &[u8]) -> Result<CachePlain, String> {
     if !is_encrypted_cache_blob(blob) {
         return Err("файл кэша повреждён или не зашифрован".into());
     }
-    let nonce = &blob[FILE_CACHE_MAGIC.len()..FILE_CACHE_MAGIC.len() + FILE_CACHE_NONCE_LEN];
-    let ct = &blob[FILE_CACHE_MAGIC.len() + FILE_CACHE_NONCE_LEN..];
+    let v2 = blob.starts_with(FILE_CACHE_MAGIC_V2);
+    let nonce = &blob[8..8 + FILE_CACHE_NONCE_LEN];
+    let ct = &blob[8 + FILE_CACHE_NONCE_LEN..];
     let cipher = Aes256Gcm::new(Key::<Aes256Gcm>::from_slice(key));
-    cipher
+    let plain = cipher
         .decrypt(Nonce::from_slice(nonce), ct)
-        .map_err(|_| "не удалось расшифровать кэш (неверный ключ vault?)".into())
+        .map_err(|_| "не удалось расшифровать кэш (неверный ключ vault?)".to_string())?;
+    if v2 {
+        let (filename, data) = unpack_named_plain(&plain);
+        Ok(CachePlain {
+            filename,
+            data: data.to_vec(),
+        })
+    } else {
+        Ok(CachePlain {
+            filename: None,
+            data: plain,
+        })
+    }
 }
 
 /// Пишет вложение в кэш как AES-256-GCM (атомарно: tmp + rename).
+/// В шифротекст кладётся исходное имя файла — в Загрузки оно вернётся как есть.
 pub fn write_encrypted_cache(
     path: &std::path::Path,
     plaintext: &[u8],
     key: &[u8; 32],
+    original_filename: &str,
 ) -> Result<(), String> {
     if let Some(parent) = path.parent() {
         std::fs::create_dir_all(parent)
             .map_err(|e| format!("не удалось создать {}: {e}", parent.display()))?;
         harden_file_cache_dir(parent);
     }
-    let blob = encrypt_cache_blob(key, plaintext)?;
+    let blob = encrypt_cache_blob(key, original_filename, plaintext)?;
     let tmp = path.with_extension("vfc.tmp");
     std::fs::write(&tmp, &blob)
         .map_err(|e| format!("не удалось записать {}: {e}", tmp.display()))?;
@@ -335,17 +467,31 @@ pub fn write_encrypted_cache(
     Ok(())
 }
 
-/// Читает вложение: расшифровывает VOIDFC01, иначе отдаёт plaintext (старый кэш) и мигрирует.
+/// Читает вложение: расшифровывает VOIDFC01/02, иначе отдаёт plaintext (старый кэш).
 pub fn read_cache_plain(path: &std::path::Path, key: &[u8; 32]) -> Result<Vec<u8>, String> {
+    Ok(read_cache_entry(path, key)?.data)
+}
+
+fn read_cache_entry(path: &std::path::Path, key: &[u8; 32]) -> Result<CachePlain, String> {
     let data = std::fs::read(path)
         .map_err(|e| format!("не удалось прочитать {}: {e}", path.display()))?;
     if is_encrypted_cache_blob(&data) {
         return decrypt_cache_blob(key, &data);
     }
+    let guessed = filename_from_bytes(
+        &path
+            .file_name()
+            .and_then(|n| n.to_str())
+            .unwrap_or("file"),
+        &data,
+    );
     if is_under_file_cache(path) {
-        let _ = write_encrypted_cache(path, &data, key);
+        let _ = write_encrypted_cache(path, &data, key, &guessed);
     }
-    Ok(data)
+    Ok(CachePlain {
+        filename: Some(guessed).filter(|s| !is_cache_blob_filename(s)),
+        data,
+    })
 }
 
 /// Путь кэша: только transfer_id, без исходного имени файла.
@@ -402,11 +548,11 @@ pub fn copy_into_file_cache(
     } else {
         std::fs::read(src).map_err(|e| format!("не удалось прочитать {}: {e}", src.display()))?
     };
-    write_encrypted_cache(&dest, &plain, key)?;
+    write_encrypted_cache(&dest, &plain, key, filename)?;
     Ok(dest)
 }
 
-/// Расшифровывает кэш в `Загрузки/VOID Messenger` (уникальное имя при конфликте).
+/// Расшифровывает кэш в `Загрузки/VOID Messenger` под исходным именем файла.
 pub fn export_cached_to_downloads(
     src: &std::path::Path,
     filename: &str,
@@ -415,13 +561,21 @@ pub fn export_cached_to_downloads(
     if !src.is_file() {
         return Err("файла нет в локальном хранилище".into());
     }
-    let dest = unique_download_path(filename);
-    let plain = read_cache_plain(src, key)?;
+    let entry = read_cache_entry(src, key)?;
+    let name = filename_from_bytes(
+        if !is_cache_blob_filename(filename) {
+            filename
+        } else {
+            entry.filename.as_deref().unwrap_or(filename)
+        },
+        &entry.data,
+    );
+    let dest = unique_download_path(&name);
     if let Some(parent) = dest.parent() {
         std::fs::create_dir_all(parent)
             .map_err(|e| format!("не удалось создать {}: {e}", parent.display()))?;
     }
-    std::fs::write(&dest, &plain)
+    std::fs::write(&dest, &entry.data)
         .map_err(|e| format!("не удалось записать {}: {e}", dest.display()))?;
     Ok(dest)
 }
@@ -889,13 +1043,29 @@ mod tests {
         master[0] = 7;
         let key = derive_file_cache_key(&master);
         let plain = b"secret-attachment-bytes";
-        let blob = encrypt_cache_blob(&key, plain).unwrap();
+        let blob = encrypt_cache_blob(&key, "video.mp4", plain).unwrap();
+        assert!(blob.starts_with(FILE_CACHE_MAGIC_V2));
         assert!(is_encrypted_cache_blob(&blob));
-        assert_ne!(&blob[8 + 12..], plain.as_slice());
-        assert_eq!(decrypt_cache_blob(&key, &blob).unwrap(), plain);
+        let got = decrypt_cache_blob(&key, &blob).unwrap();
+        assert_eq!(got.filename.as_deref(), Some("video.mp4"));
+        assert_eq!(got.data, plain);
         let mut other = master;
         other[0] = 9;
         let bad = derive_file_cache_key(&other);
         assert!(decrypt_cache_blob(&bad, &blob).is_err());
+    }
+
+    #[test]
+    fn offer_filename_ignores_vfc() {
+        assert_eq!(
+            offer_filename("C:/cache/abc.vfc", "holiday.mp4"),
+            "holiday.mp4"
+        );
+        assert_eq!(offer_filename("C:/cache/abc.vfc", ""), "file");
+        assert_eq!(display_filename("abc.vfc"), "Файл");
+        assert_eq!(
+            filename_from_bytes("x.vfc", b"%PDF-1.7 leftover"),
+            "file.pdf"
+        );
     }
 }

@@ -93,6 +93,7 @@ struct PendingFileSend {
     message_id: Option<String>,
     transfer_id: Option<[u8; 16]>,
     sender_name: String,
+    filename: String,
 }
 
 struct PendingVoiceSend {
@@ -664,6 +665,64 @@ impl Inner {
             .ok_or_else(|| "Сначала разблокируйте vault".into())
     }
 
+    fn public_name_for_path(&self, path: &str) -> String {
+        let from_journal = {
+            let map = self.messages.lock();
+            map.values().flatten().find_map(|m| {
+                m.file.as_ref().and_then(|f| {
+                    f.local_path
+                        .as_deref()
+                        .filter(|p| *p == path)
+                        .map(|_| f.filename.clone())
+                })
+            })
+        };
+        file_transfer::offer_filename(path, from_journal.as_deref().unwrap_or(""))
+    }
+
+    fn public_name_for_transfer(&self, tid_hex: &str, path: &str) -> String {
+        let from_journal = {
+            let map = self.messages.lock();
+            map.values().flatten().find_map(|m| {
+                m.file.as_ref().and_then(|f| {
+                    f.transfer_id
+                        .eq_ignore_ascii_case(tid_hex)
+                        .then(|| f.filename.clone())
+                })
+            })
+        };
+        file_transfer::offer_filename(path, from_journal.as_deref().unwrap_or(""))
+    }
+
+    fn repair_file_public_name(&mut self, tid_hex: &str, filename: &str) {
+        if file_transfer::is_cache_blob_filename(filename) || filename.trim().is_empty() {
+            return;
+        }
+        let tid = tid_hex.to_ascii_lowercase();
+        let mut dirty = false;
+        {
+            let mut map = self.messages.lock();
+            for msgs in map.values_mut() {
+                for m in msgs {
+                    if let Some(ref mut f) = m.file {
+                        if f.transfer_id.eq_ignore_ascii_case(&tid)
+                            && (file_transfer::is_cache_blob_filename(&f.filename)
+                                || f.filename == "file"
+                                || f.filename == "Файл")
+                        {
+                            f.filename = filename.to_string();
+                            dirty = true;
+                        }
+                    }
+                }
+            }
+        }
+        if dirty {
+            self.messages.mark_dirty();
+            self.persist_journal();
+        }
+    }
+
     fn unlink_cached_files(&mut self, msgs: &[ChatMessage]) {
         for m in msgs {
             if let Some(f) = &m.file {
@@ -1059,6 +1118,7 @@ impl Inner {
             Option<String>,
             Option<[u8; 16]>,
             String,
+            String,
         )> = self
             .pending_file_sends
             .iter()
@@ -1071,10 +1131,11 @@ impl Inner {
                     p.message_id.clone(),
                     p.transfer_id,
                     p.sender_name.clone(),
+                    p.filename.clone(),
                 )
             })
             .collect();
-        for (peer, path, kind, message_id, transfer_id, sender_name) in due {
+        for (peer, path, kind, message_id, transfer_id, sender_name, filename) in due {
             if let Some(slot) = self
                 .pending_file_sends
                 .iter_mut()
@@ -1092,6 +1153,7 @@ impl Inner {
                     message_id,
                     transfer_id,
                     sender_name,
+                    filename,
                 });
             }
         }
@@ -1612,7 +1674,7 @@ impl Inner {
                         file_path,
                         file_missing,
                         file_transfer_id: m.file.as_ref().map(|f| f.transfer_id.clone()),
-                        file_name: m.file.as_ref().map(|f| f.filename.clone()),
+                        file_name: m.file.as_ref().map(|f| file_transfer::display_filename(&f.filename)),
                         file_size: m.file.as_ref().map(|f| f.size),
                         group_id: m.group_id.clone(),
                         id: m.id,
@@ -1987,6 +2049,7 @@ impl VoidRuntime {
                                 } else {
                                     g.expecting_files.remove(&tid);
                                 }
+                                g.repair_file_public_name(&tid, &filename);
                                 g.ensure_file_chat_message(
                                     peer,
                                     &tid,
@@ -2021,9 +2084,9 @@ impl VoidRuntime {
                         }
                         NetworkEvent::FileResendRequest { from, transfer_id } => {
                             if let Some(path) = g.find_resend_path(&transfer_id, from) {
-                                let kind = file_transfer::FileKind::from_filename(
-                                    &file_transfer::safe_filename(&path),
-                                );
+                                let tid_hex = transfer_id_to_hex(&transfer_id);
+                                let filename = g.public_name_for_transfer(&tid_hex, &path);
+                                let kind = file_transfer::FileKind::from_filename(&filename);
                                 g.ensure_peer_routed(from);
                                 if let Some(tx) = &g.command_tx {
                                     let _ = tx.try_send(UICommand::EnsureChatSession(from));
@@ -2034,6 +2097,7 @@ impl VoidRuntime {
                                         message_id: None,
                                         transfer_id: Some(transfer_id),
                                         sender_name: String::new(),
+                                        filename,
                                     });
                                 }
                             } else if let Some(tx) = &g.command_tx {
@@ -2069,6 +2133,7 @@ impl VoidRuntime {
                                 .iter()
                                 .any(|p| p.peer == recipient && p.path == path)
                             {
+                                let filename = g.public_name_for_path(&path);
                                 g.pending_file_sends.push(PendingFileSend {
                                     peer: recipient,
                                     path: path.clone(),
@@ -2077,6 +2142,7 @@ impl VoidRuntime {
                                     message_id: None,
                                     transfer_id: None,
                                     sender_name: String::new(),
+                                    filename,
                                 });
                             }
                             g.ensure_peer_routed(recipient);
@@ -2979,6 +3045,7 @@ impl VoidRuntime {
                     message_id: mid,
                     transfer_id: tid,
                     is_retry: false,
+                    filename: filename.clone(),
                 });
             }
         } else {
@@ -3008,6 +3075,7 @@ impl VoidRuntime {
                     message_id: Some(mid.clone()),
                     transfer_id: Some(tid),
                     sender_name: nick.clone(),
+                    filename: filename.clone(),
                 });
             }
             if !g
@@ -3023,6 +3091,7 @@ impl VoidRuntime {
                     message_id: Some(mid),
                     transfer_id: Some(tid),
                     sender_name: nick,
+                    filename,
                 });
             }
         }
@@ -3071,6 +3140,10 @@ impl VoidRuntime {
             &filename,
             &key,
         )?;
+        if let Some(name) = dest.file_name().and_then(|n| n.to_str()) {
+            let mut g = self.inner.lock().unwrap_or_else(|p| p.into_inner());
+            g.repair_file_public_name(&tid_hex, name);
+        }
         Ok(dest.display().to_string())
     }
 

@@ -909,16 +909,26 @@ async fn apply_incoming_file_chunk(
                         file_transfer::cache_path_for(&transfer_id_to_hex(&transfer_id), &fname)
                     };
                     let saved_to = save_path.display().to_string();
+                    let public_name = if file_transfer::is_voice_filename(&fname) {
+                        fname.clone()
+                    } else {
+                        file_transfer::filename_from_bytes(&fname, &data)
+                    };
                     let write_res = if file_transfer::is_voice_filename(&fname) {
                         std::fs::write(&save_path, &data).map_err(|e| e.to_string())
                     } else {
-                        file_transfer::write_encrypted_cache(&save_path, &data, file_cache_key)
+                        file_transfer::write_encrypted_cache(
+                            &save_path,
+                            &data,
+                            file_cache_key,
+                            &public_name,
+                        )
                     };
                     match write_res {
                         Ok(_) => {
                             debug!(
                                 "[{}] ✅ FILE: «{}» сохранён → {}",
-                                now, fname, saved_to
+                                now, public_name, saved_to
                             );
                             if file_transfer::is_voice_filename(&fname) {
                                 crate::voice::voice_log(&format!(
@@ -930,7 +940,7 @@ async fn apply_incoming_file_chunk(
                             let _ = event_tx
                                 .send(NetworkEvent::FileComplete {
                                     transfer_id,
-                                    filename: fname,
+                                    filename: public_name,
                                     saved_to,
                                     is_outgoing: false,
                                     peer,
@@ -1029,6 +1039,8 @@ pub(crate) enum UICommand {
         message_id: Option<String>,
         transfer_id: Option<[u8; 16]>,
         sender_name: String,
+        /// Исходное имя (не путь кэша `*.vfc`).
+        filename: String,
     },
     /// Голосовое сообщение: ChatMessage + file-transfer с фиксированным transfer_id.
     SendVoiceMessage {
@@ -1049,6 +1061,7 @@ pub(crate) enum UICommand {
         message_id: String,
         transfer_id: [u8; 16],
         is_retry: bool,
+        filename: String,
     },
     /// Пользователь принял входящее предложение файла.
     AcceptFile {
@@ -3937,9 +3950,10 @@ pub async fn run_chat_network(
                                 message_id,
                                 transfer_id,
                                 sender_name,
+                                filename,
                             } => {
                                 let now = chrono::Local::now().format("%H:%M:%S").to_string();
-                                let filename = file_transfer::safe_filename(&path);
+                                let filename = file_transfer::offer_filename(&path, &filename);
                                 let file_kind = if kind == file_transfer::FileKind::Other {
                                     file_transfer::FileKind::from_filename(&filename)
                                 } else {
@@ -4037,9 +4051,10 @@ pub async fn run_chat_network(
                                 message_id,
                                 transfer_id,
                                 is_retry,
+                                filename,
                             } => {
                                 let now = chrono::Local::now().format("%H:%M:%S").to_string();
-                                let filename = file_transfer::safe_filename(&path);
+                                let filename = file_transfer::offer_filename(&path, &filename);
                                 let file_kind = file_transfer::FileKind::from_filename(&filename);
                                 let size = file_transfer::advertised_plain_size(
                                     std::path::Path::new(&path),

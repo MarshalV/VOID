@@ -2252,11 +2252,12 @@ impl App {
             }
             let _ = self.command_tx.try_send(UICommand::SendFile {
                 recipient: peer,
-                path,
+                path: path.clone(),
                 kind,
                 message_id: None,
                 transfer_id: None,
                 sender_name: String::new(),
+                filename: file_transfer::safe_filename(&path),
             });
         }
     }

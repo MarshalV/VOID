@@ -1840,11 +1840,12 @@ impl eframe::App for App {
                     for (path, kind) in files {
                         let _ = self.command_tx.try_send(UICommand::SendFile {
                             recipient: peer,
-                            path,
+                            path: path.clone(),
                             kind,
                             message_id: None,
                             transfer_id: None,
                             sender_name: String::new(),
+                            filename: file_transfer::safe_filename(&path),
                         });
                     }
                     let voices = self
@@ -3354,6 +3355,9 @@ impl eframe::App for App {
                                                                         message_id: None,
                                                                         transfer_id: None,
                                                                         sender_name: String::new(),
+                                                                        filename: file_transfer::safe_filename(
+                                                                            &path.display().to_string(),
+                                                                        ),
                                                                     },
                                                                 );
                                                             }
