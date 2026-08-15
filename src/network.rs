@@ -1041,7 +1041,7 @@ pub(crate) enum UICommand {
     AcceptFile {
         transfer_id: [u8; 16],
         from: PeerId,
-        /// Директория сохранения, выбранная пользователем. `None` → `void_downloads/`.
+        /// Директория сохранения, выбранная пользователем. `None` → `Загрузки/VOID Messenger`.
         save_dir: Option<String>,
     },
     /// Пользователь отклонил входящее предложение файла.
@@ -3944,6 +3944,7 @@ pub async fn run_chat_network(
                                                 transfer_id: transfer_id_to_hex(&tid),
                                                 filename: filename.clone(),
                                                 size,
+                                                local_path: None,
                                             }),
                                             group_id: None,
                                         };
@@ -4029,6 +4030,7 @@ pub async fn run_chat_network(
                                         transfer_id: transfer_id_to_hex(&transfer_id),
                                         filename: filename.clone(),
                                         size,
+                                        local_path: None,
                                     }),
                                     group_id: Some(group_id.clone()),
                                 };
@@ -4264,7 +4266,7 @@ pub async fn run_chat_network(
                                     "✅ FILE: Accept transfer {:x?} от {} → {}",
                                     &transfer_id[..4],
                                     &from.to_string()[..8],
-                                    save_dir.as_deref().unwrap_or("void_downloads/")
+                                    save_dir.as_deref().unwrap_or("Downloads/VOID Messenger")
                                 );
                             }
                             UICommand::RejectFile { transfer_id, from, reason } => {
@@ -6983,6 +6985,14 @@ pub async fn run_chat_network(
                                                             .to_string(),
                                                     );
                                                 }
+                                            } else if let Some(inc) =
+                                                incoming_transfers.get_mut(&transfer_id)
+                                            {
+                                                inc.save_dir = Some(
+                                                    file_transfer::user_file_downloads_dir()
+                                                        .display()
+                                                        .to_string(),
+                                                );
                                             }
                                             // Файлы в чате — как голосовые: принимаем сразу, без баннера.
                                             let accept = FilePacket::Accept { transfer_id };

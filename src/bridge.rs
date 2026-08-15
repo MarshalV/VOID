@@ -153,6 +153,9 @@ pub struct MessageDto {
     pub file_name: Option<String>,
     pub file_size: Option<u64>,
     pub file_path: Option<String>,
+    /// Transfer finished (or abandoned) but the file is no longer on disk.
+    #[serde(default)]
+    pub file_missing: bool,
     pub group_id: Option<String>,
 }
 
@@ -273,6 +276,8 @@ struct Inner {
     voice_audio_paths: HashMap<String, String>,
     /// transfer_id hex → local file path for in-chat download/open.
     file_paths: HashMap<String, String>,
+    /// Incoming file transfers still in flight (ChatMessage arrived / chunks flowing).
+    expecting_files: HashSet<String>,
     voice_preview_path: Option<String>,
     voice_preview_duration: Option<f32>,
     offline_dht_publish_after: Option<Instant>,
@@ -318,6 +323,7 @@ impl Inner {
             pending_voice_sends: Vec::new(),
             voice_audio_paths: HashMap::new(),
             file_paths: HashMap::new(),
+            expecting_files: HashSet::new(),
             voice_preview_path: None,
             voice_preview_duration: None,
             offline_dht_publish_after: None,
@@ -560,14 +566,85 @@ impl Inner {
 
     fn register_file_path(&mut self, transfer_id_hex: &str, path: String) {
         let tid = transfer_id_hex.to_ascii_lowercase();
-        if std::path::Path::new(&path).is_file() {
-            self.file_paths.insert(tid, path);
+        self.expecting_files.remove(&tid);
+        if path.trim().is_empty() {
+            return;
         }
+        self.file_paths.insert(tid, path);
     }
 
     fn lookup_file_path(&self, transfer_id_hex: &str) -> Option<String> {
         let tid = transfer_id_hex.to_ascii_lowercase();
-        self.file_paths.get(&tid).cloned().filter(|p| std::path::Path::new(p).is_file())
+        self.file_paths
+            .get(&tid)
+            .cloned()
+            .filter(|p| std::path::Path::new(p).is_file())
+    }
+
+    fn bind_file_local_path(&mut self, tid_hex: &str, path: &str) {
+        if path.trim().is_empty() {
+            return;
+        }
+        self.register_file_path(tid_hex, path.to_string());
+        let tid = tid_hex.to_ascii_lowercase();
+        let mut dirty = false;
+        {
+            let mut map = self.messages.lock();
+            for msgs in map.values_mut() {
+                for m in msgs {
+                    if let Some(ref mut f) = m.file {
+                        if f.transfer_id.eq_ignore_ascii_case(&tid)
+                            && f.local_path.as_deref() != Some(path)
+                        {
+                            f.local_path = Some(path.to_string());
+                            dirty = true;
+                        }
+                    }
+                }
+            }
+        }
+        if dirty {
+            self.messages.mark_dirty();
+            self.persist_journal();
+        }
+    }
+
+    fn find_downloaded_file(filename: &str) -> Option<String> {
+        if filename.is_empty() {
+            return None;
+        }
+        for dir in file_transfer::file_search_dirs() {
+            let p = dir.join(filename);
+            if p.is_file() {
+                return Some(p.display().to_string());
+            }
+        }
+        None
+    }
+
+    fn resolve_file_state(&mut self, f: &FileMeta, _outgoing: bool) -> (Option<String>, bool) {
+        let tid = f.transfer_id.to_ascii_lowercase();
+        if let Some(p) = f
+            .local_path
+            .as_ref()
+            .filter(|p| std::path::Path::new(p).is_file())
+        {
+            return (Some(p.clone()), false);
+        }
+        if let Some(p) = self.lookup_file_path(&tid) {
+            return (Some(p), false);
+        }
+        if self.expecting_files.contains(&tid) {
+            return (None, false);
+        }
+        if f.local_path.is_none() {
+            if let Some(found) = Self::find_downloaded_file(&f.filename) {
+                self.bind_file_local_path(&tid, &found);
+                return (Some(found), false);
+            }
+        }
+        // Нет файла на диске и передачи нет — не крутим «загрузка…» вечно.
+        (None, true)
     }
 
     fn file_message_exists(&self, tid_hex: &str) -> bool {
@@ -611,6 +688,7 @@ impl Inner {
                 transfer_id: tid_hex.to_ascii_lowercase(),
                 filename: filename.to_string(),
                 size: size.max(1),
+                local_path: None,
             }),
             group_id: None,
         };
@@ -1426,38 +1504,45 @@ impl Inner {
         let messages = if self.selected_chat.is_empty() {
             Vec::new()
         } else {
-            self.messages
+            let raw = self
+                .messages
                 .lock()
                 .get(&self.selected_chat)
                 .cloned()
-                .unwrap_or_default()
-                .into_iter()
-                .map(|m| MessageDto {
-                    outgoing: m.sender_id == local_id,
-                    delivery: match m.delivery {
-                        OutgoingDeliveryStatus::Pending => "pending".into(),
-                        OutgoingDeliveryStatus::Delivered => "delivered".into(),
-                        OutgoingDeliveryStatus::Read => "read".into(),
-                    },
-                    voice_path: m
-                        .voice
-                        .as_ref()
-                        .and_then(|v| self.lookup_voice_path(&v.transfer_id)),
-                    voice_transfer_id: m.voice.as_ref().map(|v| v.transfer_id.clone()),
-                    voice_duration_secs: m.voice.as_ref().map(|v| v.duration_secs),
-                    file_path: m
+                .unwrap_or_default();
+            raw.into_iter()
+                .map(|m| {
+                    let outgoing = m.sender_id == local_id;
+                    let (file_path, file_missing) = m
                         .file
                         .as_ref()
-                        .and_then(|f| self.lookup_file_path(&f.transfer_id)),
-                    file_transfer_id: m.file.as_ref().map(|f| f.transfer_id.clone()),
-                    file_name: m.file.as_ref().map(|f| f.filename.clone()),
-                    file_size: m.file.as_ref().map(|f| f.size),
-                    group_id: m.group_id.clone(),
-                    id: m.id,
-                    sender_id: m.sender_id,
-                    sender_name: m.sender_name,
-                    text: m.text,
-                    timestamp: m.timestamp,
+                        .map(|f| self.resolve_file_state(f, outgoing))
+                        .unwrap_or((None, false));
+                    MessageDto {
+                        outgoing,
+                        delivery: match m.delivery {
+                            OutgoingDeliveryStatus::Pending => "pending".into(),
+                            OutgoingDeliveryStatus::Delivered => "delivered".into(),
+                            OutgoingDeliveryStatus::Read => "read".into(),
+                        },
+                        voice_path: m
+                            .voice
+                            .as_ref()
+                            .and_then(|v| self.lookup_voice_path(&v.transfer_id)),
+                        voice_transfer_id: m.voice.as_ref().map(|v| v.transfer_id.clone()),
+                        voice_duration_secs: m.voice.as_ref().map(|v| v.duration_secs),
+                        file_path,
+                        file_missing,
+                        file_transfer_id: m.file.as_ref().map(|f| f.transfer_id.clone()),
+                        file_name: m.file.as_ref().map(|f| f.filename.clone()),
+                        file_size: m.file.as_ref().map(|f| f.size),
+                        group_id: m.group_id.clone(),
+                        id: m.id,
+                        sender_id: m.sender_id,
+                        sender_name: m.sender_name,
+                        text: m.text,
+                        timestamp: m.timestamp,
+                    }
                 })
                 .collect()
         };
@@ -1632,6 +1717,16 @@ impl VoidRuntime {
                                 })
                                 .unwrap_or_else(|| msg.sender_id.clone());
                             if !g.messages.is_deleted(&msg.id) {
+                                if let Some(ref f) = msg.file {
+                                    let local = g
+                                        .local_peer_id
+                                        .map(|p| p.to_string())
+                                        .unwrap_or_default();
+                                    if msg.sender_id != local {
+                                        g.expecting_files
+                                            .insert(f.transfer_id.to_ascii_lowercase());
+                                    }
+                                }
                                 let mut map = g.messages.lock();
                                 let list = map.entry(chat_id.clone()).or_default();
                                 if !list.iter().any(|m| m.id == msg.id) {
@@ -1773,6 +1868,10 @@ impl VoidRuntime {
                             filename,
                             ..
                         } => {
+                            if !file_transfer::is_voice_filename(&filename) {
+                                g.expecting_files
+                                    .insert(hex::encode(transfer_id));
+                            }
                             bridge_evs.push(BridgeEvent::FileProgress {
                                 transfer_id: hex::encode(transfer_id),
                                 sent_chunks,
@@ -1806,7 +1905,9 @@ impl VoidRuntime {
                                 }
                             } else {
                                 if !saved_to.is_empty() {
-                                    g.register_file_path(&tid, saved_to.clone());
+                                    g.bind_file_local_path(&tid, &saved_to);
+                                } else {
+                                    g.expecting_files.remove(&tid);
                                 }
                                 g.ensure_file_chat_message(
                                     peer,
@@ -1815,6 +1916,9 @@ impl VoidRuntime {
                                     std::fs::metadata(&saved_to).map(|m| m.len()).unwrap_or(0),
                                     is_outgoing,
                                 );
+                                if !saved_to.is_empty() {
+                                    g.bind_file_local_path(&tid, &saved_to);
+                                }
                                 g.pending_file_sends.retain(|p| p.peer != peer);
                                 if is_outgoing {
                                     g.add_status(format!("✅ Файл «{filename}» доставлен"));
@@ -1828,7 +1932,8 @@ impl VoidRuntime {
                             g.kick_pending_for_peer(peer);
                             emit_snapshot = true;
                         }
-                        NetworkEvent::FileError { reason, .. } => {
+                        NetworkEvent::FileError { transfer_id, reason, .. } => {
+                            g.expecting_files.remove(&hex::encode(transfer_id));
                             g.add_status(format!("Файл: {reason}"));
                             bridge_evs.push(BridgeEvent::Status {
                                 text: reason,
@@ -2719,6 +2824,7 @@ impl VoidRuntime {
             transfer_id: tid_hex.clone(),
             filename: filename.clone(),
             size,
+            local_path: Some(path.clone()),
         };
         if let Some(gid) = group::parse_group_thread_key(&chat) {
             let gid = gid.to_string();

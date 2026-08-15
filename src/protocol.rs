@@ -36,6 +36,9 @@ pub(crate) struct FileMeta {
     pub(crate) transfer_id: String,
     pub(crate) filename: String,
     pub(crate) size: u64,
+    /// Локальный путь после приёма/отправки. На провод не уходит (очищается при разборе).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) local_path: Option<String>,
 }
 
 pub(crate) fn transfer_id_to_hex(tid: &[u8; 16]) -> String {
@@ -515,7 +518,7 @@ pub(crate) fn parse_decrypted_chat_json(plaintext: &[u8]) -> Option<ChatMessage>
     if plaintext.first() != Some(&b'{') {
         return None;
     }
-    let msg: ChatMessage = serde_json::from_slice(plaintext).ok()?;
+    let mut msg: ChatMessage = serde_json::from_slice(plaintext).ok()?;
     if !msg.id.is_empty() && !validate_message_id(&msg.id) {
         return None;
     }
@@ -531,10 +534,12 @@ pub(crate) fn parse_decrypted_chat_json(plaintext: &[u8]) -> Option<ChatMessage>
             return None;
         }
     }
-    if let Some(ref file) = msg.file {
+    if let Some(ref mut file) = msg.file {
         if !validate_file_meta(file) {
             return None;
         }
+        // Чужой local_path с провода не принимаем.
+        file.local_path = None;
     }
     if msg.text.is_empty() && msg.voice.is_none() && msg.file.is_none() {
         return None;

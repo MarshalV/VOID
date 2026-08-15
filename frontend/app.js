@@ -89,7 +89,7 @@
     return msgs
       .map(
         (m) =>
-          `${m.id}:${m.delivery}:${m.text?.length || 0}:${m.voice_transfer_id || ""}:${m.voice_path || ""}:${m.file_transfer_id || ""}:${m.file_path || ""}`
+          `${m.id}:${m.delivery}:${m.text?.length || 0}:${m.voice_transfer_id || ""}:${m.voice_path || ""}:${m.file_transfer_id || ""}:${m.file_path || ""}:${m.file_missing ? 1 : 0}`
       )
       .join("|");
   }
@@ -378,12 +378,13 @@
       } else if (m.file_transfer_id) {
         div.classList.add("file-msg");
         const ready = !!m.file_path;
+        const missing = !!m.file_missing && !ready;
         div.innerHTML = `
-          <div class="file-card ${ready ? "" : "pending"}" data-path="${escapeAttr(m.file_path || "")}">
+          <div class="file-card ${ready ? "" : missing ? "missing" : "pending"}" data-path="${escapeAttr(m.file_path || "")}">
             <div class="file-icon">📄</div>
             <div>
               <div class="file-name"></div>
-              <div class="file-size">${ready ? fmtSize(m.file_size) : "загрузка…"}</div>
+              <div class="file-size">${ready ? fmtSize(m.file_size) : missing ? "файл удалён" : "загрузка…"}</div>
             </div>
           </div>
           <div class="meta"><span></span><span></span></div>`;

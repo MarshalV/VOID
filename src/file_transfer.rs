@@ -8,7 +8,8 @@
 //! * Integrity: BLAKE2b-512 (первые 32 байта) всего файла проверяется на приёмнике.
 //! * Rate-limit на relay: если соединение идёт через p2p-circuit relay,
 //!   скорость отправки ограничивается `RELAY_RATE_LIMIT_BPS` байт/сек.
-//! * Файлы сохраняются в папку `void_downloads/` рядом с исполняемым файлом.
+//! * Обычные файлы сохраняются в `Загрузки/VOID Messenger/` (как у Telegram).
+//! * Голосовые — в каталоге данных приложения (`voice/`), не в Загрузках.
 
 use libp2p::PeerId;
 use serde::{Deserialize, Serialize};
@@ -102,11 +103,17 @@ pub const RELAY_RATE_LIMIT_BPS: u64 = 64 * 1024;
 /// Минимальный интервал между чанками при прямом соединении.
 pub const DIRECT_CHUNK_DELAY: Duration = Duration::from_millis(5);
 
-/// Папка для сохранения принятых файлов.
+/// Имя папки в системных «Загрузках» (как `Telegram Desktop`).
+pub const USER_DOWNLOADS_FOLDER: &str = "VOID Messenger";
+
+/// Устаревшая папка в каталоге данных (до переноса в Загрузки).
 pub const DOWNLOADS_DIR: &str = "void_downloads";
 
-/// Подпапка для голосовых сообщений (автоприём без диалога).
-pub const VOICE_DIR: &str = "void_downloads/voice";
+/// Подпапка голосовых в каталоге данных приложения.
+pub const VOICE_DIR: &str = "voice";
+
+/// Устаревший путь голосовых (искать при открытии старых сообщений).
+const LEGACY_VOICE_DIR: &str = "void_downloads/voice";
 
 /// Префикс имени файла голосового сообщения.
 pub const VOICE_FILENAME_PREFIX: &str = "void_voice_";
@@ -151,20 +158,50 @@ pub fn voice_dir_absolute() -> std::path::PathBuf {
     dir
 }
 
-/// Все каталоги, где могут лежать WAV (текущий + устаревший рядом с exe).
+/// Все каталоги, где могут лежать WAV (текущий + устаревший рядом с exe / в data).
 pub(crate) fn voice_search_dirs() -> Vec<std::path::PathBuf> {
     let mut dirs = vec![voice_dir_absolute()];
+    let data = crate::paths::data_dir();
+    for extra in [
+        data.join(LEGACY_VOICE_DIR),
+        data.join(DOWNLOADS_DIR).join("voice"),
+    ] {
+        if !dirs.iter().any(|d| d == &extra) {
+            dirs.push(extra);
+        }
+    }
     if let Ok(exe) = std::env::current_exe() {
         if let Some(parent) = exe.parent() {
-            let legacy = parent.join(VOICE_DIR);
-            if !dirs.iter().any(|d| d == &legacy) {
-                dirs.push(legacy);
+            for extra in [parent.join(VOICE_DIR), parent.join(LEGACY_VOICE_DIR)] {
+                if !dirs.iter().any(|d| d == &extra) {
+                    dirs.push(extra);
+                }
             }
         }
     }
-    let cwd_voice = std::path::PathBuf::from(VOICE_DIR);
-    if !dirs.iter().any(|d| d == &cwd_voice) {
-        dirs.push(cwd_voice);
+    dirs
+}
+
+/// Каталог входящих файлов: `Загрузки/VOID Messenger`.
+pub fn user_file_downloads_dir() -> std::path::PathBuf {
+    let base = dirs::download_dir()
+        .or_else(|| dirs::home_dir().map(|h| h.join("Downloads")))
+        .unwrap_or_else(crate::paths::data_dir);
+    let dir = base.join(USER_DOWNLOADS_FOLDER);
+    if std::fs::create_dir_all(&dir).is_err() {
+        let fallback = crate::paths::data_dir().join(USER_DOWNLOADS_FOLDER);
+        let _ = std::fs::create_dir_all(&fallback);
+        return fallback;
+    }
+    dir
+}
+
+/// Каталоги, где может лежать уже принятый файл (новые Загрузки + старый void_downloads).
+pub fn file_search_dirs() -> Vec<std::path::PathBuf> {
+    let mut dirs = vec![user_file_downloads_dir()];
+    let legacy = crate::paths::data_dir().join(DOWNLOADS_DIR);
+    if !dirs.iter().any(|d| d == &legacy) {
+        dirs.push(legacy);
     }
     dirs
 }
@@ -369,7 +406,7 @@ pub struct IncomingTransfer {
     pub chunks: Vec<Option<Vec<u8>>>,
     pub received_count: u32,
     pub kind: FileKind,
-    /// Директория сохранения, выбранная пользователем. `None` → `void_downloads/`.
+    /// Директория сохранения, выбранная пользователем. `None` → `Загрузки/VOID Messenger`.
     pub save_dir: Option<String>,
 }
 
@@ -455,19 +492,29 @@ pub fn safe_filename(raw: &str) -> String {
         .file_name()
         .and_then(|n| n.to_str())
         .unwrap_or("file");
-    // Убираем управляющие символы и опасные последовательности.
-    name.chars()
-        .filter(|c| c.is_ascii() && !c.is_ascii_control() && *c != '/' && *c != '\\')
-        .collect::<String>()
+    let cleaned: String = name
+        .chars()
+        .filter(|c| {
+            !c.is_control()
+                && !matches!(c, '/' | '\\' | '<' | '>' | ':' | '"' | '|' | '?' | '*' | '\0')
+        })
+        .collect();
+    let cleaned = cleaned
+        .trim()
         .trim_start_matches('.')
-        .to_string()
-        .into()
+        .trim()
+        .to_string();
+    if cleaned.is_empty() {
+        "file".into()
+    } else {
+        cleaned
+    }
 }
 
-/// Формирует уникальный путь к файлу в DOWNLOADS_DIR,
+/// Формирует уникальный путь к файлу в `Загрузки/VOID Messenger`,
 /// добавляя суффикс _(1), _(2)… если файл уже существует.
 pub fn unique_download_path(filename: &str) -> std::path::PathBuf {
-    unique_download_path_in_path(&crate::paths::data_dir().join(DOWNLOADS_DIR), filename)
+    unique_download_path_in_path(&user_file_downloads_dir(), filename)
 }
 
 /// Формирует уникальный путь к файлу в указанной директории.

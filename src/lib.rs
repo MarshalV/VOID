@@ -41,11 +41,9 @@ pub fn init_paths() -> Result<(), String> {
     paths::init_storage_paths()
 }
 
-/// Absolute path to `void_downloads` (accepted files).
+/// Absolute path to incoming files (`Downloads/VOID Messenger`).
 pub fn downloads_dir() -> std::path::PathBuf {
-    let dir = paths::data_dir().join(file_transfer::DOWNLOADS_DIR);
-    let _ = std::fs::create_dir_all(&dir);
-    dir
+    file_transfer::user_file_downloads_dir()
 }
 
 /// Handle `--voice-record` / `--voice-probe` CLI before starting any UI.
