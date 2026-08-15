@@ -674,6 +674,7 @@ impl App {
                     network_bootstraps,
                     contact_addrs_flat,
                     dn_sp.chat_messages.clone(),
+                    file_transfer::derive_file_cache_key(&master_arr),
                 ));
                 self.peer_prekeys = peer_prekeys;
                 self.apply_unlock_success(
@@ -729,6 +730,7 @@ impl App {
                     Vec::new(),
                     Vec::new(),
                     dn_sp.chat_messages.clone(),
+                    file_transfer::derive_file_cache_key(&master_arr),
                 ));
 
                 self.apply_unlock_success(

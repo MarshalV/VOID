@@ -808,6 +808,11 @@ pub(crate) enum NetworkEvent {
         transfer_id: [u8; 16],
         reason: String,
     },
+    /// Пир просит прислать файл ещё раз (его локальная копия удалена).
+    FileResendRequest {
+        from: PeerId,
+        transfer_id: [u8; 16],
+    },
     /// Атомарность голосового: получатель подтвердил (или отверг) целостность
     /// собранного файла. Только по `ok: true` отправитель может показать
     /// голосовое сообщение в чате как реально доставленное.
@@ -831,6 +836,7 @@ async fn apply_incoming_file_chunk(
     now: &str,
     incoming_transfers: &mut HashMap<[u8; 16], file_transfer::IncomingTransfer>,
     event_tx: &mpsc::Sender<NetworkEvent>,
+    file_cache_key: &[u8; 32],
 ) -> Option<([u8; 16], bool)> {
     let done = if let Some(inc) = incoming_transfers.get_mut(&transfer_id) {
         inc.receive_chunk(chunk_index, data)
@@ -887,21 +893,28 @@ async fn apply_incoming_file_chunk(
                         })
                         .await;
                 } else {
-                    let save_path = if let Some(ref dir) = incoming_transfers
-                        .get(&transfer_id)
-                        .and_then(|t| t.save_dir.clone())
-                    {
-                        file_transfer::unique_download_path_in(dir, &fname)
-                    } else if file_transfer::is_voice_filename(&fname) {
-                        file_transfer::unique_download_path_in_path(
-                            &file_transfer::voice_dir_absolute(),
-                            &fname,
-                        )
+                    let save_path = if file_transfer::is_voice_filename(&fname) {
+                        if let Some(ref dir) = incoming_transfers
+                            .get(&transfer_id)
+                            .and_then(|t| t.save_dir.clone())
+                        {
+                            file_transfer::unique_download_path_in(dir, &fname)
+                        } else {
+                            file_transfer::unique_download_path_in_path(
+                                &file_transfer::voice_dir_absolute(),
+                                &fname,
+                            )
+                        }
                     } else {
-                        file_transfer::unique_download_path(&fname)
+                        file_transfer::cache_path_for(&transfer_id_to_hex(&transfer_id), &fname)
                     };
                     let saved_to = save_path.display().to_string();
-                    match std::fs::write(&save_path, &data) {
+                    let write_res = if file_transfer::is_voice_filename(&fname) {
+                        std::fs::write(&save_path, &data).map_err(|e| e.to_string())
+                    } else {
+                        file_transfer::write_encrypted_cache(&save_path, &data, file_cache_key)
+                    };
+                    match write_res {
                         Ok(_) => {
                             debug!(
                                 "[{}] ✅ FILE: «{}» сохранён → {}",
@@ -1049,6 +1062,11 @@ pub(crate) enum UICommand {
         transfer_id: [u8; 16],
         from: PeerId,
         reason: String,
+    },
+    /// Запросить у пира повторную отправку файла (тот же transfer_id).
+    RequestFile {
+        peer: PeerId,
+        transfer_id: [u8; 16],
     },
     /// Кэш X25519 prekey контактов (из vault).
     CachePeerPrekeys(Vec<(PeerId, [u8; 32])>),
@@ -2144,11 +2162,12 @@ async fn start_named_file_transfer(
     transfer_id: [u8; 16],
     filename: String,
     file_kind: file_transfer::FileKind,
+    file_cache_key: &[u8; 32],
 ) {
     if outgoing_transfers.contains_key(&transfer_id) {
         return;
     }
-    match std::fs::read(path) {
+    match file_transfer::read_cache_plain(std::path::Path::new(path), file_cache_key) {
         Err(e) => {
             let _ = event_tx
                 .send(NetworkEvent::Status(format!(
@@ -2249,6 +2268,7 @@ async fn flush_pending_named_files(
     event_tx: &mpsc::Sender<NetworkEvent>,
     peer: PeerId,
     pending_named_files: &mut HashMap<PeerId, Vec<PendingNamedFileTransfer>>,
+    file_cache_key: &[u8; 32],
 ) {
     let Some(queue) = pending_named_files.remove(&peer) else {
         return;
@@ -2264,6 +2284,7 @@ async fn flush_pending_named_files(
             item.transfer_id,
             item.filename,
             item.kind,
+            file_cache_key,
         )
         .await;
     }
@@ -2410,6 +2431,7 @@ pub async fn run_chat_network(
     void_bootstraps: Vec<Multiaddr>,
     contact_seed_addrs: Vec<(PeerId, Multiaddr)>,
     chat_messages: SharedChatMessages,
+    file_cache_key: [u8; 32],
 ) {
         let mut void_bootstraps = void_bootstraps;
         let mut sessions: HashMap<PeerId, crypto::SecureSession> = HashMap::new();
@@ -3928,7 +3950,9 @@ pub async fn run_chat_network(
                                     rand::RngCore::fill_bytes(&mut rand::thread_rng(), &mut t);
                                     t
                                 });
-                                let size = std::fs::metadata(&path).map(|m| m.len()).unwrap_or(0);
+                                let size = file_transfer::advertised_plain_size(
+                                    std::path::Path::new(&path),
+                                );
                                 if let Some(mid) = message_id.clone() {
                                     if size > 0 {
                                         let msg = ChatMessage {
@@ -4001,6 +4025,7 @@ pub async fn run_chat_network(
                                     tid,
                                     filename,
                                     file_kind,
+                                    &file_cache_key,
                                 )
                                 .await;
                             }
@@ -4016,7 +4041,9 @@ pub async fn run_chat_network(
                                 let now = chrono::Local::now().format("%H:%M:%S").to_string();
                                 let filename = file_transfer::safe_filename(&path);
                                 let file_kind = file_transfer::FileKind::from_filename(&filename);
-                                let size = std::fs::metadata(&path).map(|m| m.len()).unwrap_or(0);
+                                let size = file_transfer::advertised_plain_size(
+                                    std::path::Path::new(&path),
+                                );
                                 let msg = ChatMessage {
                                     id: message_id.clone(),
                                     sender_id: local_peer_id.to_string(),
@@ -4071,6 +4098,7 @@ pub async fn run_chat_network(
                                             peer_tid,
                                             filename.clone(),
                                             file_kind,
+                                            &file_cache_key,
                                         )
                                         .await;
                                     } else {
@@ -4283,6 +4311,12 @@ pub async fn run_chat_network(
                                     "✖ FILE: Reject transfer {:x?} ({})",
                                     &transfer_id[..4],
                                     reason
+                                );
+                            }
+                            UICommand::RequestFile { peer, transfer_id } => {
+                                swarm.behaviour_mut().file_rr.send_request(
+                                    &peer,
+                                    file_transfer::FilePacket::Request { transfer_id },
                                 );
                             }
                             UICommand::CachePeerPrekeys(keys) => {
@@ -4823,6 +4857,7 @@ pub async fn run_chat_network(
                                                                 &now,
                                                                 &mut incoming_transfers,
                                                                 &event_tx,
+                                                                &file_cache_key,
                                                             )
                                                             .await;
                                                             if let Some((vtid, vok)) = voice_outcome {
@@ -5490,6 +5525,7 @@ pub async fn run_chat_network(
                                                         &event_tx,
                                                         peer,
                                                         &mut pending_named_files,
+                                                        &file_cache_key,
                                                     )
                                                     .await;
                                                 }
@@ -5513,6 +5549,7 @@ pub async fn run_chat_network(
                                                             &now,
                                                             &mut incoming_transfers,
                                                             &event_tx,
+                                                            &file_cache_key,
                                                         )
                                                         .await;
                                                         if let Some((vtid, vok)) = voice_outcome {
@@ -6989,7 +7026,7 @@ pub async fn run_chat_network(
                                                 incoming_transfers.get_mut(&transfer_id)
                                             {
                                                 inc.save_dir = Some(
-                                                    file_transfer::user_file_downloads_dir()
+                                                    file_transfer::file_cache_dir()
                                                         .display()
                                                         .to_string(),
                                                 );
@@ -7095,6 +7132,7 @@ pub async fn run_chat_network(
                                                 &now,
                                                 &mut incoming_transfers,
                                                 &event_tx,
+                                                &file_cache_key,
                                             )
                                             .await;
                                         }
@@ -7110,6 +7148,18 @@ pub async fn run_chat_network(
                                                     transfer_id,
                                                     reason: "Передача отменена собеседником."
                                                         .into(),
+                                                })
+                                                .await;
+                                        }
+                                        FilePacket::Request { transfer_id } => {
+                                            let _ = swarm
+                                                .behaviour_mut()
+                                                .file_rr
+                                                .send_response(channel, FilePacket::Ack);
+                                            let _ = event_tx
+                                                .send(NetworkEvent::FileResendRequest {
+                                                    from: peer,
+                                                    transfer_id,
                                                 })
                                                 .await;
                                         }

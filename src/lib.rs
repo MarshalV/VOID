@@ -41,7 +41,7 @@ pub fn init_paths() -> Result<(), String> {
     paths::init_storage_paths()
 }
 
-/// Absolute path to incoming files (`Downloads/VOID Messenger`).
+/// Absolute path to user-exported copies (`Downloads/VOID Messenger`).
 pub fn downloads_dir() -> std::path::PathBuf {
     file_transfer::user_file_downloads_dir()
 }

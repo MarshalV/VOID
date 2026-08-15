@@ -379,12 +379,17 @@
         div.classList.add("file-msg");
         const ready = !!m.file_path;
         const missing = !!m.file_missing && !ready;
+        const status = ready ? fmtSize(m.file_size) : missing ? "файл удалён" : "загрузка…";
         div.innerHTML = `
-          <div class="file-card ${ready ? "" : missing ? "missing" : "pending"}" data-path="${escapeAttr(m.file_path || "")}">
+          <div class="file-card ${ready ? "" : missing ? "missing" : "pending"}" data-tid="${escapeAttr(m.file_transfer_id || "")}">
             <div class="file-icon">📄</div>
             <div>
               <div class="file-name"></div>
-              <div class="file-size">${ready ? fmtSize(m.file_size) : missing ? "файл удалён" : "загрузка…"}</div>
+              <div class="file-size">${status}</div>
+            </div>
+            <div class="file-actions">
+              ${ready ? `<button type="button" class="file-dl" data-act="download" title="Скачать в Загрузки">Скачать</button>` : ""}
+              <button type="button" class="file-del" data-act="delete" title="Удалить из чата">×</button>
             </div>
           </div>
           <div class="meta"><span></span><span></span></div>`;
@@ -392,12 +397,27 @@
         const meta = div.querySelectorAll(".meta span");
         meta[0].textContent = m.timestamp || "";
         meta[1].textContent = m.outgoing ? deliveryMark(m.delivery) : "";
-        if (ready) {
-          div.querySelector(".file-card").onclick = async () => {
+        const dl = div.querySelector("[data-act=download]");
+        if (dl) {
+          dl.onclick = async (e) => {
+            e.stopPropagation();
             try {
-              await invoke("reveal_path", { path: m.file_path });
-            } catch (e) {
-              showToast(String(e));
+              const dest = await invoke("save_file_to_downloads", { transferId: m.file_transfer_id });
+              await invoke("reveal_path", { path: dest });
+            } catch (err) {
+              showToast(String(err));
+            }
+          };
+        }
+        const del = div.querySelector("[data-act=delete]");
+        if (del) {
+          del.onclick = async (e) => {
+            e.stopPropagation();
+            if (!window.confirm("Удалить файл из чата? Копия в Загрузках останется.")) return;
+            try {
+              applySnapshot(await invoke("delete_message", { messageId: m.id }), true);
+            } catch (err) {
+              showToast(String(err));
             }
           };
         }

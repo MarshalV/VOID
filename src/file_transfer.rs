@@ -8,11 +8,20 @@
 //! * Integrity: BLAKE2b-512 (первые 32 байта) всего файла проверяется на приёмнике.
 //! * Rate-limit на relay: если соединение идёт через p2p-circuit relay,
 //!   скорость отправки ограничивается `RELAY_RATE_LIMIT_BPS` байт/сек.
-//! * Обычные файлы сохраняются в `Загрузки/VOID Messenger/` (как у Telegram).
+//! * Обычные файлы хранятся в локальном кэше (`files/`) как AES-256-GCM (ключ из vault).
+//! * «Скачать» расшифровывает копию в `Загрузки/VOID Messenger/`.
+//! * Удаление файла из чата стирает кэш; копии в Загрузках не трогаем.
 //! * Голосовые — в каталоге данных приложения (`voice/`), не в Загрузках.
 
+use aes_gcm::{
+    aead::{Aead, KeyInit},
+    Aes256Gcm, Key, Nonce,
+};
+use hkdf::Hkdf;
 use libp2p::PeerId;
+use rand::RngCore;
 use serde::{Deserialize, Serialize};
+use sha2::Sha256;
 use std::time::{Duration, Instant};
 
 // ─── Тип файла ────────────────────────────────────────────────────────────────
@@ -103,11 +112,14 @@ pub const RELAY_RATE_LIMIT_BPS: u64 = 64 * 1024;
 /// Минимальный интервал между чанками при прямом соединении.
 pub const DIRECT_CHUNK_DELAY: Duration = Duration::from_millis(5);
 
-/// Имя папки в системных «Загрузках» (как `Telegram Desktop`).
+/// Имя папки в системных «Загрузках» (как `Telegram Desktop`) — только явный «Скачать».
 pub const USER_DOWNLOADS_FOLDER: &str = "VOID Messenger";
 
 /// Устаревшая папка в каталоге данных (до переноса в Загрузки).
 pub const DOWNLOADS_DIR: &str = "void_downloads";
+
+/// Локальный кэш вложений чата (не Загрузки).
+pub const FILES_CACHE_DIR: &str = "files";
 
 /// Подпапка голосовых в каталоге данных приложения.
 pub const VOICE_DIR: &str = "voice";
@@ -182,7 +194,7 @@ pub(crate) fn voice_search_dirs() -> Vec<std::path::PathBuf> {
     dirs
 }
 
-/// Каталог входящих файлов: `Загрузки/VOID Messenger`.
+/// Каталог копий по кнопке «Скачать»: `Загрузки/VOID Messenger`.
 pub fn user_file_downloads_dir() -> std::path::PathBuf {
     let base = dirs::download_dir()
         .or_else(|| dirs::home_dir().map(|h| h.join("Downloads")))
@@ -196,12 +208,242 @@ pub fn user_file_downloads_dir() -> std::path::PathBuf {
     dir
 }
 
-/// Каталоги, где может лежать уже принятый файл (новые Загрузки + старый void_downloads).
+/// Локальный кэш вложений (каталог данных VOID / `files`).
+/// Файлы на диске — AES-256-GCM; без мастер-ключа vault это непрозрачный шифротекст.
+pub fn file_cache_dir() -> std::path::PathBuf {
+    let dir = crate::paths::data_dir().join(FILES_CACHE_DIR);
+    let _ = std::fs::create_dir_all(&dir);
+    harden_file_cache_dir(&dir);
+    dir
+}
+
+fn harden_file_cache_dir(dir: &std::path::Path) {
+    static ONCE: std::sync::Once = std::sync::Once::new();
+    ONCE.call_once(|| {
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let _ = std::fs::set_permissions(dir, std::fs::Permissions::from_mode(0o700));
+        }
+        #[cfg(windows)]
+        {
+            use std::os::windows::process::CommandExt;
+            const CREATE_NO_WINDOW: u32 = 0x0800_0000;
+            let _ = std::process::Command::new("attrib")
+                .args(["+H"])
+                .arg(dir)
+                .creation_flags(CREATE_NO_WINDOW)
+                .status();
+            if let Ok(user) = std::env::var("USERNAME") {
+                let grant = format!("{user}:(OI)(CI)F");
+                let _ = std::process::Command::new("icacls")
+                    .arg(dir)
+                    .args(["/inheritance:r", "/grant:r", &grant])
+                    .creation_flags(CREATE_NO_WINDOW)
+                    .status();
+            }
+        }
+    });
+}
+
+const FILE_CACHE_MAGIC: &[u8; 8] = b"VOIDFC01";
+const FILE_CACHE_NONCE_LEN: usize = 12;
+const FILE_CACHE_TAG_LEN: usize = 16;
+const FILE_CACHE_OVERHEAD: u64 =
+    (FILE_CACHE_MAGIC.len() + FILE_CACHE_NONCE_LEN + FILE_CACHE_TAG_LEN) as u64;
+
+/// Отдельный ключ кэша: HKDF-SHA256 от мастер-ключа vault (не сам master).
+pub fn derive_file_cache_key(vault_master: &[u8; 32]) -> [u8; 32] {
+    let hk = Hkdf::<Sha256>::new(Some(b"VOID_FILE_CACHE_SALT_v1"), vault_master);
+    let mut okm = [0u8; 32];
+    hk.expand(b"VOID_FILE_CACHE_v1", &mut okm)
+        .expect("HKDF file cache key");
+    okm
+}
+
+pub fn is_encrypted_cache_blob(data: &[u8]) -> bool {
+    data.len() >= FILE_CACHE_MAGIC.len() + FILE_CACHE_NONCE_LEN + FILE_CACHE_TAG_LEN
+        && data.starts_with(FILE_CACHE_MAGIC)
+}
+
+/// Размер исходного файла (для UI/оффера). У шифротекста вычитается заголовок GCM.
+pub fn advertised_plain_size(path: &std::path::Path) -> u64 {
+    let meta = std::fs::metadata(path).map(|m| m.len()).unwrap_or(0);
+    let mut hdr = [0u8; 8];
+    let encrypted = std::fs::File::open(path)
+        .ok()
+        .and_then(|mut f| {
+            use std::io::Read;
+            f.read_exact(&mut hdr).ok()?;
+            Some(hdr == *FILE_CACHE_MAGIC)
+        })
+        .unwrap_or(false);
+    if encrypted {
+        meta.saturating_sub(FILE_CACHE_OVERHEAD)
+    } else {
+        meta
+    }
+}
+
+fn encrypt_cache_blob(key: &[u8; 32], plaintext: &[u8]) -> Result<Vec<u8>, String> {
+    let cipher = Aes256Gcm::new(Key::<Aes256Gcm>::from_slice(key));
+    let mut nonce_bytes = [0u8; FILE_CACHE_NONCE_LEN];
+    rand::thread_rng().fill_bytes(&mut nonce_bytes);
+    let ct = cipher
+        .encrypt(Nonce::from_slice(&nonce_bytes), plaintext)
+        .map_err(|e| format!("file cache encrypt: {e}"))?;
+    let mut out =
+        Vec::with_capacity(FILE_CACHE_MAGIC.len() + nonce_bytes.len() + ct.len());
+    out.extend_from_slice(FILE_CACHE_MAGIC);
+    out.extend_from_slice(&nonce_bytes);
+    out.extend_from_slice(&ct);
+    Ok(out)
+}
+
+fn decrypt_cache_blob(key: &[u8; 32], blob: &[u8]) -> Result<Vec<u8>, String> {
+    if !is_encrypted_cache_blob(blob) {
+        return Err("файл кэша повреждён или не зашифрован".into());
+    }
+    let nonce = &blob[FILE_CACHE_MAGIC.len()..FILE_CACHE_MAGIC.len() + FILE_CACHE_NONCE_LEN];
+    let ct = &blob[FILE_CACHE_MAGIC.len() + FILE_CACHE_NONCE_LEN..];
+    let cipher = Aes256Gcm::new(Key::<Aes256Gcm>::from_slice(key));
+    cipher
+        .decrypt(Nonce::from_slice(nonce), ct)
+        .map_err(|_| "не удалось расшифровать кэш (неверный ключ vault?)".into())
+}
+
+/// Пишет вложение в кэш как AES-256-GCM (атомарно: tmp + rename).
+pub fn write_encrypted_cache(
+    path: &std::path::Path,
+    plaintext: &[u8],
+    key: &[u8; 32],
+) -> Result<(), String> {
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent)
+            .map_err(|e| format!("не удалось создать {}: {e}", parent.display()))?;
+        harden_file_cache_dir(parent);
+    }
+    let blob = encrypt_cache_blob(key, plaintext)?;
+    let tmp = path.with_extension("vfc.tmp");
+    std::fs::write(&tmp, &blob)
+        .map_err(|e| format!("не удалось записать {}: {e}", tmp.display()))?;
+    std::fs::rename(&tmp, path).or_else(|_| {
+        std::fs::write(path, &blob)
+            .map_err(|e| format!("не удалось записать {}: {e}", path.display()))
+    })?;
+    let _ = std::fs::remove_file(&tmp);
+    Ok(())
+}
+
+/// Читает вложение: расшифровывает VOIDFC01, иначе отдаёт plaintext (старый кэш) и мигрирует.
+pub fn read_cache_plain(path: &std::path::Path, key: &[u8; 32]) -> Result<Vec<u8>, String> {
+    let data = std::fs::read(path)
+        .map_err(|e| format!("не удалось прочитать {}: {e}", path.display()))?;
+    if is_encrypted_cache_blob(&data) {
+        return decrypt_cache_blob(key, &data);
+    }
+    if is_under_file_cache(path) {
+        let _ = write_encrypted_cache(path, &data, key);
+    }
+    Ok(data)
+}
+
+/// Путь кэша: только transfer_id, без исходного имени файла.
+pub fn cache_path_for(transfer_id_hex: &str, _filename: &str) -> std::path::PathBuf {
+    let dir = file_cache_dir();
+    let _ = std::fs::create_dir_all(&dir);
+    dir.join(format!("{}.vfc", transfer_id_hex.to_ascii_lowercase()))
+}
+
+pub fn legacy_cache_path(transfer_id_hex: &str, filename: &str) -> std::path::PathBuf {
+    file_cache_dir().join(format!(
+        "{}_{}",
+        transfer_id_hex.to_ascii_lowercase(),
+        safe_filename(filename)
+    ))
+}
+
+fn path_is_under(path: &std::path::Path, dir: &std::path::Path) -> bool {
+    let canon_path = std::fs::canonicalize(path).unwrap_or_else(|_| path.to_path_buf());
+    let canon_dir = std::fs::canonicalize(dir).unwrap_or_else(|_| dir.to_path_buf());
+    #[cfg(windows)]
+    {
+        let p = canon_path.to_string_lossy().to_ascii_lowercase();
+        let d = canon_dir.to_string_lossy().to_ascii_lowercase();
+        !d.is_empty() && p.starts_with(&d)
+    }
+    #[cfg(not(windows))]
+    {
+        canon_path.starts_with(&canon_dir)
+    }
+}
+
+/// Файл лежит в локальном кэше чата (его можно удалять вместе с сообщением).
+pub fn is_under_file_cache(path: &std::path::Path) -> bool {
+    path_is_under(path, &file_cache_dir())
+}
+
+/// Кладёт копию в кэш чата (на диске — шифротекст). Исходный файл не трогает.
+pub fn copy_into_file_cache(
+    src: &std::path::Path,
+    transfer_id_hex: &str,
+    filename: &str,
+    key: &[u8; 32],
+) -> Result<std::path::PathBuf, String> {
+    if !src.is_file() {
+        return Err(format!("исходный файл не найден: {}", src.display()));
+    }
+    let dest = cache_path_for(transfer_id_hex, filename);
+    if dest.is_file() {
+        return Ok(dest);
+    }
+    let plain = if is_under_file_cache(src) {
+        read_cache_plain(src, key)?
+    } else {
+        std::fs::read(src).map_err(|e| format!("не удалось прочитать {}: {e}", src.display()))?
+    };
+    write_encrypted_cache(&dest, &plain, key)?;
+    Ok(dest)
+}
+
+/// Расшифровывает кэш в `Загрузки/VOID Messenger` (уникальное имя при конфликте).
+pub fn export_cached_to_downloads(
+    src: &std::path::Path,
+    filename: &str,
+    key: &[u8; 32],
+) -> Result<std::path::PathBuf, String> {
+    if !src.is_file() {
+        return Err("файла нет в локальном хранилище".into());
+    }
+    let dest = unique_download_path(filename);
+    let plain = read_cache_plain(src, key)?;
+    if let Some(parent) = dest.parent() {
+        std::fs::create_dir_all(parent)
+            .map_err(|e| format!("не удалось создать {}: {e}", parent.display()))?;
+    }
+    std::fs::write(&dest, &plain)
+        .map_err(|e| format!("не удалось записать {}: {e}", dest.display()))?;
+    Ok(dest)
+}
+
+/// Удаляет файл только если он в кэше чата — не Загрузки и не исходник пользователя.
+pub fn delete_cached_file(path: &std::path::Path) {
+    if path.is_file() && is_under_file_cache(path) {
+        let _ = std::fs::remove_file(path);
+    }
+}
+
+/// Каталоги поиска копии: кэш, затем устаревшие папки (миграция старых чатов).
 pub fn file_search_dirs() -> Vec<std::path::PathBuf> {
-    let mut dirs = vec![user_file_downloads_dir()];
-    let legacy = crate::paths::data_dir().join(DOWNLOADS_DIR);
-    if !dirs.iter().any(|d| d == &legacy) {
-        dirs.push(legacy);
+    let mut dirs = vec![file_cache_dir()];
+    let data = crate::paths::data_dir();
+    for extra in [
+        data.join(DOWNLOADS_DIR),
+        user_file_downloads_dir(),
+    ] {
+        if !dirs.iter().any(|d| d == &extra) {
+            dirs.push(extra);
+        }
     }
     dirs
 }
@@ -294,7 +536,7 @@ pub fn validate_inbound_file_packet(p: &FilePacket) -> Result<(), &'static str> 
             }
             Ok(())
         }
-        FilePacket::Accept { .. } | FilePacket::Cancel { .. } | FilePacket::Ack => Ok(()),
+        FilePacket::Accept { .. } | FilePacket::Cancel { .. } | FilePacket::Ack | FilePacket::Request { .. } => Ok(()),
     }
 }
 
@@ -331,6 +573,8 @@ pub enum FilePacket {
     },
     /// Либая сторона → другой: прервать передачу.
     Cancel { transfer_id: [u8; 16] },
+    /// Получатель → отправитель: пришли файл ещё раз (локальная копия удалена).
+    Request { transfer_id: [u8; 16] },
     /// Универсальное подтверждение (ответ на большинство пакетов).
     Ack,
 }
@@ -637,5 +881,21 @@ mod tests {
     fn clamp_utf8_respects_boundary() {
         let s = "абв"; // 6 bytes in UTF-8
         assert_eq!(clamp_utf8_by_bytes(s, 5).len(), 4);
+    }
+
+    #[test]
+    fn file_cache_roundtrip_and_wrong_key() {
+        let mut master = [0u8; 32];
+        master[0] = 7;
+        let key = derive_file_cache_key(&master);
+        let plain = b"secret-attachment-bytes";
+        let blob = encrypt_cache_blob(&key, plain).unwrap();
+        assert!(is_encrypted_cache_blob(&blob));
+        assert_ne!(&blob[8 + 12..], plain.as_slice());
+        assert_eq!(decrypt_cache_blob(&key, &blob).unwrap(), plain);
+        let mut other = master;
+        other[0] = 9;
+        let bad = derive_file_cache_key(&other);
+        assert!(decrypt_cache_blob(&bad, &blob).is_err());
     }
 }

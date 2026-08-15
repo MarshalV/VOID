@@ -2368,6 +2368,9 @@ impl eframe::App for App {
                         TOAST_TTL_LONG,
                     );
                 }
+                NetworkEvent::FileResendRequest { from, transfer_id } => {
+                    let _ = (from, transfer_id);
+                }
                 NetworkEvent::BootstrapsLearned(addrs) => {
                     self.merge_learned_bootstraps(addrs);
                 }

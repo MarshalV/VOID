@@ -30,8 +30,9 @@ use crate::network::{run_chat_network, NetworkEvent, OfflineOutboxItem, UIComman
 use crate::offline_mail::open_envelope;
 use crate::outbox::{Outbox, OutboxEntry};
 use crate::protocol::{
-    build_group_sync_json, new_message_id, parse_decrypted_chat_frame, transfer_id_to_hex,
-    ChatMessage, DecryptedChatFrame, FileMeta, OutgoingDeliveryStatus,
+    build_group_sync_json, new_message_id, parse_decrypted_chat_frame, per_peer_voice_transfer_id,
+    transfer_id_from_hex, transfer_id_to_hex, ChatMessage, DecryptedChatFrame, FileMeta,
+    OutgoingDeliveryStatus,
 };
 use crate::shared_chat::SharedChatMessages;
 use crate::vault::{
@@ -634,17 +635,94 @@ impl Inner {
         if let Some(p) = self.lookup_file_path(&tid) {
             return (Some(p), false);
         }
+        let cached = file_transfer::cache_path_for(&tid, &f.filename);
+        if cached.is_file() {
+            let s = cached.display().to_string();
+            self.bind_file_local_path(&tid, &s);
+            return (Some(s), false);
+        }
+        let legacy = file_transfer::legacy_cache_path(&tid, &f.filename);
+        if legacy.is_file() {
+            let s = legacy.display().to_string();
+            self.bind_file_local_path(&tid, &s);
+            return (Some(s), false);
+        }
         if self.expecting_files.contains(&tid) {
             return (None, false);
         }
-        if f.local_path.is_none() {
-            if let Some(found) = Self::find_downloaded_file(&f.filename) {
-                self.bind_file_local_path(&tid, &found);
-                return (Some(found), false);
+        if let Some(found) = Self::find_downloaded_file(&f.filename) {
+            self.bind_file_local_path(&tid, &found);
+            return (Some(found), false);
+        }
+        (None, true)
+    }
+
+    fn file_cache_key(&self) -> Result<[u8; 32], String> {
+        self.vault_master_key
+            .as_ref()
+            .map(|k| file_transfer::derive_file_cache_key(k))
+            .ok_or_else(|| "Сначала разблокируйте vault".into())
+    }
+
+    fn unlink_cached_files(&mut self, msgs: &[ChatMessage]) {
+        for m in msgs {
+            if let Some(f) = &m.file {
+                let tid = f.transfer_id.to_ascii_lowercase();
+                self.file_paths.remove(&tid);
+                self.expecting_files.remove(&tid);
+                if let Some(p) = &f.local_path {
+                    file_transfer::delete_cached_file(std::path::Path::new(p));
+                }
+                file_transfer::delete_cached_file(&file_transfer::cache_path_for(
+                    &tid,
+                    &f.filename,
+                ));
+                file_transfer::delete_cached_file(&file_transfer::legacy_cache_path(
+                    &tid,
+                    &f.filename,
+                ));
             }
         }
-        // Нет файла на диске и передачи нет — не крутим «загрузка…» вечно.
-        (None, true)
+    }
+
+    fn find_resend_path(&self, requested: &[u8; 16], from: PeerId) -> Option<String> {
+        let req_hex = transfer_id_to_hex(requested);
+        if let Some(p) = self.lookup_file_path(&req_hex) {
+            return Some(p);
+        }
+        let local = self.local_peer_id?;
+        let cands: Vec<(String, Option<String>)> = {
+            let map = self.messages.lock();
+            map.values()
+                .flatten()
+                .filter_map(|m| {
+                    m.file
+                        .as_ref()
+                        .map(|f| (f.transfer_id.clone(), f.local_path.clone()))
+                })
+                .collect()
+        };
+        for (tid_hex, local_path) in cands {
+            let path = local_path
+                .filter(|p| std::path::Path::new(p).is_file())
+                .or_else(|| self.lookup_file_path(&tid_hex));
+            let Some(path) = path else {
+                continue;
+            };
+            if tid_hex.eq_ignore_ascii_case(&req_hex) {
+                return Some(path);
+            }
+            let Some(stored) = transfer_id_from_hex(&tid_hex) else {
+                continue;
+            };
+            if per_peer_voice_transfer_id(&stored, from) == *requested {
+                return Some(path);
+            }
+            if per_peer_voice_transfer_id(requested, local) == stored {
+                return Some(path);
+            }
+        }
+        None
     }
 
     fn file_message_exists(&self, tid_hex: &str) -> bool {
@@ -1913,7 +1991,9 @@ impl VoidRuntime {
                                     peer,
                                     &tid,
                                     &filename,
-                                    std::fs::metadata(&saved_to).map(|m| m.len()).unwrap_or(0),
+                                    file_transfer::advertised_plain_size(std::path::Path::new(
+                                        &saved_to,
+                                    )),
                                     is_outgoing,
                                 );
                                 if !saved_to.is_empty() {
@@ -1938,6 +2018,31 @@ impl VoidRuntime {
                             bridge_evs.push(BridgeEvent::Status {
                                 text: reason,
                             });
+                        }
+                        NetworkEvent::FileResendRequest { from, transfer_id } => {
+                            if let Some(path) = g.find_resend_path(&transfer_id, from) {
+                                let kind = file_transfer::FileKind::from_filename(
+                                    &file_transfer::safe_filename(&path),
+                                );
+                                g.ensure_peer_routed(from);
+                                if let Some(tx) = &g.command_tx {
+                                    let _ = tx.try_send(UICommand::EnsureChatSession(from));
+                                    let _ = tx.try_send(UICommand::SendFile {
+                                        recipient: from,
+                                        path,
+                                        kind,
+                                        message_id: None,
+                                        transfer_id: Some(transfer_id),
+                                        sender_name: String::new(),
+                                    });
+                                }
+                            } else if let Some(tx) = &g.command_tx {
+                                let _ = tx.try_send(UICommand::RejectFile {
+                                    transfer_id,
+                                    from,
+                                    reason: "файла больше нет".into(),
+                                });
+                            }
                         }
                         NetworkEvent::VoiceAck {
                             peer,
@@ -2298,6 +2403,7 @@ impl VoidRuntime {
                 let outbox = Outbox::load(&master_arr).unwrap_or_default();
 
                 if !self.network_started.swap(true, Ordering::SeqCst) {
+                    let file_cache_key = file_transfer::derive_file_cache_key(&master_arr);
                     self.tokio_handle.spawn(run_chat_network(
                         command_rx,
                         event_tx,
@@ -2307,6 +2413,7 @@ impl VoidRuntime {
                         network_bootstraps,
                         contact_addrs_flat,
                         messages.clone(),
+                        file_cache_key,
                     ));
                     let mut g = self.inner.lock().unwrap_or_else(|p| p.into_inner());
                     g.unlocked = true;
@@ -2427,6 +2534,7 @@ impl VoidRuntime {
                 })?;
 
                 if !self.network_started.swap(true, Ordering::SeqCst) {
+                    let file_cache_key = file_transfer::derive_file_cache_key(&master_arr);
                     self.tokio_handle.spawn(run_chat_network(
                         command_rx,
                         event_tx,
@@ -2436,6 +2544,7 @@ impl VoidRuntime {
                         Vec::new(),
                         Vec::new(),
                         messages.clone(),
+                        file_cache_key,
                     ));
                     let mut g = self.inner.lock().unwrap_or_else(|p| p.into_inner());
                     g.unlocked = true;
@@ -2666,13 +2775,13 @@ impl VoidRuntime {
         if g.selected_chat == peer_id {
             g.selected_chat.clear();
         }
-        let ids: Vec<String> = g
+        let msgs = g
             .messages
             .lock()
-            .get(&peer_id)
-            .map(|v| v.iter().map(|m| m.id.clone()).collect())
+            .remove(&peer_id)
             .unwrap_or_default();
-        g.messages.lock().remove(&peer_id);
+        let ids: Vec<String> = msgs.iter().map(|m| m.id.clone()).collect();
+        g.unlink_cached_files(&msgs);
         g.messages.mark_deleted(ids);
         g.messages.mark_dirty();
         g.persist_journal();
@@ -2713,13 +2822,13 @@ impl VoidRuntime {
         let mut g = self.inner.lock().unwrap_or_else(|p| p.into_inner());
         let pid: PeerId = peer_id.parse().map_err(|_| "Неверный PeerId")?;
         let peer_str = pid.to_string();
-        let ids: Vec<String> = g
+        let msgs = g
             .messages
             .lock()
-            .get(&peer_str)
-            .map(|v| v.iter().map(|m| m.id.clone()).collect())
+            .remove(&peer_str)
             .unwrap_or_default();
-        g.messages.lock().remove(&peer_str);
+        let ids: Vec<String> = msgs.iter().map(|m| m.id.clone()).collect();
+        g.unlink_cached_files(&msgs);
         g.messages.mark_deleted(ids);
         g.messages.mark_dirty();
         g.persist_journal();
@@ -2818,6 +2927,15 @@ impl VoidRuntime {
         let mut tid = [0u8; 16];
         rand::thread_rng().fill_bytes(&mut tid);
         let tid_hex = transfer_id_to_hex(&tid);
+        let key = g.file_cache_key()?;
+        let path = file_transfer::copy_into_file_cache(
+            std::path::Path::new(&path),
+            &tid_hex,
+            &filename,
+            &key,
+        )?
+        .display()
+        .to_string();
         g.register_file_path(&tid_hex, path.clone());
         let kind = file_transfer::FileKind::from_filename(&filename);
         let file_meta = FileMeta {
@@ -2908,6 +3026,75 @@ impl VoidRuntime {
                 });
             }
         }
+        drop(g);
+        self.emit_snapshot();
+        Ok(self.get_snapshot())
+    }
+
+    pub fn save_file_to_downloads(&self, transfer_id_hex: String) -> Result<String, String> {
+        let tid_hex = transfer_id_hex.to_ascii_lowercase();
+        let g = self.inner.lock().unwrap_or_else(|p| p.into_inner());
+        let chat = g.selected_chat.clone();
+        if chat.is_empty() {
+            return Err("Выберите чат".into());
+        }
+        let (filename, journal_path) = {
+            let map = g.messages.lock();
+            map.get(&chat)
+                .and_then(|msgs| {
+                    msgs.iter().find_map(|m| {
+                        m.file.as_ref().and_then(|f| {
+                            f.transfer_id.eq_ignore_ascii_case(&tid_hex).then(|| {
+                                (f.filename.clone(), f.local_path.clone())
+                            })
+                        })
+                    })
+                })
+                .ok_or_else(|| "файл не найден в чате".to_string())?
+        };
+        let src = journal_path
+            .filter(|p| std::path::Path::new(p).is_file())
+            .or_else(|| g.lookup_file_path(&tid_hex))
+            .or_else(|| {
+                let p = file_transfer::cache_path_for(&tid_hex, &filename);
+                p.is_file().then(|| p.display().to_string())
+            })
+            .or_else(|| {
+                let p = file_transfer::legacy_cache_path(&tid_hex, &filename);
+                p.is_file().then(|| p.display().to_string())
+            })
+            .ok_or_else(|| "файла нет в локальном хранилище".to_string())?;
+        let key = g.file_cache_key()?;
+        drop(g);
+        let dest = file_transfer::export_cached_to_downloads(
+            std::path::Path::new(&src),
+            &filename,
+            &key,
+        )?;
+        Ok(dest.display().to_string())
+    }
+
+    pub fn delete_message(&self, message_id: String) -> Result<SnapshotDto, String> {
+        let mut g = self.inner.lock().unwrap_or_else(|p| p.into_inner());
+        let chat = g.selected_chat.clone();
+        if chat.is_empty() {
+            return Err("Выберите чат".into());
+        }
+        let removed = {
+            let mut map = g.messages.lock();
+            map.get_mut(&chat).and_then(|list| {
+                list.iter()
+                    .position(|m| m.id == message_id)
+                    .map(|idx| list.remove(idx))
+            })
+        };
+        let Some(msg) = removed else {
+            return Err("сообщение не найдено".into());
+        };
+        g.unlink_cached_files(std::slice::from_ref(&msg));
+        g.messages.mark_deleted(vec![msg.id.clone()]);
+        g.messages.mark_dirty();
+        g.persist_journal();
         drop(g);
         self.emit_snapshot();
         Ok(self.get_snapshot())

@@ -201,6 +201,30 @@ fn send_file(state: State<'_, Mutex<AppState>>, path: String) -> Result<Snapshot
 }
 
 #[tauri::command]
+fn save_file_to_downloads(
+    state: State<'_, Mutex<AppState>>,
+    transfer_id: String,
+) -> Result<String, String> {
+    state
+        .lock()
+        .map_err(|e| e.to_string())?
+        .runtime
+        .save_file_to_downloads(transfer_id)
+}
+
+#[tauri::command]
+fn delete_message(
+    state: State<'_, Mutex<AppState>>,
+    message_id: String,
+) -> Result<SnapshotDto, String> {
+    state
+        .lock()
+        .map_err(|e| e.to_string())?
+        .runtime
+        .delete_message(message_id)
+}
+
+#[tauri::command]
 fn accept_file(
     state: State<'_, Mutex<AppState>>,
     transfer_id: String,
@@ -548,6 +572,8 @@ pub fn run() {
             snapshot_dht,
             set_nickname,
             send_file,
+            save_file_to_downloads,
+            delete_message,
             accept_file,
             reject_file,
             downloads_path,

@@ -256,7 +256,7 @@ button.icon-btn img {
   gap: 0.7rem;
   align-items: center;
   min-width: 220px;
-  cursor: pointer;
+  cursor: default;
 }
 .file-icon {
   width: 2.2rem;
@@ -270,9 +270,39 @@ button.icon-btn img {
 .file-name { font-weight: 600; word-break: break-all; }
 .file-size { font-size: 0.82rem; color: var(--muted); }
 .file-card.pending { opacity: 0.65; }
-.file-card.missing {
-  opacity: 0.55;
-  cursor: default;
+.file-card.missing { opacity: 0.85; }
+.file-actions {
+  display: flex;
+  gap: 0.35rem;
+  align-items: center;
+}
+.file-dl,
+.file-del {
+  border: 0;
+  cursor: pointer;
+  font: inherit;
+}
+.file-dl {
+  padding: 0.28rem 0.55rem;
+  border-radius: 8px;
+  background: rgba(62, 207, 142, 0.22);
+  color: var(--accent);
+  font-size: 0.78rem;
+  font-weight: 600;
+}
+.file-dl:hover { filter: brightness(1.12); }
+.file-del {
+  width: 1.7rem;
+  height: 1.7rem;
+  border-radius: 8px;
+  background: transparent;
+  color: var(--muted);
+  font-size: 1.1rem;
+  line-height: 1;
+}
+.file-del:hover {
+  background: rgba(255, 80, 80, 0.16);
+  color: #ff8080;
 }
 
 .beacon {
