@@ -1820,7 +1820,9 @@ impl VoidRuntime {
                         NetworkEvent::Disconnected(pid) | NetworkEvent::MdnsExpired(pid) => {
                             g.connected_peer_ids.remove(&pid);
                             g.recount_connected();
-                            if g.bootstrap_connected_count() == 0 {
+                            if g.bootstrap_connected_count() == 0
+                                && !g.listen_addrs.iter().any(|a| a.contains("p2p-circuit"))
+                            {
                                 g.relay_hop_ready = false;
                             }
                             bridge_evs.push(BridgeEvent::Peer {

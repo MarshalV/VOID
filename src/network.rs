@@ -724,7 +724,7 @@ fn ensure_bootstrap_relay_listens(
         if relay_hop_pending.contains(&relay_pid) {
             if relay_listen_attempt_at
                 .get(&relay_pid)
-                .is_some_and(|t| t.elapsed() < Duration::from_secs(45))
+                .is_some_and(|t| t.elapsed() < Duration::from_secs(12))
             {
                 continue;
             }
@@ -1804,7 +1804,12 @@ fn query_relay_mailbox(
     swarm: &mut libp2p::Swarm<ChatBehaviour>,
     local_peer_id: PeerId,
     bootstrap_peer_ids: &HashSet<PeerId>,
-) {
+    last_query_at: &mut Option<Instant>,
+) -> bool {
+    const MIN_GAP: Duration = Duration::from_millis(750);
+    if last_query_at.is_some_and(|t| t.elapsed() < MIN_GAP) {
+        return false;
+    }
     let packet = V1Packet::OfflineMailboxQuery {
         recipient: local_peer_id.to_string(),
     };
@@ -1821,12 +1826,17 @@ fn query_relay_mailbox(
             .filter(|p| *p != local_peer_id)
             .collect()
     };
+    if peers.is_empty() {
+        return false;
+    }
+    *last_query_at = Some(Instant::now());
     for peer in peers {
         let _ = swarm
             .behaviour_mut()
             .request_response
             .send_request(&peer, packet.clone());
     }
+    true
 }
 
 fn query_relay_mailbox_with_bootstraps(
@@ -1834,9 +1844,10 @@ fn query_relay_mailbox_with_bootstraps(
     local_peer_id: PeerId,
     bootstrap_peer_ids: &HashSet<PeerId>,
     void_bootstraps: &[Multiaddr],
-) {
+    last_query_at: &mut Option<Instant>,
+) -> bool {
     dial_missing_bootstraps(swarm, bootstrap_peer_ids, void_bootstraps);
-    query_relay_mailbox(swarm, local_peer_id, bootstrap_peer_ids);
+    query_relay_mailbox(swarm, local_peer_id, bootstrap_peer_ids, last_query_at)
 }
 
 async fn remember_peer_prekey(
@@ -2675,6 +2686,7 @@ pub async fn run_chat_network(
         let mut pending_kad_mail: HashMap<kad::QueryId, MailboxKadOp> = HashMap::new();
         let mut relay_mail_store = RelayMailbox::load();
         let mut fetch_mailbox_after = Some(Instant::now() + Duration::from_secs(5));
+        let mut last_mailbox_query_at: Option<Instant> = None;
         let mut mailbox_fetch_attempts: u32 = 0;
         const MAX_MAILBOX_FETCH_ATTEMPTS: u32 = 30;
 
@@ -2870,7 +2882,7 @@ pub async fn run_chat_network(
         provider_tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
         let mut gossip_tick = tokio::time::interval(Duration::from_secs(2 * 60));
         gossip_tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
-        let mut mailbox_tick = tokio::time::interval(Duration::from_secs(2));
+        let mut mailbox_tick = tokio::time::interval(Duration::from_millis(500));
         mailbox_tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
 
         // Первый tick() у interval сразу готов. Если обработать его до
@@ -2887,22 +2899,28 @@ pub async fn run_chat_network(
                 _ = mailbox_tick.tick() => {
                     if let Some(deadline) = fetch_mailbox_after {
                         if Instant::now() >= deadline {
-                            mailbox_fetch_attempts = mailbox_fetch_attempts.saturating_add(1);
                             // Почта только с bootstrap-нод (RR), без DHT-ящика.
-                            query_relay_mailbox_with_bootstraps(
+                            let sent = query_relay_mailbox_with_bootstraps(
                                 &mut swarm,
                                 local_peer_id,
                                 &bootstrap_peer_ids,
                                 &void_bootstraps,
+                                &mut last_mailbox_query_at,
                             );
-                            // Частый poll: без живого circuit доставка только через
-                            // ящик; 10–30 с выглядели как «сообщения идут очень долго».
-                            let gap = if mailbox_fetch_attempts < MAX_MAILBOX_FETCH_ATTEMPTS {
-                                Duration::from_secs(2)
-                            } else {
-                                Duration::from_secs(5)
-                            };
-                            fetch_mailbox_after = Some(Instant::now() + gap);
+                            if sent {
+                                mailbox_fetch_attempts =
+                                    mailbox_fetch_attempts.saturating_add(1);
+                                // Частый poll: без живого circuit доставка только через
+                                // ящик; 10–30 с выглядели как «сообщения идут очень долго».
+                                let gap = if mailbox_fetch_attempts
+                                    < MAX_MAILBOX_FETCH_ATTEMPTS
+                                {
+                                    Duration::from_secs(2)
+                                } else {
+                                    Duration::from_secs(5)
+                                };
+                                fetch_mailbox_after = Some(Instant::now() + gap);
+                            }
                         }
                     }
                 }
@@ -2971,14 +2989,14 @@ pub async fn run_chat_network(
                                 &relay_circuit_reserved,
                                 &mut relay_listen_attempt_at,
                                 &mut relay_hop_pending,
-                                Duration::from_secs(30),
+                                Duration::from_secs(8),
                                 Some(&event_tx),
                             );
                             for p in &due {
                                 if swarm.is_connected(p) && !relay_circuit_reserved.contains(p)
                                 {
                                     hop_listen_after
-                                        .insert(*p, Instant::now() + Duration::from_secs(30));
+                                        .insert(*p, Instant::now() + Duration::from_secs(8));
                                 }
                             }
                         }
@@ -4509,6 +4527,7 @@ pub async fn run_chat_network(
                                     &mut swarm,
                                     local_peer_id,
                                     &bootstrap_peer_ids,
+                                    &mut last_mailbox_query_at,
                                 );
                             }
                             UICommand::PublishOfflineOutbox { items, ack } => {
@@ -5598,12 +5617,11 @@ pub async fn run_chat_network(
                                                 let _ = event_tx
                                                     .send(NetworkEvent::OfflineMailbox(envelopes))
                                                     .await;
-                                                // take_batch отдаёт порциями — сразу
-                                                // запрашиваем остаток ящика.
-                                                query_relay_mailbox(
-                                                    &mut swarm,
-                                                    local_peer_id,
-                                                    &bootstrap_peer_ids,
+                                                // Остаток ящика — следующим тиком, не сразу.
+                                                // Мгновенный Query + copy_batch на ноде = tight
+                                                // loop, yamux saturates, Hop не проходит.
+                                                fetch_mailbox_after = Some(
+                                                    Instant::now() + Duration::from_millis(500),
                                                 );
                                             }
                                         }
@@ -6347,13 +6365,8 @@ pub async fn run_chat_network(
                                  let _ = event_tx.send(NetworkEvent::Status(format!("✅ СОЕДИНЕНО: {}", &peer_id.to_string()[..8]))).await;
                                  // Bootstrap: Identify + ping сначала, иначе RR/kad.bootstrap
                                  // открывают второй dial и рвут только что поднятый TCP.
-                                 if !bootstrap_peer_ids.contains(&peer_id) {
-                                     query_relay_mailbox(
-                                         &mut swarm,
-                                         local_peer_id,
-                                         &bootstrap_peer_ids,
-                                     );
-                                 }
+                                 // Ящик только у bootstrap — не Query на каждый контакт
+                                 // (лишние RR-стримы душат Hop).
                                  // Сразу делимся bootstrap-нодами с любым подключённым VOID-клиентом.
                                  if !bootstrap_peer_ids.contains(&peer_id) {
                                      let gossip = bootstrap_gossip_strings(&void_bootstraps);
@@ -6667,6 +6680,7 @@ pub async fn run_chat_network(
                                 }
                             );
                             if is_bootstrap {
+                                bootstrap_peer_ids.insert(peer_id);
                                 if let Some(pk) =
                                     crate::onion::parse_pk_from_agent(&info.agent_version)
                                 {
@@ -6710,6 +6724,7 @@ pub async fn run_chat_network(
                                         &mut swarm,
                                         local_peer_id,
                                         &bootstrap_peer_ids,
+                                        &mut last_mailbox_query_at,
                                     );
                                     publish_self_prekey_to_bootstraps(
                                         &mut swarm,
@@ -6719,7 +6734,7 @@ pub async fn run_chat_network(
                                     );
                                     hop_listen_after.insert(
                                         peer_id,
-                                        Instant::now() + Duration::from_secs(30),
+                                        Instant::now() + Duration::from_secs(3),
                                     );
                                     ensure_bootstrap_relay_listens(
                                         &mut swarm,
