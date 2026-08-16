@@ -360,6 +360,15 @@ fn expand_dial_addrs(
     // Prefer LAN, then TCP. Never dial QUIC in the same attempt as TCP:
     // libp2p concurrent-dial aborts the TCP session when QUIC "wins".
     direct = prefer_tcp_if_available(direct);
+    // Два TCP на тот же host:port (vault + Identify) → concurrent dial → оба Closed.
+    {
+        let mut seen: HashSet<String> = HashSet::new();
+        direct.retain(|a| {
+            let s = a.to_string();
+            let base = s.split("/p2p/").next().unwrap_or(&s);
+            seen.insert(base.to_string())
+        });
+    }
     direct.sort_by_key(|a| if is_likely_lan_addr(a) { 0u8 } else { 1u8 });
 
     let mut circuits: Vec<Multiaddr> = Vec::new();
@@ -1786,34 +1795,20 @@ fn build_void_swarm(
         .map_err(|e| format!("with_relay_client: {:?}", e))?
         .with_behaviour(|key, relay_client| {
             let local_peer_id = key.public().to_peer_id();
+            let _ = void_bootstraps;
+            let _ = contact_seed_addrs;
 
             let kad_store = kad::store::MemoryStore::new(local_peer_id);
             let mut kad_config = kad::Config::new(StreamProtocol::new("/void/kad/1.0.0"));
-            kad_config.set_periodic_bootstrap_interval(Some(Duration::from_secs(2 * 60)));
+            kad_config.set_periodic_bootstrap_interval(Some(Duration::from_secs(5 * 60)));
             kad_config.set_query_timeout(Duration::from_secs(15));
+            // Manual: add_address при сборке swarm сразу вставляет bootstrap в
+            // k-bucket → Kademlia сама делает bootstrap() и второй TCP рядом
+            // с нашим dial; оба закрываются yamux Closed за 1 мс.
+            kad_config.set_kbucket_inserts(kad::BucketInserts::Manual);
             let mut kad = kad::Behaviour::with_config(local_peer_id, kad_store, kad_config);
             kad.set_mode(Some(libp2p::kad::Mode::Server));
-
-            let mut kad_by_peer: HashMap<PeerId, Vec<Multiaddr>> = HashMap::new();
-            for ma in void_bootstraps {
-                if let Some(pid) = peer_id_from_multiaddr(ma) {
-                    kad_by_peer.entry(pid).or_default().push(ma.clone());
-                } else {
-                    warn!("VOID bootstrap: нет /p2p/ в конце адреса, пропуск: {}", ma);
-                }
-            }
-            for (pid, addrs) in kad_by_peer {
-                for ma in prefer_tcp_if_available(addrs) {
-                    kad.add_address(&pid, ma);
-                }
-            }
-            for (pid, ma) in contact_seed_addrs {
-                kad.add_address(pid, ma.clone());
-            }
-            // Не вызываем kad.bootstrap() здесь: параллельный dial с
-            // dial_missing_bootstraps даёт два QUIC к одной ноде — оба
-            // сразу закрываются ApplicationClosed. Периодический bootstrap
-            // Kademlia остаётся (интервал ниже).
+            // Адреса в DHT — только после живого TCP (Identify).
 
             let rr_config = libp2p::request_response::Config::default()
                 .with_request_timeout(Duration::from_secs(60))
@@ -2703,11 +2698,8 @@ pub async fn run_chat_network(
                 dial_peer_best_effort(&mut swarm, pid, addrs, &void_bootstraps);
             }
         }
-
-        publish_self_in_dht(&mut swarm.behaviour_mut().kad, local_peer_id);
-        publish_self_prekey(&mut swarm, local_peer_id, &my_public_key_bytes);
-        // kad.bootstrap() только после ConnectionEstablished: иначе второй
-        // параллельный dial (часто QUIC) закрывает только что поднятый TCP.
+        // Не start_providing / put_record до Identify: Kademlia сама наберёт
+        // bootstrap вторым TCP и обе сессии сразу умрут.
 
         let mut peer_addrs: HashMap<PeerId, Vec<Multiaddr>> = HashMap::new();
         let mut pending_dials: HashSet<PeerId> = HashSet::new();
@@ -6557,7 +6549,27 @@ pub async fn run_chat_network(
                                 if swarm.is_connected(&peer_id)
                                     && bootstrap_identified.insert(peer_id)
                                 {
+                                    for ma in prefer_tcp_if_available(
+                                        void_bootstraps
+                                            .iter()
+                                            .filter(|m| {
+                                                peer_id_from_multiaddr(m) == Some(peer_id)
+                                            })
+                                            .cloned()
+                                            .collect(),
+                                    ) {
+                                        swarm.behaviour_mut().kad.add_address(&peer_id, ma);
+                                    }
                                     let _ = swarm.behaviour_mut().kad.bootstrap();
+                                    publish_self_in_dht(
+                                        &mut swarm.behaviour_mut().kad,
+                                        local_peer_id,
+                                    );
+                                    publish_self_prekey(
+                                        &mut swarm,
+                                        local_peer_id,
+                                        &my_public_key_bytes,
+                                    );
                                     query_relay_mailbox(
                                         &mut swarm,
                                         local_peer_id,
