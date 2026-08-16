@@ -492,8 +492,16 @@ fn dial_peer_with_condition(
         );
         return;
     }
-    live_boot.extend(cold_boot);
-    let boot = live_boot;
+    // Circuit через cold bootstrap = ещё один TCP к ноде рядом со стартовым
+    // dial — libp2p закрывает оба (yamux Closed за 1 мс). Для обычного dial
+    // circuit только через уже живой relay.
+    let boot = if circuits_only {
+        let mut b = live_boot;
+        b.extend(cold_boot);
+        b
+    } else {
+        live_boot
+    };
     let clean = if circuits_only {
         let mut circuits = Vec::new();
         for relay_ma in &boot {
@@ -2677,31 +2685,8 @@ pub async fn run_chat_network(
         };
         let _ = event_tx.send(NetworkEvent::Status(startup_status)).await;
 
-        // Сразу пробуем дозвониться до сохранённых контактов: если они онлайн и
-        // их адрес не сменился — связь появится в первые же секунды без
-        // ручного «ПОДКЛЮЧИТЬ».
-        //
-        // ВАЖНО: все адреса одного пира собираем в ОДИН DialOpts, иначе второй
-        // и третий вызовы отклоняются условием DisconnectedAndNotDialing (пир уже
-        // "Dialing"), и при устаревшем первом адресе подключение молча падает —
-        // libp2p не пробует следующий адрес из другого DialOpts.
-        {
-            let mut grouped: HashMap<PeerId, Vec<Multiaddr>> = HashMap::new();
-            for (pid, ma) in &contact_seed_addrs {
-                grouped.entry(*pid).or_default().push(ma.clone());
-            }
-            for (pid, addrs) in &grouped {
-                debug!(
-                    "📇 Стартовый dial контакта {} ({} адр.)",
-                    &pid.to_string()[..8],
-                    addrs.len()
-                );
-                dial_peer_best_effort(&mut swarm, *pid, addrs.clone(), &void_bootstraps);
-            }
-        }
-
-        // Bootstrap-узлы: явный dial + регистрация в DHT. Без прямого dial
-        // kad.bootstrap() часто не наполняет таблицу достаточно быстро.
+        // Только bootstrap. Circuit к контактам до живого Hop открывает второй
+        // TCP к ноде — оба сразу закрываются (yamux Closed).
         {
             let mut grouped: HashMap<PeerId, Vec<Multiaddr>> = HashMap::new();
             for ma in &void_bootstraps {
@@ -3258,14 +3243,8 @@ pub async fn run_chat_network(
                                         local_peer_id,
                                     );
                                 }
-                                dial_unconnected_contacts(
-                                    &mut swarm,
-                                    &reconnect_targets,
-                                    &bootstrap_peer_ids,
-                                    &void_bootstraps,
-                                    &mut contact_dial_at,
-                                    Duration::from_secs(2),
-                                );
+                                // Не dial здесь: команда приходит в ту же миллисекунду, что
+                                // стартовый bootstrap, и circuit открывает второй TCP.
                             }
                             UICommand::ForgetContact(peer_id) => {
                                 reconnect_targets.remove(&peer_id);
@@ -4477,12 +4456,12 @@ pub async fn run_chat_network(
                                 }
                             }
                             UICommand::FetchOfflineMailbox => {
-                                // Только bootstrap-ноды — без DHT-ящика.
-                                query_relay_mailbox_with_bootstraps(
+                                // Только query, без dial: иначе Unlock шлёт это до
+                                // первого swarm.poll и дублирует стартовый TCP.
+                                query_relay_mailbox(
                                     &mut swarm,
                                     local_peer_id,
                                     &bootstrap_peer_ids,
-                                    &void_bootstraps,
                                 );
                             }
                             UICommand::PublishOfflineOutbox { items, ack } => {
@@ -6238,19 +6217,13 @@ pub async fn run_chat_network(
                                 // и не дёргаем mailbox заново.
                                 continue;
                             }
-                            publish_self_in_dht(&mut swarm.behaviour_mut().kad, local_peer_id);
+                            if !bootstrap_peer_ids.contains(&peer_id) {
+                                publish_self_in_dht(&mut swarm.behaviour_mut().kad, local_peer_id);
+                            }
 
                              if peer_id != local_peer_id {
-                                 if bootstrap_peer_ids.contains(&peer_id) {
-                                     dial_unconnected_contacts(
-                                         &mut swarm,
-                                         &reconnect_targets,
-                                         &bootstrap_peer_ids,
-                                         &void_bootstraps,
-                                         &mut contact_dial_at,
-                                         Duration::from_secs(5),
-                                     );
-                                 }
+                                 // Контакты через circuit — только после Hop Ack,
+                                 // иначе Listen/circuit делают второй dial к ноде.
                                  // E2EE только с VOID-чат пирами, не с bootstrap/DHT-узлами.
                                  let needs_handshake = !sessions.contains_key(&peer_id)
                                      && !bootstrap_peer_ids.contains(&peer_id);
