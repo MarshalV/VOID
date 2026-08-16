@@ -1740,11 +1740,13 @@ impl Inner {
                 .unwrap_or(0.0),
             voice_preview_path: self.voice_preview_path.clone(),
             voice_preview_duration: self.voice_preview_duration,
-            revision: {
-                self.snapshot_rev = self.snapshot_rev.saturating_add(1);
-                self.snapshot_rev
-            },
+            revision: self.snapshot_rev,
         }
+    }
+
+    fn bump_snapshot(&mut self) -> SnapshotDto {
+        self.snapshot_rev = self.snapshot_rev.saturating_add(1);
+        self.snapshot()
     }
 }
 
@@ -2264,7 +2266,7 @@ impl VoidRuntime {
                         continue;
                     }
                     g.snapshot_dirty = false;
-                    g.snapshot()
+                    g.bump_snapshot()
                 };
                 let _ = flush_bridge.send(BridgeEvent::Snapshot(snap));
             }
@@ -2294,7 +2296,7 @@ impl VoidRuntime {
     fn emit_snapshot(&self) {
         let snap = {
             let mut g = self.inner.lock().unwrap_or_else(|p| p.into_inner());
-            g.snapshot()
+            g.bump_snapshot()
         };
         let _ = self.bridge_tx.send(BridgeEvent::Snapshot(snap));
     }
@@ -2651,7 +2653,7 @@ impl VoidRuntime {
     }
 
     pub fn select_chat(&self, chat_id: String) -> SnapshotDto {
-        {
+        let snap = {
             let mut g = self.inner.lock().unwrap_or_else(|p| p.into_inner());
             g.selected_chat = chat_id.clone();
             if group::parse_group_thread_key(&chat_id).is_none() {
@@ -2676,9 +2678,10 @@ impl VoidRuntime {
                     }
                 }
             }
-        }
-        self.emit_snapshot();
-        self.get_snapshot()
+            g.bump_snapshot()
+        };
+        let _ = self.bridge_tx.send(BridgeEvent::Snapshot(snap.clone()));
+        snap
     }
 
     pub fn send_message(&self, text: String) -> Result<SnapshotDto, String> {

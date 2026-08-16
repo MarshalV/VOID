@@ -6719,7 +6719,18 @@ pub async fn run_chat_network(
                                     );
                                     hop_listen_after.insert(
                                         peer_id,
-                                        Instant::now() + Duration::from_millis(500),
+                                        Instant::now() + Duration::from_secs(30),
+                                    );
+                                    ensure_bootstrap_relay_listens(
+                                        &mut swarm,
+                                        &bootstrap_peer_ids,
+                                        &void_bootstraps,
+                                        &reconnect_targets,
+                                        &relay_circuit_reserved,
+                                        &mut relay_listen_attempt_at,
+                                        &mut relay_hop_pending,
+                                        Duration::ZERO,
+                                        Some(&event_tx),
                                     );
                                     let _ = event_tx
                                         .send(NetworkEvent::Status(

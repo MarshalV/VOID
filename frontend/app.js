@@ -165,7 +165,7 @@
   function applySnapshotNow(s) {
     if (!s) return;
     const rev = Number(s.revision || 0);
-    if (lastSnapRev && (!rev || rev < lastSnapRev)) return;
+    if (lastSnapRev && rev && rev < lastSnapRev) return;
     if (rev) lastSnapRev = Math.max(lastSnapRev, rev);
     snapshot = s;
     if (s.unlocked) {
@@ -247,7 +247,7 @@
   function applySnapshot(s, immediate) {
     if (!s) return;
     const rev = Number(s.revision || 0);
-    if (lastSnapRev && (!rev || rev < lastSnapRev)) return;
+    if (lastSnapRev && rev && rev < lastSnapRev) return;
     if (immediate) {
       if (snapTimer) {
         clearTimeout(snapTimer);
@@ -257,6 +257,8 @@
       applySnapshotNow(s);
       return;
     }
+    const pendingRev = Number(pendingSnap?.revision || 0);
+    if (pendingSnap && pendingRev && rev && rev < pendingRev) return;
     pendingSnap = s;
     if (snapTimer) return;
     snapTimer = setTimeout(() => {
@@ -298,8 +300,13 @@
         : c.last_preview || (c.is_group ? "Группа" : c.peer_id.slice(0, 20));
       item.addEventListener("click", async () => {
         hideCtx();
-        const next = await invoke("select_chat", { chatId: c.peer_id });
-        applySnapshot(next);
+        try {
+          const next = await invoke("select_chat", { chatId: c.peer_id });
+          applySnapshot(next, true);
+        } catch (err) {
+          showToast(String(err));
+          return;
+        }
         if (window.matchMedia("(max-width: 820px)").matches) {
           els.mainScreen.classList.add("sidebar-collapsed");
         }
@@ -976,22 +983,14 @@
           showToast(msg);
         }
       });
-      await listen("void://message", async () => {
-        applySnapshot(await invoke("get_snapshot"));
-      });
+      await listen("void://message", () => {});
       await listen("void://bootstraps", () => {});
-      await listen("void://file", async () => {
-        applySnapshot(await invoke("get_snapshot"));
-      });
-      await listen("void://file-complete", async (e) => {
+      await listen("void://file", () => {});
+      await listen("void://file-complete", (e) => {
         const p = e?.payload || {};
         if (p.filename && !/^void_voice_/i.test(p.filename || "")) {
           showToast(`Файл получен: ${p.filename}`);
         }
-        applySnapshot(await invoke("get_snapshot"));
-      });
-      await listen("void://file-progress", async () => {
-        applySnapshot(await invoke("get_snapshot"));
       });
     }
 
@@ -1087,13 +1086,6 @@
         showToast(String(e));
       }
     };
-
-    setInterval(async () => {
-      if (!snapshot?.unlocked) return;
-      try {
-        applySnapshot(await invoke("get_snapshot"));
-      } catch (_) {}
-    }, 4000);
   }
 
   if (document.readyState === "loading") {
