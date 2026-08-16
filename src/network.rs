@@ -192,7 +192,7 @@ fn peer_is_bootstrap_agent(info: &identify::Info) -> bool {
 fn relay_circuit_listen_addrs(relay_addrs: &[Multiaddr]) -> Vec<Multiaddr> {
     let mut out = Vec::new();
     for addr in relay_addrs {
-        if addr.to_string().contains("p2p-circuit") {
+        if addr.to_string().contains("p2p-circuit") || addr_is_quic_v1(addr) || !addr_is_tcp(addr) {
             continue;
         }
         let mut a = addr.clone();
@@ -737,23 +737,31 @@ fn ensure_bootstrap_relay_listens(
             continue;
         }
         relay_listen_attempt_at.insert(relay_pid, now);
-        // Всегда берём void_bootstraps + живые dialer-адреса.
-        let mut relay_src: Vec<Multiaddr> = void_bootstraps
-            .iter()
-            .filter(|ma| peer_id_from_multiaddr(ma) == Some(relay_pid))
-            .cloned()
-            .collect();
+        let mut relay_src: Vec<Multiaddr> = Vec::new();
+        let mut push_tcp = |raw: &Multiaddr| {
+            if addr_is_quic_v1(raw) || is_circuit_addr(raw) || is_junk_addr(raw) || !addr_is_tcp(raw)
+            {
+                return;
+            }
+            let a = normalize_peer_addr(strip_p2p_protocols(raw.clone()), relay_pid);
+            let k = addr_endpoint_key(&a);
+            if relay_src.iter().any(|x| addr_endpoint_key(x) == k) {
+                return;
+            }
+            relay_src.push(a);
+        };
+        for ma in void_bootstraps {
+            let same_peer = peer_id_from_multiaddr(ma) == Some(relay_pid);
+            let same_ep = reconnect_targets.get(&relay_pid).is_some_and(|list| {
+                list.iter().any(|e| addr_endpoint_key(e) == addr_endpoint_key(ma))
+            });
+            if same_peer || same_ep {
+                push_tcp(ma);
+            }
+        }
         if let Some(extra) = reconnect_targets.get(&relay_pid) {
             for a in extra {
-                if peer_id_from_multiaddr(a).is_none() {
-                    continue;
-                }
-                if a.to_string().contains("p2p-circuit") || is_junk_addr(a) {
-                    continue;
-                }
-                if !relay_src.contains(a) {
-                    relay_src.insert(0, a.clone());
-                }
+                push_tcp(a);
             }
         }
         if relay_src.is_empty() {
@@ -770,7 +778,7 @@ fn ensure_bootstrap_relay_listens(
             continue;
         }
         let mut any_ok = false;
-        for ma in relay_circuit_listen_addrs(&relay_src) {
+        if let Some(ma) = relay_circuit_listen_addrs(&relay_src).into_iter().next() {
             match swarm.listen_on(ma.clone()) {
                 Ok(_) => {
                     any_ok = true;
@@ -6212,6 +6220,42 @@ pub async fn run_chat_network(
                                     bootstrap_ep_mark_live(address, true);
                                     if peer_id != local_peer_id {
                                         bootstrap_peer_ids.insert(peer_id);
+                                        let mut rewritten = Vec::new();
+                                        for ma in void_bootstraps.iter_mut() {
+                                            if addr_endpoint_key(ma) != ep {
+                                                continue;
+                                            }
+                                            let next = normalize_peer_addr(
+                                                strip_p2p_protocols(ma.clone()),
+                                                peer_id,
+                                            );
+                                            if *ma != next {
+                                                *ma = next.clone();
+                                                rewritten.push(next.to_string());
+                                            }
+                                        }
+                                        if rewritten.is_empty() {
+                                            let with_id = normalize_peer_addr(
+                                                strip_p2p_protocols(address.clone()),
+                                                peer_id,
+                                            );
+                                            if !void_bootstraps.contains(&with_id) {
+                                                void_bootstraps.push(with_id.clone());
+                                                rewritten.push(with_id.to_string());
+                                            }
+                                        }
+                                        if !rewritten.is_empty() {
+                                            bootstrap_peer_ids =
+                                                bootstrap_peer_ids_from(&void_bootstraps);
+                                            onion_rt_set_keys(
+                                                onion_keys.clone(),
+                                                bootstrap_peer_ids.clone(),
+                                                local_peer_id,
+                                            );
+                                            let _ = event_tx
+                                                .send(NetworkEvent::BootstrapsLearned(rewritten))
+                                                .await;
+                                        }
                                     }
                                     info!(
                                         "bootstrap TCP живой {} peer={}",
@@ -6429,13 +6473,24 @@ pub async fn run_chat_network(
                                     bootstrap_ep_mark_live(address, false);
                                 }
                             }
-                            if bootstrap_peer_ids.contains(&peer_id) {
-                                let _ = event_tx
-                                    .send(NetworkEvent::Status(format!(
-                                        "❌ Bootstrap TCP закрыт ({:?}), осталось {}",
-                                        cause, num_established
-                                    )))
-                                    .await;
+                            if bootstrap_peer_ids.contains(&peer_id) && num_established == 0 {
+                                let quic = matches!(
+                                    endpoint,
+                                    libp2p::core::ConnectedPoint::Dialer { address, .. }
+                                        if addr_is_quic_v1(address)
+                                ) || matches!(
+                                    endpoint,
+                                    libp2p::core::ConnectedPoint::Listener { local_addr, .. }
+                                        if addr_is_quic_v1(local_addr)
+                                );
+                                if !quic {
+                                    let _ = event_tx
+                                        .send(NetworkEvent::Status(format!(
+                                            "❌ Bootstrap TCP закрыт ({:?})",
+                                            cause
+                                        )))
+                                        .await;
+                                }
                             }
 
                             // libp2p may close a duplicate connection while another remains.
@@ -6706,17 +6761,15 @@ pub async fn run_chat_network(
                                 .await;
                             }
                             let mut bootstrap_learned: Vec<String> = Vec::new();
-                            let identify_has_tcp = is_bootstrap
-                                && info.listen_addrs.iter().any(|a| {
-                                    a.iter().any(|p| {
-                                        matches!(p, libp2p::multiaddr::Protocol::Tcp(_))
-                                    })
-                                });
                             for addr in info.listen_addrs {
                                 if is_junk_addr(&addr) {
                                     continue;
                                 }
-                                if is_bootstrap && identify_has_tcp && addr_is_quic_v1(&addr) {
+                                if is_bootstrap && addr_is_quic_v1(&addr) {
+                                    let _ = swarm
+                                        .behaviour_mut()
+                                        .kad
+                                        .remove_address(&peer_id, &addr);
                                     continue;
                                 }
                                 let a = normalize_peer_addr(addr.clone(), peer_id);
@@ -7300,12 +7353,21 @@ pub async fn run_chat_network(
                             }
                         }
                         SwarmEvent::Behaviour(ChatBehaviourEvent::Kad(kad::Event::RoutingUpdated { peer, addresses, .. })) => {
-                            // Полный список адресов быстро раздувает лог (IPFS-пиры часто обновляют DHT).
                             debug!(
                                 "📍 Kademlia: маршрут для {} — {} адр.",
                                 peer,
                                 addresses.len()
                             );
+                            if bootstrap_peer_ids.contains(&peer) {
+                                for addr in addresses.iter() {
+                                    if addr_is_quic_v1(addr) {
+                                        let _ = swarm
+                                            .behaviour_mut()
+                                            .kad
+                                            .remove_address(&peer, addr);
+                                    }
+                                }
+                            }
                         }
 
                         // ─── Файловый sub-протокол /void/file/1.0.0 ─────────

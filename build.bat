@@ -20,6 +20,11 @@ if errorlevel 1 (
     )
 )
 
+echo Stopping running VOID so Windows can overwrite app.exe...
+powershell -NoProfile -Command ^
+  "Get-CimInstance Win32_Process | Where-Object { $_.ExecutablePath -and ($_.ExecutablePath -like '*p2p-messenger*app.exe' -or $_.ExecutablePath -like '*VOID-P2P-Messenger.exe') } | ForEach-Object { Stop-Process -Id $_.ProcessId -Force -ErrorAction SilentlyContinue }; Get-Process -Name app,VOID-P2P-Messenger -ErrorAction SilentlyContinue | Stop-Process -Force -ErrorAction SilentlyContinue"
+timeout /t 2 /nobreak >nul
+
 cargo tauri build
 if errorlevel 1 (
     echo Build failed!
