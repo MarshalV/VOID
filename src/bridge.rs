@@ -16,7 +16,7 @@ use tracing::{info, warn};
 use zeroize::{Zeroize, Zeroizing};
 
 use crate::bootstrap::{
-    merge_bootstrap_string_lists, migrate_void_bootstrap_txt, parse_peer_id_loose,
+    addr_endpoint_key, merge_bootstrap_string_lists, migrate_void_bootstrap_txt, parse_peer_id_loose,
     parse_seed_dial_addrs, peer_id_from_multiaddr, void_bootstrap_multiaddrs,
 };
 use crate::chat_store::ChatJournal;
@@ -2546,8 +2546,11 @@ impl VoidRuntime {
                             _ => {}
                         }
                     }
-                    // Vault entries without /p2p/ never enter kad dial list —
-                    // kick JoinViaNode (QUIC+TCP) for each bare IP / incomplete addr.
+                    // Bare IP без /p2p/: JoinViaNode, но не если тот же host:port уже
+                    // в полном multiaddr — иначе второй TCP убивает первый.
+                    let complete = void_bootstrap_multiaddrs(&g.void_bootstrap_strings);
+                    let known_eps: std::collections::HashSet<String> =
+                        complete.iter().map(addr_endpoint_key).collect();
                     let bare: Vec<String> = g
                         .void_bootstrap_strings
                         .iter()
@@ -2556,6 +2559,14 @@ impl VoidRuntime {
                         .collect();
                     if let Some(tx) = &g.command_tx {
                         for s in bare {
+                            let dup = parse_seed_dial_addrs(&s)
+                                .map(|(addrs, _)| {
+                                    addrs.iter().any(|a| known_eps.contains(&addr_endpoint_key(a)))
+                                })
+                                .unwrap_or(false);
+                            if dup {
+                                continue;
+                            }
                             let _ = tx.try_send(UICommand::JoinViaNode(s));
                         }
                     }

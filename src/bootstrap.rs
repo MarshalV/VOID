@@ -234,6 +234,28 @@ pub(crate) fn parse_peer_id_loose(raw: &str) -> Option<PeerId> {
     None
 }
 
+pub(crate) fn addr_endpoint_key(ma: &Multiaddr) -> String {
+    let mut ip = String::new();
+    let mut trans = String::new();
+    let mut port = String::new();
+    for p in ma.iter() {
+        match p {
+            Protocol::Ip4(a) => ip = a.to_string(),
+            Protocol::Ip6(a) => ip = a.to_string(),
+            Protocol::Tcp(n) => {
+                trans = "tcp".into();
+                port = n.to_string();
+            }
+            Protocol::Udp(n) => {
+                trans = "udp".into();
+                port = n.to_string();
+            }
+            _ => {}
+        }
+    }
+    format!("{ip}/{trans}/{port}")
+}
+
 pub(crate) fn addr_is_quic_v1(ma: &Multiaddr) -> bool {
     ma.iter().any(|p| matches!(p, Protocol::Udp(_))) && ma.to_string().contains("quic-v1")
 }
