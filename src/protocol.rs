@@ -639,7 +639,37 @@ pub(crate) enum V1Packet {
         header: crypto::MessageHeader,
         ciphertext: Vec<u8>,
     },
+    /// One onion cell: sealed to the next hop's onion X25519 key.
+    Onion {
+        eph: [u8; 32],
+        nonce: [u8; 12],
+        ct: Vec<u8>,
+    },
+    /// Exit hop → recipient. `src` is the logical sender (E2EE Hello still binds identity).
+    OnionDrop {
+        src: String,
+        packet: Box<V1Packet>,
+    },
     Ack,
+}
+
+/// Wrap `inner` for `dest` through live onion hops (1 node = 1 hop, else up to 3).
+pub(crate) fn wrap_onion_packet(
+    hops: &[(PeerId, [u8; 32])],
+    src: PeerId,
+    dest: PeerId,
+    inner: V1Packet,
+) -> Option<V1Packet> {
+    if hops.is_empty() {
+        return None;
+    }
+    let drop = V1Packet::OnionDrop {
+        src: src.to_string(),
+        packet: Box::new(inner),
+    };
+    let drop_val = serde_json::to_value(&drop).ok()?;
+    let (eph, nonce, ct) = crate::onion::wrap_layers(hops, dest, drop_val).ok()?;
+    Some(V1Packet::Onion { eph, nonce, ct })
 }
 
 pub(crate) fn build_v1_hello(

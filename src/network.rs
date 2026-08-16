@@ -40,8 +40,31 @@ use crate::protocol::{
     read_command_message_ids, verify_hello_transport_binding, validate_bootstrap_gossip_addrs,
     build_group_sync_json, build_group_leave_json, build_group_delete_json,
     transfer_id_to_hex, transfer_id_from_hex, per_peer_voice_transfer_id, ChatMessage,
+    wrap_onion_packet,
     DecryptedChatFrame, FileMeta, OutgoingDeliveryStatus, VoiceMeta, V1Packet,
 };
+
+struct OnionRuntime {
+    keys: HashMap<PeerId, [u8; 32]>,
+    bootstraps: HashSet<PeerId>,
+    local: PeerId,
+}
+
+static ONION_RT: Mutex<Option<OnionRuntime>> = Mutex::new(None);
+
+fn onion_rt_store(rt: OnionRuntime) {
+    if let Ok(mut g) = ONION_RT.lock() {
+        *g = Some(rt);
+    }
+}
+
+fn onion_rt_set_keys(keys: HashMap<PeerId, [u8; 32]>, bootstraps: HashSet<PeerId>, local: PeerId) {
+    onion_rt_store(OnionRuntime {
+        keys,
+        bootstraps,
+        local,
+    });
+}
 
 fn is_junk_addr(ma: &Multiaddr) -> bool {
     let ip = ma.iter().find_map(|p| match p {
@@ -1844,6 +1867,70 @@ fn build_void_swarm(
         .build())
 }
 
+fn send_v1_to_peer(
+    swarm: &mut libp2p::Swarm<ChatBehaviour>,
+    dest: PeerId,
+    packet: V1Packet,
+) -> libp2p::request_response::OutboundRequestId {
+    let snapshot = ONION_RT.lock().ok().and_then(|g| {
+        let rt = g.as_ref()?;
+        if rt.bootstraps.contains(&dest) {
+            return None;
+        }
+        let hops = crate::onion::select_hops(
+            swarm.connected_peers().copied(),
+            &rt.bootstraps,
+            &rt.keys,
+        );
+        if hops.is_empty() {
+            return None;
+        }
+        Some((hops, rt.local))
+    });
+    if let Some((hops, local)) = snapshot {
+        if let Some(onion) = wrap_onion_packet(&hops, local, dest, packet.clone()) {
+            let first = hops[0].0;
+            debug!(
+                "🧅 onion {} hop(s) → {} via {}",
+                hops.len(),
+                &dest.to_string()[..8.min(dest.to_string().len())],
+                &first.to_string()[..8.min(first.to_string().len())]
+            );
+            return swarm
+                .behaviour_mut()
+                .request_response
+                .send_request(&first, onion);
+        }
+    }
+    swarm
+        .behaviour_mut()
+        .request_response
+        .send_request(&dest, packet)
+}
+
+fn rr_reply(
+    swarm: &mut libp2p::Swarm<ChatBehaviour>,
+    channel: &mut Option<libp2p::request_response::ResponseChannel<V1Packet>>,
+    onion_reply: Option<PeerId>,
+    packet: V1Packet,
+) {
+    if onion_reply.is_some() && matches!(packet, V1Packet::Ack) {
+        let _ = channel.take();
+        return;
+    }
+    if let Some(dest) = onion_reply {
+        let _ = channel.take();
+        let _ = send_v1_to_peer(swarm, dest, packet);
+        return;
+    }
+    if let Some(ch) = channel.take() {
+        let _ = swarm
+            .behaviour_mut()
+            .request_response
+            .send_response(ch, packet);
+    }
+}
+
 async fn send_encrypted_chat_payload(
     swarm: &mut libp2p::Swarm<ChatBehaviour>,
     sessions: &mut HashMap<PeerId, crypto::SecureSession>,
@@ -1874,7 +1961,7 @@ async fn send_encrypted_chat_payload(
         return false;
     };
     let packet = V1Packet::Encrypted { header, ciphertext };
-    let req_id = swarm.behaviour_mut().request_response.send_request(&peer, packet);
+    let req_id = send_v1_to_peer(swarm, peer, packet);
     if is_delete_command_json(json_data.as_slice()) || is_read_command_json(json_data.as_slice()) {
         let ids = delete_track_ids
             .map(|v| v.to_vec())
@@ -2402,10 +2489,7 @@ async fn ensure_e2ee_handshake_started(
     };
     pending_handshakes.insert(peer_id, ephem_secret);
     handshake_started.insert(peer_id, Instant::now());
-    let _ = swarm
-        .behaviour_mut()
-        .request_response
-        .send_request(&peer_id, hello);
+    let _ = send_v1_to_peer(swarm, peer_id, hello);
     debug!(
         "[{}] 🤝 E2EE: Hello (+Ephem) → {}{}",
         now,
@@ -2554,6 +2638,8 @@ pub async fn run_chat_network(
         }
 
         let mut bootstrap_peer_ids = bootstrap_peer_ids_from(&void_bootstraps);
+        let mut onion_keys: HashMap<PeerId, [u8; 32]> = HashMap::new();
+        onion_rt_set_keys(onion_keys.clone(), bootstrap_peer_ids.clone(), local_peer_id);
 
         let startup_status = if void_bootstraps.is_empty() {
             let lan = if std::env::var("VOID_DISABLE_MDNS").is_ok() {
@@ -2828,6 +2914,38 @@ pub async fn run_chat_network(
                         &mut contact_dial_at,
                         Duration::from_secs(15),
                     );
+                    onion_rt_set_keys(
+                        onion_keys.clone(),
+                        bootstrap_peer_ids.clone(),
+                        local_peer_id,
+                    );
+                    if !onion_keys.is_empty() {
+                        let now_on = chrono::Local::now().format("%H:%M:%S").to_string();
+                        let onion_hello: Vec<PeerId> = reconnect_targets
+                            .keys()
+                            .copied()
+                            .filter(|p| {
+                                !sessions.contains_key(p)
+                                    && !bootstrap_peer_ids.contains(p)
+                                    && *p != local_peer_id
+                            })
+                            .collect();
+                        for pid in onion_hello {
+                            let _ = ensure_e2ee_handshake_started(
+                                &mut swarm,
+                                &local_key,
+                                local_peer_id,
+                                my_public_key,
+                                pid,
+                                &sessions,
+                                &mut pending_handshakes,
+                                &mut handshake_started,
+                                &now_on,
+                                false,
+                            )
+                            .await;
+                        }
+                    }
                     // Тянем остальные VOID-ноды: резервация пира может быть не на
                     // той же, к которой мы уже подключены (bootstrap 1/6 → N/6).
                     dial_missing_bootstraps(
@@ -2978,10 +3096,7 @@ pub async fn run_chat_network(
                                     header,
                                     ciphertext,
                                 };
-                                swarm
-                                    .behaviour_mut()
-                                    .request_response
-                                    .send_request(&peer, pkt)
+                                send_v1_to_peer(&mut swarm, peer, pkt)
                             });
 
                         if let Some(req_id) = sent_request_id {
@@ -4610,6 +4725,39 @@ pub async fn run_chat_network(
                             
                             match message {
                                 libp2p::request_response::Message::Request { request, channel, .. } => {
+                                    let mut peer = peer;
+                                    let mut request = request;
+                                    let mut onion_reply: Option<PeerId> = None;
+                                    let mut channel = Some(channel);
+                                    if let V1Packet::Onion { .. } = request {
+                                        rr_reply(
+                                            &mut swarm,
+                                            &mut channel,
+                                            None,
+                                            V1Packet::Ack,
+                                        );
+                                    } else {
+                                    if matches!(request, V1Packet::OnionDrop { .. }) {
+                                        if let V1Packet::OnionDrop { src, packet } =
+                                            std::mem::replace(&mut request, V1Packet::Ack)
+                                        {
+                                        rr_reply(
+                                            &mut swarm,
+                                            &mut channel,
+                                            None,
+                                            V1Packet::Ack,
+                                        );
+                                        if let Ok(src_pid) = src.parse::<PeerId>() {
+                                            if src_pid != local_peer_id
+                                                && !bootstrap_peer_ids.contains(&src_pid)
+                                            {
+                                                onion_reply = Some(src_pid);
+                                                peer = src_pid;
+                                                request = *packet;
+                                            }
+                                        }
+                                        }
+                                    }
                                     match request {
                                         V1Packet::BootstrapGossip { addrs } => {
                                             let their_set: HashSet<&str> =
@@ -4658,10 +4806,12 @@ pub async fn run_chat_network(
                                                         },
                                                     );
                                             }
-                                            let _ = swarm
-                                                .behaviour_mut()
-                                                .request_response
-                                                .send_response(channel, V1Packet::Ack);
+                                            rr_reply(
+                                                &mut swarm,
+                                                &mut channel,
+                                                onion_reply,
+                                                V1Packet::Ack,
+                                            );
                                         }
                                         V1Packet::OfflineMailboxStore {
                                             recipient,
@@ -4674,10 +4824,12 @@ pub async fn run_chat_network(
                                             ) {
                                                 let _ = RelayMailbox::save(&relay_mail_store);
                                             }
-                                            let _ = swarm
-                                                .behaviour_mut()
-                                                .request_response
-                                                .send_response(channel, V1Packet::Ack);
+                                            rr_reply(
+                                                &mut swarm,
+                                                &mut channel,
+                                                onion_reply,
+                                                V1Packet::Ack,
+                                            );
                                         }
                                         V1Packet::OfflineMailboxQuery { recipient } => {
                                             // Порциями: иначе один Deliver со всеми
@@ -4695,25 +4847,31 @@ pub async fn run_chat_network(
                                             } else {
                                                 V1Packet::OfflineMailboxDeliver { envelopes: envs }
                                             };
-                                            let _ = swarm
-                                                .behaviour_mut()
-                                                .request_response
-                                                .send_response(channel, response);
+                                            rr_reply(
+                                                &mut swarm,
+                                                &mut channel,
+                                                onion_reply,
+                                                response,
+                                            );
                                         }
                                         V1Packet::OfflineMailboxDeliver { .. } => {
-                                            let _ = swarm
-                                                .behaviour_mut()
-                                                .request_response
-                                                .send_response(channel, V1Packet::Ack);
+                                            rr_reply(
+                                                &mut swarm,
+                                                &mut channel,
+                                                onion_reply,
+                                                V1Packet::Ack,
+                                            );
                                         }
                                         V1Packet::PrekeyPut { .. }
                                         | V1Packet::PrekeyGet { .. }
                                         | V1Packet::PrekeyOffer { .. } => {
                                             // Prekey directory lives on bootstrap; peers Ack.
-                                            let _ = swarm
-                                                .behaviour_mut()
-                                                .request_response
-                                                .send_response(channel, V1Packet::Ack);
+                                            rr_reply(
+                                                &mut swarm,
+                                                &mut channel,
+                                                onion_reply,
+                                                V1Packet::Ack,
+                                            );
                                         }
                                         V1Packet::DialBack { circuit_addrs } => {
                                             // Собеседник просит обратный dial через relay —
@@ -4756,10 +4914,12 @@ pub async fn run_chat_network(
                                                 &void_bootstraps,
                                                 false,
                                             );
-                                            let _ = swarm
-                                                .behaviour_mut()
-                                                .request_response
-                                                .send_response(channel, V1Packet::Ack);
+                                            rr_reply(
+                                                &mut swarm,
+                                                &mut channel,
+                                                onion_reply,
+                                                V1Packet::Ack,
+                                            );
                                             debug!(
                                                 "[{}] ↩ DialBack от {} — обратный circuit dial",
                                                 now,
@@ -4786,10 +4946,66 @@ pub async fn run_chat_network(
                                                         now,
                                                         &peer.to_string()[..8]
                                                     );
-                                                    let _ = swarm
-                                                        .behaviour_mut()
-                                                        .request_response
-                                                        .send_response(channel, V1Packet::Ack);
+                                                    rr_reply(
+                                                &mut swarm,
+                                                &mut channel,
+                                                onion_reply,
+                                                V1Packet::Ack,
+                                            );
+                                                } else if let Some(local_ephem_secret) =
+                                                    pending_handshakes.remove(&peer)
+                                                {
+                                                    handshake_started.remove(&peer);
+                                                    drop_e2ee_session(
+                                                        &mut sessions,
+                                                        &mut session_established_at,
+                                                        peer,
+                                                    );
+                                                    let remote_static_pub =
+                                                        crypto::PublicKey::from(public_key);
+                                                    remember_peer_prekey(
+                                                        &mut peer_prekeys,
+                                                        &event_tx,
+                                                        peer,
+                                                        public_key,
+                                                    )
+                                                    .await;
+                                                    let remote_ephem_pub =
+                                                        crypto::PublicKey::from(ephemeral_key);
+                                                    let session = crypto::SecureSession::new_initiator(
+                                                        &local_static,
+                                                        &remote_static_pub,
+                                                        local_ephem_secret,
+                                                        &remote_ephem_pub,
+                                                    );
+                                                    put_e2ee_session(
+                                                        &mut sessions,
+                                                        &mut session_established_at,
+                                                        peer,
+                                                        session,
+                                                    );
+                                                    debug!(
+                                                        "[{}] 🤝 E2EE: сессия (onion Hello) с {}",
+                                                        now,
+                                                        &peer.to_string()[..8]
+                                                    );
+                                                    rr_reply(
+                                                        &mut swarm,
+                                                        &mut channel,
+                                                        onion_reply,
+                                                        V1Packet::Ack,
+                                                    );
+                                                    flush_pending_encrypted_messages(
+                                                        &mut swarm,
+                                                        &mut sessions,
+                                                        &mut outbound_msg_requests,
+                                                        &mut outbound_delete_requests,
+                                                        &event_tx,
+                                                        peer,
+                                                        &mut pending_messages,
+                                                        &now,
+                                                    )
+                                                    .await;
                                                 } else {
                                                 // Входящий Hello Request: всегда responder.
                                                 // Не flush'аем pending — initiator ещё без сессии,
@@ -4845,16 +5061,18 @@ pub async fn run_chat_network(
                                                     my_public_key,
                                                     local_ephem_pub,
                                                 ) {
-                                                    let _ = swarm
-                                                        .behaviour_mut()
-                                                        .request_response
-                                                        .send_response(channel, my_hello);
+                                                    rr_reply(
+                                                        &mut swarm,
+                                                        &mut channel,
+                                                        onion_reply,
+                                                        my_hello,
+                                                    );
                                                 }
                                                 }
                                             }
                                         }
                                         V1Packet::Encrypted { header, ciphertext } => {
-                                            let mut response_channel = Some(channel);
+                                            let mut response_channel = channel;
                                             let mut send_ack = false;
                                             if let Some(session) = sessions.get_mut(&peer) {
                                                 match session.decrypt_payload(&header, &ciphertext) {
@@ -5016,6 +5234,14 @@ pub async fn run_chat_network(
                                                         }
                                                     }
                                                     Err(_) => {
+                                                        if onion_reply.is_some() {
+                                                            debug!(
+                                                                "[{}] ❌ E2EE: onion-кадр не расшифровался от {} — сессию не сбрасываю",
+                                                                now,
+                                                                &peer.to_string()[..8]
+                                                            );
+                                                            send_ack = true;
+                                                        } else {
                                                         debug!(
                                                             "[{}] ❌ E2EE: Ошибка дешифровки от {}. Сбрасываю...",
                                                             now,
@@ -5062,6 +5288,7 @@ pub async fn run_chat_network(
                                                                 true,
                                                             )
                                                             .await;
+                                                        }
                                                         }
                                                     }
                                                 }
@@ -5139,10 +5366,24 @@ pub async fn run_chat_network(
                                                 .await;
                                             }
                                         }
+                                        V1Packet::Onion { .. } | V1Packet::OnionDrop { .. } => {
+                                            rr_reply(
+                                                &mut swarm,
+                                                &mut channel,
+                                                onion_reply,
+                                                V1Packet::Ack,
+                                            );
+                                        }
                                         V1Packet::Ack => {
-                                            let _ = swarm.behaviour_mut().request_response.send_response(channel, V1Packet::Ack);
+                                            rr_reply(
+                                                &mut swarm,
+                                                &mut channel,
+                                                onion_reply,
+                                                V1Packet::Ack,
+                                            );
                                         }
                                     }
+                                    } // onion / onion-drop unwrap
                                 }
                                 libp2p::request_response::Message::Response { request_id, response } => {
                                     match response {
@@ -5671,6 +5912,7 @@ pub async fn run_chat_network(
                                         | V1Packet::OfflineMailboxQuery { .. }
                                         | V1Packet::PrekeyPut { .. }
                                         | V1Packet::PrekeyGet { .. } => {}
+                                        V1Packet::Onion { .. } | V1Packet::OnionDrop { .. } => {}
                                     }
                                 }
                             }
@@ -6308,6 +6550,23 @@ pub async fn run_chat_network(
                                     "  ⚠️ БЕЗ /void/chat/1.0.0 (чужая версия)"
                                 }
                             );
+                            if is_bootstrap {
+                                if let Some(pk) =
+                                    crate::onion::parse_pk_from_agent(&info.agent_version)
+                                {
+                                    onion_keys.insert(peer_id, pk);
+                                    onion_rt_set_keys(
+                                        onion_keys.clone(),
+                                        bootstrap_peer_ids.clone(),
+                                        local_peer_id,
+                                    );
+                                    debug!(
+                                        "[{}] 🧅 onion-ключ bootstrap {}",
+                                        now,
+                                        &peer_id.to_string()[..8.min(peer_id.to_string().len())]
+                                    );
+                                }
+                            }
                             // Первый identify часто приходит до регистрации /void/chat/1.0.0.
                             // Не удаляем VOID-клиентов и bootstrap из контактов ошибочно.
                             if !has_chat

@@ -10,6 +10,7 @@ pub(crate) mod file_transfer;
 pub(crate) mod group;
 pub(crate) mod metadata_strip;
 pub(crate) mod network;
+pub(crate) mod onion;
 pub(crate) mod offline_mail;
 pub(crate) mod offline_publish;
 pub(crate) mod outbox;
