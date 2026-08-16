@@ -1,6 +1,7 @@
 //! libp2p swarm, сетевой цикл и события UI ↔ сеть.
 
 use std::collections::{HashMap, HashSet};
+use std::num::NonZeroU8;
 use std::sync::{mpsc as std_mpsc, Arc, Mutex};
 use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 use std::time::{Duration, Instant};
@@ -16,7 +17,7 @@ use libp2p::{
     tcp, upnp, yamux, Multiaddr, PeerId, StreamProtocol,
 };
 use tokio::sync::mpsc;
-use tracing::{debug, warn};
+use tracing::{debug, info, warn};
 
 use crate::bootstrap::{
     addr_endpoint_key, addr_is_quic_v1, addr_is_tcp, expand_transport_variants,
@@ -455,20 +456,26 @@ fn dial_bootstrap_direct(
     peer_id: PeerId,
     addrs: Vec<Multiaddr>,
 ) {
+    if peer_id == *swarm.local_peer_id() {
+        warn!("bootstrap dial: пропуск своего PeerId");
+        return;
+    }
     if swarm.is_connected(&peer_id) {
         return;
     }
     let Some(ma) = pick_one_tcp_addr(addrs, peer_id) else {
         return;
     };
+    info!("bootstrap dial {} → {}", &peer_id.to_string()[..12.min(peer_id.to_string().len())], ma);
     let opts = DialOpts::peer_id(peer_id)
         .condition(libp2p::swarm::dial_opts::PeerCondition::DisconnectedAndNotDialing)
         .addresses(vec![ma])
+        .override_dial_concurrency_factor(NonZeroU8::new(1).expect("1"))
         .build();
     if let Err(e) = swarm.dial(opts) {
         let s = format!("{:?}", e);
         if !s.contains("Condition") {
-            debug!(
+            warn!(
                 "bootstrap dial {}: {:?}",
                 &peer_id.to_string()[..8.min(peer_id.to_string().len())],
                 e
@@ -1809,9 +1816,10 @@ struct ChatBehaviour {
     identify: identify::Behaviour,
     kad: kad::Behaviour<kad::store::MemoryStore>,
     relay: relay::client::Behaviour,
-    dcutr: dcutr::Behaviour,
-    autonat: autonat::Behaviour,
-    upnp: upnp::tokio::Behaviour,
+    /// По умолчанию выкл.: AutoNAT/DCUtR/UPnP открывают второй dial к bootstrap.
+    dcutr: Toggle<dcutr::Behaviour>,
+    autonat: Toggle<autonat::Behaviour>,
+    upnp: Toggle<upnp::tokio::Behaviour>,
 }
 fn build_void_swarm(
     local_key: libp2p::identity::Keypair,
@@ -1898,6 +1906,10 @@ fn build_void_swarm(
                 Toggle::from(Some(b))
             };
 
+            let nat_on = std::env::var("VOID_ENABLE_NAT")
+                .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
+                .unwrap_or(false);
+
             Ok(ChatBehaviour {
                 request_response: rr_behaviour,
                 file_rr: file_rr_behaviour,
@@ -1913,9 +1925,11 @@ fn build_void_swarm(
                 ),
                 kad,
                 relay: relay_client,
-                dcutr: dcutr::Behaviour::new(local_peer_id),
-                autonat: autonat::Behaviour::new(local_peer_id, Default::default()),
-                upnp: upnp::tokio::Behaviour::default(),
+                dcutr: Toggle::from(nat_on.then(|| dcutr::Behaviour::new(local_peer_id))),
+                autonat: Toggle::from(
+                    nat_on.then(|| autonat::Behaviour::new(local_peer_id, Default::default())),
+                ),
+                upnp: Toggle::from(nat_on.then(upnp::tokio::Behaviour::default)),
             })
         })
         .map_err(|e| format!("with_behaviour: {:?}", e))?
@@ -2605,12 +2619,22 @@ pub async fn run_chat_network(
         let my_public_key = crypto::PublicKey::from(&local_static);
         let my_public_key_bytes = my_public_key.to_bytes();
         let local_peer_id = local_key.public().to_peer_id();
+        void_bootstraps.retain(|ma| peer_id_from_multiaddr(ma) != Some(local_peer_id));
         let mut peer_prekeys: HashMap<PeerId, [u8; 32]> = HashMap::new();
         let mut pending_kad_mail: HashMap<kad::QueryId, MailboxKadOp> = HashMap::new();
         let mut relay_mail_store = RelayMailbox::load();
         let mut fetch_mailbox_after = Some(Instant::now() + Duration::from_secs(5));
         let mut mailbox_fetch_attempts: u32 = 0;
         const MAX_MAILBOX_FETCH_ATTEMPTS: u32 = 30;
+
+        let _instance_lock = match crate::paths::acquire_instance_lock() {
+            Ok(f) => f,
+            Err(msg) => {
+                warn!("{}", msg);
+                let _ = event_tx.send(NetworkEvent::Status(format!("❌ {msg}"))).await;
+                return;
+            }
+        };
 
         let mut swarm = match build_void_swarm(
             local_key.clone(),
@@ -2644,34 +2668,13 @@ pub async fn run_chat_network(
         };
 
         if let Err(e) = swarm.listen_on(tcp_addr.clone()) {
-            debug!("⚠️ TCP порт 50001 занят ({:?}). Срочно ЗАКРОЙТЕ старые процессы или проверьте настройки.", e);
+            warn!("TCP 50001 занят ({:?}) — вторая копия VOID?", e);
             let _ = event_tx
                 .send(NetworkEvent::Status(
-                    "⚠️ ПОРТ 50001 ЗАНЯТ! Закройте старые копии программы.".into(),
+                    "❌ Порт 50001 занят. Закройте ВСЕ копии VOID (трей и Диспетчер задач) и запустите снова. Вторая копия с тем же ключом рвёт соединение с нодой.".into(),
                 ))
                 .await;
-            match "/ip4/0.0.0.0/tcp/0".parse::<Multiaddr>() {
-                Ok(fallback) => {
-                    if let Err(e2) = swarm.listen_on(fallback) {
-                        warn!("❌ TCP fallback 0: {:?}", e2);
-                        let _ = event_tx
-                            .send(NetworkEvent::Status(format!(
-                                "❌ Не удалось слушать TCP даже на свободном порту: {:?}",
-                                e2
-                            )))
-                            .await;
-                        return;
-                    }
-                }
-                Err(_) => {
-                    let _ = event_tx
-                        .send(NetworkEvent::Status(
-                            "❌ Внутренняя ошибка: некорректный fallback TCP multiaddr.".into(),
-                        ))
-                        .await;
-                    return;
-                }
-            }
+            return;
         }
 
         // Слушаем QUIC (50001 часто занят другим процессом на Windows — пробуем 50002, затем ОС).
@@ -6204,6 +6207,13 @@ pub async fn run_chat_network(
                                 let _ = event_tx.send(NetworkEvent::PublicIpConfirmed(ip)).await;
                             }
                         }
+                        SwarmEvent::Dialing { peer_id, connection_id } => {
+                            info!(
+                                "dialing peer={:?} conn={:?}",
+                                peer_id.map(|p| p.to_string()),
+                                connection_id
+                            );
+                        }
                         SwarmEvent::ConnectionEstablished { peer_id, ref endpoint, num_established, .. } => {
                             let connected_count = swarm.connected_peers().count();
                             debug!("✅ СОЕДИНЕНО: {}. Endpoint: {:?}. Всего пиров: {} (conn #{})", peer_id, endpoint, connected_count, num_established);
@@ -6254,12 +6264,6 @@ pub async fn run_chat_network(
                                         }
                                     }
                                 }
-                                // Не сразу: relay behaviour должен успеть
-                                // зарегистрировать direct connection, иначе
-                                // ListenReq делает лишний Dial → шторм соединений.
-                                hop_listen_after
-                                    .entry(peer_id)
-                                    .or_insert_with(|| Instant::now() + Duration::from_millis(800));
                             }
 
                             if u32::from(num_established) > 1 {
@@ -6367,10 +6371,8 @@ pub async fn run_chat_network(
                                  }
                              }
 
-                            // Если мы звонили этому пиру как seed (вход в сеть через IP) — страховка:
-                            // добавляем dialed-адрес в Kademlia и запускаем DHT-bootstrap сразу после коннекта,
-                            // не дожидаясь Identify. На bootstrap без Identify Identify::Received никогда не придёт,
-                            // а DHT хотя бы попробует найти маршруты через этого пира.
+                            // JoinViaNode без /p2p/: запоминаем адрес, DHT — только после Identify.
+                            // kad.bootstrap() здесь открывает второй TCP и рвёт первый.
                             let is_seed = pending_seed_peers.contains(&peer_id) || pending_seed_bare;
                             if is_seed {
                                 let addr = match endpoint {
@@ -6378,17 +6380,17 @@ pub async fn run_chat_network(
                                     _ => None,
                                 };
                                 if let Some(mut addr) = addr {
-                                    swarm.behaviour_mut().kad.add_address(&peer_id, addr.clone());
                                     if peer_id_from_multiaddr(&addr).is_none() {
                                         addr.push(libp2p::multiaddr::Protocol::P2p(peer_id));
                                     }
-                                    let added = merge_bootstraps_into_swarm(
-                                        &mut swarm,
-                                        &mut void_bootstraps,
-                                        &mut bootstrap_peer_ids,
-                                        &[addr.clone()],
-                                    );
-                                    if added > 0 {
+                                    if peer_id != local_peer_id && !void_bootstraps.contains(&addr) {
+                                        void_bootstraps.push(addr.clone());
+                                        bootstrap_peer_ids = bootstrap_peer_ids_from(&void_bootstraps);
+                                        onion_rt_set_keys(
+                                            onion_keys.clone(),
+                                            bootstrap_peer_ids.clone(),
+                                            local_peer_id,
+                                        );
                                         let learned = vec![addr.to_string()];
                                         fanout_bootstrap_gossip(
                                             &mut swarm,
@@ -6404,18 +6406,28 @@ pub async fn run_chat_network(
                                 }
                                 pending_seed_bare = false;
                                 pending_seed_peers.remove(&peer_id);
-                                let _ = swarm.behaviour_mut().kad.bootstrap();
                                 let _ = event_tx
                                     .send(NetworkEvent::Status(format!(
-                                        "🌐 Seed подхвачен ({}): DHT-bootstrap запущен.",
+                                        "🌐 Seed TCP есть ({}). Ждём Identify…",
                                         &peer_id.to_string()[..12]
                                     )))
                                     .await;
                             }
                         },
-                        SwarmEvent::ConnectionClosed { peer_id, cause, num_established, .. } => {
+                        SwarmEvent::ConnectionClosed { peer_id, cause, num_established, connection_id, .. } => {
                             let connected_count = swarm.connected_peers().count();
-                            debug!("❌ СОЕДИНЕНИЕ ЗАКРЫТО: {}. Причина: {:?}. Осталось: {} (с пиром ещё {})", peer_id, cause, connected_count, num_established);
+                            warn!(
+                                "connection closed {} conn={:?} cause={:?} remaining_with_peer={} peers={}",
+                                peer_id, connection_id, cause, num_established, connected_count
+                            );
+                            if bootstrap_peer_ids.contains(&peer_id) {
+                                let _ = event_tx
+                                    .send(NetworkEvent::Status(format!(
+                                        "❌ Bootstrap TCP закрыт ({:?}), осталось {}",
+                                        cause, num_established
+                                    )))
+                                    .await;
+                            }
 
                             // libp2p may close a duplicate connection while another remains.
                             if num_established > 0 || swarm.is_connected(&peer_id) {
@@ -6637,6 +6649,10 @@ pub async fn run_chat_network(
                                         local_peer_id,
                                         &my_public_key_bytes,
                                         &bootstrap_peer_ids,
+                                    );
+                                    hop_listen_after.insert(
+                                        peer_id,
+                                        Instant::now() + Duration::from_millis(500),
                                     );
                                     let _ = event_tx
                                         .send(NetworkEvent::Status(

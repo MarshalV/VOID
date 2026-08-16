@@ -59,6 +59,32 @@ pub(crate) fn data_file(name: impl AsRef<Path>) -> PathBuf {
     data_dir().join(name)
 }
 
+/// Одна копия VOID на vault: второй процесс с тем же ключом шлёт второй TCP
+/// на bootstrap, и libp2p закрывает оба (`yamux Closed` за 1 мс).
+pub(crate) fn acquire_instance_lock() -> Result<std::fs::File, String> {
+    let path = data_file("void.instance.lock");
+    if let Some(parent) = path.parent() {
+        let _ = std::fs::create_dir_all(parent);
+    }
+    let mut opts = std::fs::OpenOptions::new();
+    opts.create(true).write(true).read(true);
+    #[cfg(windows)]
+    {
+        use std::os::windows::fs::OpenOptionsExt;
+        opts.share_mode(0);
+    }
+    let mut file = opts.open(&path).map_err(|_| {
+        "VOID уже запущен. Закройте старую копию (трей и Диспетчер задач: VOID / app.exe) и откройте снова.".to_string()
+    })?;
+    {
+        use std::io::Write;
+        let _ = file.set_len(0);
+        let _ = writeln!(file, "{}", std::process::id());
+        let _ = file.flush();
+    }
+    Ok(file)
+}
+
 fn dir_is_writable(dir: &Path) -> bool {
     if let Err(e) = std::fs::create_dir_all(dir) {
         warn!("VOID: нельзя создать {}: {e}", dir.display());
