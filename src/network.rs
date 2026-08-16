@@ -1,7 +1,6 @@
 //! libp2p swarm, сетевой цикл и события UI ↔ сеть.
 
 use std::collections::{HashMap, HashSet};
-use std::num::NonZeroU8;
 use std::sync::{mpsc as std_mpsc, Arc, Mutex};
 use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 use std::time::{Duration, Instant};
@@ -297,14 +296,15 @@ fn merge_bootstraps_into_swarm(
         void_bootstraps.sort_by(|a, b| a.to_string().cmp(&b.to_string()));
         void_bootstraps.dedup_by(|a, b| a == b);
         *bootstrap_peer_ids = bootstrap_peer_ids_from(void_bootstraps);
-        let mut grouped: HashMap<PeerId, Vec<Multiaddr>> = HashMap::new();
+        let mut seen_ep: HashSet<String> = HashSet::new();
         for ma in new_addrs {
-            if let Some(pid) = peer_id_from_multiaddr(ma) {
-                grouped.entry(pid).or_default().push(ma.clone());
+            let k = addr_endpoint_key(ma);
+            if !seen_ep.insert(k) {
+                continue;
             }
-        }
-        for (pid, addrs) in grouped {
-            dial_bootstrap_direct(swarm, pid, addrs);
+            if let Some(pid) = peer_id_from_multiaddr(ma) {
+                dial_bootstrap_direct(swarm, pid, vec![ma.clone()]);
+            }
         }
     }
     added
@@ -431,6 +431,12 @@ fn normalize_peer_addr(mut addr: Multiaddr, peer_id: PeerId) -> Multiaddr {
     addr
 }
 
+fn strip_p2p_protocols(ma: Multiaddr) -> Multiaddr {
+    ma.into_iter()
+        .filter(|p| !matches!(p, libp2p::multiaddr::Protocol::P2p(_)))
+        .collect()
+}
+
 fn pick_one_tcp_addr(addrs: impl IntoIterator<Item = Multiaddr>, peer_id: PeerId) -> Option<Multiaddr> {
     let mut chosen: Option<Multiaddr> = None;
     let mut seen: HashSet<String> = HashSet::new();
@@ -450,36 +456,76 @@ fn pick_one_tcp_addr(addrs: impl IntoIterator<Item = Multiaddr>, peer_id: PeerId
     chosen
 }
 
-/// Ровно один исходящий TCP к bootstrap. Без circuit, без QUIC, без kad.add_address.
+#[derive(Default)]
+struct BootstrapEpGate {
+    inflight: HashSet<String>,
+    live: HashSet<String>,
+    cooldown_until: HashMap<String, Instant>,
+}
+
+fn bootstrap_ep_gate() -> std::sync::MutexGuard<'static, BootstrapEpGate> {
+    static G: std::sync::OnceLock<std::sync::Mutex<BootstrapEpGate>> = std::sync::OnceLock::new();
+    G.get_or_init(|| std::sync::Mutex::new(BootstrapEpGate::default()))
+        .lock()
+        .unwrap_or_else(|p| p.into_inner())
+}
+
+fn bootstrap_ep_mark_live(addr: &Multiaddr, live: bool) {
+    let key = addr_endpoint_key(addr);
+    if key.is_empty() || key.ends_with("//") {
+        return;
+    }
+    let mut g = bootstrap_ep_gate();
+    g.inflight.remove(&key);
+    if live {
+        g.live.insert(key.clone());
+        g.cooldown_until.remove(&key);
+    } else {
+        g.live.remove(&key);
+        g.cooldown_until
+            .insert(key, Instant::now() + Duration::from_secs(2));
+    }
+}
+
+/// Ровно один исходящий TCP на host:port. Без /p2p/ в dial: неверный PeerId
+/// в vault (старый ключ ноды) иначе рвёт yamux сразу после Noise.
 fn dial_bootstrap_direct(
     swarm: &mut libp2p::Swarm<ChatBehaviour>,
     peer_id: PeerId,
     addrs: Vec<Multiaddr>,
 ) {
-    if peer_id == *swarm.local_peer_id() {
-        warn!("bootstrap dial: пропуск своего PeerId");
-        return;
-    }
-    if swarm.is_connected(&peer_id) {
-        return;
-    }
+    let _ = peer_id;
     let Some(ma) = pick_one_tcp_addr(addrs, peer_id) else {
         return;
     };
-    info!("bootstrap dial {} → {}", &peer_id.to_string()[..12.min(peer_id.to_string().len())], ma);
-    let opts = DialOpts::peer_id(peer_id)
-        .condition(libp2p::swarm::dial_opts::PeerCondition::DisconnectedAndNotDialing)
-        .addresses(vec![ma])
-        .override_dial_concurrency_factor(NonZeroU8::new(1).expect("1"))
+    let ma = strip_p2p_protocols(ma);
+    if !addr_is_tcp(&ma) || addr_is_quic_v1(&ma) || is_circuit_addr(&ma) {
+        return;
+    }
+    let key = addr_endpoint_key(&ma);
+    {
+        let mut g = bootstrap_ep_gate();
+        if g.live.contains(&key) || g.inflight.contains(&key) {
+            return;
+        }
+        if g.cooldown_until
+            .get(&key)
+            .is_some_and(|until| Instant::now() < *until)
+        {
+            return;
+        }
+        g.inflight.insert(key.clone());
+    }
+    info!("bootstrap TCP (без проверки /p2p/) → {}", ma);
+    let opts = DialOpts::unknown_peer_id()
+        .address(ma)
+        .allocate_new_port()
         .build();
     if let Err(e) = swarm.dial(opts) {
+        bootstrap_ep_gate().inflight.remove(&key);
         let s = format!("{:?}", e);
         if !s.contains("Condition") {
-            warn!(
-                "bootstrap dial {}: {:?}",
-                &peer_id.to_string()[..8.min(peer_id.to_string().len())],
-                e
-            );
+            warn!("bootstrap dial {}: {:?}", key, e);
         }
     }
 }
@@ -1707,18 +1753,15 @@ fn dial_missing_bootstraps(
     bootstrap_peer_ids: &HashSet<PeerId>,
     void_bootstraps: &[Multiaddr],
 ) {
-    for pid in bootstrap_peer_ids {
-        if swarm.is_connected(pid) {
+    let _ = bootstrap_peer_ids;
+    let mut seen_ep: HashSet<String> = HashSet::new();
+    for ma in void_bootstraps {
+        let k = addr_endpoint_key(ma);
+        if !seen_ep.insert(k) {
             continue;
         }
-        let addrs: Vec<Multiaddr> = void_bootstraps
-            .iter()
-            .filter(|ma| peer_id_from_multiaddr(ma) == Some(*pid))
-            .cloned()
-            .collect();
-        if !addrs.is_empty() {
-            dial_bootstrap_direct(swarm, *pid, addrs);
-        }
+        let pid = peer_id_from_multiaddr(ma).unwrap_or(*swarm.local_peer_id());
+        dial_bootstrap_direct(swarm, pid, vec![ma.clone()]);
     }
 }
 
@@ -2677,29 +2720,8 @@ pub async fn run_chat_network(
             return;
         }
 
-        // Слушаем QUIC (50001 часто занят другим процессом на Windows — пробуем 50002, затем ОС).
-        let quic_candidates = [
-            "/ip4/0.0.0.0/udp/50001/quic-v1",
-            "/ip4/0.0.0.0/udp/50002/quic-v1",
-            "/ip4/0.0.0.0/udp/0/quic-v1",
-        ];
-        let mut quic_listening = false;
-        for addr in quic_candidates {
-            match addr.parse::<Multiaddr>() {
-                Ok(ma) => match swarm.listen_on(ma) {
-                    Ok(_) => {
-                        debug!("🚀 QUIC: {}", addr);
-                        quic_listening = true;
-                        break;
-                    }
-                    Err(e) => debug!("⚠️ QUIC {}: {:?} — следующий вариант...", addr, e),
-                },
-                Err(e) => debug!("⚠️ QUIC parse {}: {:?}", addr, e),
-            }
-        }
-        if !quic_listening {
-            debug!("⚠️ QUIC не поднят ни на одном порту");
-        }
+        // QUIC listen на клиенте не нужен для входа на bootstrap (только TCP).
+        // Параллельный QUIC+TCP к ноде рвёт TCP (ApplicationClosed / yamux Closed).
 
         let mut bootstrap_peer_ids = bootstrap_peer_ids_from(&void_bootstraps);
         let mut onion_keys: HashMap<PeerId, [u8; 32]> = HashMap::new();
@@ -2732,19 +2754,20 @@ pub async fn run_chat_network(
         // Только bootstrap. Circuit к контактам до живого Hop открывает второй
         // TCP к ноде — оба сразу закрываются (yamux Closed).
         {
-            let mut grouped: HashMap<PeerId, Vec<Multiaddr>> = HashMap::new();
+            let mut seen_ep: HashSet<String> = HashSet::new();
             for ma in &void_bootstraps {
-                if let Some(pid) = peer_id_from_multiaddr(ma) {
-                    grouped.entry(pid).or_default().push(ma.clone());
+                let k = addr_endpoint_key(ma);
+                if !seen_ep.insert(k) {
+                    continue;
                 }
-            }
-            for (pid, addrs) in grouped {
-                debug!(
-                    "🌐 Стартовый dial bootstrap {} ({} адр.)",
-                    &pid.to_string()[..8],
-                    addrs.len()
-                );
-                dial_bootstrap_direct(&mut swarm, pid, addrs);
+                if let Some(pid) = peer_id_from_multiaddr(ma) {
+                    info!(
+                        "стартовый bootstrap TCP {} → {}",
+                        &pid.to_string()[..8.min(pid.to_string().len())],
+                        ma
+                    );
+                    dial_bootstrap_direct(&mut swarm, pid, vec![ma.clone()]);
+                }
             }
         }
         // Не start_providing / put_record до Identify: Kademlia сама наберёт
@@ -3204,14 +3227,23 @@ pub async fn run_chat_network(
                                         let _ = event_tx.send(NetworkEvent::Status(
                                             format!("📞 Подключаюсь к {}...", &addr_str[..addr_str.len().min(50)])
                                         )).await;
-                                        match swarm.dial(addr) {
-                                            Ok(_) => {
-                                                let _ = event_tx.send(NetworkEvent::Status("⏳ Dial отправлен...".into())).await;
-                                            }
-                                            Err(e) => {
-                                                let _ = event_tx.send(NetworkEvent::Status(
-                                                    format!("❌ Ошибка подключения: {}", e)
-                                                )).await;
+                                        let is_boot = void_bootstraps.iter().any(|b| {
+                                            addr_endpoint_key(b) == addr_endpoint_key(&addr)
+                                        });
+                                        if is_boot {
+                                            let pid = peer_id_from_multiaddr(&addr)
+                                                .unwrap_or(local_peer_id);
+                                            dial_bootstrap_direct(&mut swarm, pid, vec![addr]);
+                                        } else {
+                                            match swarm.dial(addr) {
+                                                Ok(_) => {
+                                                    let _ = event_tx.send(NetworkEvent::Status("⏳ Dial отправлен...".into())).await;
+                                                }
+                                                Err(e) => {
+                                                    let _ = event_tx.send(NetworkEvent::Status(
+                                                        format!("❌ Ошибка подключения: {}", e)
+                                                    )).await;
+                                                }
                                             }
                                         }
                                     }
@@ -3444,63 +3476,17 @@ pub async fn run_chat_network(
                                     Some((addrs, peer_id_opt)) => {
                                         if let Some(pid) = peer_id_opt {
                                             pending_seed_peers.insert(pid);
-                                            dial_bootstrap_direct(
-                                                &mut swarm,
-                                                pid,
-                                                addrs.clone(),
-                                            );
-                                            let _ = event_tx
-                                                .send(NetworkEvent::Status(format!(
-                                                    "📞 Вход в сеть: дозваниваюсь до {}…",
-                                                    pid
-                                                )))
-                                                .await;
                                         } else {
                                             pending_seed_bare = true;
-                                            let one = addrs
-                                                .into_iter()
-                                                .find(|a| {
-                                                    addr_is_tcp(a)
-                                                        && !addr_is_quic_v1(a)
-                                                        && !is_junk_addr(a)
-                                                });
-                                            let _ = event_tx
-                                                .send(NetworkEvent::Status(
-                                                    "⚠ Вход без /p2p/<PeerId>: один TCP. \
-                                                     Лучше полный /ip4/…/tcp/…/p2p/…"
-                                                        .into(),
-                                                ))
-                                                .await;
-                                            match one {
-                                                Some(ma) => match swarm.dial(ma.clone()) {
-                                                    Ok(_) => {
-                                                        let _ = event_tx
-                                                            .send(NetworkEvent::Status(format!(
-                                                                "📞 Вход в сеть: дозваниваюсь до {}…",
-                                                                ma
-                                                            )))
-                                                            .await;
-                                                    }
-                                                    Err(e) => {
-                                                        debug!("JoinViaNode dial {}: {:?}", ma, e);
-                                                        let _ = event_tx
-                                                            .send(NetworkEvent::Status(format!(
-                                                                "❌ Не дозвониться до {}",
-                                                                input
-                                                            )))
-                                                            .await;
-                                                    }
-                                                },
-                                                None => {
-                                                    let _ = event_tx
-                                                        .send(NetworkEvent::Status(format!(
-                                                            "❌ Не дозвониться до {}",
-                                                            input
-                                                        )))
-                                                        .await;
-                                                }
-                                            }
                                         }
+                                        let pid = peer_id_opt
+                                            .unwrap_or(*swarm.local_peer_id());
+                                        dial_bootstrap_direct(&mut swarm, pid, addrs);
+                                        let _ = event_tx
+                                            .send(NetworkEvent::Status(
+                                                "📞 Вход в сеть: один TCP без проверки /p2p/…".into(),
+                                            ))
+                                            .await;
                                     }
                                     None => {
                                         let _ = event_tx
@@ -6217,6 +6203,22 @@ pub async fn run_chat_network(
                         SwarmEvent::ConnectionEstablished { peer_id, ref endpoint, num_established, .. } => {
                             let connected_count = swarm.connected_peers().count();
                             debug!("✅ СОЕДИНЕНО: {}. Endpoint: {:?}. Всего пиров: {} (conn #{})", peer_id, endpoint, connected_count, num_established);
+                            if let libp2p::core::ConnectedPoint::Dialer { address, .. } = endpoint {
+                                let ep = addr_endpoint_key(address);
+                                let is_boot_ep = void_bootstraps
+                                    .iter()
+                                    .any(|b| addr_endpoint_key(b) == ep);
+                                if is_boot_ep || bootstrap_peer_ids.contains(&peer_id) {
+                                    bootstrap_ep_mark_live(address, true);
+                                    if peer_id != local_peer_id {
+                                        bootstrap_peer_ids.insert(peer_id);
+                                    }
+                                    info!(
+                                        "bootstrap TCP живой {} peer={}",
+                                        address, peer_id
+                                    );
+                                }
+                            }
                             pending_dials.remove(&peer_id);
                             // Соединение установлено — снимаем задание на реконнект.
                             reconnect_queue.remove(&peer_id);
@@ -6414,12 +6416,19 @@ pub async fn run_chat_network(
                                     .await;
                             }
                         },
-                        SwarmEvent::ConnectionClosed { peer_id, cause, num_established, connection_id, .. } => {
+                        SwarmEvent::ConnectionClosed { peer_id, cause, num_established, connection_id, ref endpoint, .. } => {
                             let connected_count = swarm.connected_peers().count();
                             warn!(
                                 "connection closed {} conn={:?} cause={:?} remaining_with_peer={} peers={}",
                                 peer_id, connection_id, cause, num_established, connected_count
                             );
+                            if num_established == 0 {
+                                if let libp2p::core::ConnectedPoint::Dialer { address, .. } =
+                                    endpoint
+                                {
+                                    bootstrap_ep_mark_live(address, false);
+                                }
+                            }
                             if bootstrap_peer_ids.contains(&peer_id) {
                                 let _ = event_tx
                                     .send(NetworkEvent::Status(format!(
@@ -6489,6 +6498,9 @@ pub async fn run_chat_network(
                         },
 
                         SwarmEvent::OutgoingConnectionError { peer_id, error, .. } => {
+                            if peer_id.is_none() {
+                                bootstrap_ep_gate().inflight.clear();
+                            }
                             let now = chrono::Local::now().format("%H:%M:%S").to_string();
                             let peer_str = peer_id
                                 .map(|p| format!("{}...", &p.to_string()[..8]))
