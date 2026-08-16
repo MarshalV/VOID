@@ -15,7 +15,27 @@ ensure_tauri_cli() {
 
 echo "Building VOID P2P Messenger for macOS..."
 ensure_tauri_cli
-cargo tauri build
+
+# .app is the real artifact. DMG runs bundle_dmg.sh → osascript/Finder;
+# without Automation permission that step fails even though .app is ready.
+# CI=true skips Finder window layout and still produces a working DMG.
+echo "Bundling .app ..."
+cargo tauri build --bundles app
+
+echo "Bundling .dmg (skip Finder layout) ..."
+set +e
+CI=true cargo tauri build --bundles dmg
+dmg_status=$?
+set -e
+if [ "$dmg_status" -ne 0 ]; then
+  echo
+  echo "WARNING: DMG не собран (bundle_dmg.sh / Finder AppleScript)."
+  echo "  .app уже готов — его достаточно, чтобы запустить VOID."
+  echo "  Если нужен .dmg: System Settings → Privacy & Security → Automation"
+  echo "  → разрешите Terminal (или Cursor) управлять Finder, затем повторите."
+  echo "  Либо: CI=true ./build_mac.sh"
+  echo
+fi
 
 echo "Build succeeded."
 echo "Copying application and installers to target/ ..."
