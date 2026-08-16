@@ -7,6 +7,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use libp2p::identity::ed25519;
+use libp2p::multiaddr::Protocol;
 use libp2p::{Multiaddr, PeerId};
 use reqwest;
 use rustls::client::danger::{
@@ -233,8 +234,26 @@ pub(crate) fn parse_peer_id_loose(raw: &str) -> Option<PeerId> {
     None
 }
 
-/// Как [`parse_seed_input`], но для `IP`/`IP:PORT` отдаёт и QUIC, и TCP
-/// (VOID bootstrap обычно на `/udp/…/quic-v1`, не на голом TCP).
+pub(crate) fn addr_is_quic_v1(ma: &Multiaddr) -> bool {
+    ma.iter().any(|p| matches!(p, Protocol::Udp(_))) && ma.to_string().contains("quic-v1")
+}
+
+pub(crate) fn addr_is_tcp(ma: &Multiaddr) -> bool {
+    ma.iter().any(|p| matches!(p, Protocol::Tcp(_)))
+}
+
+/// Параллельный TCP+QUIC к одному пиру часто убивает уже установленный TCP
+/// (`yamux Closed` / QUIC `ApplicationClosed`). Если TCP есть — QUIC не набираем.
+pub(crate) fn prefer_tcp_if_available(addrs: Vec<Multiaddr>) -> Vec<Multiaddr> {
+    if addrs.iter().any(addr_is_tcp) {
+        addrs.into_iter().filter(|a| !addr_is_quic_v1(a)).collect()
+    } else {
+        addrs
+    }
+}
+
+/// Как [`parse_seed_input`], но для `IP`/`IP:PORT` — TCP (QUIC через NAT/туннель
+/// рвёт сессию; полный `/udp/…/quic-v1` по-прежнему принимается как есть).
 pub(crate) fn parse_seed_dial_addrs(raw: &str) -> Option<(Vec<Multiaddr>, Option<PeerId>)> {
     let t = raw.trim();
     if t.is_empty() {
@@ -247,7 +266,7 @@ pub(crate) fn parse_seed_dial_addrs(raw: &str) -> Option<(Vec<Multiaddr>, Option
         if addrs.is_empty() {
             addrs.push(ma);
         }
-        return Some((addrs, pid));
+        return Some((prefer_tcp_if_available(addrs), pid));
     }
     let (host, port) = if let Some((h, p)) = t.rsplit_once(':') {
         let port: u16 = p.parse().ok()?;
@@ -256,33 +275,22 @@ pub(crate) fn parse_seed_dial_addrs(raw: &str) -> Option<(Vec<Multiaddr>, Option
         (t.to_string(), 4001u16)
     };
     let ip: std::net::IpAddr = host.parse().ok()?;
-    let (quic_s, tcp_s) = match ip {
-        std::net::IpAddr::V4(v4) => (
-            format!("/ip4/{v4}/udp/{port}/quic-v1"),
-            format!("/ip4/{v4}/tcp/{port}"),
-        ),
-        std::net::IpAddr::V6(v6) => (
-            format!("/ip6/{v6}/udp/{port}/quic-v1"),
-            format!("/ip6/{v6}/tcp/{port}"),
-        ),
+    let tcp_s = match ip {
+        std::net::IpAddr::V4(v4) => format!("/ip4/{v4}/tcp/{port}"),
+        std::net::IpAddr::V6(v6) => format!("/ip6/{v6}/tcp/{port}"),
     };
-    let mut addrs = Vec::new();
-    if let Ok(ma) = quic_s.parse() {
-        addrs.push(ma);
-    }
-    if let Ok(ma) = tcp_s.parse() {
-        addrs.push(ma);
-    }
-    if addrs.is_empty() {
-        return None;
-    }
-    Some((addrs, None))
+    let ma: Multiaddr = tcp_s.parse().ok()?;
+    Some((vec![ma], None))
 }
 
-/// Если в multiaddr только TCP — добавить QUIC-вариант (и наоборот), сохранив `/p2p/`.
+/// Если в multiaddr только QUIC — добавить TCP-запас (тот же порт, `/p2p/` сохраняем).
+/// Обратное (TCP→QUIC) не делаем: двойной dial рвёт TCP-сессию.
 pub(crate) fn expand_transport_variants(ma: &Multiaddr) -> Vec<Multiaddr> {
     let s = ma.to_string();
     let mut out = vec![ma.clone()];
+    if !addr_is_quic_v1(ma) {
+        return out;
+    }
     let pid_suffix = s
         .rfind("/p2p/")
         .map(|i| s[i..].to_string())
@@ -290,26 +298,8 @@ pub(crate) fn expand_transport_variants(ma: &Multiaddr) -> Vec<Multiaddr> {
 
     if let Some(rest) = s.strip_prefix("/ip4/") {
         if let Some((ip, after)) = rest.split_once('/') {
-            if let Some(tcp_port) = after.strip_prefix("tcp/") {
-                let port = tcp_port
-                    .split('/')
-                    .next()
-                    .unwrap_or("")
-                    .to_string();
-                if !port.is_empty() {
-                    let alt = format!("/ip4/{ip}/udp/{port}/quic-v1{pid_suffix}");
-                    if let Ok(ma2) = alt.parse() {
-                        if !out.contains(&ma2) {
-                            out.push(ma2);
-                        }
-                    }
-                }
-            } else if let Some(udp_port) = after.strip_prefix("udp/") {
-                let port = udp_port
-                    .split('/')
-                    .next()
-                    .unwrap_or("")
-                    .to_string();
+            if let Some(udp_port) = after.strip_prefix("udp/") {
+                let port = udp_port.split('/').next().unwrap_or("").to_string();
                 if !port.is_empty() {
                     let alt = format!("/ip4/{ip}/tcp/{port}{pid_suffix}");
                     if let Ok(ma2) = alt.parse() {
@@ -322,26 +312,8 @@ pub(crate) fn expand_transport_variants(ma: &Multiaddr) -> Vec<Multiaddr> {
         }
     } else if let Some(rest) = s.strip_prefix("/ip6/") {
         if let Some((ip, after)) = rest.split_once('/') {
-            if let Some(tcp_port) = after.strip_prefix("tcp/") {
-                let port = tcp_port
-                    .split('/')
-                    .next()
-                    .unwrap_or("")
-                    .to_string();
-                if !port.is_empty() {
-                    let alt = format!("/ip6/{ip}/udp/{port}/quic-v1{pid_suffix}");
-                    if let Ok(ma2) = alt.parse() {
-                        if !out.contains(&ma2) {
-                            out.push(ma2);
-                        }
-                    }
-                }
-            } else if let Some(udp_port) = after.strip_prefix("udp/") {
-                let port = udp_port
-                    .split('/')
-                    .next()
-                    .unwrap_or("")
-                    .to_string();
+            if let Some(udp_port) = after.strip_prefix("udp/") {
+                let port = udp_port.split('/').next().unwrap_or("").to_string();
                 if !port.is_empty() {
                     let alt = format!("/ip6/{ip}/tcp/{port}{pid_suffix}");
                     if let Ok(ma2) = alt.parse() {
@@ -353,7 +325,7 @@ pub(crate) fn expand_transport_variants(ma: &Multiaddr) -> Vec<Multiaddr> {
             }
         }
     }
-    out
+    prefer_tcp_if_available(out)
 }
 
 pub(crate) fn hex_decode_32(s: &str) -> Option<[u8; 32]> {

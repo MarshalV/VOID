@@ -19,8 +19,8 @@ use tokio::sync::mpsc;
 use tracing::{debug, warn};
 
 use crate::bootstrap::{
-    expand_transport_variants, parse_seed_dial_addrs, peer_id_from_multiaddr,
-    void_bootstrap_multiaddrs,
+    addr_is_quic_v1, expand_transport_variants, parse_seed_dial_addrs, peer_id_from_multiaddr,
+    prefer_tcp_if_available, void_bootstrap_multiaddrs,
 };
 use crate::shared_chat::SharedChatMessages;
 use crate::crypto;
@@ -357,14 +357,10 @@ fn expand_dial_addrs(
             }
         }
     }
-    // Prefer LAN, then TCP (NAT / CloudPub / port-forward), then QUIC.
-    // Two simultaneous QUIC dials to the same bootstrap often both die with
-    // ApplicationClosed (libp2p-quic). TCP first keeps a stable hop.
-    direct.sort_by_key(|a| {
-        let lan = if is_likely_lan_addr(a) { 0u8 } else { 1u8 };
-        let quic = if a.to_string().contains("quic-v1") { 1u8 } else { 0u8 };
-        (lan, quic)
-    });
+    // Prefer LAN, then TCP. Never dial QUIC in the same attempt as TCP:
+    // libp2p concurrent-dial aborts the TCP session when QUIC "wins".
+    direct = prefer_tcp_if_available(direct);
+    direct.sort_by_key(|a| if is_likely_lan_addr(a) { 0u8 } else { 1u8 });
 
     let mut circuits: Vec<Multiaddr> = Vec::new();
     for relay_ma in bootstrap_addrs {
@@ -1790,11 +1786,17 @@ fn build_void_swarm(
             let mut kad = kad::Behaviour::with_config(local_peer_id, kad_store, kad_config);
             kad.set_mode(Some(libp2p::kad::Mode::Server));
 
+            let mut kad_by_peer: HashMap<PeerId, Vec<Multiaddr>> = HashMap::new();
             for ma in void_bootstraps {
                 if let Some(pid) = peer_id_from_multiaddr(ma) {
-                    kad.add_address(&pid, ma.clone());
+                    kad_by_peer.entry(pid).or_default().push(ma.clone());
                 } else {
                     warn!("VOID bootstrap: нет /p2p/ в конце адреса, пропуск: {}", ma);
+                }
+            }
+            for (pid, addrs) in kad_by_peer {
+                for ma in prefer_tcp_if_available(addrs) {
+                    kad.add_address(&pid, ma);
                 }
             }
             for (pid, ma) in contact_seed_addrs {
@@ -2719,9 +2721,8 @@ pub async fn run_chat_network(
 
         publish_self_in_dht(&mut swarm.behaviour_mut().kad, local_peer_id);
         publish_self_prekey(&mut swarm, local_peer_id, &my_public_key_bytes);
-        if !void_bootstraps.is_empty() {
-            let _ = swarm.behaviour_mut().kad.bootstrap();
-        }
+        // kad.bootstrap() только после ConnectionEstablished: иначе второй
+        // параллельный dial (часто QUIC) закрывает только что поднятый TCP.
 
         let mut peer_addrs: HashMap<PeerId, Vec<Multiaddr>> = HashMap::new();
         let mut pending_dials: HashSet<PeerId> = HashSet::new();
@@ -6200,6 +6201,9 @@ pub async fn run_chat_network(
                             // Живой dialer-адрес bootstrap нужен для Hop listen
                             // (публичный IP раньше отбрасывался → пустой relay_src).
                             if bootstrap_peer_ids.contains(&peer_id) {
+                                if u32::from(num_established) <= 1 {
+                                    let _ = swarm.behaviour_mut().kad.bootstrap();
+                                }
                                 if let libp2p::core::ConnectedPoint::Dialer { address, .. } =
                                     endpoint
                                 {
@@ -6610,8 +6614,17 @@ pub async fn run_chat_network(
                                 .await;
                             }
                             let mut bootstrap_learned: Vec<String> = Vec::new();
+                            let identify_has_tcp = is_bootstrap
+                                && info.listen_addrs.iter().any(|a| {
+                                    a.iter().any(|p| {
+                                        matches!(p, libp2p::multiaddr::Protocol::Tcp(_))
+                                    })
+                                });
                             for addr in info.listen_addrs {
                                 if is_junk_addr(&addr) {
+                                    continue;
+                                }
+                                if is_bootstrap && identify_has_tcp && addr_is_quic_v1(&addr) {
                                     continue;
                                 }
                                 let a = normalize_peer_addr(addr.clone(), peer_id);
