@@ -357,11 +357,20 @@ fn expand_dial_addrs(
             }
         }
     }
-    // Prefer stable LAN addrs before ephemeral public NAT mappings.
-    direct.sort_by_key(|a| if is_likely_lan_addr(a) { 0u8 } else { 1u8 });
+    // Prefer LAN, then TCP (NAT / CloudPub / port-forward), then QUIC.
+    // Two simultaneous QUIC dials to the same bootstrap often both die with
+    // ApplicationClosed (libp2p-quic). TCP first keeps a stable hop.
+    direct.sort_by_key(|a| {
+        let lan = if is_likely_lan_addr(a) { 0u8 } else { 1u8 };
+        let quic = if a.to_string().contains("quic-v1") { 1u8 } else { 0u8 };
+        (lan, quic)
+    });
 
     let mut circuits: Vec<Multiaddr> = Vec::new();
     for relay_ma in bootstrap_addrs {
+        if peer_id_from_multiaddr(relay_ma) == Some(peer_id) {
+            continue;
+        }
         for circuit in relay_circuit_dial_addrs(std::slice::from_ref(relay_ma), peer_id) {
             if !circuits.contains(&circuit) {
                 circuits.push(circuit);
@@ -1791,9 +1800,10 @@ fn build_void_swarm(
             for (pid, ma) in contact_seed_addrs {
                 kad.add_address(pid, ma.clone());
             }
-            if !void_bootstraps.is_empty() {
-                let _ = kad.bootstrap();
-            }
+            // Не вызываем kad.bootstrap() здесь: параллельный dial с
+            // dial_missing_bootstraps даёт два QUIC к одной ноде — оба
+            // сразу закрываются ApplicationClosed. Периодический bootstrap
+            // Kademlia остаётся (интервал ниже).
 
             let rr_config = libp2p::request_response::Config::default()
                 .with_request_timeout(Duration::from_secs(60))
@@ -6763,8 +6773,10 @@ pub async fn run_chat_network(
                                         e
                                     );
                                     if bootstrap_peer_ids.contains(&peer) {
-                                        let _ = swarm.disconnect_peer_id(peer);
-                                        peer_ping_fail_streak.remove(&peer);
+                                        if *streak >= 3 {
+                                            let _ = swarm.disconnect_peer_id(peer);
+                                            peer_ping_fail_streak.remove(&peer);
+                                        }
                                     } else if *streak >= 2 {
                                         // Zombie: Mac «в сети», Windows нет / RR мёртв.
                                         peer_ping_fail_streak.remove(&peer);
