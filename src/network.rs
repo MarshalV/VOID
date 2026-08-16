@@ -1873,7 +1873,7 @@ fn build_void_swarm(
         .with_swarm_config(|c| {
             // Bound idle so half-open / zombie peers (Mac shows online, Windows not)
             // get dropped; ping (20s/40s) should close sooner on real failures.
-            c.with_idle_connection_timeout(Duration::from_secs(120))
+            c.with_idle_connection_timeout(Duration::from_secs(1200))
                 .with_per_connection_event_buffer_size(256)
         })
         .build())
@@ -2787,6 +2787,7 @@ pub async fn run_chat_network(
         // Пиры-«seed», к которым мы дозвонились через JoinViaNode: после Identify запускаем DHT-bootstrap.
         let mut pending_seed_peers: HashSet<PeerId> = HashSet::new();
         let mut pending_seed_bare: bool = false;
+        let mut bootstrap_identified: HashSet<PeerId> = HashSet::new();
 
         // ─── Автоматическое переподключение к контактам из vault ─────────────
         //
@@ -2801,14 +2802,8 @@ pub async fn run_chat_network(
             for (pid, ma) in &contact_seed_addrs {
                 m.entry(*pid).or_default().push(ma.clone());
             }
-            // Bootstrap-ноды: их адреса известны заранее из конфига/файла,
-            // поэтому добавляем сразу — реконнект к ним будет автоматическим
-            // при обрыве соединения (NAT-timeout, перезагрузка ноды и т.п.).
-            for ma in &void_bootstraps {
-                if let Some(pid) = peer_id_from_multiaddr(ma) {
-                    m.entry(pid).or_default().push(ma.clone());
-                }
-            }
+            // Bootstrap не кладём в reconnect_targets: redial_contact_hard
+            // (PeerCondition::Always) открывает второй TCP и убивает первый.
             m
         };
         let mut reconnect_queue: HashMap<PeerId, (Instant, u32)> = HashMap::new();
@@ -2820,6 +2815,15 @@ pub async fn run_chat_network(
         gossip_tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
         let mut mailbox_tick = tokio::time::interval(Duration::from_secs(2));
         mailbox_tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+
+        // Первый tick() у interval сразу готов. Если обработать его до
+        // swarm.select_next_some, стартовый dial ещё не зарегистрирован —
+        // dial_missing_bootstraps открывает второй TCP, оба закрываются.
+        reconnect_tick.tick().await;
+        mailbox_tick.tick().await;
+        gossip_tick.tick().await;
+        provider_tick.tick().await;
+        chunk_tick.tick().await;
 
         loop {
             tokio::select! {
@@ -2869,6 +2873,9 @@ pub async fn run_chat_network(
                         .collect();
 
                     for (pid, addrs) in to_dial {
+                        if bootstrap_peer_ids.contains(&pid) {
+                            continue;
+                        }
                         let _ = addrs;
                         let attempt = reconnect_queue
                             .get(&pid)
@@ -2898,10 +2905,7 @@ pub async fn run_chat_network(
                         for p in &due {
                             hop_listen_after.remove(p);
                         }
-                        let need_hop = bootstrap_peer_ids.iter().any(|b| {
-                            swarm.is_connected(b) && !relay_circuit_reserved.contains(b)
-                        });
-                        if !due.is_empty() || need_hop {
+                        if !due.is_empty() {
                             ensure_bootstrap_relay_listens(
                                 &mut swarm,
                                 &bootstrap_peer_ids,
@@ -2913,6 +2917,13 @@ pub async fn run_chat_network(
                                 Duration::from_secs(30),
                                 Some(&event_tx),
                             );
+                            for p in &due {
+                                if swarm.is_connected(p) && !relay_circuit_reserved.contains(p)
+                                {
+                                    hop_listen_after
+                                        .insert(*p, Instant::now() + Duration::from_secs(30));
+                                }
+                            }
                         }
                     }
                     // Пока хоть один bootstrap жив — набираем контакты через VOID circuit
@@ -6201,9 +6212,6 @@ pub async fn run_chat_network(
                             // Живой dialer-адрес bootstrap нужен для Hop listen
                             // (публичный IP раньше отбрасывался → пустой relay_src).
                             if bootstrap_peer_ids.contains(&peer_id) {
-                                if u32::from(num_established) <= 1 {
-                                    let _ = swarm.behaviour_mut().kad.bootstrap();
-                                }
                                 if let libp2p::core::ConnectedPoint::Dialer { address, .. } =
                                     endpoint
                                 {
@@ -6264,24 +6272,14 @@ pub async fn run_chat_network(
                                  }
                                  let _ = event_tx.send(NetworkEvent::Connected(peer_id)).await;
                                  let _ = event_tx.send(NetworkEvent::Status(format!("✅ СОЕДИНЕНО: {}", &peer_id.to_string()[..8]))).await;
-                                 // Запрашиваем офлайн-почту у всех пиров (включая bootstrap-relay).
-                                 query_relay_mailbox(
-                                     &mut swarm,
-                                     local_peer_id,
-                                     &bootstrap_peer_ids,
-                                 );
-                                 if bootstrap_peer_ids.contains(&peer_id) {
-                                     publish_self_prekey_to_bootstraps(
+                                 // Bootstrap: Identify + ping сначала, иначе RR/kad.bootstrap
+                                 // открывают второй dial и рвут только что поднятый TCP.
+                                 if !bootstrap_peer_ids.contains(&peer_id) {
+                                     query_relay_mailbox(
                                          &mut swarm,
                                          local_peer_id,
-                                         &my_public_key_bytes,
                                          &bootstrap_peer_ids,
                                      );
-                                     let _ = event_tx
-                                         .send(NetworkEvent::Status(
-                                             "📬 Запрос офлайн-почты у bootstrap-ноды".into(),
-                                         ))
-                                         .await;
                                  }
                                  // Сразу делимся bootstrap-нодами с любым подключённым VOID-клиентом.
                                  if !bootstrap_peer_ids.contains(&peer_id) {
@@ -6407,6 +6405,7 @@ pub async fn run_chat_network(
                             relay_hop_pending.remove(&peer_id);
                             hop_listen_after.remove(&peer_id);
                             peer_ping_fail_streak.remove(&peer_id);
+                            bootstrap_identified.remove(&peer_id);
 
                             // E2EE: при обрыве TCP/QUIC сбрасываем криптосостояние с пиром.
                             // Иначе после рестарта одного клиента второй держит «старый» ratchet
@@ -6422,7 +6421,9 @@ pub async fn run_chat_network(
 
                             // Планируем переподключение для контактов из vault.
                             // Backoff: 2 с → 5 с → 15 с → 60 с (и далее 60 с).
-                            if reconnect_targets.contains_key(&peer_id) {
+                            if !bootstrap_peer_ids.contains(&peer_id)
+                                && reconnect_targets.contains_key(&peer_id)
+                            {
                                 // Не накапливаем reconnect-очередь для уже-диалящихся (swarm сам retry).
                                 let attempt = reconnect_queue
                                     .get(&peer_id)
@@ -6579,6 +6580,27 @@ pub async fn run_chat_network(
                                         now,
                                         &peer_id.to_string()[..8.min(peer_id.to_string().len())]
                                     );
+                                }
+                                if swarm.is_connected(&peer_id)
+                                    && bootstrap_identified.insert(peer_id)
+                                {
+                                    let _ = swarm.behaviour_mut().kad.bootstrap();
+                                    query_relay_mailbox(
+                                        &mut swarm,
+                                        local_peer_id,
+                                        &bootstrap_peer_ids,
+                                    );
+                                    publish_self_prekey_to_bootstraps(
+                                        &mut swarm,
+                                        local_peer_id,
+                                        &my_public_key_bytes,
+                                        &bootstrap_peer_ids,
+                                    );
+                                    let _ = event_tx
+                                        .send(NetworkEvent::Status(
+                                            "📬 Запрос офлайн-почты у bootstrap-ноды".into(),
+                                        ))
+                                        .await;
                                 }
                             }
                             // Первый identify часто приходит до регистрации /void/chat/1.0.0.
