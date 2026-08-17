@@ -13,6 +13,7 @@ use libp2p::{
         dial_opts::DialOpts,
         NetworkBehaviour, SwarmEvent,
     },
+    core::transport::ListenerId,
     tcp, upnp, yamux, Multiaddr, PeerId, StreamProtocol,
 };
 use tokio::sync::mpsc;
@@ -668,6 +669,7 @@ fn dial_unconnected_contacts(
     void_bootstraps: &[Multiaddr],
     contact_dial_at: &mut HashMap<PeerId, Instant>,
     min_interval: Duration,
+    hop_ready: bool,
 ) {
     let connected: HashSet<PeerId> = swarm.connected_peers().copied().collect();
     let boot_live = bootstrap_peer_ids.iter().any(|b| connected.contains(b));
@@ -683,9 +685,8 @@ fn dial_unconnected_contacts(
             continue;
         }
         contact_dial_at.insert(*pid, now);
-        if boot_live {
-            // Не Always: каждый лишний circuit открывает HOP-стрим на
-            // bootstrap (лимит 10/соединение) и душит живой чат.
+        if boot_live && hop_ready {
+            // Circuit до Hop Ack открывает HOP-стрим (лимит 10) и душит Reserve.
             dial_peer_live_circuits(swarm, *pid, void_bootstraps, false);
         }
         // LAN/mDNS (без public ephemeral) — вторым заходом.
@@ -700,8 +701,44 @@ fn dial_unconnected_contacts(
     }
 }
 
+/// Circuit listen addr for a live bootstrap: `/ip4/…/tcp/…/p2p/<relay>/p2p-circuit`.
+/// Prefer the proven dialer endpoint (reconnect_targets), then vault.
+fn hop_circuit_listen_addr(
+    relay_pid: PeerId,
+    void_bootstraps: &[Multiaddr],
+    reconnect_targets: &HashMap<PeerId, Vec<Multiaddr>>,
+) -> Option<Multiaddr> {
+    let mut candidates: Vec<Multiaddr> = Vec::new();
+    if let Some(extra) = reconnect_targets.get(&relay_pid) {
+        candidates.extend(extra.iter().cloned());
+    }
+    for ma in void_bootstraps {
+        if peer_id_from_multiaddr(ma) == Some(relay_pid) {
+            candidates.push(ma.clone());
+            continue;
+        }
+        if reconnect_targets.get(&relay_pid).is_some_and(|list| {
+            list.iter()
+                .any(|e| addr_endpoint_key(e) == addr_endpoint_key(ma))
+        }) {
+            candidates.push(ma.clone());
+        }
+    }
+    for raw in &candidates {
+        if addr_is_quic_v1(raw) || is_circuit_addr(raw) || is_junk_addr(raw) || !addr_is_tcp(raw) {
+            continue;
+        }
+        let a = normalize_peer_addr(strip_p2p_protocols(raw.clone()), relay_pid);
+        return relay_circuit_listen_addrs(std::slice::from_ref(&a))
+            .into_iter()
+            .next();
+    }
+    None
+}
+
 /// listen_on(/p2p-circuit) for each live bootstrap that has no confirmed Hop yet.
-/// `relay_circuit_reserved` = ReservationReqAccepted only (not listen_on Ok).
+/// One listener per relay: a second listen_on opens another HOP stream and the
+/// relay client drops Reserve at capacity 10 → UI stays «нет Hop».
 fn ensure_bootstrap_relay_listens(
     swarm: &mut libp2p::Swarm<ChatBehaviour>,
     bootstrap_peer_ids: &HashSet<PeerId>,
@@ -710,6 +747,7 @@ fn ensure_bootstrap_relay_listens(
     relay_circuit_reserved: &HashSet<PeerId>,
     relay_listen_attempt_at: &mut HashMap<PeerId, Instant>,
     relay_hop_pending: &mut HashSet<PeerId>,
+    relay_hop_listeners: &mut HashMap<PeerId, ListenerId>,
     min_retry: Duration,
     event_tx: Option<&mpsc::Sender<NetworkEvent>>,
 ) {
@@ -719,12 +757,21 @@ fn ensure_bootstrap_relay_listens(
             relay_hop_pending.remove(&relay_pid);
             continue;
         }
-        // Один pending listen_on на relay: повторные Reserve забивают
-        // MAX_CONCURRENT_STREAMS(10) → Dropping inbound stream / нет Hop.
+        if let Some(lid) = relay_hop_listeners.get(&relay_pid).copied() {
+            if relay_listen_attempt_at
+                .get(&relay_pid)
+                .is_some_and(|t| t.elapsed() < Duration::from_secs(25))
+            {
+                continue;
+            }
+            let _ = swarm.remove_listener(lid);
+            relay_hop_listeners.remove(&relay_pid);
+            relay_hop_pending.remove(&relay_pid);
+        }
         if relay_hop_pending.contains(&relay_pid) {
             if relay_listen_attempt_at
                 .get(&relay_pid)
-                .is_some_and(|t| t.elapsed() < Duration::from_secs(12))
+                .is_some_and(|t| t.elapsed() < Duration::from_secs(20))
             {
                 continue;
             }
@@ -736,35 +783,8 @@ fn ensure_bootstrap_relay_listens(
         {
             continue;
         }
-        relay_listen_attempt_at.insert(relay_pid, now);
-        let mut relay_src: Vec<Multiaddr> = Vec::new();
-        let mut push_tcp = |raw: &Multiaddr| {
-            if addr_is_quic_v1(raw) || is_circuit_addr(raw) || is_junk_addr(raw) || !addr_is_tcp(raw)
-            {
-                return;
-            }
-            let a = normalize_peer_addr(strip_p2p_protocols(raw.clone()), relay_pid);
-            let k = addr_endpoint_key(&a);
-            if relay_src.iter().any(|x| addr_endpoint_key(x) == k) {
-                return;
-            }
-            relay_src.push(a);
-        };
-        for ma in void_bootstraps {
-            let same_peer = peer_id_from_multiaddr(ma) == Some(relay_pid);
-            let same_ep = reconnect_targets.get(&relay_pid).is_some_and(|list| {
-                list.iter().any(|e| addr_endpoint_key(e) == addr_endpoint_key(ma))
-            });
-            if same_peer || same_ep {
-                push_tcp(ma);
-            }
-        }
-        if let Some(extra) = reconnect_targets.get(&relay_pid) {
-            for a in extra {
-                push_tcp(a);
-            }
-        }
-        if relay_src.is_empty() {
+        let Some(ma) = hop_circuit_listen_addr(relay_pid, void_bootstraps, reconnect_targets)
+        else {
             debug!(
                 "📡 relay Hop: нет multiaddr для {} — пропуск",
                 &relay_pid.to_string()[..8.min(relay_pid.to_string().len())]
@@ -776,32 +796,29 @@ fn ensure_bootstrap_relay_listens(
                 )));
             }
             continue;
-        }
-        let mut any_ok = false;
-        if let Some(ma) = relay_circuit_listen_addrs(&relay_src).into_iter().next() {
-            match swarm.listen_on(ma.clone()) {
-                Ok(_) => {
-                    any_ok = true;
-                    debug!("📡 relay circuit listen (pending Hop Ack): {}", ma);
-                }
-                Err(e) => {
-                    debug!("relay circuit listen retry {}: {:?}", ma, e);
+        };
+        relay_listen_attempt_at.insert(relay_pid, now);
+        match swarm.listen_on(ma.clone()) {
+            Ok(lid) => {
+                relay_hop_listeners.insert(relay_pid, lid);
+                relay_hop_pending.insert(relay_pid);
+                info!("relay Hop listen → {}", ma);
+                if let Some(tx) = event_tx {
+                    let _ = tx.try_send(NetworkEvent::Status(format!(
+                        "📡 Запрос Hop на {}…",
+                        &relay_pid.to_string()[..8.min(relay_pid.to_string().len())]
+                    )));
                 }
             }
-        }
-        if any_ok {
-            relay_hop_pending.insert(relay_pid);
-            if let Some(tx) = event_tx {
-                let _ = tx.try_send(NetworkEvent::Status(format!(
-                    "📡 Запрос Hop на {}…",
-                    &relay_pid.to_string()[..8.min(relay_pid.to_string().len())]
-                )));
+            Err(e) => {
+                warn!("Hop listen {}: {:?}", ma, e);
+                if let Some(tx) = event_tx {
+                    let _ = tx.try_send(NetworkEvent::Status(format!(
+                        "⚠ Hop listen не стартовал на {} — проверьте bootstrap multiaddr (/ip4/…/p2p/…)",
+                        &relay_pid.to_string()[..8.min(relay_pid.to_string().len())]
+                    )));
+                }
             }
-        } else if let Some(tx) = event_tx {
-            let _ = tx.try_send(NetworkEvent::Status(format!(
-                "⚠ Hop listen не стартовал на {} — проверьте bootstrap multiaddr (/ip4/…/p2p/…)",
-                &relay_pid.to_string()[..8.min(relay_pid.to_string().len())]
-            )));
         }
     }
 }
@@ -2804,8 +2821,10 @@ pub async fn run_chat_network(
         let mut relay_listen_attempt_at: HashMap<PeerId, Instant> = HashMap::new();
         // listen_on уже вызван, ждём ReservationReqAccepted (не спамим Reserve).
         let mut relay_hop_pending: HashSet<PeerId> = HashSet::new();
+        let mut relay_hop_listeners: HashMap<PeerId, ListenerId> = HashMap::new();
         // Отложенный Hop: даём relay behaviour зарегистрировать direct conn.
         let mut hop_listen_after: HashMap<PeerId, Instant> = HashMap::new();
+        let swarm_started = Instant::now();
         // Consecutive ping failures for chat peers → drop zombie after threshold.
         let mut peer_ping_fail_streak: HashMap<PeerId, u32> = HashMap::new();
         // Throttle contact dials when chasing via bootstrap circuit.
@@ -2899,6 +2918,13 @@ pub async fn run_chat_network(
                 _ = mailbox_tick.tick() => {
                     if let Some(deadline) = fetch_mailbox_after {
                         if Instant::now() >= deadline {
+                            // RR-ящик до Hop забивает HOP-стримы (лимит 10) → нет Reserve.
+                            if relay_circuit_reserved.is_empty()
+                                && swarm_started.elapsed() < Duration::from_secs(12)
+                            {
+                                fetch_mailbox_after = Some(Instant::now() + Duration::from_secs(2));
+                                continue;
+                            }
                             // Почта только с bootstrap-нод (RR), без DHT-ящика.
                             let sent = query_relay_mailbox_with_bootstraps(
                                 &mut swarm,
@@ -2968,8 +2994,7 @@ pub async fn run_chat_network(
                             &void_bootstraps,
                         );
                     }
-                    // Hop reservation: retry listen until ReservationReqAccepted.
-                    // Hop reservation: отложенные + редкий retry (не чаще 30 с).
+                    // Hop: пока живой bootstrap без ReservationReqAccepted — пробуем.
                     {
                         let now_h = Instant::now();
                         let due: Vec<PeerId> = hop_listen_after
@@ -2980,7 +3005,10 @@ pub async fn run_chat_network(
                         for p in &due {
                             hop_listen_after.remove(p);
                         }
-                        if !due.is_empty() {
+                        let need_hop = bootstrap_peer_ids.iter().any(|b| {
+                            swarm.is_connected(b) && !relay_circuit_reserved.contains(b)
+                        });
+                        if !due.is_empty() || need_hop {
                             ensure_bootstrap_relay_listens(
                                 &mut swarm,
                                 &bootstrap_peer_ids,
@@ -2989,20 +3017,21 @@ pub async fn run_chat_network(
                                 &relay_circuit_reserved,
                                 &mut relay_listen_attempt_at,
                                 &mut relay_hop_pending,
+                                &mut relay_hop_listeners,
                                 Duration::from_secs(8),
                                 Some(&event_tx),
                             );
-                            for p in &due {
-                                if swarm.is_connected(p) && !relay_circuit_reserved.contains(p)
+                            for b in &bootstrap_peer_ids {
+                                if swarm.is_connected(b) && !relay_circuit_reserved.contains(b)
                                 {
-                                    hop_listen_after
-                                        .insert(*p, Instant::now() + Duration::from_secs(8));
+                                    hop_listen_after.entry(*b).or_insert(
+                                        Instant::now() + Duration::from_secs(8),
+                                    );
                                 }
                             }
                         }
                     }
-                    // Пока хоть один bootstrap жив — набираем контакты через VOID circuit
-                    // (LAN не требуется: путь relay/p2p-circuit/p2p/<peer>).
+                    // Circuit к контактам — только после Hop Ack.
                     dial_unconnected_contacts(
                         &mut swarm,
                         &reconnect_targets,
@@ -3010,6 +3039,7 @@ pub async fn run_chat_network(
                         &void_bootstraps,
                         &mut contact_dial_at,
                         Duration::from_secs(15),
+                        !relay_circuit_reserved.is_empty(),
                     );
                     onion_rt_set_keys(
                         onion_keys.clone(),
@@ -4744,6 +4774,32 @@ pub async fn run_chat_network(
                                 }
                             }
                         },
+
+                        SwarmEvent::ListenerClosed {
+                            listener_id,
+                            addresses,
+                            reason,
+                        } => {
+                            let circuit = addresses.iter().any(is_circuit_addr);
+                            if circuit {
+                                warn!(
+                                    "circuit listener closed {:?}: {:?}",
+                                    listener_id, reason
+                                );
+                                relay_hop_listeners.retain(|_, id| *id != listener_id);
+                                for a in &addresses {
+                                    local_listen_addrs.remove(a);
+                                    if let Some(relay) = relay_peer_id_from_circuit_addr(a) {
+                                        relay_circuit_reserved.remove(&relay);
+                                        relay_hop_pending.remove(&relay);
+                                        hop_listen_after.insert(
+                                            relay,
+                                            Instant::now() + Duration::from_secs(2),
+                                        );
+                                    }
+                                }
+                            }
+                        }
 
                         SwarmEvent::Behaviour(ChatBehaviourEvent::Mdns(mdns::Event::Discovered(list))) => {
                             for (peer_id, addr) in list {
@@ -6515,6 +6571,9 @@ pub async fn run_chat_network(
                             relay_circuit_reserved.remove(&peer_id);
                             relay_listen_attempt_at.remove(&peer_id);
                             relay_hop_pending.remove(&peer_id);
+                            if let Some(lid) = relay_hop_listeners.remove(&peer_id) {
+                                let _ = swarm.remove_listener(lid);
+                            }
                             hop_listen_after.remove(&peer_id);
                             peer_ping_fail_streak.remove(&peer_id);
                             bootstrap_identified.remove(&peer_id);
@@ -6720,36 +6779,15 @@ pub async fn run_chat_network(
                                         local_peer_id,
                                         &my_public_key_bytes,
                                     );
-                                    query_relay_mailbox(
-                                        &mut swarm,
-                                        local_peer_id,
-                                        &bootstrap_peer_ids,
-                                        &mut last_mailbox_query_at,
-                                    );
-                                    publish_self_prekey_to_bootstraps(
-                                        &mut swarm,
-                                        local_peer_id,
-                                        &my_public_key_bytes,
-                                        &bootstrap_peer_ids,
-                                    );
+                                    // Hop first: mailbox/prekey RR on this TCP starve Reserve
+                                    // (relay client max 10 HOP streams).
                                     hop_listen_after.insert(
                                         peer_id,
-                                        Instant::now() + Duration::from_secs(3),
-                                    );
-                                    ensure_bootstrap_relay_listens(
-                                        &mut swarm,
-                                        &bootstrap_peer_ids,
-                                        &void_bootstraps,
-                                        &reconnect_targets,
-                                        &relay_circuit_reserved,
-                                        &mut relay_listen_attempt_at,
-                                        &mut relay_hop_pending,
-                                        Duration::ZERO,
-                                        Some(&event_tx),
+                                        Instant::now() + Duration::from_secs(1),
                                     );
                                     let _ = event_tx
                                         .send(NetworkEvent::Status(
-                                            "📬 Запрос офлайн-почты у bootstrap-ноды".into(),
+                                            "📡 Bootstrap Identify — запрос Hop через 1 с".into(),
                                         ))
                                         .await;
                                 }
@@ -6905,6 +6943,18 @@ pub async fn run_chat_network(
                                 &mut swarm.behaviour_mut().kad,
                                 local_peer_id,
                             );
+                            publish_self_prekey_to_bootstraps(
+                                &mut swarm,
+                                local_peer_id,
+                                &my_public_key_bytes,
+                                &bootstrap_peer_ids,
+                            );
+                            query_relay_mailbox(
+                                &mut swarm,
+                                local_peer_id,
+                                &bootstrap_peer_ids,
+                                &mut last_mailbox_query_at,
+                            );
                             // Мы только что стали достижимы через VOID relay —
                             // чужие клиенты (другая сеть/NAT) могут дозвониться к нам;
                             // сами тоже сразу набираем контакты по всем bootstrap.
@@ -6922,6 +6972,7 @@ pub async fn run_chat_network(
                                 &void_bootstraps,
                                 &mut contact_dial_at,
                                 Duration::from_secs(2),
+                                true,
                             );
                         }
                         SwarmEvent::Behaviour(ChatBehaviourEvent::Relay(
@@ -7690,4 +7741,54 @@ pub fn env_flag_true(name: &str) -> bool {
     std::env::var(name)
         .map(|v| v == "1" || v.eq_ignore_ascii_case("true") || v.eq_ignore_ascii_case("yes"))
         .unwrap_or(false)
+}
+
+#[cfg(test)]
+mod hop_listen_tests {
+    use super::*;
+    use libp2p::identity::Keypair;
+
+    fn pid() -> PeerId {
+        PeerId::from(Keypair::generate_ed25519().public())
+    }
+
+    #[test]
+    fn hop_addr_from_live_dialer_without_p2p() {
+        let relay = pid();
+        let live: Multiaddr = "/ip4/147.78.64.22/tcp/4001".parse().unwrap();
+        let mut rec = HashMap::new();
+        rec.insert(relay, vec![live]);
+        let ma = hop_circuit_listen_addr(relay, &[], &rec).expect("listen addr");
+        let s = ma.to_string();
+        assert!(s.contains("p2p-circuit"), "{s}");
+        assert!(s.contains(&relay.to_string()), "{s}");
+        assert!(s.contains("/tcp/4001"), "{s}");
+        assert!(!addr_is_quic_v1(&ma));
+    }
+
+    #[test]
+    fn hop_addr_rewrites_stale_vault_peer_id() {
+        let relay = pid();
+        let stale = pid();
+        let vault: Multiaddr = format!("/ip4/1.2.3.4/tcp/4001/p2p/{stale}")
+            .parse()
+            .unwrap();
+        let live: Multiaddr = "/ip4/1.2.3.4/tcp/4001".parse().unwrap();
+        let mut rec = HashMap::new();
+        rec.insert(relay, vec![live]);
+        let ma = hop_circuit_listen_addr(relay, &[vault], &rec).expect("listen addr");
+        let s = ma.to_string();
+        assert!(s.contains(&relay.to_string()), "{s}");
+        assert!(!s.contains(&stale.to_string()), "{s}");
+        assert!(s.ends_with("/p2p-circuit") || s.contains("/p2p-circuit"), "{s}");
+    }
+
+    #[test]
+    fn hop_addr_skips_quic() {
+        let relay = pid();
+        let q: Multiaddr = "/ip4/1.2.3.4/udp/4001/quic-v1".parse().unwrap();
+        let mut rec = HashMap::new();
+        rec.insert(relay, vec![q]);
+        assert!(hop_circuit_listen_addr(relay, &[], &rec).is_none());
+    }
 }
