@@ -744,6 +744,14 @@ fn hop_circuit_listen_addr(
     None
 }
 
+fn circuit_listen_relays(swarm: &libp2p::Swarm<ChatBehaviour>) -> Vec<(PeerId, Multiaddr)> {
+    swarm
+        .listeners()
+        .chain(swarm.external_addresses())
+        .filter_map(|a| relay_peer_id_from_circuit_addr(a).map(|p| (p, a.clone())))
+        .collect()
+}
+
 /// listen_on(/p2p-circuit) for each live bootstrap that has no confirmed Hop yet.
 /// One listener per relay: a second listen_on opens another HOP stream and the
 /// relay client drops Reserve at capacity 10 → UI stays «нет Hop».
@@ -768,10 +776,12 @@ fn ensure_bootstrap_relay_listens(
         }
         if relay_hop_listeners.contains_key(&relay_pid) || relay_hop_pending.contains(&relay_pid)
         {
-            // Ждём Ack. Снимаем только если зависло >45 с (ListenerClosed ретраит сам).
-            if relay_listen_attempt_at
-                .get(&relay_pid)
-                .is_some_and(|t| t.elapsed() < Duration::from_secs(45))
+            // Нет circuit в swarm — listen_on Ok, но Reserve не завершился.
+            // 5 с, не 45: иначе UI вечно на «Hop…».
+            if circuit_listen_relays(swarm).iter().any(|(p, _)| *p == relay_pid)
+                || relay_listen_attempt_at
+                    .get(&relay_pid)
+                    .is_some_and(|t| t.elapsed() < Duration::from_secs(5))
             {
                 continue;
             }
@@ -4706,9 +4716,22 @@ pub async fn run_chat_network(
                     }
                 }
                 _ = hop_tick.tick() => {
-                    // Только когда hop_listen_after наступил. need_hop сразу
-                    // после TCP вызывает listen_on до того, как relay-client
-                    // внесёт conn в directly_connected_peers → Dial №2 и «Hop…».
+                    // Живой circuit в swarm — Hop уже есть, даже если
+                    // ReservationReqAccepted не дошёл до match.
+                    for (relay, addr) in circuit_listen_relays(&swarm) {
+                        local_listen_addrs.insert(addr.clone());
+                        if relay_circuit_reserved.insert(relay) {
+                            relay_hop_pending.remove(&relay);
+                            hop_listen_after.remove(&relay);
+                            info!("Hop OK из swarm.listen ({})", addr);
+                            let _ = event_tx
+                                .send(NetworkEvent::NewListenAddr(addr.clone()))
+                                .await;
+                            let _ = event_tx
+                                .send(NetworkEvent::RelayHopReady { relay })
+                                .await;
+                        }
+                    }
                     let now_h = Instant::now();
                     let due: Vec<PeerId> = hop_listen_after
                         .iter()
@@ -4718,7 +4741,10 @@ pub async fn run_chat_network(
                     for p in &due {
                         hop_listen_after.remove(p);
                     }
-                    if !due.is_empty() {
+                    let stale_pending = relay_hop_pending.iter().any(|p| {
+                        swarm.is_connected(p) && !relay_circuit_reserved.contains(p)
+                    });
+                    if !due.is_empty() || stale_pending {
                         ensure_bootstrap_relay_listens(
                             &mut swarm,
                             &bootstrap_peer_ids,
@@ -4801,31 +4827,40 @@ pub async fn run_chat_network(
                             reason,
                         } => {
                             let circuit = addresses.iter().any(is_circuit_addr);
-                            if circuit {
+                            let ours = relay_hop_listeners.values().any(|id| *id == listener_id);
+                            if circuit || ours {
                                 warn!(
-                                    "circuit listener closed {:?}: {:?}",
-                                    listener_id, reason
+                                    "circuit listener closed {:?}: {:?} addrs={:?}",
+                                    listener_id, reason, addresses
                                 );
                                 relay_hop_listeners.retain(|_, id| *id != listener_id);
                                 for a in &addresses {
                                     local_listen_addrs.remove(a);
-                                    if let Some(relay) = relay_peer_id_from_circuit_addr(a) {
-                                        relay_circuit_reserved.remove(&relay);
-                                        relay_hop_pending.remove(&relay);
-                                        hop_listen_after.insert(
-                                            relay,
-                                            Instant::now() + Duration::from_secs(2),
-                                        );
-                                        let _ = event_tx
-                                            .send(NetworkEvent::RelayHopLost { relay })
-                                            .await;
-                                        let _ = event_tx
-                                            .send(NetworkEvent::Status(format!(
-                                                "⚠ Hop сброшен ({:?})",
-                                                reason
-                                            )))
-                                            .await;
-                                    }
+                                }
+                                let relays: Vec<PeerId> = if addresses.is_empty() {
+                                    relay_hop_pending.iter().copied().collect()
+                                } else {
+                                    addresses
+                                        .iter()
+                                        .filter_map(relay_peer_id_from_circuit_addr)
+                                        .collect()
+                                };
+                                for relay in relays {
+                                    relay_circuit_reserved.remove(&relay);
+                                    relay_hop_pending.remove(&relay);
+                                    hop_listen_after.insert(
+                                        relay,
+                                        Instant::now() + Duration::from_secs(2),
+                                    );
+                                    let _ = event_tx
+                                        .send(NetworkEvent::RelayHopLost { relay })
+                                        .await;
+                                    let _ = event_tx
+                                        .send(NetworkEvent::Status(format!(
+                                            "⚠ Hop сброшен ({:?})",
+                                            reason
+                                        )))
+                                        .await;
                                 }
                             }
                         }
@@ -7026,7 +7061,7 @@ pub async fn run_chat_network(
                                 ..
                             },
                         )) => {
-                            debug!(
+                            info!(
                                 "📡 Relay: Hop Ack на {} (renewal={renewal})",
                                 &relay_peer_id.to_string()[..8]
                             );
