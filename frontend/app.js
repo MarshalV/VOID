@@ -175,13 +175,14 @@
     els.beaconBanner.hidden = !s.beacon_active;
     const pidShort = (s.peer_id || "").slice(0, 12);
     const live = (s.bootstrap_connected || 0) + (s.connected_peers || 0);
-    const relay = s.relay_reserved
-      ? " · relay Hop OK"
-      : s.bootstrap_connected > 0
-        ? " · через ноду"
-        : s.network_ok
-          ? " · без relay"
+    const hop = s.relay_reserved
+      ? " · Hop OK"
+      : s.relay_hop_pending
+        ? " · Hop…"
+        : s.bootstrap_connected > 0
+          ? " · нет Hop"
           : "";
+    const via = s.bootstrap_connected > 0 && !s.relay_reserved ? " · через ноду" : "";
     const netLabel = s.network_ok
       ? s.bootstrap_connected > 0
         ? "в сети"
@@ -189,13 +190,15 @@
       : s.bootstraps?.length
         ? "нет связи с bootstrap"
         : "bootstrap не задан";
-    els.connStatus.textContent = `${netLabel}${relay} · ${pidShort}… · live ${live} · контакты ${s.connected_peers} · bootstrap ${s.bootstrap_connected}/${s.bootstraps?.length || 0}`;
+    els.connStatus.textContent = `${netLabel}${via}${hop} · ${pidShort}… · live ${live} · контакты ${s.connected_peers} · bootstrap ${s.bootstrap_connected}/${s.bootstraps?.length || 0}`;
     els.connStatus.title = [
       s.relay_reserved
         ? "Hop: вас можно набрать из‑за NAT через relay"
-        : s.bootstrap_connected > 0
-          ? "Нода на связи: сообщения идут через неё (ящик). Live-circuit (Hop) ещё нет — это не обрыв чата."
-          : "",
+        : s.relay_hop_pending
+          ? "Hop: запрос резервации отправлен, ждём Ack от ноды"
+          : s.bootstrap_connected > 0
+            ? "Нода на связи: сообщения идут через неё (ящик). Live-circuit (Hop) ещё нет — это не обрыв чата."
+            : "",
       s.peer_id || "",
       ...(s.bootstraps || []).slice(0, 4),
     ]
@@ -203,9 +206,11 @@
       .join("\n");
     els.connStatus.style.color = s.relay_reserved
       ? "var(--accent)"
-      : s.network_ok
+      : s.relay_hop_pending
         ? "#c9a227"
-        : "var(--danger)";
+        : s.network_ok
+          ? "#c9a227"
+          : "var(--danger)";
 
     const cSig = contactsSig(s);
     lastContactSig = cSig;
@@ -703,10 +708,12 @@
         }</p>
         <p class="muted">${
           snapshot?.relay_reserved
-            ? "Relay Hop есть — вас можно набрать из‑за NAT."
-            : snapshot?.bootstrap_connected > 0
-              ? "Нода на связи: чат идёт через неё (офлайн-ящик). Live-звонок из другой сети — после Hop."
-              : "Нет связи с нодой — сообщения наружу не уйдут."
+            ? "Hop OK — вас можно набрать из‑за NAT через relay."
+            : snapshot?.relay_hop_pending
+              ? "Hop… — запрос резервации отправлен, ждём Ack ноды."
+              : snapshot?.bootstrap_connected > 0
+                ? "нет Hop — нода на связи, чат идёт через ящик. Live-звонок из другой сети — после Hop."
+                : "Нет связи с нодой — сообщения наружу не уйдут."
         }</p>
         <p class="muted">Сейчас online: ${
           (snapshot?.contacts || [])

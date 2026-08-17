@@ -200,6 +200,9 @@ pub struct SnapshotDto {
     pub listen_addrs: Vec<String>,
     /// True if we have at least one p2p-circuit listen (reachable behind NAT).
     pub relay_reserved: bool,
+    /// listen_on(circuit) sent, waiting for ReservationReqAccepted.
+    #[serde(default)]
+    pub relay_hop_pending: bool,
     pub selected_chat: String,
     pub contacts: Vec<ContactDto>,
     pub messages: Vec<MessageDto>,
@@ -289,6 +292,8 @@ struct Inner {
     snapshot_rev: u64,
     /// Confirmed Circuit Relay Hop (ReservationReqAccepted).
     relay_hop_ready: bool,
+    /// listen_on(circuit) in flight.
+    relay_hop_pending: bool,
 }
 
 impl Inner {
@@ -334,6 +339,7 @@ impl Inner {
             snapshot_dirty: false,
             snapshot_rev: 0,
             relay_hop_ready: false,
+            relay_hop_pending: false,
         }
     }
 
@@ -1723,6 +1729,7 @@ impl Inner {
                     .listen_addrs
                     .iter()
                     .any(|a| a.contains("p2p-circuit")),
+            relay_hop_pending: self.relay_hop_pending && !self.relay_hop_ready,
             selected_chat: self.selected_chat.clone(),
             contacts,
             messages,
@@ -1824,6 +1831,7 @@ impl VoidRuntime {
                                 && !g.listen_addrs.iter().any(|a| a.contains("p2p-circuit"))
                             {
                                 g.relay_hop_ready = false;
+                                g.relay_hop_pending = false;
                             }
                             bridge_evs.push(BridgeEvent::Peer {
                                 peer_id: pid.to_string(),
@@ -1915,8 +1923,29 @@ impl VoidRuntime {
                         }
                         NetworkEvent::RelayHopReady { relay } => {
                             g.relay_hop_ready = true;
+                            g.relay_hop_pending = false;
                             g.add_status(format!(
                                 "Relay Hop OK ({})",
+                                &relay.to_string()[..12.min(relay.to_string().len())]
+                            ));
+                            emit_snapshot = true;
+                        }
+                        NetworkEvent::RelayHopPending { relay } => {
+                            if !g.relay_hop_ready {
+                                g.relay_hop_pending = true;
+                                g.add_status(format!(
+                                    "Hop… ({})",
+                                    &relay.to_string()[..12.min(relay.to_string().len())]
+                                ));
+                                emit_snapshot = true;
+                            }
+                        }
+                        NetworkEvent::RelayHopLost { relay } => {
+                            g.relay_hop_ready = false;
+                            g.relay_hop_pending = false;
+                            g.listen_addrs.retain(|a| !a.contains("p2p-circuit"));
+                            g.add_status(format!(
+                                "Hop сброшен ({})",
                                 &relay.to_string()[..12.min(relay.to_string().len())]
                             ));
                             emit_snapshot = true;

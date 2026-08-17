@@ -2385,6 +2385,13 @@ impl eframe::App for App {
                         TOAST_TTL_SHORT,
                     );
                 }
+                NetworkEvent::RelayHopPending { .. } => {}
+                NetworkEvent::RelayHopLost { relay } => {
+                    self.add_status(format!(
+                        "⚠ Hop сброшен ({})",
+                        &relay.to_string()[..12.min(relay.to_string().len())]
+                    ));
+                }
                 NetworkEvent::PeerAddress(peer, ma) => {
                     if peer == self.local_peer_id {
                         continue;
