@@ -1,7 +1,7 @@
 (() => {
   const asset = (name) => {
     const encoded = name.split("/").map(encodeURIComponent).join("/");
-    return `static/${encoded}?v=7`;
+    return `static/${encoded}?v=8`;
   };
 
   function resolveInvoke() {
@@ -175,7 +175,13 @@
     els.beaconBanner.hidden = !s.beacon_active;
     const pidShort = (s.peer_id || "").slice(0, 12);
     const live = (s.bootstrap_connected || 0) + (s.connected_peers || 0);
-    const relay = s.relay_reserved ? " · relay Hop OK" : " · нет Hop (NAT закрыт)";
+    const relay = s.relay_reserved
+      ? " · relay Hop OK"
+      : s.bootstrap_connected > 0
+        ? " · через ноду"
+        : s.network_ok
+          ? " · без relay"
+          : "";
     const netLabel = s.network_ok
       ? s.bootstrap_connected > 0
         ? "в сети"
@@ -184,7 +190,15 @@
         ? "нет связи с bootstrap"
         : "bootstrap не задан";
     els.connStatus.textContent = `${netLabel}${relay} · ${pidShort}… · live ${live} · контакты ${s.connected_peers} · bootstrap ${s.bootstrap_connected}/${s.bootstraps?.length || 0}`;
-    els.connStatus.title = [s.peer_id || "", ...(s.bootstraps || []).slice(0, 4)]
+    els.connStatus.title = [
+      s.relay_reserved
+        ? "Hop: вас можно набрать из‑за NAT через relay"
+        : s.bootstrap_connected > 0
+          ? "Нода на связи: сообщения идут через неё (ящик). Live-circuit (Hop) ещё нет — это не обрыв чата."
+          : "",
+      s.peer_id || "",
+      ...(s.bootstraps || []).slice(0, 4),
+    ]
       .filter(Boolean)
       .join("\n");
     els.connStatus.style.color = s.relay_reserved
@@ -689,8 +703,10 @@
         }</p>
         <p class="muted">${
           snapshot?.relay_reserved
-            ? "Relay-резервация есть — вас можно набрать из‑за NAT."
-            : "Нет relay-резервации — собеседники за NAT до вас не дозвонятся."
+            ? "Relay Hop есть — вас можно набрать из‑за NAT."
+            : snapshot?.bootstrap_connected > 0
+              ? "Нода на связи: чат идёт через неё (офлайн-ящик). Live-звонок из другой сети — после Hop."
+              : "Нет связи с нодой — сообщения наружу не уйдут."
         }</p>
         <p class="muted">Сейчас online: ${
           (snapshot?.contacts || [])

@@ -6982,6 +6982,20 @@ pub async fn run_chat_network(
                                 "📡 Relay: входящий circuit от {}",
                                 &src_peer_id.to_string()[..8]
                             );
+                            // Входящий circuit бывает только при живой резервации.
+                            if let Some(relay) = bootstrap_peer_ids
+                                .iter()
+                                .copied()
+                                .find(|b| swarm.is_connected(b))
+                            {
+                                if relay_circuit_reserved.insert(relay) {
+                                    relay_hop_pending.remove(&relay);
+                                    hop_listen_after.remove(&relay);
+                                    let _ = event_tx
+                                        .send(NetworkEvent::RelayHopReady { relay })
+                                        .await;
+                                }
+                            }
                         }
                         SwarmEvent::Behaviour(ChatBehaviourEvent::Relay(
                             relay::client::Event::OutboundCircuitEstablished { relay_peer_id, .. },
@@ -6990,6 +7004,15 @@ pub async fn run_chat_network(
                                 "📡 Relay: исходящий circuit через {}",
                                 &relay_peer_id.to_string()[..8]
                             );
+                            if relay_circuit_reserved.insert(relay_peer_id) {
+                                relay_hop_pending.remove(&relay_peer_id);
+                                hop_listen_after.remove(&relay_peer_id);
+                                let _ = event_tx
+                                    .send(NetworkEvent::RelayHopReady {
+                                        relay: relay_peer_id,
+                                    })
+                                    .await;
+                            }
                         }
                         SwarmEvent::Behaviour(ChatBehaviourEvent::Ping(ev)) => {
                             match ev.result {
