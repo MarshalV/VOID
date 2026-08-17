@@ -766,23 +766,17 @@ fn ensure_bootstrap_relay_listens(
             relay_hop_pending.remove(&relay_pid);
             continue;
         }
-        if let Some(lid) = relay_hop_listeners.get(&relay_pid).copied() {
+        if relay_hop_listeners.contains_key(&relay_pid) || relay_hop_pending.contains(&relay_pid)
+        {
+            // Ждём Ack. Снимаем только если зависло >45 с (ListenerClosed ретраит сам).
             if relay_listen_attempt_at
                 .get(&relay_pid)
-                .is_some_and(|t| t.elapsed() < Duration::from_secs(10))
+                .is_some_and(|t| t.elapsed() < Duration::from_secs(45))
             {
                 continue;
             }
-            let _ = swarm.remove_listener(lid);
-            relay_hop_listeners.remove(&relay_pid);
-            relay_hop_pending.remove(&relay_pid);
-        }
-        if relay_hop_pending.contains(&relay_pid) {
-            if relay_listen_attempt_at
-                .get(&relay_pid)
-                .is_some_and(|t| t.elapsed() < Duration::from_secs(20))
-            {
-                continue;
+            if let Some(lid) = relay_hop_listeners.remove(&relay_pid) {
+                let _ = swarm.remove_listener(lid);
             }
             relay_hop_pending.remove(&relay_pid);
         }
@@ -4712,9 +4706,9 @@ pub async fn run_chat_network(
                     }
                 }
                 _ = hop_tick.tick() => {
-                    // Не listen_on из ConnectionEstablished: relay-client ещё
-                    // не видит conn в directly_connected_peers → Dial заново
-                    // или Reserve на мёртвый стрим.
+                    // Только когда hop_listen_after наступил. need_hop сразу
+                    // после TCP вызывает listen_on до того, как relay-client
+                    // внесёт conn в directly_connected_peers → Dial №2 и «Hop…».
                     let now_h = Instant::now();
                     let due: Vec<PeerId> = hop_listen_after
                         .iter()
@@ -4724,10 +4718,7 @@ pub async fn run_chat_network(
                     for p in &due {
                         hop_listen_after.remove(p);
                     }
-                    let need_hop = bootstrap_peer_ids.iter().any(|b| {
-                        swarm.is_connected(b) && !relay_circuit_reserved.contains(b)
-                    });
-                    if !due.is_empty() || need_hop {
+                    if !due.is_empty() {
                         ensure_bootstrap_relay_listens(
                             &mut swarm,
                             &bootstrap_peer_ids,
@@ -4741,13 +4732,15 @@ pub async fn run_chat_network(
                             Duration::from_secs(3),
                             Some(&event_tx),
                         );
-                        for b in &bootstrap_peer_ids {
-                            if swarm.is_connected(b) && !relay_circuit_reserved.contains(b)
-                            {
-                                hop_listen_after.entry(*b).or_insert(
-                                    Instant::now() + Duration::from_secs(8),
-                                );
-                            }
+                    }
+                    for b in &bootstrap_peer_ids {
+                        if swarm.is_connected(b) && !relay_circuit_reserved.contains(b)
+                            && !relay_hop_pending.contains(b)
+                            && !relay_hop_listeners.contains_key(b)
+                        {
+                            hop_listen_after.entry(*b).or_insert(
+                                Instant::now() + Duration::from_secs(1),
+                            );
                         }
                     }
                 }
@@ -6336,13 +6329,14 @@ pub async fn run_chat_network(
                                             addr_endpoint_key(b) == addr_endpoint_key(address)
                                         })
                                 );
-                            // Логи ноды: 7 TCP + QUIC к одному bootstrap за 350 мс.
-                            // Hop Ack есть, но лишние сессии рвут yamux / прячут Hop.
-                            if is_boot_peer && (is_quic_ep || u32::from(num_established) > 1) {
+                            // QUIC к bootstrap рвёт TCP (ApplicationClosed). Второй TCP
+                            // не трогаем, пока нет Hop: listen_on при промахе
+                            // directly_connected_peers сам набирает ноду, и Reserve
+                            // идёт уже на этом conn — close → вечный «Hop…».
+                            if is_boot_peer && is_quic_ep {
                                 warn!(
-                                    "drop extra bootstrap conn {:?} quic={} n={} peer={}",
+                                    "drop bootstrap QUIC {:?} n={} peer={}",
                                     connection_id,
-                                    is_quic_ep,
                                     num_established,
                                     &peer_id.to_string()[..8.min(peer_id.to_string().len())]
                                 );
@@ -6458,8 +6452,10 @@ pub async fn run_chat_network(
                                         if u32::from(num_established) <= 1
                                             && !relay_circuit_reserved.contains(&peer_id)
                                         {
-                                            hop_listen_after
-                                                .insert(peer_id, Instant::now());
+                                            hop_listen_after.insert(
+                                                peer_id,
+                                                Instant::now() + Duration::from_secs(1),
+                                            );
                                         }
                                     }
                                 }
