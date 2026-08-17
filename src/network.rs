@@ -4846,18 +4846,19 @@ pub async fn run_chat_network(
                                         .collect()
                                 };
                                 for relay in relays {
-                                    relay_circuit_reserved.remove(&relay);
+                                    let was_ready = relay_circuit_reserved.remove(&relay);
                                     relay_hop_pending.remove(&relay);
-                                    hop_listen_after.insert(
-                                        relay,
-                                        Instant::now() + Duration::from_secs(2),
-                                    );
-                                    let _ = event_tx
-                                        .send(NetworkEvent::RelayHopLost { relay })
-                                        .await;
+                                    hop_listen_after.insert(relay, Instant::now());
+                                    // Lost только если Hop уже был OK. Иначе UI
+                                    // прыгает на «нет Hop», хотя сейчас повтор.
+                                    if was_ready {
+                                        let _ = event_tx
+                                            .send(NetworkEvent::RelayHopLost { relay })
+                                            .await;
+                                    }
                                     let _ = event_tx
                                         .send(NetworkEvent::Status(format!(
-                                            "⚠ Hop сброшен ({:?})",
+                                            "⚠ Hop listener closed ({:?}) — повтор",
                                             reason
                                         )))
                                         .await;
@@ -6368,7 +6369,7 @@ pub async fn run_chat_network(
                             // не трогаем, пока нет Hop: listen_on при промахе
                             // directly_connected_peers сам набирает ноду, и Reserve
                             // идёт уже на этом conn — close → вечный «Hop…».
-                            if is_boot_peer && is_quic_ep {
+                            if is_boot_peer && is_quic_ep && u32::from(num_established) > 1 {
                                 warn!(
                                     "drop bootstrap QUIC {:?} n={} peer={}",
                                     connection_id,
@@ -6482,14 +6483,23 @@ pub async fn run_chat_network(
                                             peer_id,
                                             strip_p2p_protocols(address.clone()),
                                         );
-                                        // Hop на следующем hop_tick: здесь relay-client
-                                        // ещё может не видеть conn.
+                                        // Сразу Hop: на ноде Ack приходил через ~270 мс
+                                        // от этого listen_on, не от отложенного тика.
                                         if u32::from(num_established) <= 1
                                             && !relay_circuit_reserved.contains(&peer_id)
                                         {
-                                            hop_listen_after.insert(
-                                                peer_id,
-                                                Instant::now() + Duration::from_secs(1),
+                                            ensure_bootstrap_relay_listens(
+                                                &mut swarm,
+                                                &bootstrap_peer_ids,
+                                                &void_bootstraps,
+                                                &reconnect_targets,
+                                                &bootstrap_hop_addr,
+                                                &relay_circuit_reserved,
+                                                &mut relay_listen_attempt_at,
+                                                &mut relay_hop_pending,
+                                                &mut relay_hop_listeners,
+                                                Duration::ZERO,
+                                                Some(&event_tx),
                                             );
                                         }
                                     }
@@ -6679,14 +6689,14 @@ pub async fn run_chat_network(
 
                             relay_peers.remove(&peer_id);
                             let hop_was_up = relay_circuit_reserved.remove(&peer_id);
-                            let hop_pending = relay_hop_pending.remove(&peer_id);
+                            let _ = relay_hop_pending.remove(&peer_id);
                             relay_listen_attempt_at.remove(&peer_id);
                             bootstrap_hop_addr.remove(&peer_id);
                             if let Some(lid) = relay_hop_listeners.remove(&peer_id) {
                                 let _ = swarm.remove_listener(lid);
                             }
                             hop_listen_after.remove(&peer_id);
-                            if hop_was_up || hop_pending {
+                            if hop_was_up {
                                 let _ = event_tx
                                     .send(NetworkEvent::RelayHopLost { relay: peer_id })
                                     .await;
