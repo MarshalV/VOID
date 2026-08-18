@@ -952,19 +952,18 @@ fn ensure_bootstrap_relay_listens(
             relay_hop_pending.remove(&relay_pid);
             continue;
         }
-        if relay_hop_listeners.contains_key(&relay_pid) || relay_hop_pending.contains(&relay_pid)
-        {
-            // Нет circuit в swarm — listen_on Ok, но Reserve не завершился.
-            // 5 с, не 45: иначе UI вечно на «Hop…».
-            if circuit_listen_relays(swarm).iter().any(|(p, _)| *p == relay_pid)
-                || relay_listen_attempt_at
-                    .get(&relay_pid)
-                    .is_some_and(|t| t.elapsed() < Duration::from_secs(5))
+        // Не трогаем уже отправленный listen_on: remove_listener сразу
+        // после Reserve Ack даёт цикл «accepted → closed → listen» каждые ~3 с
+        // и забивает HOP-стримы ноды (второй клиент не коннектится).
+        if relay_hop_listeners.contains_key(&relay_pid) {
+            continue;
+        }
+        if relay_hop_pending.contains(&relay_pid) {
+            if relay_listen_attempt_at
+                .get(&relay_pid)
+                .is_some_and(|t| t.elapsed() < Duration::from_secs(45))
             {
                 continue;
-            }
-            if let Some(lid) = relay_hop_listeners.remove(&relay_pid) {
-                let _ = swarm.remove_listener(lid);
             }
             relay_hop_pending.remove(&relay_pid);
         }
@@ -1993,13 +1992,32 @@ fn ordered_bootstrap_addrs(void_bootstraps: &[Multiaddr]) -> Vec<Multiaddr> {
 }
 
 /// Dial any configured bootstrap that is not yet connected (for store or fetch).
+fn extra_bootstrap_dial_gate() -> std::sync::MutexGuard<'static, Option<Instant>> {
+    static G: std::sync::OnceLock<std::sync::Mutex<Option<Instant>>> = std::sync::OnceLock::new();
+    G.get_or_init(|| std::sync::Mutex::new(None))
+        .lock()
+        .unwrap_or_else(|p| p.into_inner())
+}
+
 fn dial_missing_bootstraps(
     swarm: &mut libp2p::Swarm<ChatBehaviour>,
     bootstrap_peer_ids: &HashSet<PeerId>,
     void_bootstraps: &[Multiaddr],
 ) {
-    let _ = bootstrap_peer_ids;
     ensure_void_node_dial(swarm);
+    let any_live = void_node_ep_is_live()
+        || swarm
+            .connected_peers()
+            .any(|p| bootstrap_peer_ids.contains(p));
+    if any_live {
+        // Уже есть сессия с нодой — второй TCP на тот же host:port убивает оба.
+        // Остальные ноды (onion 2/3 hop) добираем редко, не каждые 5 с.
+        let mut last = extra_bootstrap_dial_gate();
+        if last.is_some_and(|t| t.elapsed() < Duration::from_secs(20)) {
+            return;
+        }
+        *last = Some(Instant::now());
+    }
     let mut seen_ep: HashSet<String> = HashSet::new();
     for ma in ordered_bootstrap_addrs(void_bootstraps) {
         if is_void_bootstrap_host(&ma) {
@@ -5037,22 +5055,29 @@ pub async fn run_chat_network(
                                     "circuit listener closed {:?}: {:?} addrs={:?}",
                                     listener_id, reason, addresses
                                 );
+                                let mut relays: Vec<PeerId> = addresses
+                                    .iter()
+                                    .filter_map(relay_peer_id_from_circuit_addr)
+                                    .collect();
+                                if relays.is_empty() {
+                                    relays.extend(
+                                        relay_hop_listeners
+                                            .iter()
+                                            .filter(|(_, id)| **id == listener_id)
+                                            .map(|(p, _)| *p),
+                                    );
+                                }
                                 relay_hop_listeners.retain(|_, id| *id != listener_id);
                                 for a in &addresses {
                                     local_listen_addrs.remove(a);
                                 }
-                                let relays: Vec<PeerId> = if addresses.is_empty() {
-                                    relay_hop_pending.iter().copied().collect()
-                                } else {
-                                    addresses
-                                        .iter()
-                                        .filter_map(relay_peer_id_from_circuit_addr)
-                                        .collect()
-                                };
                                 for relay in relays {
                                     let was_ready = relay_circuit_reserved.remove(&relay);
                                     relay_hop_pending.remove(&relay);
-                                    hop_listen_after.insert(relay, Instant::now());
+                                    hop_listen_after.insert(
+                                        relay,
+                                        Instant::now() + Duration::from_secs(3),
+                                    );
                                     // Lost только если Hop уже был OK. Иначе UI
                                     // прыгает на «нет Hop», хотя сейчас повтор.
                                     if was_ready {
@@ -7232,7 +7257,9 @@ pub async fn run_chat_network(
                                         }
                                     }
                                     if !relay_circuit_reserved.contains(&peer_id) {
-                                        hop_listen_after.insert(peer_id, Instant::now());
+                                        hop_listen_after.entry(peer_id).or_insert(
+                                            Instant::now() + Duration::from_secs(1),
+                                        );
                                     }
                                     for ma in prefer_tcp_if_available(
                                         void_bootstraps
@@ -7420,41 +7447,38 @@ pub async fn run_chat_network(
                                     relay: relay_peer_id,
                                 })
                                 .await;
-                            publish_self_in_dht(
-                                &mut swarm.behaviour_mut().kad,
-                                local_peer_id,
-                            );
-                            publish_self_prekey_to_bootstraps(
-                                &mut swarm,
-                                local_peer_id,
-                                &my_public_key_bytes,
-                                &bootstrap_peer_ids,
-                            );
-                            query_relay_mailbox(
-                                &mut swarm,
-                                local_peer_id,
-                                &bootstrap_peer_ids,
-                                &mut last_mailbox_query_at,
-                            );
-                            // Мы только что стали достижимы через VOID relay —
-                            // чужие клиенты (другая сеть/NAT) могут дозвониться к нам;
-                            // сами тоже сразу набираем контакты по всем bootstrap.
                             if !renewal {
+                                publish_self_in_dht(
+                                    &mut swarm.behaviour_mut().kad,
+                                    local_peer_id,
+                                );
+                                publish_self_prekey_to_bootstraps(
+                                    &mut swarm,
+                                    local_peer_id,
+                                    &my_public_key_bytes,
+                                    &bootstrap_peer_ids,
+                                );
+                                query_relay_mailbox(
+                                    &mut swarm,
+                                    local_peer_id,
+                                    &bootstrap_peer_ids,
+                                    &mut last_mailbox_query_at,
+                                );
                                 let _ = event_tx
                                     .send(NetworkEvent::Status(
                                         "СВЯЗЬ ЧЕРЕЗ RELAY — можно принимать звонки из VOID".into(),
                                     ))
                                     .await;
+                                dial_unconnected_contacts(
+                                    &mut swarm,
+                                    &reconnect_targets,
+                                    &bootstrap_peer_ids,
+                                    &void_bootstraps,
+                                    &mut contact_dial_at,
+                                    Duration::from_secs(2),
+                                    true,
+                                );
                             }
-                            dial_unconnected_contacts(
-                                &mut swarm,
-                                &reconnect_targets,
-                                &bootstrap_peer_ids,
-                                &void_bootstraps,
-                                &mut contact_dial_at,
-                                Duration::from_secs(2),
-                                true,
-                            );
                         }
                         SwarmEvent::Behaviour(ChatBehaviourEvent::Relay(
                             relay::client::Event::InboundCircuitEstablished { src_peer_id, .. },
