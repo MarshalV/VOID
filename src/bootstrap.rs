@@ -118,6 +118,14 @@ pub(crate) fn merge_bootstrap_string_lists(
         }
         if let Ok(ma) = t.parse::<Multiaddr>() {
             if peer_id_from_multiaddr(&ma).is_some() {
+                let key = addr_endpoint_key(&ma);
+                if !key.is_empty() && !key.ends_with("//") {
+                    out.retain(|old| {
+                        old.parse::<Multiaddr>()
+                            .map(|o| addr_endpoint_key(&o) != key)
+                            .unwrap_or(true)
+                    });
+                }
                 let normalized = ma.to_string();
                 if !out.contains(&normalized) {
                     out.push(normalized);
@@ -640,7 +648,7 @@ fn append_global_bootstraps_body(out: &mut Vec<Multiaddr>) {
 
 #[cfg(test)]
 mod tests {
-    use super::parse_peer_id_loose;
+    use super::{merge_bootstrap_string_lists, parse_peer_id_loose};
     use libp2p::identity::Keypair;
     use libp2p::PeerId;
 
@@ -657,5 +665,17 @@ mod tests {
             Some(pid)
         );
         assert!(parse_peer_id_loose("1.2.3.4:4001").is_none());
+    }
+
+    #[test]
+    fn merge_replaces_same_endpoint_peer_id() {
+        let stale = PeerId::from(Keypair::generate_ed25519().public());
+        let live = PeerId::from(Keypair::generate_ed25519().public());
+        let existing = vec![format!("/ip4/147.78.64.22/tcp/4001/p2p/{stale}")];
+        let incoming = vec![format!("/ip4/147.78.64.22/tcp/4001/p2p/{live}")];
+        let merged = merge_bootstrap_string_lists(&existing, &incoming);
+        assert_eq!(merged.len(), 1);
+        assert!(merged[0].contains(&live.to_string()));
+        assert!(!merged[0].contains(&stale.to_string()));
     }
 }

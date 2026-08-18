@@ -1514,9 +1514,8 @@ impl Inner {
     }
 
     fn merge_learned_bootstraps(&mut self, learned: Vec<String>) {
-        let before = self.void_bootstrap_strings.len();
         let merged = merge_bootstrap_string_lists(&self.void_bootstrap_strings, &learned);
-        if merged.len() != before {
+        if merged != self.void_bootstrap_strings {
             self.void_bootstrap_strings = merged;
             self.persist_vault();
             self.add_status(format!(
