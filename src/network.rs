@@ -955,7 +955,7 @@ fn ensure_bootstrap_relay_listens(
         // Живой Reserve не трогаем. Зависший listen_on (нет Ack ~12 с) —
         // один повтор, иначе UI вечно на «Hop…». Не каждые 3 с: это
         // забивало HOP-стримы ноды.
-        const HANG: Duration = Duration::from_secs(12);
+        const HANG: Duration = Duration::from_secs(25);
         let hung = relay_listen_attempt_at
             .get(&relay_pid)
             .is_some_and(|t| t.elapsed() >= HANG);
@@ -4955,6 +4955,7 @@ pub async fn run_chat_network(
                             relay_hop_pending.remove(&relay);
                             hop_listen_after.remove(&relay);
                             info!("Hop OK из swarm.listen ({})", addr);
+                            let _ = swarm.behaviour_mut().kad.bootstrap();
                             let _ = event_tx
                                 .send(NetworkEvent::NewListenAddr(addr.clone()))
                                 .await;
@@ -6572,7 +6573,9 @@ pub async fn run_chat_network(
                         SwarmEvent::ExternalAddrConfirmed { address } => {
                             debug!("🌍 ВНЕШНИЙ АДРЕС ПОДТВЕРЖДЕН: {}", address);
                             publish_self_in_dht(&mut swarm.behaviour_mut().kad, local_peer_id);
-                            let _ = swarm.behaviour_mut().kad.bootstrap();
+                            if !relay_circuit_reserved.is_empty() {
+                                let _ = swarm.behaviour_mut().kad.bootstrap();
+                            }
                             if let Some(relay) = relay_peer_id_from_circuit_addr(&address) {
                                 // Дубль сигнала Hop (на случай если Event::ReservationReqAccepted
                                 // не дошёл до match из-за версии).
@@ -6771,23 +6774,14 @@ pub async fn run_chat_network(
                                             peer_id,
                                             strip_p2p_protocols(address.clone()),
                                         );
-                                        // Сразу Hop: на ноде Ack приходил через ~270 мс
-                                        // от этого listen_on, не от отложенного тика.
+                                        // Hop только после Identify: listen_on здесь
+                                        // гоняет Reserve по полуживому conn, а
+                                        // kad.bootstrap() сразу открывает второй TCP.
                                         if u32::from(num_established) <= 1
                                             && !relay_circuit_reserved.contains(&peer_id)
                                         {
-                                            ensure_bootstrap_relay_listens(
-                                                &mut swarm,
-                                                &bootstrap_peer_ids,
-                                                &void_bootstraps,
-                                                &reconnect_targets,
-                                                &bootstrap_hop_addr,
-                                                &relay_circuit_reserved,
-                                                &mut relay_listen_attempt_at,
-                                                &mut relay_hop_pending,
-                                                &mut relay_hop_listeners,
-                                                Duration::ZERO,
-                                                Some(&event_tx),
+                                            hop_listen_after.entry(peer_id).or_insert(
+                                                Instant::now() + Duration::from_millis(800),
                                             );
                                         }
                                     }
@@ -7287,7 +7281,8 @@ pub async fn run_chat_network(
                                     {
                                         swarm.behaviour_mut().kad.add_address(&peer_id, ma);
                                     }
-                                    let _ = swarm.behaviour_mut().kad.bootstrap();
+                                    // Не kad.bootstrap() до Hop Ack: второй TCP к ноде
+                                    // убивает HOP-стрим → вечный «Hop…» на обоих клиентах.
                                     publish_self_in_dht(
                                         &mut swarm.behaviour_mut().kad,
                                         local_peer_id,
@@ -7411,7 +7406,9 @@ pub async fn run_chat_network(
                             let was_seed = pending_seed_peers.remove(&peer_id);
                             if was_seed || pending_seed_bare {
                                 pending_seed_bare = false;
-                                let _ = swarm.behaviour_mut().kad.bootstrap();
+                                if !relay_circuit_reserved.is_empty() {
+                                    let _ = swarm.behaviour_mut().kad.bootstrap();
+                                }
                                 let _ = event_tx
                                     .send(NetworkEvent::Status(format!(
                                         "🌐 Вход в сеть через {}: DHT-bootstrap запущен.",
@@ -7461,6 +7458,7 @@ pub async fn run_chat_network(
                                     &mut swarm.behaviour_mut().kad,
                                     local_peer_id,
                                 );
+                                let _ = swarm.behaviour_mut().kad.bootstrap();
                                 publish_self_prekey_to_bootstraps(
                                     &mut swarm,
                                     local_peer_id,
