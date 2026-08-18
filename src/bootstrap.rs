@@ -25,7 +25,9 @@ pub(crate) fn peer_id_from_multiaddr(ma: &Multiaddr) -> Option<PeerId> {
         _ => None,
     })
 }
-const BUILTIN_VOID_BOOTSTRAP: &[&str] = &[];
+const BUILTIN_VOID_BOOTSTRAP: &[&str] = &[
+    "/ip4/147.78.64.22/tcp/4001/p2p/12D3KooWCAH8ykDMThNRRVLAM6LnuVrJeoZrQADzHC2x6ddhZxyG",
+];
 
 /// Публичный URL со списком seed (как `void-bootstrap.txt`: одна multiaddr на строку, `#` — комментарий).
 /// Замените на свой endpoint один раз на релиз; клиенты подтянут список при старте.
@@ -628,33 +630,32 @@ fn verify_void_bootstrap_http_body(body: &str, source: &str) -> Result<bool, Str
     Ok(true)
 }
 
-/// Собирает полный список bootstrap: сначала из vault, затем встроенные/URL/env.
+/// Собирает полный список bootstrap: встроенный VOID-узел, затем vault/URL/env.
+/// Один host:port — один слот; встроенный адрес не вытесняется gossip-мусором.
 pub fn void_bootstrap_multiaddrs(vault_bootstraps: &[String]) -> Vec<Multiaddr> {
-    let mut out = Vec::new();
-
+    let mut raw = Vec::new();
+    append_global_bootstraps(&mut raw);
     for s in vault_bootstraps {
         let t = s.trim();
         if t.is_empty() {
             continue;
         }
         match t.parse::<Multiaddr>() {
-            Ok(ma) => {
-                if let Some(c) = canonicalize_bootstrap_ma(&ma) {
-                    out.push(c);
-                } else {
-                    warn!("vault bootstrap: не TCP с /p2p/, пропуск: {}", t);
-                }
-            }
+            Ok(ma) => raw.push(ma),
             Err(_) => warn!("vault bootstrap: пропуск: {}", t),
         }
     }
 
-    append_global_bootstraps(&mut out);
-
-    out.sort_by(|a, b| a.to_string().cmp(&b.to_string()));
-    out.dedup_by(|a, b| a == b);
+    let mut out = Vec::new();
     let mut seen_ep: HashSet<String> = HashSet::new();
-    out.retain(|ma| seen_ep.insert(addr_endpoint_key(ma)));
+    for ma in raw {
+        let Some(c) = canonicalize_bootstrap_ma(&ma) else {
+            continue;
+        };
+        if seen_ep.insert(addr_endpoint_key(&c)) {
+            out.push(c);
+        }
+    }
     out
 }
 
@@ -713,7 +714,7 @@ fn append_global_bootstraps_body(out: &mut Vec<Multiaddr>) {
 mod tests {
     use super::{
         bootstrap_tcp_dial_addr, canonicalize_bootstrap_ma, merge_bootstrap_string_lists,
-        parse_peer_id_loose,
+        parse_peer_id_loose, void_bootstrap_multiaddrs,
     };
     use libp2p::identity::Keypair;
     use libp2p::PeerId;
@@ -764,5 +765,25 @@ mod tests {
         let merged = merge_bootstrap_string_lists(&[circuit.to_string()], &[]);
         assert_eq!(merged.len(), 1);
         assert!(!merged[0].contains("p2p-circuit"));
+    }
+
+    #[test]
+    fn builtin_node_wins_over_junk_vault() {
+        let junk = PeerId::from(Keypair::generate_ed25519().public());
+        let vault = vec![
+            format!("/ip4/93.153.49.177/tcp/4001/p2p/{junk}"),
+            format!("/ip4/147.78.64.22/tcp/4001/p2p/{junk}"),
+        ];
+        let addrs = void_bootstrap_multiaddrs(&vault);
+        let node = addrs
+            .iter()
+            .find(|a| a.to_string().contains("147.78.64.22"))
+            .expect("builtin node")
+            .to_string();
+        assert!(
+            node.contains("12D3KooWCAH8ykDMThNRRVLAM6LnuVrJeoZrQADzHC2x6ddhZxyG"),
+            "{node}"
+        );
+        assert!(!node.contains(&junk.to_string()), "{node}");
     }
 }

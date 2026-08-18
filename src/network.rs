@@ -189,6 +189,17 @@ fn peer_is_bootstrap_agent(info: &identify::Info) -> bool {
     info.agent_version.starts_with("void-bootstrap-node")
 }
 
+fn peer_offers_relay_hop(info: &identify::Info) -> bool {
+    info.protocols.iter().any(|p| {
+        let s = p.as_ref();
+        s.contains("circuit/relay") && s.contains("/hop") && !s.contains("/stop")
+    })
+}
+
+fn peer_is_void_bootstrap(info: &identify::Info) -> bool {
+    peer_is_bootstrap_agent(info) || peer_offers_relay_hop(info)
+}
+
 /// Адреса для listen через relay v2: `<relay>/p2p/<relay_id>/p2p-circuit`.
 fn relay_circuit_listen_addrs(relay_addrs: &[Multiaddr]) -> Vec<Multiaddr> {
     let mut out = Vec::new();
@@ -1830,7 +1841,17 @@ fn publish_relay_mail(
 
 fn ordered_bootstrap_addrs(void_bootstraps: &[Multiaddr]) -> Vec<Multiaddr> {
     let mut addrs: Vec<Multiaddr> = void_bootstraps.to_vec();
-    addrs.sort_by_key(|ma| (is_likely_lan_addr(ma), ma.to_string()));
+    addrs.sort_by_key(|ma| {
+        let s = ma.to_string();
+        let rank = if s.contains("147.78.64.22") {
+            0u8
+        } else if is_likely_lan_addr(ma) {
+            2
+        } else {
+            1
+        };
+        (rank, s)
+    });
     addrs
 }
 
@@ -1898,12 +1919,13 @@ fn query_relay_mailbox(
     let packet = V1Packet::OfflineMailboxQuery {
         recipient: local_peer_id.to_string(),
     };
-    let peers: Vec<PeerId> = if !bootstrap_peer_ids.is_empty() {
-        swarm
-            .connected_peers()
-            .copied()
-            .filter(|p| bootstrap_peer_ids.contains(p))
-            .collect()
+    let boot: Vec<PeerId> = swarm
+        .connected_peers()
+        .copied()
+        .filter(|p| bootstrap_peer_ids.contains(p))
+        .collect();
+    let peers: Vec<PeerId> = if !boot.is_empty() {
+        boot
     } else {
         swarm
             .connected_peers()
@@ -6967,38 +6989,21 @@ pub async fn run_chat_network(
                         SwarmEvent::Behaviour(ChatBehaviourEvent::Identify(identify::Event::Received { peer_id, info, .. })) => {
                             let now = chrono::Local::now().format("%H:%M:%S").to_string();
                             let has_chat = peer_advertises_void_chat(&info);
-                            let agent_bootstrap = peer_is_bootstrap_agent(&info);
-                            if has_chat && !agent_bootstrap {
+                            let is_void_node = peer_is_void_bootstrap(&info);
+                            if has_chat && !is_void_node {
                                 if bootstrap_peer_ids.remove(&peer_id) {
                                     onion_rt_set_keys(
                                         onion_keys.clone(),
                                         bootstrap_peer_ids.clone(),
                                         local_peer_id,
                                     );
-                                    {
-                                        let mut g = bootstrap_ep_gate();
-                                        g.live.clear();
-                                        g.inflight.clear();
-                                    }
-                                    let _ = event_tx
-                                        .send(NetworkEvent::BootstrapSession {
-                                            peer: peer_id,
-                                            up: false,
-                                        })
-                                        .await;
                                     warn!(
-                                        "Identify: {} — VOID-чат, не нода; отпускаем TCP",
+                                        "Identify: {} — VOID-чат, не relay-нода",
                                         &peer_id.to_string()[..12.min(peer_id.to_string().len())]
-                                    );
-                                    let _ = swarm.disconnect_peer_id(peer_id);
-                                    dial_missing_bootstraps(
-                                        &mut swarm,
-                                        &bootstrap_peer_ids,
-                                        &void_bootstraps,
                                     );
                                 }
                             }
-                            let is_bootstrap = agent_bootstrap
+                            let is_bootstrap = is_void_node
                                 || (bootstrap_peer_ids.contains(&peer_id) && !has_chat);
                             debug!(
                                 "[{}] 🆔 Identify: {} — {} listen, {} протоколов{}",

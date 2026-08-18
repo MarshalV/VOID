@@ -2464,20 +2464,12 @@ impl VoidRuntime {
                         bootstraps = migrated;
                     }
                 }
-                let cleaned = merge_bootstrap_string_lists(&bootstraps, &[]);
-                if cleaned != bootstraps {
-                    bootstraps = cleaned;
-                    let _ = Storage::save(
-                        &master_arr,
-                        &storage.nickname,
-                        None,
-                        None,
-                        None,
-                        Some(&bootstraps),
-                        None,
-                        None,
-                    );
-                } else if storage.void_bootstraps.is_empty() && !bootstraps.is_empty() {
+                bootstraps = merge_bootstrap_string_lists(&bootstraps, &[]);
+                let network_bootstraps = void_bootstrap_multiaddrs(&bootstraps);
+                let learned: Vec<String> =
+                    network_bootstraps.iter().map(|m| m.to_string()).collect();
+                bootstraps = merge_bootstrap_string_lists(&bootstraps, &learned);
+                if bootstraps != storage.void_bootstraps {
                     let _ = Storage::save(
                         &master_arr,
                         &storage.nickname,
@@ -2489,7 +2481,6 @@ impl VoidRuntime {
                         None,
                     );
                 }
-                let network_bootstraps = void_bootstrap_multiaddrs(&bootstraps);
 
                 let mut book = HashMap::new();
                 let mut addrs_map: HashMap<PeerId, Vec<Multiaddr>> = HashMap::new();
