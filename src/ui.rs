@@ -2375,6 +2375,14 @@ impl eframe::App for App {
                 NetworkEvent::BootstrapsLearned(addrs) => {
                     self.merge_learned_bootstraps(addrs);
                 }
+                NetworkEvent::BootstrapSession { peer, up } => {
+                    if up {
+                        self.add_status(format!(
+                            "🌐 Bootstrap TCP {}...",
+                            &peer.to_string()[..8.min(peer.to_string().len())]
+                        ));
+                    }
+                }
                 NetworkEvent::RelayHopReady { relay } => {
                     self.push_toast(
                         format!(

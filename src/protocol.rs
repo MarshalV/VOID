@@ -6,7 +6,6 @@ use serde::{Deserialize, Serialize};
 
 use crate::crypto;
 use crate::file_transfer;
-use crate::bootstrap::peer_id_from_multiaddr;
 use crate::group::{self, GroupMember};
 
 /// Статус доставки исходящего сообщения (галочки в UI).
@@ -572,8 +571,8 @@ pub(crate) fn validate_bootstrap_gossip_addrs(addrs: &[String]) -> Option<Vec<St
             continue;
         }
         if let Ok(ma) = t.parse::<libp2p::Multiaddr>() {
-            if peer_id_from_multiaddr(&ma).is_some() {
-                let normalized = ma.to_string();
+            if let Some(c) = crate::bootstrap::canonicalize_bootstrap_ma(&ma) {
+                let normalized = c.to_string();
                 if !out.contains(&normalized) {
                     out.push(normalized);
                 }

@@ -110,28 +110,36 @@ pub(crate) fn merge_bootstrap_string_lists(
     existing: &[String],
     incoming: &[String],
 ) -> Vec<String> {
-    let mut out: Vec<String> = existing.to_vec();
-    for s in incoming {
+    let mut out: Vec<String> = Vec::new();
+    let mut ingest = |s: &str| {
         let t = s.trim();
         if t.is_empty() {
-            continue;
+            return;
         }
-        if let Ok(ma) = t.parse::<Multiaddr>() {
-            if peer_id_from_multiaddr(&ma).is_some() {
-                let key = addr_endpoint_key(&ma);
-                if !key.is_empty() && !key.ends_with("//") {
-                    out.retain(|old| {
-                        old.parse::<Multiaddr>()
-                            .map(|o| addr_endpoint_key(&o) != key)
-                            .unwrap_or(true)
-                    });
-                }
-                let normalized = ma.to_string();
-                if !out.contains(&normalized) {
-                    out.push(normalized);
-                }
-            }
+        let Ok(raw) = t.parse::<Multiaddr>() else {
+            return;
+        };
+        let Some(ma) = canonicalize_bootstrap_ma(&raw) else {
+            return;
+        };
+        let key = addr_endpoint_key(&ma);
+        if !key.is_empty() && !key.ends_with("//") {
+            out.retain(|old| {
+                old.parse::<Multiaddr>()
+                    .map(|o| addr_endpoint_key(&o) != key)
+                    .unwrap_or(true)
+            });
         }
+        let normalized = ma.to_string();
+        if !out.contains(&normalized) {
+            out.push(normalized);
+        }
+    };
+    for s in existing {
+        ingest(s);
+    }
+    for s in incoming {
+        ingest(s);
     }
     out.sort();
     out.dedup();
@@ -270,6 +278,59 @@ pub(crate) fn addr_is_quic_v1(ma: &Multiaddr) -> bool {
 
 pub(crate) fn addr_is_tcp(ma: &Multiaddr) -> bool {
     ma.iter().any(|p| matches!(p, Protocol::Tcp(_)))
+}
+
+/// `/ip4|ip6/…/tcp/port` из любого bootstrap-адреса, в том числе circuit.
+/// Dial идёт без `/p2p/`: в vault часто лежит PeerId контакта, не ноды.
+pub(crate) fn bootstrap_tcp_dial_addr(ma: &Multiaddr) -> Option<Multiaddr> {
+    if addr_is_quic_v1(ma) {
+        return None;
+    }
+    let mut out = Multiaddr::empty();
+    let mut have_ip = false;
+    let mut have_tcp = false;
+    for p in ma.iter() {
+        match p {
+            Protocol::Ip4(_) | Protocol::Ip6(_) if !have_ip => {
+                out.push(p);
+                have_ip = true;
+            }
+            Protocol::Tcp(_) if !have_tcp => {
+                out.push(p);
+                have_tcp = true;
+            }
+            _ => {}
+        }
+    }
+    if have_ip && have_tcp {
+        Some(out)
+    } else {
+        None
+    }
+}
+
+/// Для vault: только прямой TCP с `/p2p/` (id реле до `p2p-circuit`, не контакт после него).
+pub(crate) fn canonicalize_bootstrap_ma(ma: &Multiaddr) -> Option<Multiaddr> {
+    let tcp = bootstrap_tcp_dial_addr(ma)?;
+    let mut peer_before_circuit = None;
+    let mut seen_circuit = false;
+    let mut last_p2p = None;
+    for p in ma.iter() {
+        match p {
+            Protocol::P2pCircuit => seen_circuit = true,
+            Protocol::P2p(id) => {
+                if !seen_circuit {
+                    peer_before_circuit = Some(id);
+                }
+                last_p2p = Some(id);
+            }
+            _ => {}
+        }
+    }
+    let pid = peer_before_circuit.or(last_p2p)?;
+    let mut out = tcp;
+    out.push(Protocol::P2p(pid));
+    Some(out)
 }
 
 /// Параллельный TCP+QUIC к одному пиру часто убивает уже установленный TCP
@@ -578,10 +639,10 @@ pub fn void_bootstrap_multiaddrs(vault_bootstraps: &[String]) -> Vec<Multiaddr> 
         }
         match t.parse::<Multiaddr>() {
             Ok(ma) => {
-                if peer_id_from_multiaddr(&ma).is_some() {
-                    out.push(ma);
+                if let Some(c) = canonicalize_bootstrap_ma(&ma) {
+                    out.push(c);
                 } else {
-                    warn!("vault bootstrap: нет /p2p/, пропуск: {}", t);
+                    warn!("vault bootstrap: не TCP с /p2p/, пропуск: {}", t);
                 }
             }
             Err(_) => warn!("vault bootstrap: пропуск: {}", t),
@@ -592,6 +653,8 @@ pub fn void_bootstrap_multiaddrs(vault_bootstraps: &[String]) -> Vec<Multiaddr> 
 
     out.sort_by(|a, b| a.to_string().cmp(&b.to_string()));
     out.dedup_by(|a, b| a == b);
+    let mut seen_ep: HashSet<String> = HashSet::new();
+    out.retain(|ma| seen_ep.insert(addr_endpoint_key(ma)));
     out
 }
 
@@ -648,7 +711,10 @@ fn append_global_bootstraps_body(out: &mut Vec<Multiaddr>) {
 
 #[cfg(test)]
 mod tests {
-    use super::{merge_bootstrap_string_lists, parse_peer_id_loose};
+    use super::{
+        bootstrap_tcp_dial_addr, canonicalize_bootstrap_ma, merge_bootstrap_string_lists,
+        parse_peer_id_loose,
+    };
     use libp2p::identity::Keypair;
     use libp2p::PeerId;
 
@@ -677,5 +743,26 @@ mod tests {
         assert_eq!(merged.len(), 1);
         assert!(merged[0].contains(&live.to_string()));
         assert!(!merged[0].contains(&stale.to_string()));
+    }
+
+    #[test]
+    fn circuit_canonicalizes_to_relay_tcp() {
+        let relay = PeerId::from(Keypair::generate_ed25519().public());
+        let contact = PeerId::from(Keypair::generate_ed25519().public());
+        let circuit: libp2p::Multiaddr = format!(
+            "/ip4/147.78.64.22/tcp/4001/p2p/{relay}/p2p-circuit/p2p/{contact}"
+        )
+        .parse()
+        .unwrap();
+        let canon = canonicalize_bootstrap_ma(&circuit).expect("tcp");
+        let s = canon.to_string();
+        assert!(s.contains(&relay.to_string()), "{s}");
+        assert!(!s.contains("p2p-circuit"), "{s}");
+        assert!(!s.contains(&contact.to_string()), "{s}");
+        let dial = bootstrap_tcp_dial_addr(&circuit).expect("dial");
+        assert_eq!(dial.to_string(), "/ip4/147.78.64.22/tcp/4001");
+        let merged = merge_bootstrap_string_lists(&[circuit.to_string()], &[]);
+        assert_eq!(merged.len(), 1);
+        assert!(!merged[0].contains("p2p-circuit"));
     }
 }

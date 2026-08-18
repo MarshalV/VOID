@@ -294,6 +294,8 @@ struct Inner {
     relay_hop_ready: bool,
     /// listen_on(circuit) in flight.
     relay_hop_pending: bool,
+    /// PeerId с живым прямым TCP к VOID-ноде (может не совпадать с vault /p2p/).
+    live_bootstrap_peers: HashSet<PeerId>,
 }
 
 impl Inner {
@@ -340,28 +342,28 @@ impl Inner {
             snapshot_rev: 0,
             relay_hop_ready: false,
             relay_hop_pending: false,
+            live_bootstrap_peers: HashSet::new(),
         }
     }
 
     fn recount_connected(&mut self) {
-        let boots = bootstrap_peer_ids(&self.void_bootstrap_strings);
         self.connected_peers = self
             .connected_peer_ids
             .iter()
-            .filter(|p| !boots.contains(p))
+            .filter(|p| !self.is_bootstrap_peer(p))
             .count();
     }
 
     fn bootstrap_connected_count(&self) -> usize {
-        let boots = bootstrap_peer_ids(&self.void_bootstrap_strings);
         self.connected_peer_ids
             .iter()
-            .filter(|p| boots.contains(p))
+            .filter(|p| self.is_bootstrap_peer(p))
             .count()
     }
 
     fn is_bootstrap_peer(&self, peer: &PeerId) -> bool {
-        bootstrap_peer_ids(&self.void_bootstrap_strings).contains(peer)
+        self.live_bootstrap_peers.contains(peer)
+            || bootstrap_peer_ids(&self.void_bootstrap_strings).contains(peer)
     }
 
     fn schedule_offline_publish(&mut self) {
@@ -1915,9 +1917,23 @@ impl VoidRuntime {
                         }
                         NetworkEvent::BootstrapsLearned(learned) => {
                             g.merge_learned_bootstraps(learned);
+                            g.recount_connected();
                             bridge_evs.push(BridgeEvent::Bootstraps {
                                 addrs: g.void_bootstrap_strings.clone(),
                             });
+                            emit_snapshot = true;
+                        }
+                        NetworkEvent::BootstrapSession { peer, up } => {
+                            if up {
+                                g.live_bootstrap_peers.insert(peer);
+                                g.add_status(format!(
+                                    "🌐 Bootstrap TCP {}",
+                                    &peer.to_string()[..12.min(peer.to_string().len())]
+                                ));
+                            } else {
+                                g.live_bootstrap_peers.remove(&peer);
+                            }
+                            g.recount_connected();
                             emit_snapshot = true;
                         }
                         NetworkEvent::RelayHopReady { relay } => {
@@ -2446,17 +2462,32 @@ impl VoidRuntime {
                     let migrated = migrate_void_bootstrap_txt();
                     if !migrated.is_empty() {
                         bootstraps = migrated;
-                        let _ = Storage::save(
-                            &master_arr,
-                            &storage.nickname,
-                            None,
-                            None,
-                            None,
-                            Some(&bootstraps),
-                            None,
-                            None,
-                        );
                     }
+                }
+                let cleaned = merge_bootstrap_string_lists(&bootstraps, &[]);
+                if cleaned != bootstraps {
+                    bootstraps = cleaned;
+                    let _ = Storage::save(
+                        &master_arr,
+                        &storage.nickname,
+                        None,
+                        None,
+                        None,
+                        Some(&bootstraps),
+                        None,
+                        None,
+                    );
+                } else if storage.void_bootstraps.is_empty() && !bootstraps.is_empty() {
+                    let _ = Storage::save(
+                        &master_arr,
+                        &storage.nickname,
+                        None,
+                        None,
+                        None,
+                        Some(&bootstraps),
+                        None,
+                        None,
+                    );
                 }
                 let network_bootstraps = void_bootstrap_multiaddrs(&bootstraps);
 
