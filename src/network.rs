@@ -5030,7 +5030,7 @@ pub async fn run_chat_network(
                             hop_listen_after.remove(&relay);
                             info!("Hop OK из swarm.listen ({})", addr);
                             kad_bootstrap_after =
-                                Some(Instant::now() + Duration::from_secs(8));
+                                Some(Instant::now() + Duration::from_secs(30));
                             let _ = event_tx
                                 .send(NetworkEvent::NewListenAddr(addr.clone()))
                                 .await;
@@ -6672,7 +6672,7 @@ pub async fn run_chat_network(
                             if is_circuit_addr(&address) || !relay_circuit_reserved.is_empty() {
                                 publish_self_in_dht(&mut swarm.behaviour_mut().kad, local_peer_id);
                                 kad_bootstrap_after.get_or_insert(
-                                    Instant::now() + Duration::from_secs(8),
+                                    Instant::now() + Duration::from_secs(30),
                                 );
                             }
                             if let Some(relay) = relay_peer_id_from_circuit_addr(&address) {
@@ -6732,22 +6732,26 @@ pub async fn run_chat_network(
                                         libp2p::core::ConnectedPoint::Dialer { address, .. }
                                             if is_direct_bootstrap_tcp(address, &void_bootstraps)
                                     ));
-                            // QUIC к bootstrap рвёт TCP (ApplicationClosed). Любой
-                            // второй conn до Hop Ack — listen_on / kad / merge
-                            // набирают ноду снова, Reserve идёт на умирающий TCP.
-                            if is_boot_peer
-                                && u32::from(num_established) > 1
-                                && (is_quic_ep || relay_circuit_reserved.is_empty())
-                            {
-                                warn!(
-                                    "drop extra bootstrap {:?} n={} quic={} peer={}",
-                                    connection_id,
-                                    num_established,
-                                    is_quic_ep,
-                                    &peer_id.to_string()[..8.min(peer_id.to_string().len())]
-                                );
-                                let _ = swarm.close_connection(connection_id);
-                                continue;
+                            // QUIC к bootstrap рвёт TCP. Второй TCP до Hop Ack
+                            // может быть самим Reserve (listen_on dial) — его
+                            // нельзя закрывать, иначе вечный «Hop…».
+                            // После Hop Ack наоборот: лишний TCP от kad.bootstrap
+                            // убивает conn с резервацией.
+                            if is_boot_peer && u32::from(num_established) > 1 {
+                                let drop_extra = is_quic_ep
+                                    || relay_circuit_reserved.contains(&peer_id);
+                                if drop_extra {
+                                    warn!(
+                                        "drop extra bootstrap {:?} n={} quic={} hop={} peer={}",
+                                        connection_id,
+                                        num_established,
+                                        is_quic_ep,
+                                        relay_circuit_reserved.contains(&peer_id),
+                                        &peer_id.to_string()[..8.min(peer_id.to_string().len())]
+                                    );
+                                    let _ = swarm.close_connection(connection_id);
+                                    continue;
+                                }
                             }
                             debug!("✅ СОЕДИНЕНО: {}. Endpoint: {:?}. Всего пиров: {} (conn #{})", peer_id, endpoint, connected_count, num_established);
                             if let Some(address) = connected_point_remote_tcp(endpoint) {
@@ -7478,7 +7482,7 @@ pub async fn run_chat_network(
                                 pending_seed_bare = false;
                                 if !relay_circuit_reserved.is_empty() {
                                     kad_bootstrap_after.get_or_insert(
-                                        Instant::now() + Duration::from_secs(8),
+                                        Instant::now() + Duration::from_secs(30),
                                     );
                                 }
                                 let _ = event_tx
@@ -7548,7 +7552,7 @@ pub async fn run_chat_network(
                                     local_peer_id,
                                 );
                                 kad_bootstrap_after =
-                                    Some(Instant::now() + Duration::from_secs(8));
+                                    Some(Instant::now() + Duration::from_secs(30));
                                 publish_self_prekey(
                                     &mut swarm,
                                     local_peer_id,
