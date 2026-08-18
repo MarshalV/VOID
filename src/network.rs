@@ -1004,28 +1004,20 @@ fn ensure_bootstrap_relay_listens(
             relay_hop_pending.remove(&relay_pid);
             continue;
         }
-        // Живой Reserve не трогаем. Зависший listen_on (нет Ack ~45 с) —
-        // один повтор, иначе UI вечно на «Hop…». Не каждые 3 с: это
-        // забивало HOP-стримы ноды.
-        const HANG: Duration = Duration::from_secs(45);
+        // Не трогаем живой listen_on. Повтор только если Ack нет ~90 с
+        // (listener уже мёртв или Reserve молчит).
+        let pending = relay_hop_listeners.contains_key(&relay_pid)
+            || relay_hop_pending.contains(&relay_pid);
         let hung = relay_listen_attempt_at
             .get(&relay_pid)
-            .is_some_and(|t| t.elapsed() >= HANG);
-        if let Some(lid) = relay_hop_listeners.get(&relay_pid).copied() {
-            if !hung {
-                continue;
-            }
-            let _ = swarm.remove_listener(lid);
-            relay_hop_listeners.remove(&relay_pid);
-            relay_hop_pending.remove(&relay_pid);
-            warn!(
-                "Hop listen hung {}s on {} — retry",
-                HANG.as_secs(),
-                &relay_pid.to_string()[..8.min(relay_pid.to_string().len())]
-            );
-        } else if relay_hop_pending.contains(&relay_pid) && !hung {
+            .is_some_and(|t| t.elapsed() >= Duration::from_secs(90));
+        if pending && !hung {
             continue;
-        } else {
+        }
+        if hung {
+            if let Some(lid) = relay_hop_listeners.remove(&relay_pid) {
+                let _ = swarm.remove_listener(lid);
+            }
             relay_hop_pending.remove(&relay_pid);
         }
         if relay_listen_attempt_at
@@ -2237,7 +2229,6 @@ fn build_void_swarm(
             },
         )
         .map_err(|e| format!("with_tcp: {:?}", e))?
-        .with_quic()
         .with_dns()
         .map_err(|e| format!("with_dns: {:?}", e))?
         .with_relay_client(noise::Config::new, || {
@@ -3249,10 +3240,9 @@ pub async fn run_chat_network(
                 _ = mailbox_tick.tick() => {
                     if let Some(deadline) = fetch_mailbox_after {
                         if Instant::now() >= deadline {
-                            // RR-ящик до Hop забивает HOP-стримы (лимит 10) → нет Reserve.
-                            // 30 с, не 12: иначе оба клиента зависают на «Hop…».
+                            // RR-ящик до Hop забивает HOP-стримы. Ждём Hop Ack.
                             if relay_circuit_reserved.is_empty()
-                                && swarm_started.elapsed() < Duration::from_secs(30)
+                                && swarm_started.elapsed() < Duration::from_secs(90)
                             {
                                 fetch_mailbox_after = Some(Instant::now() + Duration::from_secs(2));
                                 continue;
@@ -7223,8 +7213,9 @@ pub async fn run_chat_network(
                             if let Some(p) = peer_id {
                                 pending_dials.remove(&p);
                                 dial_backoff.insert(p, std::time::Instant::now());
-                                // Bootstrap failover: dial next vault bootstrap quietly (no UI spam).
-                                if bootstrap_peer_ids.contains(&p) {
+                                // listen_on(/p2p-circuit) сам может дать DialFailure,
+                                // пока TCP к ноде жив — это не падение bootstrap.
+                                if bootstrap_peer_ids.contains(&p) && !swarm.is_connected(&p) {
                                     let streak = bootstrap_fail_streak.entry(p).or_insert(0);
                                     *streak = streak.saturating_add(1);
                                     debug!(
@@ -7360,8 +7351,18 @@ pub async fn run_chat_network(
                                         }
                                     }
                                     if !relay_circuit_reserved.contains(&peer_id) {
-                                        hop_listen_after.entry(peer_id).or_insert(
-                                            Instant::now() + Duration::from_millis(500),
+                                        ensure_bootstrap_relay_listens(
+                                            &mut swarm,
+                                            &bootstrap_peer_ids,
+                                            &void_bootstraps,
+                                            &reconnect_targets,
+                                            &bootstrap_hop_addr,
+                                            &relay_circuit_reserved,
+                                            &mut relay_listen_attempt_at,
+                                            &mut relay_hop_pending,
+                                            &mut relay_hop_listeners,
+                                            Duration::ZERO,
+                                            Some(&event_tx),
                                         );
                                     }
                                     // Kademlia (add_address / provide / put) до Hop Ack
