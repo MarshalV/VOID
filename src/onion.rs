@@ -1,8 +1,8 @@
 //! Application-level onion hops over `/void/chat` (VOID_ONION_v1).
 //!
-//! One live bootstrap → single hop (node sees Alice↔Bob after unwrap).
-//! Two or more → layered cells so the entry hop does not learn Bob and the
-//! exit hop does not see Alice's IP.
+//! 1 live node → one hop (node sees Alice↔Bob after unwrap).
+//! 2 nodes → both hops. 3 or more → three random; entry does not learn Bob,
+//! exit does not see Alice's IP.
 
 use anyhow::{anyhow, Result};
 use chacha20poly1305::{
@@ -28,7 +28,6 @@ pub struct OnionPayload {
     pub inner: serde_json::Value,
 }
 
-#[cfg_attr(not(test), allow(dead_code))]
 pub fn hex32(bytes: &[u8; 32]) -> String {
     bytes.iter().map(|b| format!("{b:02x}")).collect()
 }
@@ -105,19 +104,53 @@ pub fn open(
     Ok(serde_json::from_slice(&plain)?)
 }
 
-/// Live bootstrap nodes we have an onion public key for, shuffled, 1..=MAX_HOPS.
+/// Сколько hop'ов брать из пула известных onion-нод.
+pub fn target_hop_count(available: usize) -> usize {
+    match available {
+        0 => 0,
+        1 => 1,
+        2 => 2,
+        _ => MAX_HOPS,
+    }
+}
+
+/// Entry — живой bootstrap; остальные hop'ы могут быть только из каталога ключей.
+/// 1 нода → 1 hop, 2 → обе, 3+ → три случайных.
 pub fn select_hops(
     connected: impl Iterator<Item = PeerId>,
     bootstrap_ids: &HashSet<PeerId>,
     keys: &HashMap<PeerId, [u8; 32]>,
 ) -> Vec<(PeerId, [u8; 32])> {
     use rand::seq::SliceRandom;
-    let mut hops: Vec<(PeerId, [u8; 32])> = connected
-        .filter(|p| bootstrap_ids.contains(p))
-        .filter_map(|p| keys.get(&p).copied().map(|k| (p, k)))
+    let connected: HashSet<PeerId> = connected.collect();
+    let mut pool: Vec<(PeerId, [u8; 32])> = keys
+        .iter()
+        .filter(|(p, _)| bootstrap_ids.contains(p))
+        .map(|(p, k)| (*p, *k))
         .collect();
-    hops.shuffle(&mut rand::thread_rng());
-    hops.truncate(MAX_HOPS);
+    if pool.is_empty() {
+        return Vec::new();
+    }
+    let mut entry_pool: Vec<(PeerId, [u8; 32])> = pool
+        .iter()
+        .filter(|(p, _)| connected.contains(p))
+        .cloned()
+        .collect();
+    if entry_pool.is_empty() {
+        return Vec::new();
+    }
+    entry_pool.shuffle(&mut rand::thread_rng());
+    let entry = entry_pool[0].clone();
+    let want = target_hop_count(pool.len());
+    pool.retain(|(p, _)| *p != entry.0);
+    pool.shuffle(&mut rand::thread_rng());
+    let mut hops = vec![entry];
+    for hop in pool {
+        if hops.len() >= want {
+            break;
+        }
+        hops.push(hop);
+    }
     hops
 }
 
@@ -214,5 +247,84 @@ mod tests {
                 assert_eq!(p.inner, inner);
             }
         }
+    }
+
+    #[test]
+    fn hop_count_follows_node_pool() {
+        assert_eq!(target_hop_count(0), 0);
+        assert_eq!(target_hop_count(1), 1);
+        assert_eq!(target_hop_count(2), 2);
+        assert_eq!(target_hop_count(3), 3);
+        assert_eq!(target_hop_count(9), 3);
+    }
+
+    #[test]
+    fn select_hops_two_nodes_uses_both_even_if_one_connected() {
+        let a = PeerId::random();
+        let b = PeerId::random();
+        let mut keys = HashMap::new();
+        keys.insert(a, [1u8; 32]);
+        keys.insert(b, [2u8; 32]);
+        let mut ids = HashSet::new();
+        ids.insert(a);
+        ids.insert(b);
+        let hops = select_hops(std::iter::once(a), &ids, &keys);
+        assert_eq!(hops.len(), 2);
+        assert_eq!(hops[0].0, a);
+        assert_eq!(hops[1].0, b);
+    }
+
+    #[test]
+    fn select_hops_three_plus_caps_at_three() {
+        let connected = PeerId::random();
+        let mut keys = HashMap::new();
+        let mut ids = HashSet::new();
+        keys.insert(connected, [9u8; 32]);
+        ids.insert(connected);
+        for i in 0..4u8 {
+            let p = PeerId::random();
+            keys.insert(p, [i; 32]);
+            ids.insert(p);
+        }
+        let hops = select_hops(std::iter::once(connected), &ids, &keys);
+        assert_eq!(hops.len(), 3);
+        assert_eq!(hops[0].0, connected);
+    }
+
+    #[test]
+    fn select_hops_empty_without_live_entry() {
+        let a = PeerId::random();
+        let mut keys = HashMap::new();
+        keys.insert(a, [1u8; 32]);
+        let mut ids = HashSet::new();
+        ids.insert(a);
+        let hops = select_hops(std::iter::empty(), &ids, &keys);
+        assert!(hops.is_empty());
+    }
+
+    #[test]
+    fn two_hops_unwrap() {
+        let keys: Vec<StaticSecret> = (0..2)
+            .map(|_| StaticSecret::random_from_rng(rand::rngs::OsRng))
+            .collect();
+        let hops: Vec<(PeerId, [u8; 32])> = keys
+            .iter()
+            .map(|sk| {
+                let pid = PeerId::random();
+                (pid, PublicKey::from(sk).to_bytes())
+            })
+            .collect();
+        let dest = PeerId::random();
+        let inner = serde_json::json!({"OnionDrop":{"src":"alice","packet":{"Ack":null}}});
+        let (eph, nonce, ct) = wrap_layers(&hops, dest, inner.clone()).unwrap();
+        let p0 = open(&keys[0], &eph, &nonce, &ct).unwrap();
+        assert_eq!(p0.next, hops[1].0.to_string());
+        let onion = p0.inner.get("Onion").expect("inner onion");
+        let eph1: [u8; 32] = serde_json::from_value(onion["eph"].clone()).unwrap();
+        let nonce1: [u8; 12] = serde_json::from_value(onion["nonce"].clone()).unwrap();
+        let ct1: Vec<u8> = serde_json::from_value(onion["ct"].clone()).unwrap();
+        let p1 = open(&keys[1], &eph1, &nonce1, &ct1).unwrap();
+        assert_eq!(p1.next, dest.to_string());
+        assert_eq!(p1.inner, inner);
     }
 }

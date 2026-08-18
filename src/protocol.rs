@@ -586,6 +586,17 @@ pub(crate) fn validate_bootstrap_gossip_addrs(addrs: &[String]) -> Option<Vec<St
     }
 }
 
+/// Публичный onion-hop соседней VOID-ноды (gossip / каталог bootstrap).
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+pub(crate) struct OnionHopHint {
+    #[serde(default)]
+    pub(crate) peer_id: String,
+    #[serde(default)]
+    pub(crate) pk_hex: String,
+    #[serde(default)]
+    pub(crate) addrs: Vec<String>,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub(crate) enum V1Packet {
     Hello {
@@ -601,6 +612,9 @@ pub(crate) enum V1Packet {
     /// Обмен известными VOID bootstrap-нодами между участниками (публичные multiaddr).
     BootstrapGossip {
         addrs: Vec<String>,
+        /// Ключи onion hop'ов (`peer_id` + X25519 hex). Старые клиенты поле игнорируют.
+        #[serde(default)]
+        onion_keys: Vec<OnionHopHint>,
     },
     /// «Дозвонись ко мне через relay» — чинит асимметрию NAT (A→B есть, B→A нет).
     DialBack {
@@ -652,7 +666,8 @@ pub(crate) enum V1Packet {
     Ack,
 }
 
-/// Wrap `inner` for `dest` through live onion hops (1 node = 1 hop, else up to 3).
+/// Wrap `inner` for `dest` through live onion hops:
+/// 1 node → 1 hop, 2 nodes → both, 3+ → three random (entry is connected).
 pub(crate) fn wrap_onion_packet(
     hops: &[(PeerId, [u8; 32])],
     src: PeerId,

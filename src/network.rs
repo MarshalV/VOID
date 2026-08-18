@@ -42,7 +42,7 @@ use crate::protocol::{
     read_command_message_ids, verify_hello_transport_binding, validate_bootstrap_gossip_addrs,
     build_group_sync_json, build_group_leave_json, build_group_delete_json,
     transfer_id_to_hex, transfer_id_from_hex, per_peer_voice_transfer_id, ChatMessage,
-    wrap_onion_packet,
+    wrap_onion_packet, OnionHopHint,
     DecryptedChatFrame, FileMeta, OutgoingDeliveryStatus, VoiceMeta, V1Packet,
 };
 
@@ -50,22 +50,32 @@ struct OnionRuntime {
     keys: HashMap<PeerId, [u8; 32]>,
     bootstraps: HashSet<PeerId>,
     local: PeerId,
+    relay_peers: HashSet<PeerId>,
 }
 
 static ONION_RT: Mutex<Option<OnionRuntime>> = Mutex::new(None);
 
-fn onion_rt_store(rt: OnionRuntime) {
+fn onion_rt_set_keys(keys: HashMap<PeerId, [u8; 32]>, bootstraps: HashSet<PeerId>, local: PeerId) {
     if let Ok(mut g) = ONION_RT.lock() {
-        *g = Some(rt);
+        let relay_peers = g
+            .as_ref()
+            .map(|rt| rt.relay_peers.clone())
+            .unwrap_or_default();
+        *g = Some(OnionRuntime {
+            keys,
+            bootstraps,
+            local,
+            relay_peers,
+        });
     }
 }
 
-fn onion_rt_set_keys(keys: HashMap<PeerId, [u8; 32]>, bootstraps: HashSet<PeerId>, local: PeerId) {
-    onion_rt_store(OnionRuntime {
-        keys,
-        bootstraps,
-        local,
-    });
+fn onion_rt_set_relay_peers(relay_peers: HashSet<PeerId>) {
+    if let Ok(mut g) = ONION_RT.lock() {
+        if let Some(rt) = g.as_mut() {
+            rt.relay_peers = relay_peers;
+        }
+    }
 }
 
 fn is_junk_addr(ma: &Multiaddr) -> bool {
@@ -340,15 +350,75 @@ fn bootstrap_gossip_strings(void_bootstraps: &[Multiaddr]) -> Vec<String> {
     void_bootstraps.iter().map(|a| a.to_string()).collect()
 }
 
+fn collect_onion_hints(
+    keys: &HashMap<PeerId, [u8; 32]>,
+    void_bootstraps: &[Multiaddr],
+) -> Vec<OnionHopHint> {
+    keys.iter()
+        .take(32)
+        .map(|(pid, pk)| OnionHopHint {
+            peer_id: pid.to_string(),
+            pk_hex: crate::onion::hex32(pk),
+            addrs: void_bootstraps
+                .iter()
+                .filter(|ma| peer_id_from_multiaddr(ma) == Some(*pid))
+                .map(|ma| ma.to_string())
+                .collect(),
+        })
+        .collect()
+}
+
+fn ingest_onion_hints(
+    hints: &[OnionHopHint],
+    onion_keys: &mut HashMap<PeerId, [u8; 32]>,
+    bootstrap_peer_ids: &mut HashSet<PeerId>,
+    void_bootstraps: &mut Vec<Multiaddr>,
+    swarm: &mut libp2p::Swarm<ChatBehaviour>,
+    local_peer_id: PeerId,
+) -> usize {
+    let mut added = 0usize;
+    let mut extra_addrs: Vec<Multiaddr> = Vec::new();
+    for hint in hints {
+        let Ok(pid) = hint.peer_id.parse::<PeerId>() else {
+            continue;
+        };
+        if pid == local_peer_id {
+            continue;
+        }
+        let Some(pk) = crate::onion::parse_hex32(&hint.pk_hex) else {
+            continue;
+        };
+        if onion_keys.insert(pid, pk).is_none() {
+            added += 1;
+        }
+        bootstrap_peer_ids.insert(pid);
+        for s in &hint.addrs {
+            if let Ok(ma) = s.parse::<Multiaddr>() {
+                extra_addrs.push(ma);
+            }
+        }
+    }
+    if !extra_addrs.is_empty() {
+        added += merge_bootstraps_into_swarm(
+            swarm,
+            void_bootstraps,
+            bootstrap_peer_ids,
+            &extra_addrs,
+        );
+    }
+    added
+}
+
 /// Эпидемический обмен bootstrap-нодами: рассылаем список всем подключённым VOID-клиентам.
 fn fanout_bootstrap_gossip(
     swarm: &mut libp2p::Swarm<ChatBehaviour>,
     local_peer_id: PeerId,
     bootstrap_peer_ids: &HashSet<PeerId>,
     addrs: Vec<String>,
+    onion_keys: Vec<OnionHopHint>,
     exclude: Option<PeerId>,
 ) {
-    if addrs.is_empty() {
+    if addrs.is_empty() && onion_keys.is_empty() {
         return;
     }
     let targets: Vec<PeerId> = swarm
@@ -365,6 +435,7 @@ fn fanout_bootstrap_gossip(
             &peer,
             V1Packet::BootstrapGossip {
                 addrs: addrs.clone(),
+                onion_keys: onion_keys.clone(),
             },
         );
     }
@@ -1929,9 +2000,6 @@ fn dial_missing_bootstraps(
 ) {
     let _ = bootstrap_peer_ids;
     ensure_void_node_dial(swarm);
-    if void_node_ep_is_live() {
-        return;
-    }
     let mut seen_ep: HashSet<String> = HashSet::new();
     for ma in ordered_bootstrap_addrs(void_bootstraps) {
         if is_void_bootstrap_host(&ma) {
@@ -1942,6 +2010,9 @@ fn dial_missing_bootstraps(
             continue;
         }
         let pid = peer_id_from_multiaddr(&ma).unwrap_or(*swarm.local_peer_id());
+        if pid == *swarm.local_peer_id() || swarm.is_connected(&pid) {
+            continue;
+        }
         dial_bootstrap_direct(swarm, pid, vec![ma]);
     }
 }
@@ -2194,6 +2265,13 @@ fn send_v1_to_peer(
             &rt.keys,
         );
         if hops.is_empty() {
+            return None;
+        }
+        let dest_connected = swarm.is_connected(&dest);
+        let dest_relayed = rt.relay_peers.contains(&dest);
+        // LAN / прямой TCP — как сейчас. Circuit и «нет живого канала» —
+        // через 1/2/3 bootstrap-hop'а.
+        if dest_connected && !dest_relayed {
             return None;
         }
         Some((hops, rt.local))
@@ -3111,6 +3189,7 @@ pub async fn run_chat_network(
                         local_peer_id,
                         &bootstrap_peer_ids,
                         addrs,
+                        collect_onion_hints(&onion_keys, &void_bootstraps),
                         None,
                     );
                 }
@@ -5072,9 +5151,29 @@ pub async fn run_chat_network(
                                         }
                                     }
                                     match request {
-                                        V1Packet::BootstrapGossip { addrs } => {
+                                        V1Packet::BootstrapGossip { addrs, onion_keys: hints } => {
                                             let their_set: HashSet<&str> =
                                                 addrs.iter().map(|s| s.as_str()).collect();
+                                            let hint_added = ingest_onion_hints(
+                                                &hints,
+                                                &mut onion_keys,
+                                                &mut bootstrap_peer_ids,
+                                                &mut void_bootstraps,
+                                                &mut swarm,
+                                                local_peer_id,
+                                            );
+                                            if hint_added > 0 {
+                                                onion_rt_set_keys(
+                                                    onion_keys.clone(),
+                                                    bootstrap_peer_ids.clone(),
+                                                    local_peer_id,
+                                                );
+                                                dial_missing_bootstraps(
+                                                    &mut swarm,
+                                                    &bootstrap_peer_ids,
+                                                    &void_bootstraps,
+                                                );
+                                            }
                                             if let Some(valid) =
                                                 validate_bootstrap_gossip_addrs(&addrs)
                                             {
@@ -5094,6 +5193,10 @@ pub async fn run_chat_network(
                                                         local_peer_id,
                                                         &bootstrap_peer_ids,
                                                         valid.clone(),
+                                                        collect_onion_hints(
+                                                            &onion_keys,
+                                                            &void_bootstraps,
+                                                        ),
                                                         Some(peer),
                                                     );
                                                     let _ = event_tx
@@ -5108,7 +5211,9 @@ pub async fn run_chat_network(
                                                 .map(|a| a.to_string())
                                                 .filter(|s| !their_set.contains(s.as_str()))
                                                 .collect();
-                                            if !our_extra.is_empty() {
+                                            let our_hints =
+                                                collect_onion_hints(&onion_keys, &void_bootstraps);
+                                            if !our_extra.is_empty() || !our_hints.is_empty() {
                                                 let _ = swarm
                                                     .behaviour_mut()
                                                     .request_response
@@ -5116,6 +5221,7 @@ pub async fn run_chat_network(
                                                         &peer,
                                                         V1Packet::BootstrapGossip {
                                                             addrs: our_extra,
+                                                            onion_keys: our_hints,
                                                         },
                                                     );
                                             }
@@ -6609,6 +6715,7 @@ pub async fn run_chat_network(
                                     relay_peers.remove(&peer_id);
                                 }
                             }
+                            onion_rt_set_relay_peers(relay_peers.clone());
 
                             // Живой dialer-адрес bootstrap нужен для Hop listen
                             // (публичный IP раньше отбрасывался → пустой relay_src).
@@ -6693,10 +6800,15 @@ pub async fn run_chat_network(
                                  // Сразу делимся bootstrap-нодами с любым подключённым VOID-клиентом.
                                  if !bootstrap_peer_ids.contains(&peer_id) {
                                      let gossip = bootstrap_gossip_strings(&void_bootstraps);
-                                     if !gossip.is_empty() {
+                                     let hints =
+                                         collect_onion_hints(&onion_keys, &void_bootstraps);
+                                     if !gossip.is_empty() || !hints.is_empty() {
                                          let _ = swarm.behaviour_mut().request_response.send_request(
                                              &peer_id,
-                                             V1Packet::BootstrapGossip { addrs: gossip },
+                                             V1Packet::BootstrapGossip {
+                                                 addrs: gossip,
+                                                 onion_keys: hints,
+                                             },
                                          );
                                      }
                                      // Просим собеседника набрать НАС через circuit —
@@ -6779,6 +6891,7 @@ pub async fn run_chat_network(
                                             local_peer_id,
                                             &bootstrap_peer_ids,
                                             learned.clone(),
+                                            collect_onion_hints(&onion_keys, &void_bootstraps),
                                             None,
                                         );
                                         let _ = event_tx
@@ -6840,6 +6953,7 @@ pub async fn run_chat_network(
                             }
 
                             relay_peers.remove(&peer_id);
+                            onion_rt_set_relay_peers(relay_peers.clone());
                             // Circuit к контакту не должен снимать Hop/listen на ноде,
                             // даже если PeerId контакта ошибочно попал в bootstrap_peer_ids.
                             let drop_bootstrap_session = bootstrap_peer_ids.contains(&peer_id)
@@ -7250,6 +7364,7 @@ pub async fn run_chat_network(
                                         local_peer_id,
                                         &bootstrap_peer_ids,
                                         bootstrap_learned.clone(),
+                                        collect_onion_hints(&onion_keys, &void_bootstraps),
                                         None,
                                     );
                                     let _ = event_tx
