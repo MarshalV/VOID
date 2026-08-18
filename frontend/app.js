@@ -162,6 +162,66 @@
     return escapeHtml(s).replace(/"/g, "&quot;");
   }
 
+  function shortPeer(id) {
+    const s = String(id || "");
+    if (s.length <= 14) return s;
+    return `${s.slice(0, 12)}…`;
+  }
+
+  function peerRouteLabel(id, s) {
+    if (!id) return "—";
+    const c = (s?.contacts || []).find((x) => x.peer_id === id);
+    if (c?.display_name) return escapeHtml(c.display_name);
+    const boots = s?.bootstraps || [];
+    const isBoot =
+      boots.some((b) => b.includes(id)) || (s?.onion_hops || []).includes(id);
+    const short = escapeHtml(shortPeer(id));
+    return isBoot ? `нода ${short}` : short;
+  }
+
+  function onionChip(label) {
+    return `<span class="onion-hop">${label}</span>`;
+  }
+
+  function hopCountRu(n) {
+    const mod10 = n % 10;
+    const mod100 = n % 100;
+    if (mod10 === 1 && mod100 !== 11) return `${n} нода`;
+    if (mod10 >= 2 && mod10 <= 4 && (mod100 < 12 || mod100 > 14)) return `${n} ноды`;
+    return `${n} нод`;
+  }
+
+  function onionRouteHtml(s) {
+    const hops = s?.onion_hops || [];
+    let path;
+    if (hops.length) {
+      const chips = [
+        onionChip("вы"),
+        ...hops.map((h) => onionChip(peerRouteLabel(h, s))),
+        onionChip("собеседник"),
+      ];
+      path = `<div class="onion-path">${chips.join('<span class="onion-arrow">→</span>')}</div>
+        <p class="muted">Сейчас: onion, ${hopCountRu(hops.length)}</p>`;
+    } else if ((s?.bootstrap_connected || 0) > 0) {
+      path = `<p class="muted">Живая нода есть. Onion-цепочка появится, когда пакет пойдёт не по LAN.</p>`;
+    } else {
+      path = `<p class="muted">Нет живых нод — маршрут появится после входа в VOID.</p>`;
+    }
+    const traces = (s?.onion_traces || []).slice().reverse();
+    const list = traces.length
+      ? traces
+          .map((t) => {
+            const dir =
+              t.dir === "in" ? "вход" : t.dir === "direct" ? "напрямую" : "исход";
+            const dest = peerRouteLabel(t.dest, s);
+            const via = (t.hops || []).map((h) => peerRouteLabel(h, s)).join(" → ") || "—";
+            return `<div class="onion-trace"><strong>${dir}</strong> · ${dest}<div>${via}</div></div>`;
+          })
+          .join("")
+      : `<p class="muted">Пока нет пакетов. После сообщения путь появится здесь.</p>`;
+    return `${path}<div class="onion-traces">${list}</div>`;
+  }
+
   function applySnapshotNow(s) {
     if (!s) return;
     const rev = Number(s.revision || 0);
@@ -235,6 +295,8 @@
     els.composer.classList.toggle("recording", recording);
     updateRecBar(s);
     updateVoicePreview(s);
+    const onionEl = document.getElementById("onion-live");
+    if (onionEl) onionEl.innerHTML = onionRouteHtml(s);
   }
 
   function updateChatHeader(s) {
@@ -734,7 +796,11 @@
         <button class="btn primary" id="s-save">Сохранить ник</button>
         <button class="btn" id="s-copy">Копировать Peer ID</button>
         <button class="btn" id="s-downloads">Открыть папку загрузок</button>
-        <button class="btn" id="s-quit">Полный выход</button>`;
+        <button class="btn" id="s-quit">Полный выход</button>
+        <hr class="menu-hr" />
+        <h4 class="menu-h">Маршрут onion</h4>
+        <p class="muted">Через какие ноды сейчас проходит информация — обновляется само.</p>
+        <div id="onion-live">${onionRouteHtml(snapshot)}</div>`;
     }
 
     openModal(`

@@ -592,6 +592,40 @@ button.icon-btn img {
   border-top: 1px solid var(--line);
   margin: 0.35rem 0;
 }
+.onion-path {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 0.35rem;
+}
+.onion-hop {
+  background: var(--accent-dim);
+  border: 1px solid rgba(62, 207, 142, 0.35);
+  border-radius: 8px;
+  padding: 0.28rem 0.55rem;
+  font-size: 0.82rem;
+  font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+  color: var(--text);
+}
+.onion-arrow {
+  color: var(--muted);
+  font-size: 0.9rem;
+}
+.onion-traces {
+  max-height: 180px;
+  overflow: auto;
+}
+.onion-trace {
+  font-size: 0.85rem;
+  color: var(--muted);
+  border-left: 2px solid rgba(62, 207, 142, 0.4);
+  padding: 0.25rem 0 0.25rem 0.65rem;
+  margin: 0.4rem 0;
+}
+.onion-trace strong {
+  color: var(--text);
+  font-weight: 600;
+}
 .ctx-menu {
   position: fixed;
   z-index: 60;

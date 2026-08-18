@@ -51,21 +51,36 @@ struct OnionRuntime {
     bootstraps: HashSet<PeerId>,
     local: PeerId,
     relay_peers: HashSet<PeerId>,
+    traces: Vec<OnionTraceItem>,
+    live_hops: Vec<String>,
+    dirty: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct OnionTraceItem {
+    pub dir: String,
+    pub dest: String,
+    pub hops: Vec<String>,
 }
 
 static ONION_RT: Mutex<Option<OnionRuntime>> = Mutex::new(None);
 
+const ONION_TRACE_CAP: usize = 8;
+
 fn onion_rt_set_keys(keys: HashMap<PeerId, [u8; 32]>, bootstraps: HashSet<PeerId>, local: PeerId) {
     if let Ok(mut g) = ONION_RT.lock() {
-        let relay_peers = g
-            .as_ref()
-            .map(|rt| rt.relay_peers.clone())
-            .unwrap_or_default();
+        let (relay_peers, traces, live_hops) = match g.as_ref() {
+            Some(rt) => (rt.relay_peers.clone(), rt.traces.clone(), rt.live_hops.clone()),
+            None => (HashSet::new(), Vec::new(), Vec::new()),
+        };
         *g = Some(OnionRuntime {
             keys,
             bootstraps,
             local,
             relay_peers,
+            traces,
+            live_hops,
+            dirty: true,
         });
     }
 }
@@ -76,6 +91,44 @@ fn onion_rt_set_relay_peers(relay_peers: HashSet<PeerId>) {
             rt.relay_peers = relay_peers;
         }
     }
+}
+
+fn onion_rt_note(dir: &str, dest: PeerId, hops: &[PeerId]) {
+    let item = OnionTraceItem {
+        dir: dir.to_string(),
+        dest: dest.to_string(),
+        hops: hops.iter().map(ToString::to_string).collect(),
+    };
+    if let Ok(mut g) = ONION_RT.lock() {
+        if let Some(rt) = g.as_mut() {
+            if rt.traces.last() == Some(&item) {
+                return;
+            }
+            rt.traces.push(item);
+            if rt.traces.len() > ONION_TRACE_CAP {
+                let extra = rt.traces.len() - ONION_TRACE_CAP;
+                rt.traces.drain(0..extra);
+            }
+            rt.dirty = true;
+        }
+    }
+}
+
+fn onion_rt_poll_ui(
+    connected: impl Iterator<Item = PeerId>,
+) -> Option<(Vec<String>, Vec<OnionTraceItem>)> {
+    let connected: Vec<PeerId> = connected.collect();
+    let mut g = ONION_RT.lock().ok()?;
+    let rt = g.as_mut()?;
+    let hops = crate::onion::select_hops(connected.into_iter(), &rt.bootstraps, &rt.keys);
+    let live: Vec<String> = hops.iter().map(|(p, _)| p.to_string()).collect();
+    let live_changed = live != rt.live_hops;
+    if !rt.dirty && !live_changed {
+        return None;
+    }
+    rt.live_hops = live.clone();
+    rt.dirty = false;
+    Some((live, rt.traces.clone()))
 }
 
 fn is_junk_addr(ma: &Multiaddr) -> bool {
@@ -1124,6 +1177,11 @@ pub(crate) enum NetworkEvent {
     RelayHopPending { relay: PeerId },
     /// Circuit listener закрыт / резервация сброшена.
     RelayHopLost { relay: PeerId },
+    /// Текущий onion-маршрут и последние проходы пакетов (UI «Настройки»).
+    OnionRoutes {
+        hops: Vec<String>,
+        traces: Vec<OnionTraceItem>,
+    },
     /// Получен Response (Ack) на ранее отправленное сообщение — доставка подтверждена.
     MessageDelivered { peer: PeerId, message_id: String },
     /// Собеседник прочитал наши сообщения.
@@ -2319,11 +2377,18 @@ fn send_v1_to_peer(
                 &dest.to_string()[..8.min(dest.to_string().len())],
                 &first.to_string()[..8.min(first.to_string().len())]
             );
+            if !matches!(packet, V1Packet::Ack) {
+                let hop_ids: Vec<PeerId> = hops.iter().map(|(p, _)| *p).collect();
+                onion_rt_note("out", dest, &hop_ids);
+            }
             return swarm
                 .behaviour_mut()
                 .request_response
                 .send_request(&first, onion);
         }
+    }
+    if matches!(packet, V1Packet::Encrypted { .. }) {
+        onion_rt_note("direct", dest, &[]);
     }
     swarm
         .behaviour_mut()
@@ -4980,6 +5045,13 @@ pub async fn run_chat_network(
                             let _ = swarm.behaviour_mut().kad.bootstrap();
                         }
                     }
+                    if let Some((hops, traces)) =
+                        onion_rt_poll_ui(swarm.connected_peers().copied())
+                    {
+                        let _ = event_tx
+                            .send(NetworkEvent::OnionRoutes { hops, traces })
+                            .await;
+                    }
                     let now_h = Instant::now();
                     let due: Vec<PeerId> = hop_listen_after
                         .iter()
@@ -5200,6 +5272,9 @@ pub async fn run_chat_network(
                                             if src_pid != local_peer_id
                                                 && !bootstrap_peer_ids.contains(&src_pid)
                                             {
+                                                if !matches!(*packet, V1Packet::Ack) {
+                                                    onion_rt_note("in", src_pid, &[peer]);
+                                                }
                                                 onion_reply = Some(src_pid);
                                                 peer = src_pid;
                                                 request = *packet;

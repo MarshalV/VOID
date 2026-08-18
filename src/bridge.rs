@@ -203,6 +203,12 @@ pub struct SnapshotDto {
     /// listen_on(circuit) sent, waiting for ReservationReqAccepted.
     #[serde(default)]
     pub relay_hop_pending: bool,
+    /// Planned onion hops (bootstrap PeerIds, entry first).
+    #[serde(default)]
+    pub onion_hops: Vec<String>,
+    /// Last onion / direct packet paths (newest last).
+    #[serde(default)]
+    pub onion_traces: Vec<OnionTraceDto>,
     pub selected_chat: String,
     pub contacts: Vec<ContactDto>,
     pub messages: Vec<MessageDto>,
@@ -223,6 +229,14 @@ pub struct SnapshotDto {
     /// Монотонный номер снимка — UI отбрасывает запоздалые старые события.
     #[serde(default)]
     pub revision: u64,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+pub struct OnionTraceDto {
+    /// `out` | `in` | `direct`
+    pub dir: String,
+    pub dest: String,
+    pub hops: Vec<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -296,6 +310,8 @@ struct Inner {
     relay_hop_pending: bool,
     /// PeerId с живым прямым TCP к VOID-ноде (может не совпадать с vault /p2p/).
     live_bootstrap_peers: HashSet<PeerId>,
+    onion_hops: Vec<String>,
+    onion_traces: Vec<OnionTraceDto>,
 }
 
 impl Inner {
@@ -343,6 +359,8 @@ impl Inner {
             relay_hop_ready: false,
             relay_hop_pending: false,
             live_bootstrap_peers: HashSet::new(),
+            onion_hops: Vec::new(),
+            onion_traces: Vec::new(),
         }
     }
 
@@ -1731,6 +1749,8 @@ impl Inner {
                     .iter()
                     .any(|a| a.contains("p2p-circuit")),
             relay_hop_pending: self.relay_hop_pending && !self.relay_hop_ready,
+            onion_hops: self.onion_hops.clone(),
+            onion_traces: self.onion_traces.clone(),
             selected_chat: self.selected_chat.clone(),
             contacts,
             messages,
@@ -1963,6 +1983,18 @@ impl VoidRuntime {
                                 "Hop сброшен ({})",
                                 &relay.to_string()[..12.min(relay.to_string().len())]
                             ));
+                            emit_snapshot = true;
+                        }
+                        NetworkEvent::OnionRoutes { hops, traces } => {
+                            g.onion_hops = hops;
+                            g.onion_traces = traces
+                                .into_iter()
+                                .map(|t| OnionTraceDto {
+                                    dir: t.dir,
+                                    dest: t.dest,
+                                    hops: t.hops,
+                                })
+                                .collect();
                             emit_snapshot = true;
                         }
                         NetworkEvent::MessageDelivered { peer, message_id } => {

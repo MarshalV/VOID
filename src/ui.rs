@@ -2400,6 +2400,7 @@ impl eframe::App for App {
                         &relay.to_string()[..12.min(relay.to_string().len())]
                     ));
                 }
+                NetworkEvent::OnionRoutes { .. } => {}
                 NetworkEvent::PeerAddress(peer, ma) => {
                     if peer == self.local_peer_id {
                         continue;
