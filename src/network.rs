@@ -952,19 +952,28 @@ fn ensure_bootstrap_relay_listens(
             relay_hop_pending.remove(&relay_pid);
             continue;
         }
-        // Не трогаем уже отправленный listen_on: remove_listener сразу
-        // после Reserve Ack даёт цикл «accepted → closed → listen» каждые ~3 с
-        // и забивает HOP-стримы ноды (второй клиент не коннектится).
-        if relay_hop_listeners.contains_key(&relay_pid) {
-            continue;
-        }
-        if relay_hop_pending.contains(&relay_pid) {
-            if relay_listen_attempt_at
-                .get(&relay_pid)
-                .is_some_and(|t| t.elapsed() < Duration::from_secs(45))
-            {
+        // Живой Reserve не трогаем. Зависший listen_on (нет Ack ~12 с) —
+        // один повтор, иначе UI вечно на «Hop…». Не каждые 3 с: это
+        // забивало HOP-стримы ноды.
+        const HANG: Duration = Duration::from_secs(12);
+        let hung = relay_listen_attempt_at
+            .get(&relay_pid)
+            .is_some_and(|t| t.elapsed() >= HANG);
+        if let Some(lid) = relay_hop_listeners.get(&relay_pid).copied() {
+            if !hung {
                 continue;
             }
+            let _ = swarm.remove_listener(lid);
+            relay_hop_listeners.remove(&relay_pid);
+            relay_hop_pending.remove(&relay_pid);
+            warn!(
+                "Hop listen hung {}s on {} — retry",
+                HANG.as_secs(),
+                &relay_pid.to_string()[..8.min(relay_pid.to_string().len())]
+            );
+        } else if relay_hop_pending.contains(&relay_pid) && !hung {
+            continue;
+        } else {
             relay_hop_pending.remove(&relay_pid);
         }
         if relay_listen_attempt_at
