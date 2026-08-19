@@ -775,7 +775,13 @@ fn dial_peer_live_circuits(
     bootstrap_addrs: &[Multiaddr],
     force: bool,
 ) {
-    // Исходящий circuit не ждёт наш Hop Ack: резервация нужна у получателя.
+    // Circuit-dial к контакту идёт через тот же TCP к ноде, что и Reserve.
+    // До Hop Ack это второй dial на bootstrap → yamux рвёт HOP-стрим, UI
+    // вечно на «Hop…», контакты 0. Резервация получателя нужна, чтобы нас
+    // приняли; наша — чтобы этот dial не убил listen_on.
+    if !hop_reservation_confirmed(swarm) {
+        return;
+    }
     let condition = if force {
         libp2p::swarm::dial_opts::PeerCondition::Always
     } else {
@@ -892,7 +898,7 @@ fn dial_unconnected_contacts(
     void_bootstraps: &[Multiaddr],
     contact_dial_at: &mut HashMap<PeerId, Instant>,
     min_interval: Duration,
-    _hop_ready: bool,
+    hop_ready: bool,
 ) {
     let connected: HashSet<PeerId> = swarm.connected_peers().copied().collect();
     let boot_live = bootstrap_peer_ids.iter().any(|b| connected.contains(b));
@@ -908,7 +914,7 @@ fn dial_unconnected_contacts(
             continue;
         }
         contact_dial_at.insert(*pid, now);
-        if boot_live {
+        if boot_live && hop_ready {
             dial_peer_live_circuits(swarm, *pid, void_bootstraps, false);
         }
         // LAN/mDNS (без public ephemeral) — вторым заходом.
@@ -3350,7 +3356,8 @@ pub async fn run_chat_network(
                             &void_bootstraps,
                         );
                     }
-                    // Circuit к контактам: резервация нужна у получателя, не у нас.
+                    // Circuit к контактам — только после Hop Ack, иначе Reserve
+                    // на том же TCP к ноде не доживает до Ack.
                     dial_unconnected_contacts(
                         &mut swarm,
                         &reconnect_targets,
@@ -7870,15 +7877,9 @@ pub async fn run_chat_network(
                                 "📡 Relay: исходящий circuit через {}",
                                 &relay_peer_id.to_string()[..8]
                             );
-                            if relay_circuit_reserved.insert(relay_peer_id) {
-                                relay_hop_pending.remove(&relay_peer_id);
-                                hop_listen_after.remove(&relay_peer_id);
-                                let _ = event_tx
-                                    .send(NetworkEvent::RelayHopReady {
-                                        relay: relay_peer_id,
-                                    })
-                                    .await;
-                            }
+                            // STOP к чужому пиру ≠ наша Hop-резервация. Не ставим
+                            // Hop OK: иначе UI зелёный, а listen_on так и без Ack.
+                            let _ = relay_peer_id;
                         }
                         SwarmEvent::Behaviour(ChatBehaviourEvent::Ping(ev)) => {
                             match ev.result {
