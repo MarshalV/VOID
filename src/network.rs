@@ -512,27 +512,10 @@ fn expand_dial_addrs(
         });
     }
     direct.sort_by_key(|a| if is_likely_lan_addr(a) { 0u8 } else { 1u8 });
-
-    let mut circuits: Vec<Multiaddr> = Vec::new();
-    for relay_ma in bootstrap_addrs {
-        if peer_id_from_multiaddr(relay_ma) == Some(peer_id) {
-            continue;
-        }
-        for circuit in relay_circuit_dial_addrs(std::slice::from_ref(relay_ma), peer_id) {
-            if !circuits.contains(&circuit) {
-                circuits.push(circuit);
-            }
-        }
-    }
-    // Circuit FIRST — a stuck dial to a dead NAT addr never reaches relay, and
-    // PeerCondition::NotDialing then blocks a second dial that would use circuit.
-    let mut expanded = circuits;
-    for d in direct {
-        if !expanded.contains(&d) {
-            expanded.push(d);
-        }
-    }
-    expanded
+    let _ = (peer_id, bootstrap_addrs);
+    // Circuit только через dial_peer_live_circuits. Иначе LAN/best-effort
+    // шлёт STOP на том же TCP, что и Reserve → NoReservation пачками и Hop…
+    direct
 }
 
 fn is_likely_lan_addr(ma: &Multiaddr) -> bool {
@@ -826,7 +809,7 @@ fn dial_peer_live_circuits(
     // До Hop Ack это второй dial на bootstrap → yamux рвёт HOP-стрим, UI
     // вечно на «Hop…», контакты 0. Резервация получателя нужна, чтобы нас
     // приняли; наша — чтобы этот dial не убил listen_on.
-    if !hop_reservation_confirmed(swarm) || !hop_ok_settled() {
+    if !hop_ok_settled() {
         return;
     }
     if circuit_recently_failed(&peer_id) {
@@ -5140,6 +5123,30 @@ pub async fn run_chat_network(
                                 .await;
                         }
                     }
+                    // Нода уже приняла Reserve, а клиентские события Hop
+                    // иногда не доходят — UI тогда вечно «Hop…».
+                    let pending_now: Vec<PeerId> = relay_hop_pending.iter().copied().collect();
+                    for relay in pending_now {
+                        if relay_circuit_reserved.contains(&relay) || !swarm.is_connected(&relay)
+                        {
+                            continue;
+                        }
+                        let waited = relay_listen_attempt_at
+                            .get(&relay)
+                            .map(|t| t.elapsed())
+                            .unwrap_or(Duration::ZERO);
+                        if waited < Duration::from_secs(2) {
+                            continue;
+                        }
+                        relay_circuit_reserved.insert(relay);
+                        relay_hop_pending.remove(&relay);
+                        hop_listen_after.remove(&relay);
+                        note_hop_ok();
+                        info!("Hop OK (listen_on + 2s, нода приняла Reserve)");
+                        let _ = event_tx
+                            .send(NetworkEvent::RelayHopReady { relay })
+                            .await;
+                    }
                     if let Some(when) = kad_bootstrap_after {
                         if Instant::now() >= when {
                             kad_bootstrap_after = None;
@@ -5234,7 +5241,14 @@ pub async fn run_chat_network(
                                 let _ = event_tx.send(NetworkEvent::Status(
                                     "✨ СВЯЗЬ ЧЕРЕЗ RELAY: Вы доступны через посредника (за NAT)!".into()
                                 )).await;
-                                if let Some(relay) = relay_peer_id_from_circuit_addr(&address) {
+                                let relay = relay_peer_id_from_circuit_addr(&address)
+                                    .or_else(|| {
+                                        bootstrap_peer_ids
+                                            .iter()
+                                            .copied()
+                                            .find(|b| swarm.is_connected(b))
+                                    });
+                                if let Some(relay) = relay {
                                     if relay_circuit_reserved.insert(relay) {
                                         relay_hop_pending.remove(&relay);
                                         hop_listen_after.remove(&relay);
@@ -6959,19 +6973,22 @@ pub async fn run_chat_network(
                         }
                         SwarmEvent::ExternalAddrConfirmed { address } => {
                             debug!("🌍 ВНЕШНИЙ АДРЕС ПОДТВЕРЖДЕН: {}", address);
-                            if is_circuit_addr(&address) || !relay_circuit_reserved.is_empty() {
-                                publish_self_in_dht(&mut swarm.behaviour_mut().kad, local_peer_id);
-                                kad_bootstrap_after.get_or_insert(
-                                    Instant::now() + Duration::from_secs(30),
-                                );
-                            }
-                            if let Some(relay) = relay_peer_id_from_circuit_addr(&address) {
-                                // Дубль сигнала Hop (на случай если Event::ReservationReqAccepted
-                                // не дошёл до match из-за версии).
-                                if relay_circuit_reserved.insert(relay) {
+                            if is_circuit_addr(&address) {
+                                let relay = relay_peer_id_from_circuit_addr(&address)
+                                    .or_else(|| {
+                                        bootstrap_peer_ids
+                                            .iter()
+                                            .copied()
+                                            .find(|b| swarm.is_connected(b))
+                                    });
+                                if let Some(relay) = relay {
+                                    relay_circuit_reserved.insert(relay);
                                     relay_hop_pending.remove(&relay);
                                     hop_listen_after.remove(&relay);
                                     note_hop_ok();
+                                    let _ = event_tx
+                                        .send(NetworkEvent::NewListenAddr(address.clone()))
+                                        .await;
                                     let _ = event_tx
                                         .send(NetworkEvent::RelayHopReady { relay })
                                         .await;
@@ -6981,7 +6998,14 @@ pub async fn run_chat_network(
                                         ))
                                         .await;
                                 }
-                            } else {
+                            } else if !relay_circuit_reserved.is_empty() {
+                                publish_self_in_dht(
+                                    &mut swarm.behaviour_mut().kad,
+                                    local_peer_id,
+                                );
+                                kad_bootstrap_after.get_or_insert(
+                                    Instant::now() + Duration::from_secs(30),
+                                );
                                 let _ = event_tx
                                     .send(NetworkEvent::Status(
                                         "🌍 ГЛОБАЛЬНЫЙ АДРЕС: Вы доступны из интернета!".into(),
@@ -6995,7 +7019,11 @@ pub async fn run_chat_network(
                                 _ => None,
                             });
                             if let Some(ip) = extracted_ip {
-                                let _ = event_tx.send(NetworkEvent::PublicIpConfirmed(ip)).await;
+                                if !is_circuit_addr(&address) {
+                                    let _ = event_tx
+                                        .send(NetworkEvent::PublicIpConfirmed(ip))
+                                        .await;
+                                }
                             }
                         }
                         SwarmEvent::Dialing { peer_id, connection_id } => {
@@ -8708,5 +8736,28 @@ mod hop_listen_tests {
         assert!(!is_void_bootstrap_host(&circuit));
         let lan: Multiaddr = "/ip4/192.168.1.5/tcp/50001".parse().unwrap();
         assert!(!is_void_bootstrap_host(&lan));
+    }
+
+    #[test]
+    fn expand_dial_addrs_does_not_inject_circuits() {
+        let node = pid();
+        let contact = pid();
+        let vault: Multiaddr = format!("/ip4/147.78.64.22/tcp/4001/p2p/{node}")
+            .parse()
+            .unwrap();
+        let lan: Multiaddr = "/ip4/192.168.1.5/tcp/50001".parse().unwrap();
+        let out = expand_dial_addrs(contact, vec![lan.clone()], &[vault]);
+        assert!(out.iter().any(|a| a.to_string().contains("192.168.1.5")));
+        assert!(
+            out.iter().all(|a| !a.to_string().contains("p2p-circuit")),
+            "{out:?}"
+        );
+    }
+
+    #[test]
+    fn circuit_addr_without_relay_p2p_parses_none() {
+        let a: Multiaddr = "/ip4/147.78.64.22/tcp/4001/p2p-circuit".parse().unwrap();
+        assert!(is_circuit_addr(&a));
+        assert!(relay_peer_id_from_circuit_addr(&a).is_none());
     }
 }
