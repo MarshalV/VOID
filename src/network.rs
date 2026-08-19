@@ -775,13 +775,7 @@ fn dial_peer_live_circuits(
     bootstrap_addrs: &[Multiaddr],
     force: bool,
 ) {
-    if !force && !hop_reservation_confirmed(swarm) {
-        debug!(
-            "circuit dial skip {} — нет Hop Ack",
-            &peer_id.to_string()[..8.min(peer_id.to_string().len())]
-        );
-        return;
-    }
+    // Исходящий circuit не ждёт наш Hop Ack: резервация нужна у получателя.
     let condition = if force {
         libp2p::swarm::dial_opts::PeerCondition::Always
     } else {
@@ -898,7 +892,7 @@ fn dial_unconnected_contacts(
     void_bootstraps: &[Multiaddr],
     contact_dial_at: &mut HashMap<PeerId, Instant>,
     min_interval: Duration,
-    hop_ready: bool,
+    _hop_ready: bool,
 ) {
     let connected: HashSet<PeerId> = swarm.connected_peers().copied().collect();
     let boot_live = bootstrap_peer_ids.iter().any(|b| connected.contains(b));
@@ -914,8 +908,7 @@ fn dial_unconnected_contacts(
             continue;
         }
         contact_dial_at.insert(*pid, now);
-        if boot_live && hop_ready {
-            // Circuit до Hop Ack открывает HOP-стрим (лимит 10) и душит Reserve.
+        if boot_live {
             dial_peer_live_circuits(swarm, *pid, void_bootstraps, false);
         }
         // LAN/mDNS (без public ephemeral) — вторым заходом.
@@ -2351,10 +2344,10 @@ fn send_v1_to_peer(
             return None;
         }
         let dest_connected = swarm.is_connected(&dest);
-        let dest_relayed = rt.relay_peers.contains(&dest);
-        // LAN / прямой TCP — как сейчас. Circuit и «нет живого канала» —
-        // через 1/2/3 bootstrap-hop'а.
-        if dest_connected && !dest_relayed {
+        // Живой канал (LAN или circuit) — напрямую. Onion только если пира нет
+        // в swarm: иначе file/voice чанки (32 КиБ) раздуваются в JSON и Offer
+        // по /void/file до NAT не доходит.
+        if dest_connected {
             return None;
         }
         Some((hops, rt.local))
@@ -2472,6 +2465,29 @@ async fn send_encrypted_chat_payload(
     true
 }
 
+fn send_e2ee_file_ctrl(
+    swarm: &mut libp2p::Swarm<ChatBehaviour>,
+    sessions: &mut HashMap<PeerId, crypto::SecureSession>,
+    peer: PeerId,
+    packet: &file_transfer::FilePacket,
+) -> bool {
+    let Some(frame) = file_transfer::encode_e2ee_file_ctrl(packet) else {
+        return false;
+    };
+    let Some(session) = sessions.get_mut(&peer) else {
+        return false;
+    };
+    let Ok((header, ciphertext)) = session.encrypt_payload(&frame) else {
+        return false;
+    };
+    let _ = send_v1_to_peer(
+        swarm,
+        peer,
+        V1Packet::Encrypted { header, ciphertext },
+    );
+    true
+}
+
 fn requeue_pending_chat_json(
     pending_messages: &mut HashMap<PeerId, Vec<Vec<u8>>>,
     peer: PeerId,
@@ -2584,6 +2600,7 @@ const VOICE_OFFER_RESEND: Duration = Duration::from_secs(12);
 
 async fn resend_voice_offer(
     swarm: &mut libp2p::Swarm<ChatBehaviour>,
+    sessions: &mut HashMap<PeerId, crypto::SecureSession>,
     outgoing_transfers: &mut HashMap<[u8; 16], file_transfer::OutgoingTransfer>,
     transfer_id: [u8; 16],
     recipient: PeerId,
@@ -2595,10 +2612,13 @@ async fn resend_voice_offer(
         return;
     }
     let offer = t.build_offer();
-    swarm
-        .behaviour_mut()
-        .file_rr
-        .send_request(&recipient, offer);
+    let _ = send_e2ee_file_ctrl(swarm, sessions, recipient, &offer);
+    if swarm.is_connected(&recipient) {
+        swarm
+            .behaviour_mut()
+            .file_rr
+            .send_request(&recipient, offer);
+    }
     if let Some(t) = outgoing_transfers.get_mut(&transfer_id) {
         t.last_chunk_at = Instant::now();
     }
@@ -2610,6 +2630,7 @@ async fn resend_voice_offer(
 
 async fn start_voice_file_transfer(
     swarm: &mut libp2p::Swarm<ChatBehaviour>,
+    sessions: &mut HashMap<PeerId, crypto::SecureSession>,
     outgoing_transfers: &mut HashMap<[u8; 16], file_transfer::OutgoingTransfer>,
     relay_peers: &HashSet<PeerId>,
     event_tx: &mpsc::Sender<NetworkEvent>,
@@ -2627,6 +2648,7 @@ async fn start_voice_file_transfer(
         {
             resend_voice_offer(
                 swarm,
+                sessions,
                 outgoing_transfers,
                 transfer_id,
                 recipient,
@@ -2685,10 +2707,13 @@ async fn start_voice_file_transfer(
                     sha256,
                     kind: file_kind,
                 };
-                swarm
-                    .behaviour_mut()
-                    .file_rr
-                    .send_request(&recipient, offer);
+                let _ = send_e2ee_file_ctrl(swarm, sessions, recipient, &offer);
+                if swarm.is_connected(&recipient) {
+                    swarm
+                        .behaviour_mut()
+                        .file_rr
+                        .send_request(&recipient, offer);
+                }
 
                 let transfer = file_transfer::OutgoingTransfer {
                     peer: recipient,
@@ -2733,6 +2758,7 @@ async fn start_voice_file_transfer(
 
 async fn start_named_file_transfer(
     swarm: &mut libp2p::Swarm<ChatBehaviour>,
+    sessions: &mut HashMap<PeerId, crypto::SecureSession>,
     outgoing_transfers: &mut HashMap<[u8; 16], file_transfer::OutgoingTransfer>,
     relay_peers: &HashSet<PeerId>,
     event_tx: &mpsc::Sender<NetworkEvent>,
@@ -2778,10 +2804,13 @@ async fn start_named_file_transfer(
                 sha256,
                 kind: file_kind,
             };
-            swarm
-                .behaviour_mut()
-                .file_rr
-                .send_request(&recipient, offer);
+            let _ = send_e2ee_file_ctrl(swarm, sessions, recipient, &offer);
+            if swarm.is_connected(&recipient) {
+                swarm
+                    .behaviour_mut()
+                    .file_rr
+                    .send_request(&recipient, offer);
+            }
             outgoing_transfers.insert(
                 transfer_id,
                 file_transfer::OutgoingTransfer {
@@ -2817,6 +2846,7 @@ async fn start_named_file_transfer(
 
 async fn flush_pending_voice_transfers(
     swarm: &mut libp2p::Swarm<ChatBehaviour>,
+    sessions: &mut HashMap<PeerId, crypto::SecureSession>,
     outgoing_transfers: &mut HashMap<[u8; 16], file_transfer::OutgoingTransfer>,
     relay_peers: &HashSet<PeerId>,
     event_tx: &mpsc::Sender<NetworkEvent>,
@@ -2829,6 +2859,7 @@ async fn flush_pending_voice_transfers(
     for item in queue {
         start_voice_file_transfer(
             swarm,
+            sessions,
             outgoing_transfers,
             relay_peers,
             event_tx,
@@ -2842,6 +2873,7 @@ async fn flush_pending_voice_transfers(
 
 async fn flush_pending_named_files(
     swarm: &mut libp2p::Swarm<ChatBehaviour>,
+    sessions: &mut HashMap<PeerId, crypto::SecureSession>,
     outgoing_transfers: &mut HashMap<[u8; 16], file_transfer::OutgoingTransfer>,
     relay_peers: &HashSet<PeerId>,
     event_tx: &mpsc::Sender<NetworkEvent>,
@@ -2855,6 +2887,7 @@ async fn flush_pending_named_files(
     for item in queue {
         start_named_file_transfer(
             swarm,
+            sessions,
             outgoing_transfers,
             relay_peers,
             event_tx,
@@ -3317,7 +3350,7 @@ pub async fn run_chat_network(
                             &void_bootstraps,
                         );
                     }
-                    // Circuit к контактам — только после Hop Ack.
+                    // Circuit к контактам: резервация нужна у получателя, не у нас.
                     dial_unconnected_contacts(
                         &mut swarm,
                         &reconnect_targets,
@@ -3441,6 +3474,7 @@ pub async fn run_chat_network(
                     for (tid, peer) in voice_reoffer {
                         resend_voice_offer(
                             &mut swarm,
+                            &mut sessions,
                             &mut outgoing_transfers,
                             tid,
                             peer,
@@ -4196,6 +4230,7 @@ pub async fn run_chat_network(
                                         if has_voice {
                                             start_voice_file_transfer(
                                                 &mut swarm,
+                                                &mut sessions,
                                                 &mut outgoing_transfers,
                                                 &relay_peers,
                                                 &event_tx,
@@ -4528,6 +4563,7 @@ pub async fn run_chat_network(
                                 }
                                 start_named_file_transfer(
                                     &mut swarm,
+                                    &mut sessions,
                                     &mut outgoing_transfers,
                                     &relay_peers,
                                     &event_tx,
@@ -4602,6 +4638,7 @@ pub async fn run_chat_network(
                                         .await;
                                         start_named_file_transfer(
                                             &mut swarm,
+                                            &mut sessions,
                                             &mut outgoing_transfers,
                                             &relay_peers,
                                             &event_tx,
@@ -4786,6 +4823,7 @@ pub async fn run_chat_network(
 
                                 start_voice_file_transfer(
                                     &mut swarm,
+                                    &mut sessions,
                                     &mut outgoing_transfers,
                                     &relay_peers,
                                     &event_tx,
@@ -4801,7 +4839,15 @@ pub async fn run_chat_network(
                                     t.save_dir = save_dir.clone();
                                 }
                                 let packet = file_transfer::FilePacket::Accept { transfer_id };
-                                swarm.behaviour_mut().file_rr.send_request(&from, packet);
+                                let _ = send_e2ee_file_ctrl(
+                                    &mut swarm,
+                                    &mut sessions,
+                                    from,
+                                    &packet,
+                                );
+                                if swarm.is_connected(&from) {
+                                    swarm.behaviour_mut().file_rr.send_request(&from, packet);
+                                }
                                 debug!(
                                     "✅ FILE: Accept transfer {:x?} от {} → {}",
                                     &transfer_id[..4],
@@ -4817,7 +4863,15 @@ pub async fn run_chat_network(
                                         file_transfer::MAX_REJECT_REASON_BYTES,
                                     ),
                                 };
-                                swarm.behaviour_mut().file_rr.send_request(&from, packet);
+                                let _ = send_e2ee_file_ctrl(
+                                    &mut swarm,
+                                    &mut sessions,
+                                    from,
+                                    &packet,
+                                );
+                                if swarm.is_connected(&from) {
+                                    swarm.behaviour_mut().file_rr.send_request(&from, packet);
+                                }
                                 incoming_transfers.remove(&transfer_id);
                                 debug!(
                                     "✖ FILE: Reject transfer {:x?} ({})",
@@ -4826,10 +4880,16 @@ pub async fn run_chat_network(
                                 );
                             }
                             UICommand::RequestFile { peer, transfer_id } => {
-                                swarm.behaviour_mut().file_rr.send_request(
-                                    &peer,
-                                    file_transfer::FilePacket::Request { transfer_id },
+                                let packet = file_transfer::FilePacket::Request { transfer_id };
+                                let _ = send_e2ee_file_ctrl(
+                                    &mut swarm,
+                                    &mut sessions,
+                                    peer,
+                                    &packet,
                                 );
+                                if swarm.is_connected(&peer) {
+                                    swarm.behaviour_mut().file_rr.send_request(&peer, packet);
+                                }
                             }
                             UICommand::CachePeerPrekeys(keys) => {
                                 for (peer, pk) in keys {
@@ -5618,7 +5678,148 @@ pub async fn run_chat_network(
                                             if let Some(session) = sessions.get_mut(&peer) {
                                                 match session.decrypt_payload(&header, &ciphertext) {
                                                     Ok(plaintext) => {
-                                                        if let Some((tid, idx, pdata)) =
+                                                        if let Some(ctrl) =
+                                                            file_transfer::try_decode_e2ee_file_ctrl(
+                                                                &plaintext,
+                                                            )
+                                                        {
+                                                            match ctrl {
+                                                                file_transfer::FilePacket::Offer {
+                                                                    transfer_id,
+                                                                    filename,
+                                                                    total_size,
+                                                                    total_chunks,
+                                                                    sha256,
+                                                                    kind,
+                                                                } => {
+                                                                    if file_transfer::validate_file_offer(
+                                                                        &filename,
+                                                                        total_size,
+                                                                        total_chunks,
+                                                                    )
+                                                                    .is_ok()
+                                                                    {
+                                                                        let safe = file_transfer::safe_filename(
+                                                                            &filename,
+                                                                        );
+                                                                        let resume = incoming_transfers
+                                                                            .get(&transfer_id)
+                                                                            .is_some_and(|inc| {
+                                                                                inc.received_count > 0
+                                                                                    && inc.total_size
+                                                                                        == total_size
+                                                                                    && inc.total_chunks
+                                                                                        == total_chunks
+                                                                                    && inc.sha256 == sha256
+                                                                                    && inc.filename == safe
+                                                                            });
+                                                                        if !resume {
+                                                                            incoming_transfers.insert(
+                                                                                transfer_id,
+                                                                                file_transfer::IncomingTransfer::new(
+                                                                                    peer,
+                                                                                    transfer_id,
+                                                                                    safe.clone(),
+                                                                                    total_size,
+                                                                                    total_chunks,
+                                                                                    sha256,
+                                                                                    kind,
+                                                                                ),
+                                                                            );
+                                                                        }
+                                                                        if let Some(inc) = incoming_transfers
+                                                                            .get_mut(&transfer_id)
+                                                                        {
+                                                                            inc.save_dir = Some(
+                                                                                if file_transfer::is_voice_filename(
+                                                                                    &safe,
+                                                                                ) {
+                                                                                    file_transfer::voice_dir_absolute()
+                                                                                        .display()
+                                                                                        .to_string()
+                                                                                } else {
+                                                                                    file_transfer::file_cache_dir()
+                                                                                        .display()
+                                                                                        .to_string()
+                                                                                },
+                                                                            );
+                                                                        }
+                                                                        let accept =
+                                                                            file_transfer::FilePacket::Accept {
+                                                                                transfer_id,
+                                                                            };
+                                                                        let _ = send_e2ee_file_ctrl(
+                                                                            &mut swarm,
+                                                                            &mut sessions,
+                                                                            peer,
+                                                                            &accept,
+                                                                        );
+                                                                        if swarm.is_connected(&peer) {
+                                                                            swarm
+                                                                                .behaviour_mut()
+                                                                                .file_rr
+                                                                                .send_request(&peer, accept);
+                                                                        }
+                                                                        let _ = event_tx
+                                                                            .send(NetworkEvent::FileOffer {
+                                                                                transfer_id,
+                                                                                from: peer,
+                                                                                filename: safe,
+                                                                                total_size,
+                                                                                kind,
+                                                                            })
+                                                                            .await;
+                                                                    }
+                                                                }
+                                                                file_transfer::FilePacket::Accept {
+                                                                    transfer_id,
+                                                                } => {
+                                                                    if let Some(t) = outgoing_transfers
+                                                                        .get_mut(&transfer_id)
+                                                                    {
+                                                                        t.accepted = true;
+                                                                        t.chunk_inflight = false;
+                                                                        t.last_chunk_at = Instant::now()
+                                                                            - file_transfer::DIRECT_CHUNK_DELAY;
+                                                                    }
+                                                                }
+                                                                file_transfer::FilePacket::Reject {
+                                                                    transfer_id,
+                                                                    reason,
+                                                                } => {
+                                                                    outgoing_transfers.remove(&transfer_id);
+                                                                    let _ = event_tx
+                                                                        .send(NetworkEvent::FileError {
+                                                                            transfer_id,
+                                                                            reason: format!(
+                                                                                "Отклонено: {}",
+                                                                                reason
+                                                                            ),
+                                                                        })
+                                                                        .await;
+                                                                }
+                                                                file_transfer::FilePacket::Cancel {
+                                                                    transfer_id,
+                                                                } => {
+                                                                    incoming_transfers.remove(&transfer_id);
+                                                                    outgoing_transfers.remove(&transfer_id);
+                                                                }
+                                                                file_transfer::FilePacket::Request {
+                                                                    transfer_id,
+                                                                } => {
+                                                                    let _ = event_tx
+                                                                        .send(
+                                                                            NetworkEvent::FileResendRequest {
+                                                                                from: peer,
+                                                                                transfer_id,
+                                                                            },
+                                                                        )
+                                                                        .await;
+                                                                }
+                                                                _ => {}
+                                                            }
+                                                            send_ack = true;
+                                                        } else if let Some((tid, idx, pdata)) =
                                                             file_transfer::try_decode_e2ee_file_chunk_frame(
                                                                 &plaintext,
                                                             )
@@ -6307,6 +6508,7 @@ pub async fn run_chat_network(
                                                     .await;
                                                     flush_pending_voice_transfers(
                                                         &mut swarm,
+                                                        &mut sessions,
                                                         &mut outgoing_transfers,
                                                         &relay_peers,
                                                         &event_tx,
@@ -6316,6 +6518,7 @@ pub async fn run_chat_network(
                                                     .await;
                                                     flush_pending_named_files(
                                                         &mut swarm,
+                                                        &mut sessions,
                                                         &mut outgoing_transfers,
                                                         &relay_peers,
                                                         &event_tx,
@@ -6332,7 +6535,58 @@ pub async fn run_chat_network(
                                             if let Some(session) = sessions.get_mut(&peer) {
                                                 if let Ok(plaintext) = session.decrypt_payload(&header, &ciphertext)
                                                 {
-                                                    if let Some((tid, idx, pdata)) =
+                                                    if let Some(ctrl) =
+                                                        file_transfer::try_decode_e2ee_file_ctrl(&plaintext)
+                                                    {
+                                                        match ctrl {
+                                                            file_transfer::FilePacket::Accept {
+                                                                transfer_id,
+                                                            } => {
+                                                                if let Some(t) = outgoing_transfers
+                                                                    .get_mut(&transfer_id)
+                                                                {
+                                                                    t.accepted = true;
+                                                                    t.chunk_inflight = false;
+                                                                    t.last_chunk_at = Instant::now()
+                                                                        - file_transfer::DIRECT_CHUNK_DELAY;
+                                                                }
+                                                            }
+                                                            file_transfer::FilePacket::Reject {
+                                                                transfer_id,
+                                                                reason,
+                                                            } => {
+                                                                outgoing_transfers.remove(&transfer_id);
+                                                                let _ = event_tx
+                                                                    .send(NetworkEvent::FileError {
+                                                                        transfer_id,
+                                                                        reason: format!(
+                                                                            "Отклонено: {}",
+                                                                            reason
+                                                                        ),
+                                                                    })
+                                                                    .await;
+                                                            }
+                                                            file_transfer::FilePacket::Cancel {
+                                                                transfer_id,
+                                                            } => {
+                                                                incoming_transfers.remove(&transfer_id);
+                                                                outgoing_transfers.remove(&transfer_id);
+                                                            }
+                                                            file_transfer::FilePacket::Request {
+                                                                transfer_id,
+                                                            } => {
+                                                                let _ = event_tx
+                                                                    .send(
+                                                                        NetworkEvent::FileResendRequest {
+                                                                            from: peer,
+                                                                            transfer_id,
+                                                                        },
+                                                                    )
+                                                                    .await;
+                                                            }
+                                                            _ => {}
+                                                        }
+                                                    } else if let Some((tid, idx, pdata)) =
                                                         file_transfer::try_decode_e2ee_file_chunk_frame(
                                                             &plaintext,
                                                         )
@@ -8198,10 +8452,18 @@ pub async fn run_chat_network(
                                             }
                                             // Файлы в чате — как голосовые: принимаем сразу, без баннера.
                                             let accept = FilePacket::Accept { transfer_id };
-                                            swarm
-                                                .behaviour_mut()
-                                                .file_rr
-                                                .send_request(&peer, accept);
+                                            let _ = send_e2ee_file_ctrl(
+                                                &mut swarm,
+                                                &mut sessions,
+                                                peer,
+                                                &accept,
+                                            );
+                                            if swarm.is_connected(&peer) {
+                                                swarm
+                                                    .behaviour_mut()
+                                                    .file_rr
+                                                    .send_request(&peer, accept);
+                                            }
 
                                             let _ = event_tx
                                                 .send(NetworkEvent::FileOffer {

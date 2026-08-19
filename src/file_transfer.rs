@@ -604,6 +604,8 @@ pub fn file_search_dirs() -> Vec<std::path::PathBuf> {
 
 /// Префикс открытого текста перед Double Ratchet: не начинается с `{`, чтобы отличаться от JSON чата.
 pub const FILE_CHUNK_E2EE_MAGIC: &[u8; 4] = b"VfC1";
+/// Offer / Accept / Reject / Cancel по тому же E2EE-каналу, что и чат (onion / circuit).
+pub const FILE_CTRL_E2EE_MAGIC: &[u8; 4] = b"VfP1";
 
 /// Кодирует один чанк для `SecureSession::encrypt_payload` / `decrypt_payload`.
 pub fn encode_e2ee_file_chunk_frame(
@@ -629,6 +631,33 @@ pub fn try_decode_e2ee_file_chunk_frame(buf: &[u8]) -> Option<([u8; 16], u32, Ve
     tid.copy_from_slice(&buf[4..20]);
     let idx = u32::from_le_bytes(buf[20..HEADER].try_into().ok()?);
     Some((tid, idx, buf[HEADER..].to_vec()))
+}
+
+pub fn encode_e2ee_file_ctrl(packet: &FilePacket) -> Option<Vec<u8>> {
+    match packet {
+        FilePacket::Offer { .. }
+        | FilePacket::Accept { .. }
+        | FilePacket::Reject { .. }
+        | FilePacket::Cancel { .. }
+        | FilePacket::Request { .. } => {}
+        FilePacket::Chunk { .. } | FilePacket::Ack => return None,
+    }
+    let json = serde_json::to_vec(packet).ok()?;
+    let mut v = Vec::with_capacity(FILE_CTRL_E2EE_MAGIC.len() + json.len());
+    v.extend_from_slice(FILE_CTRL_E2EE_MAGIC);
+    v.extend_from_slice(&json);
+    Some(v)
+}
+
+pub fn try_decode_e2ee_file_ctrl(buf: &[u8]) -> Option<FilePacket> {
+    if buf.len() < FILE_CTRL_E2EE_MAGIC.len() + 2 || &buf[..4] != FILE_CTRL_E2EE_MAGIC {
+        return None;
+    }
+    let p: FilePacket = serde_json::from_slice(&buf[4..]).ok()?;
+    match p {
+        FilePacket::Chunk { .. } | FilePacket::Ack => None,
+        other => Some(other),
+    }
 }
 
 /// Вычисляет задержку между чанками для relay-соединения.
@@ -1053,6 +1082,36 @@ mod tests {
         other[0] = 9;
         let bad = derive_file_cache_key(&other);
         assert!(decrypt_cache_blob(&bad, &blob).is_err());
+    }
+
+    #[test]
+    fn e2ee_file_ctrl_roundtrip() {
+        let offer = FilePacket::Offer {
+            transfer_id: [7u8; 16],
+            filename: "voice.webm".into(),
+            total_size: 100,
+            total_chunks: 1,
+            sha256: [1u8; 32],
+            kind: FileKind::Audio,
+        };
+        let enc = encode_e2ee_file_ctrl(&offer).expect("encode");
+        assert!(enc.starts_with(FILE_CTRL_E2EE_MAGIC));
+        let got = try_decode_e2ee_file_ctrl(&enc).expect("decode");
+        match got {
+            FilePacket::Offer {
+                filename,
+                total_size,
+                kind,
+                ..
+            } => {
+                assert_eq!(filename, "voice.webm");
+                assert_eq!(total_size, 100);
+                assert_eq!(kind, FileKind::Audio);
+            }
+            other => panic!("unexpected {other:?}"),
+        }
+        assert!(encode_e2ee_file_ctrl(&FilePacket::Ack).is_none());
+        assert!(try_decode_e2ee_file_ctrl(b"VfC1xxxx").is_none());
     }
 
     #[test]
