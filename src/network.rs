@@ -684,13 +684,6 @@ fn bootstrap_ep_expire_stale() {
     }
 }
 
-fn void_node_ep_is_live() -> bool {
-    bootstrap_ep_gate()
-        .live
-        .iter()
-        .any(|k| k.starts_with("147.78.64.22/"))
-}
-
 /// Ровно один исходящий TCP на host:port. Без /p2p/ в dial: неверный PeerId
 /// в vault (старый ключ ноды / PeerId контакта) иначе рвёт yamux сразу после Noise.
 fn dial_bootstrap_direct(
@@ -742,9 +735,27 @@ fn dial_bootstrap_direct(
     }
 }
 
-fn ensure_void_node_dial(swarm: &mut libp2p::Swarm<ChatBehaviour>) {
-    if void_node_ep_is_live() {
+fn swarm_has_bootstrap_tcp(
+    swarm: &libp2p::Swarm<ChatBehaviour>,
+    bootstrap_peer_ids: &HashSet<PeerId>,
+) -> bool {
+    swarm
+        .connected_peers()
+        .any(|p| bootstrap_peer_ids.contains(p))
+}
+
+fn ensure_void_node_dial(
+    swarm: &mut libp2p::Swarm<ChatBehaviour>,
+    bootstrap_peer_ids: &HashSet<PeerId>,
+) {
+    if swarm_has_bootstrap_tcp(swarm, bootstrap_peer_ids) {
         return;
+    }
+    // После обрыва TCP флаг live часто остаётся → набор ноды стопорится
+    // навсегда, UI «нет связи с bootstrap».
+    {
+        let mut g = bootstrap_ep_gate();
+        g.live.retain(|k| !k.starts_with("147.78.64.22/"));
     }
     dial_bootstrap_direct(swarm, *swarm.local_peer_id(), vec![void_node_tcp_addr()]);
 }
@@ -2066,17 +2077,20 @@ fn dial_missing_bootstraps(
     bootstrap_peer_ids: &HashSet<PeerId>,
     void_bootstraps: &[Multiaddr],
 ) {
-    ensure_void_node_dial(swarm);
-    let any_live = void_node_ep_is_live()
-        || swarm
-            .connected_peers()
-            .any(|p| bootstrap_peer_ids.contains(p));
-    if any_live && !hop_reservation_confirmed(swarm) {
-        // Пока нет Hop Ack, второй TCP (другая нода / тот же host:port) рвёт
-        // единственную сессию и UI остаётся на «Hop…».
+    let up = swarm_has_bootstrap_tcp(swarm, bootstrap_peer_ids);
+    if !up {
+        {
+            let mut g = bootstrap_ep_gate();
+            g.live.clear();
+        }
+        ensure_void_node_dial(swarm, bootstrap_peer_ids);
+    } else if !hop_reservation_confirmed(swarm) {
+        // Живой TCP к ноде есть. Второй dial до Hop Ack рвёт HOP-стрим.
         return;
+    } else {
+        ensure_void_node_dial(swarm, bootstrap_peer_ids);
     }
-    if any_live {
+    if up {
         let mut last = extra_bootstrap_dial_gate();
         if last.is_some_and(|t| t.elapsed() < Duration::from_secs(20)) {
             return;
@@ -3162,7 +3176,7 @@ pub async fn run_chat_network(
                 "набор VOID-ноды 147.78.64.22:4001".into(),
             ))
             .await;
-        ensure_void_node_dial(&mut swarm);
+        ensure_void_node_dial(&mut swarm, &bootstrap_peer_ids);
         // Не start_providing / put_record до Identify: Kademlia сама наберёт
         // bootstrap вторым TCP и обе сессии сразу умрут.
 
@@ -7295,12 +7309,11 @@ pub async fn run_chat_network(
                                 peer_id, connection_id, cause, num_established, connected_count
                             );
                             if num_established == 0 {
-                                if let libp2p::core::ConnectedPoint::Dialer { address, .. } =
-                                    endpoint
-                                {
-                                    if is_direct_bootstrap_tcp(address, &void_bootstraps) {
-                                        bootstrap_ep_mark_live(address, false);
-                                    }
+                                if let Some(address) = connected_point_remote_tcp(endpoint) {
+                                    bootstrap_ep_mark_live(address, false);
+                                }
+                                if bootstrap_peer_ids.contains(&peer_id) {
+                                    bootstrap_ep_mark_live(&void_node_tcp_addr(), false);
                                 }
                             }
                             if bootstrap_peer_ids.contains(&peer_id)
@@ -7435,7 +7448,7 @@ pub async fn run_chat_network(
                                     );
                                 }
                                 drop(g);
-                                if !void_node_ep_is_live() {
+                                if !swarm_has_bootstrap_tcp(&swarm, &bootstrap_peer_ids) {
                                     dial_missing_bootstraps(
                                         &mut swarm,
                                         &bootstrap_peer_ids,
@@ -7898,7 +7911,10 @@ pub async fn run_chat_network(
                                         e
                                     );
                                     if bootstrap_peer_ids.contains(&peer) {
-                                        if *streak >= 3 {
+                                        // Пока Hop не встал, ping timeout на ноде —
+                                        // не рвём единственный TCP (иначе «нет связи
+                                        // с bootstrap» и набор больше не идёт).
+                                        if hop_reservation_confirmed(&swarm) && *streak >= 8 {
                                             let _ = swarm.disconnect_peer_id(peer);
                                             peer_ping_fail_streak.remove(&peer);
                                         }
