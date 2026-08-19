@@ -1112,6 +1112,69 @@ fn relay_peer_id_from_circuit_addr(addr: &Multiaddr) -> Option<PeerId> {
     last_before_circuit
 }
 
+fn emit_hop_ready(event_tx: &mpsc::Sender<NetworkEvent>, relay: PeerId, addr: Option<Multiaddr>) {
+    note_hop_ok();
+    if let Some(a) = addr {
+        let _ = event_tx.try_send(NetworkEvent::NewListenAddr(a));
+    }
+    let _ = event_tx.try_send(NetworkEvent::RelayHopReady { relay });
+    let _ = event_tx.try_send(NetworkEvent::Status("СВЯЗЬ ЧЕРЕЗ RELAY — Hop OK".into()));
+}
+
+/// listen_on уже ушёл, нода в логах приняла Reserve, а Ack/NewListenAddr
+/// часто не доходят до UI. Не ждём hop_tick: chunk_tick 20 мс не голодает.
+fn promote_pending_hop_if_due(
+    swarm: &libp2p::Swarm<ChatBehaviour>,
+    bootstrap_peer_ids: &HashSet<PeerId>,
+    relay_circuit_reserved: &mut HashSet<PeerId>,
+    relay_hop_pending: &mut HashSet<PeerId>,
+    hop_listen_after: &mut HashMap<PeerId, Instant>,
+    relay_listen_attempt_at: &HashMap<PeerId, Instant>,
+    event_tx: &mpsc::Sender<NetworkEvent>,
+) {
+    let pending_now: Vec<PeerId> = relay_hop_pending.iter().copied().collect();
+    if pending_now.is_empty() {
+        return;
+    }
+    let live_boot = bootstrap_peer_ids
+        .iter()
+        .copied()
+        .find(|b| swarm.is_connected(b));
+    for relay in pending_now {
+        if relay_circuit_reserved.contains(&relay) {
+            relay_hop_pending.remove(&relay);
+            continue;
+        }
+        let waited = relay_listen_attempt_at
+            .get(&relay)
+            .map(|t| t.elapsed())
+            .unwrap_or(Duration::from_secs(30));
+        if waited < Duration::from_secs(2) {
+            continue;
+        }
+        let ready_id = if swarm.is_connected(&relay) {
+            relay
+        } else if let Some(b) = live_boot {
+            b
+        } else {
+            continue;
+        };
+        relay_circuit_reserved.insert(ready_id);
+        relay_hop_pending.remove(&relay);
+        hop_listen_after.remove(&relay);
+        hop_listen_after.remove(&ready_id);
+        let addr = circuit_listen_relays(swarm)
+            .into_iter()
+            .find(|(p, _)| *p == ready_id)
+            .map(|(_, a)| a);
+        info!(
+            "Hop OK (listen_on + {}s)",
+            waited.as_secs()
+        );
+        emit_hop_ready(event_tx, ready_id, addr);
+    }
+}
+
 /// Force circuit + LAN redial after zombie / RR failure.
 fn redial_contact_hard(
     swarm: &mut libp2p::Swarm<ChatBehaviour>,
@@ -3493,6 +3556,15 @@ pub async fn run_chat_network(
                 }
                 // ─── Tick: отправка очередных чанков с rate-limit ───────────
                 _ = chunk_tick.tick() => {
+                    promote_pending_hop_if_due(
+                        &swarm,
+                        &bootstrap_peer_ids,
+                        &mut relay_circuit_reserved,
+                        &mut relay_hop_pending,
+                        &mut hop_listen_after,
+                        &relay_listen_attempt_at,
+                        &event_tx,
+                    );
                     const VOICE_OFFER_STALE: Duration = Duration::from_secs(90);
                     let voice_reoffer: Vec<([u8; 16], PeerId)> = outgoing_transfers
                         .iter()
@@ -5111,42 +5183,21 @@ pub async fn run_chat_network(
                         if relay_circuit_reserved.insert(relay) {
                             relay_hop_pending.remove(&relay);
                             hop_listen_after.remove(&relay);
-                            note_hop_ok();
                             info!("Hop OK из swarm.listen ({})", addr);
                             kad_bootstrap_after =
                                 Some(Instant::now() + Duration::from_secs(30));
-                            let _ = event_tx
-                                .send(NetworkEvent::NewListenAddr(addr.clone()))
-                                .await;
-                            let _ = event_tx
-                                .send(NetworkEvent::RelayHopReady { relay })
-                                .await;
+                            emit_hop_ready(&event_tx, relay, Some(addr));
                         }
                     }
-                    // Нода уже приняла Reserve, а клиентские события Hop
-                    // иногда не доходят — UI тогда вечно «Hop…».
-                    let pending_now: Vec<PeerId> = relay_hop_pending.iter().copied().collect();
-                    for relay in pending_now {
-                        if relay_circuit_reserved.contains(&relay) || !swarm.is_connected(&relay)
-                        {
-                            continue;
-                        }
-                        let waited = relay_listen_attempt_at
-                            .get(&relay)
-                            .map(|t| t.elapsed())
-                            .unwrap_or(Duration::ZERO);
-                        if waited < Duration::from_secs(2) {
-                            continue;
-                        }
-                        relay_circuit_reserved.insert(relay);
-                        relay_hop_pending.remove(&relay);
-                        hop_listen_after.remove(&relay);
-                        note_hop_ok();
-                        info!("Hop OK (listen_on + 2s, нода приняла Reserve)");
-                        let _ = event_tx
-                            .send(NetworkEvent::RelayHopReady { relay })
-                            .await;
-                    }
+                    promote_pending_hop_if_due(
+                        &swarm,
+                        &bootstrap_peer_ids,
+                        &mut relay_circuit_reserved,
+                        &mut relay_hop_pending,
+                        &mut hop_listen_after,
+                        &relay_listen_attempt_at,
+                        &event_tx,
+                    );
                     if let Some(when) = kad_bootstrap_after {
                         if Instant::now() >= when {
                             kad_bootstrap_after = None;
@@ -5252,10 +5303,7 @@ pub async fn run_chat_network(
                                     if relay_circuit_reserved.insert(relay) {
                                         relay_hop_pending.remove(&relay);
                                         hop_listen_after.remove(&relay);
-                                        note_hop_ok();
-                                        let _ = event_tx
-                                            .send(NetworkEvent::RelayHopReady { relay })
-                                            .await;
+                                        emit_hop_ready(&event_tx, relay, None);
                                     }
                                 }
                             }
@@ -6985,18 +7033,7 @@ pub async fn run_chat_network(
                                     relay_circuit_reserved.insert(relay);
                                     relay_hop_pending.remove(&relay);
                                     hop_listen_after.remove(&relay);
-                                    note_hop_ok();
-                                    let _ = event_tx
-                                        .send(NetworkEvent::NewListenAddr(address.clone()))
-                                        .await;
-                                    let _ = event_tx
-                                        .send(NetworkEvent::RelayHopReady { relay })
-                                        .await;
-                                    let _ = event_tx
-                                        .send(NetworkEvent::Status(
-                                            "СВЯЗЬ ЧЕРЕЗ RELAY — Hop OK".into(),
-                                        ))
-                                        .await;
+                                    emit_hop_ready(&event_tx, relay, Some(address.clone()));
                                 }
                             } else if !relay_circuit_reserved.is_empty() {
                                 publish_self_in_dht(
@@ -7849,21 +7886,11 @@ pub async fn run_chat_network(
                             relay_circuit_reserved.insert(relay_peer_id);
                             relay_hop_pending.remove(&relay_peer_id);
                             hop_listen_after.remove(&relay_peer_id);
-                            note_hop_ok();
-                            let _ = event_tx
-                                .send(NetworkEvent::RelayHopReady {
-                                    relay: relay_peer_id,
-                                })
-                                .await;
+                            emit_hop_ready(&event_tx, relay_peer_id, None);
                             if !renewal {
                                 kad_bootstrap_after.get_or_insert(
                                     Instant::now() + Duration::from_secs(30),
                                 );
-                                let _ = event_tx
-                                    .send(NetworkEvent::Status(
-                                        "СВЯЗЬ ЧЕРЕЗ RELAY — можно принимать звонки из VOID".into(),
-                                    ))
-                                    .await;
                             }
                         }
                         SwarmEvent::Behaviour(ChatBehaviourEvent::Relay(
@@ -7882,10 +7909,7 @@ pub async fn run_chat_network(
                                 if relay_circuit_reserved.insert(relay) {
                                     relay_hop_pending.remove(&relay);
                                     hop_listen_after.remove(&relay);
-                                    note_hop_ok();
-                                    let _ = event_tx
-                                        .send(NetworkEvent::RelayHopReady { relay })
-                                        .await;
+                                    emit_hop_ready(&event_tx, relay, None);
                                 }
                             }
                         }

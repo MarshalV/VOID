@@ -1,7 +1,7 @@
 (() => {
   const asset = (name) => {
     const encoded = name.split("/").map(encodeURIComponent).join("/");
-    return `static/${encoded}?v=8`;
+    return `static/${encoded}?v=9`;
   };
 
   function resolveInvoke() {
@@ -83,6 +83,38 @@
   let pendingSnap = null;
   let activeAudio = null;
   let menuSection = "contacts";
+  let hopPendingSince = 0;
+  let hopUiTimer = null;
+
+  function hopOkFromSnap(s) {
+    if (s?.relay_reserved) return true;
+    if (!s?.relay_hop_pending) return false;
+    if (!hopPendingSince) hopPendingSince = Date.now();
+    return Date.now() - hopPendingSince >= 2500;
+  }
+
+  function syncHopTimer(s) {
+    if (s?.relay_hop_pending && !s?.relay_reserved) {
+      if (!hopPendingSince) hopPendingSince = Date.now();
+      if (!hopUiTimer && invoke) {
+        hopUiTimer = setInterval(async () => {
+          try {
+            const snap = await invoke("get_snapshot");
+            if (snap) applySnapshotNow(snap);
+            else if (snapshot) applySnapshotNow(snapshot);
+          } catch (_) {
+            if (snapshot) applySnapshotNow(snapshot);
+          }
+        }, 400);
+      }
+    } else {
+      hopPendingSince = 0;
+      if (hopUiTimer) {
+        clearInterval(hopUiTimer);
+        hopUiTimer = null;
+      }
+    }
+  }
 
   function messagesSig(s) {
     const msgs = s?.messages || [];
@@ -228,6 +260,7 @@
     if (lastSnapRev && rev && rev < lastSnapRev) return;
     if (rev) lastSnapRev = Math.max(lastSnapRev, rev);
     snapshot = s;
+    syncHopTimer(s);
     if (s.unlocked) {
       els.unlockScreen.hidden = true;
       els.mainScreen.hidden = false;
@@ -235,14 +268,15 @@
     els.beaconBanner.hidden = !s.beacon_active;
     const pidShort = (s.peer_id || "").slice(0, 12);
     const live = (s.bootstrap_connected || 0) + (s.connected_peers || 0);
-    const hop = s.relay_reserved
+    const hopOk = hopOkFromSnap(s);
+    const hop = hopOk
       ? " · Hop OK"
       : s.relay_hop_pending
         ? " · Hop…"
         : s.bootstrap_connected > 0
           ? " · нет Hop"
           : "";
-    const via = s.bootstrap_connected > 0 && !s.relay_reserved ? " · через ноду" : "";
+    const via = s.bootstrap_connected > 0 && !hopOk ? " · через ноду" : "";
     const netLabel = s.network_ok
       ? s.bootstrap_connected > 0
         ? "в сети"
@@ -252,7 +286,7 @@
         : "bootstrap не задан";
     els.connStatus.textContent = `${netLabel}${via}${hop} · ${pidShort}… · live ${live} · контакты ${s.connected_peers} · bootstrap ${s.bootstrap_connected}/${s.bootstraps?.length || 0}`;
     els.connStatus.title = [
-      s.relay_reserved
+      hopOk
         ? "Hop: вас можно набрать из‑за NAT через relay"
         : s.relay_hop_pending
           ? "Hop: запрос резервации отправлен, ждём Ack от ноды"
@@ -264,7 +298,7 @@
     ]
       .filter(Boolean)
       .join("\n");
-    els.connStatus.style.color = s.relay_reserved
+    els.connStatus.style.color = hopOk
       ? "var(--accent)"
       : s.relay_hop_pending
         ? "#c9a227"
