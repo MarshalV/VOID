@@ -778,6 +778,24 @@ fn circuit_recently_failed(peer: &PeerId) -> bool {
         .is_some_and(|t| t.elapsed() < Duration::from_secs(45))
 }
 
+fn hop_ok_at() -> std::sync::MutexGuard<'static, Option<Instant>> {
+    static G: std::sync::OnceLock<std::sync::Mutex<Option<Instant>>> = std::sync::OnceLock::new();
+    G.get_or_init(|| std::sync::Mutex::new(None))
+        .lock()
+        .unwrap_or_else(|p| p.into_inner())
+}
+
+fn note_hop_ok() {
+    let mut g = hop_ok_at();
+    if g.is_none() {
+        *g = Some(Instant::now());
+    }
+}
+
+fn hop_ok_settled() -> bool {
+    hop_ok_at().is_some_and(|t| t.elapsed() >= Duration::from_secs(8))
+}
+
 fn dial_peer_best_effort(
     swarm: &mut libp2p::Swarm<ChatBehaviour>,
     peer_id: PeerId,
@@ -808,7 +826,7 @@ fn dial_peer_live_circuits(
     // До Hop Ack это второй dial на bootstrap → yamux рвёт HOP-стрим, UI
     // вечно на «Hop…», контакты 0. Резервация получателя нужна, чтобы нас
     // приняли; наша — чтобы этот dial не убил listen_on.
-    if !hop_reservation_confirmed(swarm) {
+    if !hop_reservation_confirmed(swarm) || !hop_ok_settled() {
         return;
     }
     if circuit_recently_failed(&peer_id) {
@@ -5110,6 +5128,7 @@ pub async fn run_chat_network(
                         if relay_circuit_reserved.insert(relay) {
                             relay_hop_pending.remove(&relay);
                             hop_listen_after.remove(&relay);
+                            note_hop_ok();
                             info!("Hop OK из swarm.listen ({})", addr);
                             kad_bootstrap_after =
                                 Some(Instant::now() + Duration::from_secs(30));
@@ -5169,7 +5188,7 @@ pub async fn run_chat_network(
                         {
                             // Identify сначала: иначе Reserve на полуживом conn.
                             let delay = if bootstrap_identified.contains(b) {
-                                Duration::from_millis(400)
+                                Duration::from_millis(1500)
                             } else {
                                 Duration::from_secs(3)
                             };
@@ -5219,6 +5238,7 @@ pub async fn run_chat_network(
                                     if relay_circuit_reserved.insert(relay) {
                                         relay_hop_pending.remove(&relay);
                                         hop_listen_after.remove(&relay);
+                                        note_hop_ok();
                                         let _ = event_tx
                                             .send(NetworkEvent::RelayHopReady { relay })
                                             .await;
@@ -6951,6 +6971,7 @@ pub async fn run_chat_network(
                                 if relay_circuit_reserved.insert(relay) {
                                     relay_hop_pending.remove(&relay);
                                     hop_listen_after.remove(&relay);
+                                    note_hop_ok();
                                     let _ = event_tx
                                         .send(NetworkEvent::RelayHopReady { relay })
                                         .await;
@@ -7002,18 +7023,25 @@ pub async fn run_chat_network(
                                         libp2p::core::ConnectedPoint::Dialer { address, .. }
                                             if is_direct_bootstrap_tcp(address, &void_bootstraps)
                                     ));
-                            // Второй TCP к той же ноде (дубль dial / listen_on) рвёт
-                            // yamux и HOP. Reserve идёт по первому conn.
+                            // QUIC к bootstrap рвёт TCP. Второй TCP до Hop Ack
+                            // часто и есть Reserve (listen_on, если ещё нет
+                            // записи в relay client) — закрывать нельзя, иначе
+                            // нода пишет reservation accepted, а UI «Hop…».
                             if is_boot_peer && u32::from(num_established) > 1 {
-                                warn!(
-                                    "drop extra bootstrap {:?} n={} quic={} peer={}",
-                                    connection_id,
-                                    num_established,
-                                    is_quic_ep,
-                                    &peer_id.to_string()[..8.min(peer_id.to_string().len())]
-                                );
-                                let _ = swarm.close_connection(connection_id);
-                                continue;
+                                let drop_extra = is_quic_ep
+                                    || relay_circuit_reserved.contains(&peer_id);
+                                if drop_extra {
+                                    warn!(
+                                        "drop extra bootstrap {:?} n={} quic={} hop={} peer={}",
+                                        connection_id,
+                                        num_established,
+                                        is_quic_ep,
+                                        relay_circuit_reserved.contains(&peer_id),
+                                        &peer_id.to_string()[..8.min(peer_id.to_string().len())]
+                                    );
+                                    let _ = swarm.close_connection(connection_id);
+                                    continue;
+                                }
                             }
                             debug!("✅ СОЕДИНЕНО: {}. Endpoint: {:?}. Всего пиров: {} (conn #{})", peer_id, endpoint, connected_count, num_established);
                             if let Some(address) = connected_point_remote_tcp(endpoint) {
@@ -7352,6 +7380,7 @@ pub async fn run_chat_network(
                                 let _ = relay_hop_pending.remove(&peer_id);
                                 relay_listen_attempt_at.remove(&peer_id);
                                 bootstrap_hop_addr.remove(&peer_id);
+                                *hop_ok_at() = None;
                                 if let Some(lid) = relay_hop_listeners.remove(&peer_id) {
                                     let _ = swarm.remove_listener(lid);
                                 }
@@ -7625,18 +7654,11 @@ pub async fn run_chat_network(
                                         }
                                     }
                                     if !relay_circuit_reserved.contains(&peer_id) {
-                                        ensure_bootstrap_relay_listens(
-                                            &mut swarm,
-                                            &bootstrap_peer_ids,
-                                            &void_bootstraps,
-                                            &reconnect_targets,
-                                            &bootstrap_hop_addr,
-                                            &relay_circuit_reserved,
-                                            &mut relay_listen_attempt_at,
-                                            &mut relay_hop_pending,
-                                            &mut relay_hop_listeners,
-                                            Duration::ZERO,
-                                            Some(&event_tx),
+                                        // Не listen_on в том же тике, что Identify:
+                                        // relay client ещё без этого conn → второй
+                                        // dial на Reserve.
+                                        hop_listen_after.entry(peer_id).or_insert(
+                                            Instant::now() + Duration::from_millis(1500),
                                         );
                                     }
                                     // Kademlia (add_address / provide / put) до Hop Ack
@@ -7799,6 +7821,7 @@ pub async fn run_chat_network(
                             relay_circuit_reserved.insert(relay_peer_id);
                             relay_hop_pending.remove(&relay_peer_id);
                             hop_listen_after.remove(&relay_peer_id);
+                            note_hop_ok();
                             let _ = event_tx
                                 .send(NetworkEvent::RelayHopReady {
                                     relay: relay_peer_id,
@@ -7831,6 +7854,7 @@ pub async fn run_chat_network(
                                 if relay_circuit_reserved.insert(relay) {
                                     relay_hop_pending.remove(&relay);
                                     hop_listen_after.remove(&relay);
+                                    note_hop_ok();
                                     let _ = event_tx
                                         .send(NetworkEvent::RelayHopReady { relay })
                                         .await;
