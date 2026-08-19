@@ -760,6 +760,24 @@ fn ensure_void_node_dial(
     dial_bootstrap_direct(swarm, *swarm.local_peer_id(), vec![void_node_tcp_addr()]);
 }
 
+fn circuit_fail_at() -> std::sync::MutexGuard<'static, HashMap<PeerId, Instant>> {
+    static G: std::sync::OnceLock<std::sync::Mutex<HashMap<PeerId, Instant>>> =
+        std::sync::OnceLock::new();
+    G.get_or_init(|| std::sync::Mutex::new(HashMap::new()))
+        .lock()
+        .unwrap_or_else(|p| p.into_inner())
+}
+
+fn note_circuit_fail(peer: PeerId) {
+    circuit_fail_at().insert(peer, Instant::now());
+}
+
+fn circuit_recently_failed(peer: &PeerId) -> bool {
+    circuit_fail_at()
+        .get(peer)
+        .is_some_and(|t| t.elapsed() < Duration::from_secs(45))
+}
+
 fn dial_peer_best_effort(
     swarm: &mut libp2p::Swarm<ChatBehaviour>,
     peer_id: PeerId,
@@ -791,6 +809,9 @@ fn dial_peer_live_circuits(
     // вечно на «Hop…», контакты 0. Резервация получателя нужна, чтобы нас
     // приняли; наша — чтобы этот dial не убил listen_on.
     if !hop_reservation_confirmed(swarm) {
+        return;
+    }
+    if circuit_recently_failed(&peer_id) {
         return;
     }
     let condition = if force {
@@ -841,26 +862,20 @@ fn dial_peer_with_condition(
         );
         return;
     }
-    // Circuit через cold bootstrap = ещё один TCP к ноде рядом со стартовым
-    // dial — libp2p закрывает оба (yamux Closed за 1 мс). Для обычного dial
-    // circuit только через уже живой relay.
-    let boot = if circuits_only {
-        let mut b = live_boot;
-        b.extend(cold_boot);
-        b
-    } else {
-        live_boot
-    };
+    // Circuit только через уже живой relay, один адрес. Cold + пачка
+    // multiaddr → несколько STOP на том же HOP-conn → NoReservation спам
+    // и ConnectionReset ноды.
+    let boot = live_boot;
     let clean = if circuits_only {
-        let mut circuits = Vec::new();
-        for relay_ma in &boot {
-            for circuit in relay_circuit_dial_addrs(std::slice::from_ref(relay_ma), peer_id) {
-                if !circuits.contains(&circuit) {
-                    circuits.push(circuit);
-                }
-            }
-        }
-        circuits
+        boot.iter()
+            .find(|ma| addr_is_tcp(ma) && !addr_is_quic_v1(ma) && !is_circuit_addr(ma))
+            .and_then(|relay_ma| {
+                relay_circuit_dial_addrs(std::slice::from_ref(relay_ma), peer_id)
+                    .into_iter()
+                    .next()
+            })
+            .into_iter()
+            .collect::<Vec<_>>()
     } else {
         expand_dial_addrs(peer_id, addrs, &boot)
     };
@@ -3374,7 +3389,7 @@ pub async fn run_chat_network(
                         &bootstrap_peer_ids,
                         &void_bootstraps,
                         &mut contact_dial_at,
-                        Duration::from_secs(15),
+                        Duration::from_secs(45),
                         !relay_circuit_reserved.is_empty(),
                     );
                     onion_rt_set_keys(
@@ -7469,6 +7484,9 @@ pub async fn run_chat_network(
                             if let Some(p) = peer_id {
                                 pending_dials.remove(&p);
                                 dial_backoff.insert(p, std::time::Instant::now());
+                                if !bootstrap_peer_ids.contains(&p) {
+                                    note_circuit_fail(p);
+                                }
                                 // listen_on(/p2p-circuit) сам может дать DialFailure,
                                 // пока TCP к ноде жив — это не падение bootstrap.
                                 if bootstrap_peer_ids.contains(&p) && !swarm.is_connected(&p) {
