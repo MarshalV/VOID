@@ -76,7 +76,6 @@ fn validate_file_meta(f: &FileMeta) -> bool {
         && f.filename.len() <= 256
         && !f.filename.contains('/')
         && !f.filename.contains('\\')
-        && f.size > 0
         && f.size <= file_transfer::MAX_FILE_SIZE
 }
 

@@ -175,7 +175,12 @@ html, body {
   font-size: 1.1rem;
   min-width: 0;
 }
-.brand-mini-img { width: 26px; height: 26px; object-fit: contain; }
+.brand-mini-img {
+  width: 36px;
+  height: 36px;
+  object-fit: contain;
+  background: transparent;
+}
 
 button.icon-btn {
   all: unset;

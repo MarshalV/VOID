@@ -105,6 +105,18 @@ struct PendingVoiceSend {
     last_attempt: Instant,
 }
 
+#[derive(Clone)]
+struct PendingGroupVoice {
+    group_id: String,
+    members: Vec<PeerId>,
+    path: String,
+    duration_secs: f32,
+    message_id: String,
+    transfer_id: [u8; 16],
+    last_attempt: Instant,
+    attempts: u32,
+}
+
 fn bootstrap_peer_ids(bootstraps: &[String]) -> HashSet<PeerId> {
     bootstraps
         .iter()
@@ -291,6 +303,7 @@ struct Inner {
     pending_sends: Vec<PendingSend>,
     pending_file_sends: Vec<PendingFileSend>,
     pending_voice_sends: Vec<PendingVoiceSend>,
+    pending_group_voices: Vec<PendingGroupVoice>,
     /// transfer_id hex → absolute WAV path for in-chat playback.
     voice_audio_paths: HashMap<String, String>,
     /// transfer_id hex → local file path for in-chat download/open.
@@ -346,6 +359,7 @@ impl Inner {
             pending_sends: Vec::new(),
             pending_file_sends: Vec::new(),
             pending_voice_sends: Vec::new(),
+            pending_group_voices: Vec::new(),
             voice_audio_paths: HashMap::new(),
             file_paths: HashMap::new(),
             expecting_files: HashSet::new(),
@@ -1222,6 +1236,62 @@ impl Inner {
                     message_id,
                     transfer_id,
                     is_retry: true,
+                });
+            }
+        }
+    }
+
+    fn tick_pending_group_voices(&mut self) {
+        const RETRY: Duration = Duration::from_secs(8);
+        let now = Instant::now();
+        let due: Vec<PendingGroupVoice> = self
+            .pending_group_voices
+            .iter()
+            .filter(|p| now.duration_since(p.last_attempt) >= RETRY)
+            .cloned()
+            .collect();
+        let nick = self.local_nickname.clone();
+        let local = self.local_peer_id;
+        for item in due {
+            let too_old = if let Some(slot) = self
+                .pending_group_voices
+                .iter_mut()
+                .find(|p| p.message_id == item.message_id)
+            {
+                slot.last_attempt = now;
+                slot.attempts = slot.attempts.saturating_add(1);
+                slot.attempts >= 24
+            } else {
+                false
+            };
+            if too_old {
+                self.pending_group_voices
+                    .retain(|p| p.message_id != item.message_id);
+                continue;
+            }
+            let members: Vec<PeerId> = item
+                .members
+                .iter()
+                .copied()
+                .filter(|p| Some(*p) != local)
+                .collect();
+            if let Some(tx) = &self.command_tx {
+                for peer in &members {
+                    self.ensure_peer_routed(*peer);
+                    let _ = tx.try_send(UICommand::EnsureChatSession(*peer));
+                    let _ = tx.try_send(UICommand::SearchPeer(*peer));
+                }
+                let _ = tx.try_send(UICommand::SendGroupMessage {
+                    sender_name: nick.clone(),
+                    text: String::new(),
+                    group_id: item.group_id,
+                    members,
+                    message_id: Some(item.message_id),
+                    is_retry: true,
+                    voice_path: Some(item.path),
+                    voice_duration_secs: item.duration_secs,
+                    voice_transfer_id: Some(item.transfer_id),
+                    voice_only_members: Vec::new(),
                 });
             }
         }
@@ -2362,6 +2432,7 @@ impl VoidRuntime {
                     g.tick_pending_sends();
                     g.tick_pending_file_sends();
                     g.tick_pending_voice_sends();
+                    g.tick_pending_group_voices();
                     g.tick_voice_recorder();
                     g.tick_group_sync_outbox();
                 }
@@ -3070,8 +3141,8 @@ impl VoidRuntime {
         let nick = g.local_nickname.clone();
         let filename = file_transfer::safe_filename(&path);
         let size = std::fs::metadata(&path).map(|m| m.len()).unwrap_or(0);
-        if size == 0 {
-            return Err("Файл пустой или недоступен".into());
+        if !std::path::Path::new(&path).is_file() {
+            return Err("Файл недоступен".into());
         }
         if size > file_transfer::MAX_FILE_SIZE {
             return Err(format!(
@@ -3450,17 +3521,39 @@ impl VoidRuntime {
                 }
             }
             if let Some(tx) = &g.command_tx {
+                for pid in &members {
+                    if *pid != local {
+                        let _ = tx.try_send(UICommand::EnsureChatSession(*pid));
+                        let _ = tx.try_send(UICommand::SearchPeer(*pid));
+                    }
+                }
                 let _ = tx.try_send(UICommand::SendGroupMessage {
                     sender_name: nick,
                     text: String::new(),
-                    group_id: gid,
-                    members,
-                    message_id: Some(mid),
+                    group_id: gid.clone(),
+                    members: members.clone(),
+                    message_id: Some(mid.clone()),
                     is_retry: false,
-                    voice_path: Some(staged),
+                    voice_path: Some(staged.clone()),
                     voice_duration_secs: duration,
                     voice_transfer_id: Some(tid),
                     voice_only_members: Vec::new(),
+                });
+            }
+            if !g
+                .pending_group_voices
+                .iter()
+                .any(|p| p.message_id == mid)
+            {
+                g.pending_group_voices.push(PendingGroupVoice {
+                    group_id: gid,
+                    members,
+                    path: staged,
+                    duration_secs: duration,
+                    message_id: mid,
+                    transfer_id: tid,
+                    last_attempt: Instant::now(),
+                    attempts: 0,
                 });
             }
         } else {

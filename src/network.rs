@@ -1485,6 +1485,30 @@ async fn apply_incoming_file_chunk(
     voice_outcome
 }
 
+async fn complete_empty_outgoing_file(
+    transfer_id: [u8; 16],
+    outgoing_transfers: &mut HashMap<[u8; 16], file_transfer::OutgoingTransfer>,
+    event_tx: &mpsc::Sender<NetworkEvent>,
+) {
+    let ready = outgoing_transfers.get(&transfer_id).is_some_and(|t| {
+        t.accepted && t.chunks.is_empty()
+    });
+    if !ready {
+        return;
+    }
+    if let Some(t) = outgoing_transfers.remove(&transfer_id) {
+        let _ = event_tx
+            .send(NetworkEvent::FileComplete {
+                transfer_id,
+                filename: t.filename,
+                saved_to: String::new(),
+                is_outgoing: true,
+                peer: t.peer,
+            })
+            .await;
+    }
+}
+
 #[cfg_attr(not(feature = "egui-ui"), allow(dead_code))]
 pub(crate) enum UICommand {
     Dial(String),
@@ -4605,8 +4629,7 @@ pub async fn run_chat_network(
                                     std::path::Path::new(&path),
                                 );
                                 if let Some(mid) = message_id.clone() {
-                                    if size > 0 {
-                                        let msg = ChatMessage {
+                                    let msg = ChatMessage {
                                             id: mid,
                                             sender_id: local_peer_id.to_string(),
                                             sender_name: sender_name.clone(),
@@ -4645,7 +4668,6 @@ pub async fn run_chat_network(
                                                 );
                                             }
                                         }
-                                    }
                                 }
                                 if !sessions.contains_key(&recipient) {
                                     let q = pending_named_files.entry(recipient).or_default();
@@ -5877,6 +5899,19 @@ pub async fn run_chat_network(
                                                                                 kind,
                                                                             })
                                                                             .await;
+                                                                        if total_chunks == 0 {
+                                                                            let _ = apply_incoming_file_chunk(
+                                                                                transfer_id,
+                                                                                0,
+                                                                                Vec::new(),
+                                                                                peer,
+                                                                                &now,
+                                                                                &mut incoming_transfers,
+                                                                                &event_tx,
+                                                                                &file_cache_key,
+                                                                            )
+                                                                            .await;
+                                                                        }
                                                                     }
                                                                 }
                                                                 file_transfer::FilePacket::Accept {
@@ -5890,6 +5925,12 @@ pub async fn run_chat_network(
                                                                         t.last_chunk_at = Instant::now()
                                                                             - file_transfer::DIRECT_CHUNK_DELAY;
                                                                     }
+                                                                    complete_empty_outgoing_file(
+                                                                        transfer_id,
+                                                                        &mut outgoing_transfers,
+                                                                        &event_tx,
+                                                                    )
+                                                                    .await;
                                                                 }
                                                                 file_transfer::FilePacket::Reject {
                                                                     transfer_id,
@@ -8521,6 +8562,19 @@ pub async fn run_chat_network(
                                                     kind,
                                                 })
                                                 .await;
+                                            if total_chunks == 0 {
+                                                let _ = apply_incoming_file_chunk(
+                                                    transfer_id,
+                                                    0,
+                                                    Vec::new(),
+                                                    peer,
+                                                    &now,
+                                                    &mut incoming_transfers,
+                                                    &event_tx,
+                                                    &file_cache_key,
+                                                )
+                                                .await;
+                                            }
                                         }
                                         FilePacket::Accept { transfer_id } => {
                                             debug!(
@@ -8537,6 +8591,12 @@ pub async fn run_chat_network(
                                                 t.last_chunk_at =
                                                     Instant::now() - file_transfer::DIRECT_CHUNK_DELAY;
                                             }
+                                            complete_empty_outgoing_file(
+                                                transfer_id,
+                                                &mut outgoing_transfers,
+                                                &event_tx,
+                                            )
+                                            .await;
                                             // Чанки идут только по E2EE — без сессии Accept
                                             // «есть», а файл не поедет.
                                             if !sessions.contains_key(&peer)

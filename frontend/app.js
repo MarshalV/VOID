@@ -1,7 +1,7 @@
 (() => {
   const asset = (name) => {
     const encoded = name.split("/").map(encodeURIComponent).join("/");
-    return `static/${encoded}?v=9`;
+    return `static/${encoded}?v=11`;
   };
 
   function resolveInvoke() {

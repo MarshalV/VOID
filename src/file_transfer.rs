@@ -675,12 +675,16 @@ pub fn validate_file_offer(
     if filename.len() > MAX_OFFER_FILENAME_BYTES {
         return Err("слишком длинное имя файла в оффере");
     }
-    if total_size == 0 || total_size > MAX_FILE_SIZE {
+    if total_size > MAX_FILE_SIZE {
         return Err("некорректный размер файла в оффере");
     }
     let chunk_sz = FILE_CHUNK_SIZE as u64;
-    let expected = ((total_size + chunk_sz - 1) / chunk_sz) as u32;
-    if total_chunks == 0 || total_chunks != expected {
+    let expected = if total_size == 0 {
+        0
+    } else {
+        ((total_size + chunk_sz - 1) / chunk_sz) as u32
+    };
+    if total_chunks != expected {
         return Err("несогласованы размер файла и число чанков");
     }
     Ok(())
@@ -1036,8 +1040,9 @@ mod tests {
     }
 
     #[test]
-    fn validate_offer_rejects_zero_size() {
-        assert!(validate_file_offer("a.txt", 0, 0).is_err());
+    fn validate_offer_allows_empty_file() {
+        assert!(validate_file_offer("a.txt", 0, 0).is_ok());
+        assert!(validate_file_offer("a.txt", 0, 1).is_err());
     }
 
     #[test]
