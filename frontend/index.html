@@ -4,7 +4,7 @@
   <meta charset="UTF-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0" />
   <title>VOID P2P Messenger</title>
-  <link rel="stylesheet" href="style.css?v=16" />
+  <link rel="stylesheet" href="style.css?v=17" />
   <link rel="preconnect" href="https://fonts.googleapis.com" />
   <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
   <link href="https://fonts.googleapis.com/css2?family=Orbitron:wght@500;700&family=IBM+Plex+Sans:wght@400;500;600&display=swap" rel="stylesheet" />
@@ -14,28 +14,28 @@
     <div class="unlock-card">
       <img id="brand-logo" class="brand-logo" alt="VOID" />
       <h1 class="brand">VOID</h1>
-      <p id="unlock-subtitle" class="muted">Разблокировка vault</p>
+      <p id="unlock-subtitle" class="muted" data-i18n="unlock.subtitle">Разблокировка vault</p>
       <label class="field">
-        <span>Пароль</span>
+        <span data-i18n="unlock.password">Пароль</span>
         <input type="password" id="password" autocomplete="current-password" />
       </label>
       <label class="field" id="confirm-wrap" hidden>
-        <span>Пароль ещё раз</span>
+        <span data-i18n="unlock.passwordAgain">Пароль ещё раз</span>
         <input type="password" id="password-confirm" autocomplete="new-password" />
       </label>
       <label class="check">
         <input type="checkbox" id="remember" />
-        <span>Запомнить пароль</span>
+        <span data-i18n="unlock.remember">Запомнить пароль</span>
       </label>
       <p id="unlock-error" class="error" hidden></p>
-      <button type="button" id="unlock-btn" class="btn primary">Войти</button>
+      <button type="button" id="unlock-btn" class="btn primary" data-i18n="unlock.enter">Войти</button>
     </div>
   </div>
 
   <div id="main-screen" class="screen" hidden>
     <aside id="sidebar">
       <div class="sidebar-top">
-        <button type="button" id="menu-btn" class="icon-btn" title="Меню">
+        <button type="button" id="menu-btn" class="icon-btn" data-i18n-title="menu.tooltip" title="Меню">
           <img data-icon="menu.png" alt="" />
         </button>
         <div class="brand-mini">
@@ -43,9 +43,9 @@
           <span>VOID</span>
         </div>
       </div>
-      <div id="beacon-banner" class="beacon" hidden>Маяк активен — сеть в фоне</div>
+      <div id="beacon-banner" class="beacon" hidden data-i18n="beacon">Маяк активен — сеть в фоне</div>
       <div class="search-row">
-        <input type="search" id="contact-filter" placeholder="Поиск…" />
+        <input type="search" id="contact-filter" data-i18n-placeholder="search.placeholder" placeholder="Поиск…" />
       </div>
       <div id="chat-list" class="chat-list"></div>
       <div class="sidebar-foot">
@@ -55,10 +55,10 @@
 
     <main id="chat-area">
       <header id="chat-header">
-        <button type="button" id="toggle-sidebar" class="icon-btn sidebar-toggle" title="Показать / скрыть панель">
+        <button type="button" id="toggle-sidebar" class="icon-btn sidebar-toggle" data-i18n-title="toggle.sidebar" title="Показать / скрыть панель">
           <img data-icon="scip_panele.png" alt="" />
         </button>
-        <button type="button" id="chat-peer-btn" class="chat-peer-btn" title="Информация о собеседнике" hidden>
+        <button type="button" id="chat-peer-btn" class="chat-peer-btn" data-i18n-title="chat.peerInfo" title="Информация о собеседнике" hidden>
           <div id="chat-avatar" class="avatar header-avatar">?</div>
           <div class="chat-header-text">
             <h2 id="chat-title">Выберите чат</h2>
@@ -66,7 +66,7 @@
           </div>
         </button>
         <div id="chat-header-empty" class="chat-header-text">
-          <h2>Выберите чат</h2>
+          <h2 data-i18n="chat.pick">Выберите чат</h2>
           <p class="muted"></p>
         </div>
       </header>
@@ -74,28 +74,28 @@
       <div id="file-offers" class="file-offers"></div>
       <div id="rec-bar" class="rec-bar" hidden>
         <span class="rec-dot"></span>
-        <span>Запись</span>
+        <span data-i18n="rec.recording">Запись</span>
         <span id="rec-time">0:00</span>
-        <button type="button" id="rec-stop" class="btn">Стоп</button>
+        <button type="button" id="rec-stop" class="btn" data-i18n="rec.stop">Стоп</button>
       </div>
       <div id="voice-preview" class="voice-preview" hidden>
         <div class="voice-player" id="preview-player">
-          <button type="button" class="voice-play" id="preview-play" title="Прослушать">▶</button>
+          <button type="button" class="voice-play" id="preview-play" data-i18n-title="preview.listen" title="Прослушать">▶</button>
           <input type="range" class="voice-seek" id="preview-seek" min="0" max="1000" value="0" />
           <span class="voice-time" id="preview-time">0:00</span>
         </div>
-        <button type="button" id="preview-cancel" class="btn">Отмена</button>
-        <button type="button" id="preview-send" class="btn primary">Отправить</button>
+        <button type="button" id="preview-cancel" class="btn" data-i18n="preview.cancel">Отмена</button>
+        <button type="button" id="preview-send" class="btn primary" data-i18n="preview.send">Отправить</button>
       </div>
       <form id="composer" class="composer">
-        <button type="button" id="attach-btn" class="icon-btn" title="Файл">
+        <button type="button" id="attach-btn" class="icon-btn" data-i18n-title="composer.file" title="Файл">
           <img data-icon="send file.png" alt="" />
         </button>
-        <button type="button" id="voice-btn" class="icon-btn" title="Голос">
+        <button type="button" id="voice-btn" class="icon-btn" data-i18n-title="composer.voice" title="Голос">
           <img data-icon="voice.png" alt="" />
         </button>
-        <input type="text" id="message-input" placeholder="Сообщение…" autocomplete="off" disabled />
-        <button type="submit" id="send-btn" class="icon-btn primary-icon" title="Отправить" disabled>
+        <input type="text" id="message-input" data-i18n-placeholder="composer.message" placeholder="Сообщение…" autocomplete="off" disabled />
+        <button type="submit" id="send-btn" class="icon-btn primary-icon" data-i18n-title="composer.send" title="Отправить" disabled>
           <img data-icon="send.png" alt="" />
         </button>
       </form>
@@ -106,12 +106,13 @@
 
   <div id="overlay" class="overlay" hidden aria-hidden="true">
     <div class="modal" id="modal-panel" role="dialog" aria-modal="true">
-      <button type="button" class="modal-close" id="modal-close" aria-label="Закрыть">×</button>
+      <button type="button" class="modal-close" id="modal-close" data-i18n-aria="modal.close" aria-label="Закрыть">×</button>
       <div id="modal-body"></div>
     </div>
   </div>
 
   <div id="toast" class="toast" hidden role="status" aria-live="polite"></div>
-  <script src="app.js?v=25"></script>
+  <script src="i18n.js?v=2"></script>
+  <script src="app.js?v=29"></script>
 </body>
 </html>

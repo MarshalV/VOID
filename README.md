@@ -1,6 +1,6 @@
 <div align="center">
 
-<img src="static/icon.png" alt="VOID Logo" width="160" />
+<img src="static/Image_programm.png" alt="VOID Logo" width="160" />
 
 # VOID — P2P Messenger
 
@@ -39,16 +39,17 @@ Bootstrap-нода нужна, чтобы **найти** собеседника,
 - **E2EE** — транспорт **Noise**, затем `Hello` (X25519 + подпись Ed25519 к `PeerId`), далее **Double Ratchet**.
 - **1-на-1 и группы** — группы с invite `void://group/…`, рассылка каждому участнику (не MLS).
 - **Голос** — запись, превью, WAV по E2EE; в чате плеер. Автоприём, без баннера «принять файл».
-- **Файлы** — до 512 МБ. Чанки по E2EE-чату; оффер (имя, размер, хэш) по `/void/file/1.0.0`.
+- **Файлы** — до 512 МБ, в том числе пустые (0 байт). Чанки (`VfC1`) и оффер/accept (`VfP1`) идут в E2EE `/void/chat`. `/void/file/1.0.0` — запасной канал, если пир уже на живом TCP.
 - **Офлайн-почта** — store-and-forward на bootstrap (`OfflineMailboxStore` / `Query` / `Deliver`). `ct` непрозрачен; `sender` / `recipient` / `kind` на ноде открыты. TTL 7 суток.
 - **Свой DHT** — Kademlia `/void/kad/1.0.0`, не IPFS. Текст чата в DHT не пишется.
 - **NAT** — рабочий путь: **Relay v2 Hop** (`listen_on(…/p2p-circuit)` → `ReservationReqAccepted`). DCUtR / AutoNAT / UPnP **выключены** (включаются `VOID_ENABLE_NAT=1`: второй dial к ноде рвёт TCP).
 - **Транспорт клиента** — listen только **TCP :50001**. К bootstrap — один TCP; `/p2p/` на dial снимается, реальный PeerId пишется в vault после Identify. QUIC к ноде клиент не поднимает.
 - **LAN** — mDNS (отключается `VOID_DISABLE_MDNS`).
-- **Один процесс на vault** — `void.instance.lock`; вторая копия с тем же ключом рвёт yamux на ноде.
+- **Один процесс** — `void.instance.lock` + порт TCP `50001`; в Tauri повторный запуск (ярлык, пока окно в трее) поднимает уже работающее окно (`tauri-plugin-single-instance`), а не вторую копию.
 - **Vault** — ник, ключи, контакты, группы в `vault.bin`; мастер-ключ в `void.key`. Журнал — `chat_journal.bin`, недоставленное — `outbox.bin`.
 - **Доставка** — ○ / ✓ / ✓✓; read receipt при открытом чате.
-- **Beacon** — закрытие окна прячет в трей, процесс живёт.
+- **Beacon** — закрытие окна прячет в трей, процесс живёт. В шапке UI — логотип `Image_programm.png`.
+- **Onion** — `VOID_ONION_v1`: 1 живая нода с ключом → 1 hop, 2 → оба, 3+ → до трёх. Живой путь виден в настройках.
 
 ---
 
@@ -91,7 +92,26 @@ Bootstrap-нода нужна, чтобы **найти** собеседника,
 | `src/bootstrap.rs` | Склейка seed: vault, env, HTTP, вшитый список |
 | `src/file_transfer.rs` / `voice.rs` / `group.rs` | Файлы, голос, группы |
 
-UI **не** крутит `get_snapshot` по таймеру. Состояние уходит событием `void://snapshot` (флашер ~120 мс, `revision` монотонный).
+UI **не** крутит `get_snapshot` по таймеру в обычном режиме. Состояние уходит событием `void://snapshot` (флашер ~120 мс, `revision` монотонный). Пока в статусе `Hop…`, UI дополнительно опрашивает снимок, чтобы не зависнуть на «ждём Ack».
+
+### Строка статуса
+
+Пример: `в сети · Hop OK · 12D3KooW… · live 1 · контакты 0 · bootstrap 1/2`
+
+Пока Hop нет, к «в сети» добавляется `через ноду` (чат ящиком). Пока ждём Ack — ещё `Hop…`.
+
+| Кусок | Смысл |
+|-------|--------|
+| `в сети` | Есть TCP хотя бы к одной bootstrap-ноде |
+| `через ноду` | Нода жива, **Hop ещё нет** (чат ящиком, live-circuit нет) |
+| `Hop…` | `listen_on(…/p2p-circuit)` ушёл, ждём Ack |
+| `Hop OK` | Резервация принята (или UI подтвердил её ~2.5 с спустя, если событие Ack не всплыло) |
+| `нет Hop` | Нода есть, запрос резервации не висит |
+| `live N` | Число живых TCP: bootstrap + контакты |
+| `контакты N` | Живые чат-пиры (**без** bootstrap) |
+| `bootstrap A/B` | `A` — сколько seed сейчас на TCP; `B` — сколько адресов в vault. `1/2` = одна нода жива из двух в списке |
+
+`1/2` — не ошибка: клиент сначала держит **одну** основную ноду (`147.78.64.22:4001`), вторую добирает после Hop. Для NAT и ящика достаточно одной с `Hop OK`.
 
 ### Как два клиента встречаются
 
@@ -102,7 +122,7 @@ Alice                         Bootstrap                         Bob
   │ vault: реальный PeerId ноды     │
   │ listen …/p2p/<node>/p2p-circuit │
   │ ◄── ReservationReqAccepted ──── │
-  │          «relay Hop OK»         │
+  │          «Hop OK»               │
   │                                 │
   │  dial …/p2p-circuit/p2p/<Bob>   │
   │  (после Hop; LAN/mDNS отдельно) │
@@ -113,11 +133,12 @@ Alice                         Bootstrap                         Bob
 
 1. Один TCP на `IP:4001`. `/p2p/` с dial снимается (`DialOpts::unknown_peer_id()`), иначе старый PeerId в vault рвёт Noise за 1 мс.
 2. После Identify клиент переписывает bootstrap в vault на **живой** PeerId ноды.
-3. Hop: `listen_on(/ip4/…/tcp/4001/p2p/<node>/p2p-circuit)`. В статусе **relay Hop OK** только после `ReservationReqAccepted` (не после `listen_on Ok`).
-4. Контакты набираются **через circuit**, когда Hop есть. Без Hop UI показывает `нет Hop (NAT закрыт)` — чат в LAN при этом может уже работать.
+3. Hop: один `listen_on(/ip4/…/tcp/4001/p2p/<node>/p2p-circuit)` **после Identify** (~1.5 с). Повтор только если Hop всё ещё pending (cooldown ~3 с), без спама Reserve. В статусе **Hop OK** после `ReservationReqAccepted`; если событие не дошло до UI — через ~2.5 с при живом TCP.
+4. Circuit к контакту — **после** Hop (пауза ~8 с после Ack), один адрес живого relay, при `NoReservation` пауза ~45 с. LAN/mDNS — отдельно, без подмешивания circuit в тот же dial.
 5. `DialBack` просит собеседника набрать нас по circuit (асимметрия NAT).
+6. Пока Hop нет, почта на bootstrap не долбит HOP-стримы (откладывается до Ack или ~90 с).
 
-Две копии VOID с одним vault дают два TCP на одну ноду — оба сразу `yamux Closed`. Поэтому instance lock и отказ, если `:50001` занят (без fallback-порта).
+Две копии VOID с одним vault дают два TCP на одну ноду — оба сразу `yamux Closed`. Поэтому instance lock, отказ если `:50001` занят, и в Tauri — один экземпляр окна.
 
 ### Сетевой стек (`libp2p`)
 
@@ -129,8 +150,8 @@ Alice                         Bootstrap                         Bob
 | Канал | Noise |
 | Identify | `/void/v1`; bootstrap узнаётся по `agent_version` `void-bootstrap-node…` |
 | Чат | `/void/chat/1.0.0` |
-| Файлы (оффер) | `/void/file/1.0.0` |
-| Чанки файла/голоса | E2EE-кадры внутри `/void/chat` |
+| Файлы (оффер, fallback) | `/void/file/1.0.0` |
+| Оффер/чанки файла и голоса | E2EE-кадры `VfP1` / `VfC1` внутри `/void/chat` |
 | DHT | `/void/kad/1.0.0`, `Mode::Server`, k-bucket **Manual** (адреса после живого TCP) |
 | Discovery | mDNS + Kademlia + список bootstrap |
 | Relay | клиент: `relay::client`; Hop = `ReservationReqAccepted` |
@@ -138,24 +159,25 @@ Alice                         Bootstrap                         Bob
 
 Выделенного сервера переписки нет. Relay таскает непрозрачные байты circuit. Офлайн-конверты **лежат на ноде** до выдачи (`take_batch`) или TTL.
 
-Kademlia `bootstrap()` / `start_providing` — **после** Identify, не в момент первого TCP (иначе второй dial убивает сессию).
+Kademlia `start_providing` — после Identify с чат-пиром (не с bootstrap). `kad.bootstrap()` — ~30 с **после** Hop Ack, не в момент первого TCP (иначе второй dial убивает сессию).
 
 #### Надёжность
 
 | Механизм | Поведение |
 |----------|-----------|
 | Dial bootstrap | один endpoint (`host/tcp/port`), cooldown, без параллельного QUIC |
-| Автореконнект контакта | тик ~5 с, backoff 2 → 5 → 15 → 60 с |
-| Hop retry | пока нет Ack: повтор listen ~3–12 с, не чаще (лишние Reserve забивают стримы ноды) |
-| KAD | periodic bootstrap 5 мин, после Identify |
+| Автореконнект контакта | тик ~5 с; circuit только после Hop, backoff ~45 с после `NoReservation` |
+| Hop | один `listen_on` после Identify (~1.5 с); повтор только если pending (cooldown ~3 с) |
+| KAD | `kad.bootstrap()` ~30 с **после** Hop Ack, затем periodic 5 мин |
 | E2EE Hello | при `ConnectionEstablished` с контактом (не с bootstrap) |
 | Ретрай исходящих | `RESEND_GRACE` 1 с, экспоненциально до 300 с |
+| Групповой голос | fan-out + повтор `SendGroupMessage` (~8 с), пока WAV не уйдёт |
 | Недоставленное | `outbox.bin` → `OfflineMailboxStore` на bootstrap (Ack ноды = handoff) |
-| Офлайн-ящик | Query к bootstrap, не чаще ~750 мс; остаток порции — через ~500 мс, не в tight loop |
+| Офлайн-ящик | Query к bootstrap после Hop; не чаще ~750 мс; остаток порции — через ~500 мс |
 
 ### Поиск собеседника
 
-Нужны **bootstrap multiaddr** с `/p2p/<PeerId>` в vault (после первого успешного Identify PeerId ноды подставляется сам). Референс ноды: [`MarshalV/bootstrap_node`](https://github.com/MarshalV/bootstrap_node).
+Нужны **bootstrap multiaddr** с `/p2p/<PeerId>` в vault (после первого успешного Identify PeerId ноды подставляется сам). Вшитый seed: `/ip4/147.78.64.22/tcp/4001/p2p/12D3KooWCAH8ykDMThNRRVLAM6LnuVrJeoZrQADzHC2x6ddhZxyG`. Референс ноды: [`MarshalV/bootstrap_node`](https://github.com/MarshalV/bootstrap_node).
 
 Источники (склеиваются, дедуп):
 
@@ -224,25 +246,28 @@ Alice → Node A → [Node B → Node C] → Bob
 
 | Живые ноды с onion-ключом | Цепочка |
 |---------------------------|---------|
+| 0 | onion нет — circuit / прямой RR |
 | 1 | один hop: нода после unwrap видит пару Alice↔Bob |
 | 2 | оба hop'а |
 | 3+ | до трёх случайных; entry не видит Bob, exit не видит IP Alice |
 
-Старые ноды без `;onion=` в цепочку не входят — чат идёт circuit / прямой RR. Это не mixnet и не защита от глобального наблюдателя. DCUtR (если включён) может открыть прямой канал и снова связать IP.
+Живой маршрут (PeerId hop'ов) показывается в настройках. Старые ноды без `;onion=` в цепочку не входят. Это не mixnet и не защита от глобального наблюдателя. DCUtR (если включён) может открыть прямой канал и снова связать IP.
 
 ### Файлы (`src/file_transfer.rs`)
 
 | Параметр | Значение |
 |----------|----------|
 | Чанк | 32 КБ |
-| Макс. размер | 512 МБ |
+| Макс. размер | 512 МБ (0 байт разрешён) |
+| Оффер / Accept | E2EE `VfP1` в `/void/chat`; `/void/file` если пир уже connected |
+| Чанки | E2EE `VfC1` в `/void/chat` |
 | Кэш | `%APPDATA%\VOID\files` (и аналоги) — AES-256-GCM, `*.vfc` |
 | Ключ кэша | HKDF-SHA256 от мастер-ключа (`VOID_FILE_CACHE_v1`) |
 | «Скачать» | копия в `Загрузки/VOID Messenger/` |
 | Удаление из чата | только кэш |
 | Через circuit | ~64 КБ/с |
 
-После `Accept` чанки идут по E2EE `/void/chat`. По `/void/file` — `Offer` / `Accept` / `Reject` / `Cancel` / `Ack` (имя файла на этом слое видит тот, кто терминирует соединение).
+Имя файла в оффере видит тот, кто терминирует соединение (собеседник; при `/void/file` — ещё и кто видит этот substream). Через relay без E2EE-оффера метаданные не должны светиться на ноде.
 
 ### Голосовые (`src/voice.rs`)
 
@@ -250,7 +275,7 @@ WAV mono 48 kHz 16-bit PCM, до 5 мин. Запись — дочерний п�
 
 ### Группы (`src/group.rs`)
 
-Список участников в vault + тред `group:<id>`. Сообщение/файл/голос — fan-out каждому (у файла свой `transfer_id` на пира). Invite: `void://group/…`. **Не MLS**: компрометация участника раскрывает то, что он получил.
+Список участников в vault + тред `group:<id>`. Сообщение/файл/голос — fan-out каждому (у файла и голоса свой `transfer_id` на пира). Голос в группе ставится в очередь и повторяется, пока WAV не уйдёт. Invite: `void://group/…`. **Не MLS**: компрометация участника раскрывает то, что он получил.
 
 ### Локальное хранилище
 
@@ -306,7 +331,7 @@ Relay не видит plaintext, но **может** сопоставить IP�
 
 - **Язык:** Rust 2021
 - **Сеть:** libp2p 0.56
-- **Десктоп:** Tauri 2 + HTML/JS (`frontend/`); опционально egui 0.29 (`egui-ui`)
+- **Десктоп:** Tauri 2.6 (`frontend/` + `src-tauri/`); опционально egui 0.29 (`egui-ui`)
 - **Аудио:** cpal + hound; WinMM fallback на Windows
 - **Крипто:** x25519-dalek, chacha20poly1305, aes-gcm, argon2, hkdf, blake2, zeroize
 
@@ -330,7 +355,7 @@ cargo tauri build
 
 Скрипты кладут установщики в корневой `target/`: `build.bat` (Windows, перед линковкой гасит запущенный `app.exe` / `VOID-P2P-Messenger.exe`), `./build.sh` (Linux), `./build_mac.sh` (macOS).
 
-На одном vault — **одна** копия процесса. Вторая не стартует (`void.instance.lock` / порт 50001).
+На одном vault — **одна** копия процесса. Вторая не стартует (`void.instance.lock` / порт 50001). Если VOID уже в трее, ярлык открывает то же окно.
 
 ### egui (опционально)
 
@@ -346,7 +371,7 @@ cargo run --release --features egui-ui
 
 1. Свой Peer ID — в настройках.
 2. Контакт — по Peer ID (не голый IP без `/p2p/<PeerId>`).
-3. Bootstrap в списке seed; в статусе должно быть `bootstrap 1/N` и после резервации — **relay Hop OK**.
+3. Bootstrap в списке seed; в статусе `bootstrap 1/N` и **Hop OK** (не вечный `Hop…`). `1/2` значит жива одна нода из двух в vault — для чата этого достаточно.
 
 ---
 
@@ -449,16 +474,16 @@ QUIC-адрес ноды клиент в seed для dial не использу�
 ### Есть
 
 - [x] P2P + Double Ratchet + Noise + Hello к identity
-- [x] Kademlia `/void/kad/1.0.0` после Identify
-- [x] Relay v2 Hop (`ReservationReqAccepted`)
-- [x] Vault, журнал, outbox, один процесс на vault
-- [x] Личные чаты и группы
+- [x] Kademlia `/void/kad/1.0.0` после Hop (`kad.bootstrap` ~30 с)
+- [x] Relay v2 Hop (`ReservationReqAccepted` / UI `Hop OK`)
+- [x] Vault, журнал, outbox, один процесс на vault + single-instance в Tauri
+- [x] Личные чаты и группы (голос в группе с ретраем)
 - [x] Офлайн-почта через bootstrap (порции + удаление на ноде)
 - [x] Доставка и read receipt
-- [x] Голос и файлы (E2EE-чанки, кэш, Загрузки)
+- [x] Голос и файлы (E2EE `VfP1`/`VfC1`, пустые файлы, кэш, Загрузки)
 - [x] Tauri UI (push-snapshot) + опциональный egui
-- [x] Трей / beacon
-- [x] `VOID_ONION_v1` — 1 нода = 1 hop; 2+ до трёх hop'ов
+- [x] Трей / beacon, повторный запуск поднимает то же окно
+- [x] `VOID_ONION_v1` — 1/2/3 hop по числу нод с ключом; путь в настройках
 
 ### Опционально / не по умолчанию
 

@@ -2,6 +2,7 @@
 //! Owns vault unlock, network spawn, journal/outbox, and UI snapshots.
 
 use std::collections::{HashMap, HashSet};
+use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::{self as std_mpsc, Receiver as StdReceiver, Sender as StdSender};
 use std::sync::{Arc, Mutex};
@@ -42,6 +43,38 @@ use crate::vault::{
 use crate::voice::VoiceRecorder;
 
 const RESEND_GRACE: Duration = Duration::from_secs(1);
+
+fn b64_encode(data: &[u8]) -> String {
+    const A: &[u8] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+    let mut out = String::with_capacity(data.len().div_ceil(3) * 4);
+    let mut i = 0;
+    while i + 3 <= data.len() {
+        let n = ((data[i] as u32) << 16) | ((data[i + 1] as u32) << 8) | data[i + 2] as u32;
+        out.push(A[((n >> 18) & 63) as usize] as char);
+        out.push(A[((n >> 12) & 63) as usize] as char);
+        out.push(A[((n >> 6) & 63) as usize] as char);
+        out.push(A[(n & 63) as usize] as char);
+        i += 3;
+    }
+    match data.len() - i {
+        1 => {
+            let n = (data[i] as u32) << 16;
+            out.push(A[((n >> 18) & 63) as usize] as char);
+            out.push(A[((n >> 12) & 63) as usize] as char);
+            out.push('=');
+            out.push('=');
+        }
+        2 => {
+            let n = ((data[i] as u32) << 16) | ((data[i + 1] as u32) << 8);
+            out.push(A[((n >> 18) & 63) as usize] as char);
+            out.push(A[((n >> 12) & 63) as usize] as char);
+            out.push(A[((n >> 6) & 63) as usize] as char);
+            out.push('=');
+        }
+        _ => {}
+    }
+    out
+}
 
 fn multiaddr_lan_or_circuit(a: &Multiaddr) -> bool {
     if a.iter()
@@ -874,6 +907,39 @@ impl Inner {
         self.persist_journal();
     }
 
+    fn voice_file_allowed(&self, path: &Path) -> bool {
+        let Ok(canon) = std::fs::canonicalize(path) else {
+            return false;
+        };
+        let name = canon
+            .file_name()
+            .and_then(|s| s.to_str())
+            .unwrap_or("");
+        if !file_transfer::is_voice_filename(name) {
+            return false;
+        }
+        for dir in file_transfer::voice_search_dirs() {
+            if let Ok(d) = std::fs::canonicalize(&dir) {
+                if canon.starts_with(&d) {
+                    return true;
+                }
+            }
+        }
+        if let Ok(tmp) = std::fs::canonicalize(std::env::temp_dir()) {
+            if canon.starts_with(tmp) {
+                return true;
+            }
+        }
+        if let Some(p) = &self.voice_preview_path {
+            if std::fs::canonicalize(p).ok().as_ref() == Some(&canon) {
+                return true;
+            }
+        }
+        self.voice_audio_paths
+            .values()
+            .any(|p| std::fs::canonicalize(p).ok().as_ref() == Some(&canon))
+    }
+
     fn lookup_voice_path(&self, transfer_id_hex: &str) -> Option<String> {
         let tid = transfer_id_hex.to_ascii_lowercase();
         if let Some(p) = self.voice_audio_paths.get(&tid) {
@@ -1622,7 +1688,7 @@ impl Inner {
             .and_then(|v| v.last())
             .map(|m| {
                 if m.voice.is_some() {
-                    "Голосовое сообщение".into()
+                    "__void_voice__".into()
                 } else if let Some(ref f) = m.file {
                     format!("📄 {}", f.filename)
                 } else if m.text.chars().count() > 48 {
@@ -3047,22 +3113,26 @@ impl VoidRuntime {
 
     pub fn clear_chat(&self, peer_id: String) -> Result<SnapshotDto, String> {
         let mut g = self.inner.lock().unwrap_or_else(|p| p.into_inner());
-        let pid: PeerId = peer_id.parse().map_err(|_| "Неверный PeerId")?;
-        let peer_str = pid.to_string();
+        let chat_key = if group::parse_group_thread_key(&peer_id).is_some() {
+            peer_id.clone()
+        } else {
+            let pid: PeerId = peer_id.parse().map_err(|_| "Неверный PeerId")?;
+            g.pending_sends.retain(|p| p.peer != pid);
+            g.pending_file_sends.retain(|p| p.peer != pid);
+            g.pending_voice_sends.retain(|p| p.peer != pid);
+            pid.to_string()
+        };
         let msgs = g
             .messages
             .lock()
-            .remove(&peer_str)
+            .remove(&chat_key)
             .unwrap_or_default();
         let ids: Vec<String> = msgs.iter().map(|m| m.id.clone()).collect();
         g.unlink_cached_files(&msgs);
         g.messages.mark_deleted(ids);
         g.messages.mark_dirty();
         g.persist_journal();
-        g.pending_sends.retain(|p| p.peer != pid);
-        g.pending_file_sends.retain(|p| p.peer != pid);
-        g.pending_voice_sends.retain(|p| p.peer != pid);
-        g.add_status("Переписка очищена (контакт сохранён)".into());
+        g.add_status("Переписка очищена".into());
         drop(g);
         self.emit_snapshot();
         Ok(self.get_snapshot())
@@ -3451,6 +3521,21 @@ impl VoidRuntime {
         Ok(self.get_snapshot())
     }
 
+    pub fn read_voice_file(&self, path: String) -> Result<String, String> {
+        let p = PathBuf::from(path.trim());
+        let g = self.inner.lock().unwrap_or_else(|p| p.into_inner());
+        if !g.voice_file_allowed(&p) {
+            return Err("Недопустимый путь голосового".into());
+        }
+        drop(g);
+        let data = std::fs::read(&p).map_err(|e| format!("не удалось прочитать WAV: {e}"))?;
+        const MAX: usize = 32 * 1024 * 1024;
+        if data.len() > MAX {
+            return Err("Голосовой файл слишком большой".into());
+        }
+        Ok(b64_encode(&data))
+    }
+
     pub fn send_voice_preview(&self) -> Result<SnapshotDto, String> {
         let mut g = self.inner.lock().unwrap_or_else(|p| p.into_inner());
         let path = g
@@ -3727,6 +3812,87 @@ impl VoidRuntime {
         ));
         g.persist_vault();
         g.broadcast_group_sync(&group);
+        drop(g);
+        self.emit_snapshot();
+        Ok(self.get_snapshot())
+    }
+
+    pub fn rename_group(&self, group_id: String, name: String) -> Result<SnapshotDto, String> {
+        let mut g = self.inner.lock().unwrap_or_else(|p| p.into_inner());
+        let gid = group_id
+            .strip_prefix("group:")
+            .unwrap_or(group_id.as_str())
+            .to_string();
+        let trimmed = name.trim().to_string();
+        if trimmed.is_empty() {
+            return Err("Имя пустое".into());
+        }
+        {
+            let group = g.groups.get_mut(&gid).ok_or("Группа не найдена")?;
+            group.name = trimmed;
+        }
+        g.persist_vault();
+        drop(g);
+        self.emit_snapshot();
+        Ok(self.get_snapshot())
+    }
+
+    pub fn leave_group(&self, group_id: String) -> Result<SnapshotDto, String> {
+        let mut g = self.inner.lock().unwrap_or_else(|p| p.into_inner());
+        let local = g.local_peer_id.ok_or("нет peer")?;
+        let gid = group_id
+            .strip_prefix("group:")
+            .unwrap_or(group_id.as_str())
+            .to_string();
+        let group = g.groups.get(&gid).cloned().ok_or("Группа не найдена")?;
+        let me = local.to_string();
+        let notify: Vec<PeerId> = group
+            .member_peer_ids()
+            .into_iter()
+            .filter(|p| *p != local)
+            .collect();
+        let is_creator = group.creator_id == me;
+        let tx = g.command_tx.clone();
+        if let Some(tx) = tx {
+            if is_creator {
+                let _ = tx.try_send(UICommand::SendGroupDelete {
+                    group_id: gid.clone(),
+                    recipients: notify,
+                });
+            } else {
+                let _ = tx.try_send(UICommand::SendGroupLeave {
+                    group_id: gid.clone(),
+                    peer_id: me.clone(),
+                    recipients: notify.clone(),
+                });
+                let mut updated = group.clone();
+                updated.members.retain(|m| m.peer_id != me);
+                if !updated.members.is_empty() {
+                    g.broadcast_group_sync(&updated);
+                }
+            }
+        }
+        g.left_groups.insert(gid.clone());
+        g.groups.remove(&gid);
+        g.outbox_entries.retain(|e| match e {
+            OutboxEntry::GroupMessage { group_id, .. }
+            | OutboxEntry::GroupVoice { group_id, .. }
+            | OutboxEntry::GroupSync { group_id, .. } => group_id != &gid,
+            _ => true,
+        });
+        g.pending_group_voices.retain(|p| p.group_id != gid);
+        g.persist_outbox();
+        let thread = group_thread_key(&gid);
+        let msgs = g.messages.lock().remove(&thread).unwrap_or_default();
+        let ids: Vec<String> = msgs.iter().map(|m| m.id.clone()).collect();
+        g.unlink_cached_files(&msgs);
+        g.messages.mark_deleted(ids);
+        g.messages.mark_dirty();
+        g.persist_journal();
+        if g.selected_chat == thread {
+            g.selected_chat.clear();
+        }
+        g.persist_vault();
         drop(g);
         self.emit_snapshot();
         Ok(self.get_snapshot())

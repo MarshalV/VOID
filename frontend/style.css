@@ -28,6 +28,7 @@
 
 html {
   font-size: 18px;
+  color-scheme: dark;
 }
 
 html, body {
@@ -94,7 +95,7 @@ html, body {
 .error { color: var(--danger); font-size: 1rem; }
 
 .field { display: flex; flex-direction: column; gap: 0.45rem; font-size: 1rem; }
-.field input, .search-row input, .composer input, .modal input, .modal textarea {
+.field input, .field select, .search-row input, .composer input, .modal input, .modal textarea, .modal select {
   width: 100%;
   padding: var(--input-pad-y) var(--input-pad-x);
   border-radius: 12px;
@@ -105,7 +106,23 @@ html, body {
   font-size: 1.05rem;
   min-width: 0;
 }
-.field input:focus, .composer input:focus, .search-row input:focus {
+.field select, .modal select {
+  appearance: none;
+  -webkit-appearance: none;
+  cursor: pointer;
+  padding-right: 2.5rem;
+  background-image: url("data:image/svg+xml;utf8,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 12 8'><path fill='%238b9bb0' d='M1 1.5h10L6 7z'/></svg>");
+  background-repeat: no-repeat;
+  background-position: right 0.9rem center;
+  background-size: 12px 8px;
+  background-color: var(--bg0);
+  color-scheme: dark;
+}
+.field select option, .modal select option {
+  background: var(--bg1);
+  color: var(--text);
+}
+.field input:focus, .field select:focus, .composer input:focus, .search-row input:focus, .modal select:focus {
   outline: 1px solid rgba(62, 207, 142, 0.45);
 }
 
@@ -343,7 +360,9 @@ button.icon-btn img {
   border-radius: 12px;
   cursor: pointer;
   border: 1px solid transparent;
+  user-select: none;
 }
+.chat-item > * { pointer-events: none; }
 .chat-item:hover { background: rgba(255, 255, 255, 0.04); }
 .chat-item.active {
   background: var(--accent-dim);

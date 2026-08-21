@@ -38,7 +38,6 @@ VOID — зрелый **alpha** по сети и E2EE: libp2p, Noise, Double Rat
 | 1.3 | В CI: `cargo audit` и/или `cargo deny` (см. [SECURITY_REVISION.md](./SECURITY_REVISION.md) §7.3) | P0 |
 | 1.4 | Добавить файл **`LICENSE`** в корень репозитория | P0 |
 | 1.5 | Опционально: единый конфиг `void.toml` (bootstrap, пути, флаги) вместо только env | P2 |
-| 1.6 | Обновить или удалить устаревший [analysis_results.md](./analysis_results.md) (plain Hello, libp2p.io relay) | P0 |
 
 ---
 
@@ -142,7 +141,6 @@ VOID — зрелый **alpha** по сети и E2EE: libp2p, Noise, Double Rat
 2. Зашифрованная **история чатов** в локальном хранилище
 3. **Fingerprint / safety number** для контактов
 4. Файл **LICENSE**
-5. Актуализировать или удалить **analysis_results.md**
 
 ### P1 — качество и стабильность
 
@@ -173,7 +171,6 @@ VOID — зрелый **alpha** по сети и E2EE: libp2p, Noise, Double Rat
 
 - [ ] GitHub Actions workflow
 - [ ] `LICENSE` (MIT / Apache-2.0 / dual)
-- [ ] Удалить/обновить `analysis_results.md`
 - [ ] Экран «отпечаток ключа» в UI (hex/QR)
 - [ ] Документировать в README ссылку на этот файл
 

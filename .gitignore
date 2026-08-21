@@ -14,4 +14,10 @@ outbox.bin.bak
 nickname.txt
 *.log
 *.txt
+*.error
+*.backup
+*.rootbackup
+check.out
 check_results.txt
+build.error
+src/_network_extract.txt

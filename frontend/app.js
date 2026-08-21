@@ -1,4 +1,6 @@
 (() => {
+  const t = (key, vars) => window.VOID_I18N.t(key, vars);
+
   const asset = (name) => {
     const encoded = name.split("/").map(encodeURIComponent).join("/");
     return `static/${encoded}?v=11`;
@@ -21,6 +23,174 @@
     const c = window.__TAURI__?.core?.convertFileSrc;
     if (c && path) return c(path);
     return path || "";
+  }
+
+  function b64ToBytes(b64) {
+    const bin = atob(String(b64 || ""));
+    const out = new Uint8Array(bin.length);
+    for (let i = 0; i < bin.length; i++) out[i] = bin.charCodeAt(i);
+    return out;
+  }
+
+  function parseWavPcm(u8) {
+    if (u8.length < 44) throw new Error("short wav");
+    const view = new DataView(u8.buffer, u8.byteOffset, u8.byteLength);
+    const tag = (o) => String.fromCharCode(u8[o], u8[o + 1], u8[o + 2], u8[o + 3]);
+    if (tag(0) !== "RIFF" || tag(8) !== "WAVE") throw new Error("not wav");
+    let off = 12;
+    let sampleRate = 48000;
+    let channels = 1;
+    let bits = 16;
+    let dataOff = 0;
+    let dataLen = 0;
+    while (off + 8 <= u8.length) {
+      const id = tag(off);
+      const sz = view.getUint32(off + 4, true);
+      const body = off + 8;
+      if (id === "fmt ") {
+        channels = view.getUint16(body + 2, true) || 1;
+        sampleRate = view.getUint32(body + 4, true) || 48000;
+        bits = view.getUint16(body + 14, true) || 16;
+      } else if (id === "data") {
+        dataOff = body;
+        dataLen = sz;
+        break;
+      }
+      off = body + sz + (sz & 1);
+    }
+    if (!dataLen) throw new Error("wav has no data");
+    const frame = channels * (bits / 8);
+    const n = Math.floor(dataLen / frame);
+    const pcm = new Float32Array(n);
+    if (bits === 16) {
+      let i = 0;
+      for (let s = 0; s < n; s++) {
+        let acc = 0;
+        for (let c = 0; c < channels; c++) {
+          acc += view.getInt16(dataOff + i, true);
+          i += 2;
+        }
+        pcm[s] = acc / channels / 32768;
+      }
+    } else if (bits === 8) {
+      let i = 0;
+      for (let s = 0; s < n; s++) {
+        let acc = 0;
+        for (let c = 0; c < channels; c++) {
+          acc += u8[dataOff + i] - 128;
+          i += 1;
+        }
+        pcm[s] = acc / channels / 128;
+      }
+    } else {
+      throw new Error("unsupported wav");
+    }
+    return { sampleRate, pcm };
+  }
+
+  function createPcmPlayer() {
+    let ctx = null;
+    let pcm = null;
+    let sampleRate = 48000;
+    let source = null;
+    let startedAt = 0;
+    let offset = 0;
+    let paused = true;
+    let onTime = null;
+    let onEnd = null;
+    let raf = 0;
+    let path = "";
+
+    const ensureCtx = () => {
+      if (!ctx) ctx = new (window.AudioContext || window.webkitAudioContext)();
+      return ctx;
+    };
+    const duration = () => (pcm ? pcm.length / sampleRate : 0);
+    const now = () => {
+      if (paused || !ctx) return offset;
+      return Math.min(duration(), offset + (ctx.currentTime - startedAt));
+    };
+    const stopSource = () => {
+      if (source) {
+        try {
+          source.onended = null;
+          source.stop();
+        } catch (_) {}
+        source = null;
+      }
+      if (raf) cancelAnimationFrame(raf);
+      raf = 0;
+    };
+    const tick = () => {
+      if (onTime) onTime(now(), duration());
+      if (!paused) raf = requestAnimationFrame(tick);
+    };
+
+    return {
+      get paused() {
+        return paused;
+      },
+      get currentTime() {
+        return now();
+      },
+      get duration() {
+        return duration();
+      },
+      async load(filePath) {
+        if (path === filePath && pcm) return;
+        stopSource();
+        paused = true;
+        offset = 0;
+        pcm = null;
+        path = filePath;
+        const b64 = await invoke("read_voice_file", { path: filePath });
+        const parsed = parseWavPcm(b64ToBytes(b64));
+        pcm = parsed.pcm;
+        sampleRate = parsed.sampleRate;
+      },
+      async play() {
+        if (!pcm) return;
+        const ac = ensureCtx();
+        if (ac.resume) await ac.resume();
+        stopSource();
+        if (offset >= duration() - 0.02) offset = 0;
+        const buf = ac.createBuffer(1, pcm.length, sampleRate);
+        buf.copyToChannel(pcm, 0);
+        source = ac.createBufferSource();
+        source.buffer = buf;
+        source.connect(ac.destination);
+        const startOff = Math.max(0, Math.min(offset, duration() - 0.02));
+        source.onended = () => {
+          if (paused) return;
+          paused = true;
+          offset = duration();
+          stopSource();
+          if (onEnd) onEnd();
+        };
+        source.start(0, startOff);
+        startedAt = ac.currentTime;
+        offset = startOff;
+        paused = false;
+        tick();
+      },
+      pause() {
+        if (paused) return;
+        offset = now();
+        paused = true;
+        stopSource();
+      },
+      seek(t) {
+        offset = Math.max(0, Math.min(duration(), t));
+        if (!paused) this.play();
+        else if (onTime) onTime(offset, duration());
+      },
+      set ontimeupdate(fn) {
+        onTime = fn;
+      },
+      set onended(fn) {
+        onEnd = fn;
+      },
+    };
   }
 
   const els = {
@@ -118,18 +288,27 @@
 
   function messagesSig(s) {
     const msgs = s?.messages || [];
-    return msgs
+    const lang = window.VOID_I18N.lang();
+    return `${lang}|${s?.selected_chat || ""}|${msgs
       .map(
         (m) =>
           `${m.id}:${m.delivery}:${m.text?.length || 0}:${m.voice_transfer_id || ""}:${m.voice_path || ""}:${m.file_transfer_id || ""}:${m.file_path || ""}:${m.file_missing ? 1 : 0}`
       )
-      .join("|");
+      .join("|")}`;
   }
 
   function contactsSig(s) {
-    return (s?.contacts || [])
+    const lang = window.VOID_I18N.lang();
+    return `${lang}|${s?.selected_chat || ""}|${filter}|${(s?.contacts || [])
       .map((c) => `${c.peer_id}:${c.online}:${c.display_name}:${c.last_preview || ""}`)
-      .join("|");
+      .join("|")}`;
+  }
+
+  function formatChatPreview(c) {
+    const raw = c?.last_preview || "";
+    if (raw === "__void_voice__" || raw === "Голосовое сообщение") return t("preview.voice");
+    if (raw) return raw;
+    return c?.is_group ? t("chat.group") : (c?.peer_id || "").slice(0, 20);
   }
 
   function wireIcons() {
@@ -208,19 +387,22 @@
     const isBoot =
       boots.some((b) => b.includes(id)) || (s?.onion_hops || []).includes(id);
     const short = escapeHtml(shortPeer(id));
-    return isBoot ? `нода ${short}` : short;
+    return isBoot ? t("onion.node", { id: short }) : short;
   }
 
   function onionChip(label) {
     return `<span class="onion-hop">${label}</span>`;
   }
 
-  function hopCountRu(n) {
-    const mod10 = n % 10;
-    const mod100 = n % 100;
-    if (mod10 === 1 && mod100 !== 11) return `${n} нода`;
-    if (mod10 >= 2 && mod10 <= 4 && (mod100 < 12 || mod100 > 14)) return `${n} ноды`;
-    return `${n} нод`;
+  function hopCountLabel(n) {
+    if (window.VOID_I18N.lang() === "ru") {
+      const mod10 = n % 10;
+      const mod100 = n % 100;
+      if (mod10 === 1 && mod100 !== 11) return t("onion.hops1", { n });
+      if (mod10 >= 2 && mod10 <= 4 && (mod100 < 12 || mod100 > 14)) return t("onion.hops24", { n });
+      return t("onion.hopsN", { n });
+    }
+    return n === 1 ? t("onion.hops1", { n }) : t("onion.hopsN", { n });
   }
 
   function onionRouteHtml(s) {
@@ -228,29 +410,29 @@
     let path;
     if (hops.length) {
       const chips = [
-        onionChip("вы"),
+        onionChip(t("onion.you")),
         ...hops.map((h) => onionChip(peerRouteLabel(h, s))),
-        onionChip("собеседник"),
+        onionChip(t("onion.peer")),
       ];
       path = `<div class="onion-path">${chips.join('<span class="onion-arrow">→</span>')}</div>
-        <p class="muted">Сейчас: onion, ${hopCountRu(hops.length)}</p>`;
+        <p class="muted">${t("onion.now", { n: hopCountLabel(hops.length) })}</p>`;
     } else if ((s?.bootstrap_connected || 0) > 0) {
-      path = `<p class="muted">Живая нода есть. Onion-цепочка появится, когда пакет пойдёт не по LAN.</p>`;
+      path = `<p class="muted">${t("onion.hasNode")}</p>`;
     } else {
-      path = `<p class="muted">Нет живых нод — маршрут появится после входа в VOID.</p>`;
+      path = `<p class="muted">${t("onion.noNode")}</p>`;
     }
     const traces = (s?.onion_traces || []).slice().reverse();
     const list = traces.length
       ? traces
-          .map((t) => {
+          .map((tr) => {
             const dir =
-              t.dir === "in" ? "вход" : t.dir === "direct" ? "напрямую" : "исход";
-            const dest = peerRouteLabel(t.dest, s);
-            const via = (t.hops || []).map((h) => peerRouteLabel(h, s)).join(" → ") || "—";
+              tr.dir === "in" ? t("onion.in") : tr.dir === "direct" ? t("onion.direct") : t("onion.out");
+            const dest = peerRouteLabel(tr.dest, s);
+            const via = (tr.hops || []).map((h) => peerRouteLabel(h, s)).join(" → ") || "—";
             return `<div class="onion-trace"><strong>${dir}</strong> · ${dest}<div>${via}</div></div>`;
           })
           .join("")
-      : `<p class="muted">Пока нет пакетов. После сообщения путь появится здесь.</p>`;
+      : `<p class="muted">${t("onion.noPkts")}</p>`;
     return `${path}<div class="onion-traces">${list}</div>`;
   }
 
@@ -274,24 +456,24 @@
       : s.relay_hop_pending
         ? " · Hop…"
         : s.bootstrap_connected > 0
-          ? " · нет Hop"
+          ? " · " + t("status.noHop")
           : "";
-    const via = s.bootstrap_connected > 0 && !hopOk ? " · через ноду" : "";
+    const via = s.bootstrap_connected > 0 && !hopOk ? " · " + t("status.viaNode") : "";
     const netLabel = s.network_ok
       ? s.bootstrap_connected > 0
-        ? "в сети"
-        : "есть соединения"
+        ? t("status.online")
+        : t("status.hasLinks")
       : s.bootstraps?.length
-        ? "нет связи с bootstrap"
-        : "bootstrap не задан";
-    els.connStatus.textContent = `${netLabel}${via}${hop} · ${pidShort}… · live ${live} · контакты ${s.connected_peers} · bootstrap ${s.bootstrap_connected}/${s.bootstraps?.length || 0}`;
+        ? t("status.noBootstrap")
+        : t("status.noBootstrapSet");
+    els.connStatus.textContent = `${netLabel}${via}${hop} · ${pidShort}… · live ${live} · ${t("status.contacts")} ${s.connected_peers} · bootstrap ${s.bootstrap_connected}/${s.bootstraps?.length || 0}`;
     els.connStatus.title = [
       hopOk
-        ? "Hop: вас можно набрать из‑за NAT через relay"
+        ? t("status.hopOkTitle")
         : s.relay_hop_pending
-          ? "Hop: запрос резервации отправлен, ждём Ack от ноды"
+          ? t("status.hopWaitTitle")
           : s.bootstrap_connected > 0
-            ? "Нода на связи: сообщения идут через неё (ящик). Live-circuit (Hop) ещё нет — это не обрыв чата."
+            ? t("status.viaMailboxTitle")
             : "",
       s.peer_id || "",
       ...(s.bootstraps || []).slice(0, 4),
@@ -307,8 +489,10 @@
           : "var(--danger)";
 
     const cSig = contactsSig(s);
-    lastContactSig = cSig;
-    renderContacts();
+    if (cSig !== lastContactSig) {
+      lastContactSig = cSig;
+      renderContacts();
+    }
     const mSig = messagesSig(s);
     if (mSig !== lastMsgSig) {
       lastMsgSig = mSig;
@@ -349,12 +533,13 @@
     els.chatAvatar.classList.toggle("online", !!c?.online);
     els.chatTitle.textContent = name;
     if (c?.is_group) {
-      els.chatSub.textContent = "Группа";
+      els.chatSub.textContent = t("chat.group");
     } else if (c?.online) {
-      els.chatSub.textContent = "в сети · " + (c.peer_id || "").slice(0, 16) + "…";
+      els.chatSub.textContent = t("chat.onlinePeer", { id: (c.peer_id || "").slice(0, 16) });
     } else {
-      els.chatSub.textContent =
-        "не в сети · PeerId " + (c?.peer_id || s.selected_chat || "").slice(0, 20) + "…";
+      els.chatSub.textContent = t("chat.offlinePeer", {
+        id: (c?.peer_id || s.selected_chat || "").slice(0, 20),
+      });
       els.chatSub.title = c?.peer_id || s.selected_chat || "";
     }
   }
@@ -402,6 +587,7 @@
     list.forEach((c) => {
       const item = document.createElement("div");
       item.className = "chat-item" + (snapshot.selected_chat === c.peer_id ? " active" : "");
+      item.dataset.id = c.peer_id;
       const letter = (c.display_name || "?").trim().charAt(0).toUpperCase();
       item.innerHTML = `
         <div class="avatar ${c.online ? "online" : ""}" style="background:${avatarColor(c.peer_id)}">${letter}</div>
@@ -410,38 +596,39 @@
           <p></p>
         </div>`;
       item.querySelector("h3").textContent = c.display_name;
-      item.querySelector("p").textContent = c.online
-        ? "в сети"
-        : c.last_preview || (c.is_group ? "Группа" : c.peer_id.slice(0, 20));
-      item.addEventListener("click", async () => {
-        hideCtx();
-        try {
-          const next = await invoke("select_chat", { chatId: c.peer_id });
-          applySnapshot(next, true);
-        } catch (err) {
-          showToast(String(err));
-          return;
-        }
-        if (window.matchMedia("(max-width: 820px)").matches) {
-          els.mainScreen.classList.add("sidebar-collapsed");
-        }
-        els.sidebar.classList.remove("open");
-      });
-      item.addEventListener("contextmenu", (e) => {
-        e.preventDefault();
-        if (c.is_group) return;
-        showContactContextMenu(e.clientX, e.clientY, c);
-      });
+      item.querySelector("p").textContent = c.online ? t("status.online") : formatChatPreview(c);
       els.chatList.appendChild(item);
     });
   }
 
+  async function selectChat(id) {
+    if (!id || !invoke) return;
+    hideCtx();
+    if (snapshot) snapshot.selected_chat = id;
+    lastContactSig = contactsSig(snapshot);
+    lastMsgSig = "";
+    els.chatList.querySelectorAll(".chat-item").forEach((el) => {
+      el.classList.toggle("active", el.dataset.id === id);
+    });
+    try {
+      const next = await invoke("select_chat", { chatId: id, chat_id: id });
+      applySnapshot(next, true);
+    } catch (err) {
+      showToast(String(err));
+      return;
+    }
+    if (window.matchMedia("(max-width: 820px)").matches) {
+      els.mainScreen.classList.add("sidebar-collapsed");
+    }
+    els.sidebar.classList.remove("open");
+  }
+
   function showContactContextMenu(x, y, c) {
     els.ctxMenu.innerHTML = `
-      <button type="button" data-act="rename">Переименовать контакт</button>
-      <button type="button" data-act="clear">Очистить чат</button>
-      <button type="button" data-act="copy">Копировать Peer ID</button>
-      <button type="button" data-act="delete" class="danger">Удалить пир</button>`;
+      <button type="button" data-act="rename">${t("ctx.renameContact")}</button>
+      <button type="button" data-act="clear">${t("ctx.clearChat")}</button>
+      <button type="button" data-act="copy">${t("ctx.copyPeer")}</button>
+      <button type="button" data-act="delete" class="danger">${t("ctx.deletePeer")}</button>`;
     els.ctxMenu.hidden = false;
     const pad = 8;
     const rect = els.ctxMenu.getBoundingClientRect();
@@ -456,17 +643,75 @@
         try {
           if (act === "copy") {
             await navigator.clipboard.writeText(c.peer_id);
-            showToast("Peer ID скопирован");
+            showToast(t("toast.peerCopied"));
           } else if (act === "rename") {
-            const name = window.prompt("Новое имя контакта", c.display_name || "");
+            const name = window.prompt(t("prompt.renameContact"), c.display_name || "");
             if (name == null || !name.trim()) return;
             applySnapshot(await invoke("rename_contact", { peerId: c.peer_id, name: name.trim() }));
           } else if (act === "clear") {
-            if (!window.confirm("Очистить переписку с этим контактом?")) return;
+            if (!window.confirm(t("confirm.clearContact"))) return;
             applySnapshot(await invoke("clear_chat", { peerId: c.peer_id }));
           } else if (act === "delete") {
-            if (!window.confirm("Удалить контакт из книги?")) return;
+            if (!window.confirm(t("confirm.deleteContact"))) return;
             applySnapshot(await invoke("remove_contact", { peerId: c.peer_id }));
+          }
+        } catch (err) {
+          showToast(String(err));
+        }
+      };
+    });
+  }
+
+  function groupIdFromChat(peerId) {
+    const s = String(peerId || "");
+    return s.startsWith("group:") ? s.slice(6) : s;
+  }
+
+  function showGroupContextMenu(x, y, c) {
+    const gid = groupIdFromChat(c.peer_id);
+    const group = (snapshot?.groups || []).find((g) => g.id === gid);
+    const isCreator = !!(group && snapshot?.peer_id && group.creator_id === snapshot.peer_id);
+    els.ctxMenu.innerHTML = `
+      <button type="button" data-act="rename">${t("ctx.renameGroup")}</button>
+      <button type="button" data-act="clear">${t("ctx.clearChat")}</button>
+      <button type="button" data-act="copy">${t("ctx.copyInvite")}</button>
+      <button type="button" data-act="leave" class="danger">${
+        isCreator ? t("ctx.deleteGroup") : t("ctx.leaveGroup")
+      }</button>`;
+    els.ctxMenu.hidden = false;
+    const pad = 8;
+    const rect = els.ctxMenu.getBoundingClientRect();
+    const w = rect.width || 220;
+    const h = rect.height || 160;
+    els.ctxMenu.style.left = `${Math.min(x, window.innerWidth - w - pad)}px`;
+    els.ctxMenu.style.top = `${Math.min(y, window.innerHeight - h - pad)}px`;
+    els.ctxMenu.querySelectorAll("button").forEach((btn) => {
+      btn.onclick = async () => {
+        hideCtx();
+        const act = btn.getAttribute("data-act");
+        try {
+          if (act === "copy") {
+            const link = group?.invite_link || "";
+            if (!link) {
+              showToast(t("toast.noLink"));
+              return;
+            }
+            await navigator.clipboard.writeText(link);
+            showToast(t("toast.inviteCopied"));
+          } else if (act === "rename") {
+            const name = window.prompt(t("prompt.renameGroup"), c.display_name || "");
+            if (name == null || !name.trim()) return;
+            applySnapshot(
+              await invoke("rename_group", { groupId: gid, group_id: gid, name: name.trim() })
+            );
+          } else if (act === "clear") {
+            if (!window.confirm(t("confirm.clearGroup"))) return;
+            applySnapshot(await invoke("clear_chat", { peerId: c.peer_id }));
+          } else if (act === "leave") {
+            if (!window.confirm(isCreator ? t("confirm.deleteGroup") : t("confirm.leaveGroup"))) {
+              return;
+            }
+            applySnapshot(await invoke("leave_group", { groupId: gid, group_id: gid }));
           }
         } catch (err) {
           showToast(String(err));
@@ -488,7 +733,7 @@
         const ready = !!m.voice_path;
         div.innerHTML = `
           <div class="voice-player" data-tid="${escapeAttr(m.voice_transfer_id)}">
-            <button type="button" class="voice-play" ${ready ? "" : "disabled"} title="${ready ? "Play/Pause" : "Ещё загружается…"}">${ready ? "▶" : "…"}</button>
+            <button type="button" class="voice-play" ${ready ? "" : "disabled"} title="${ready ? "Play/Pause" : t("voice.loading")}">${ready ? "▶" : "…"}</button>
             <input type="range" class="voice-seek" min="0" max="1000" value="0" ${ready ? "" : "disabled"} />
             <span class="voice-time">0:00 / ${fmtTime(m.voice_duration_secs || 0)}</span>
           </div>
@@ -501,7 +746,7 @@
         div.classList.add("file-msg");
         const ready = !!m.file_path;
         const missing = !!m.file_missing && !ready;
-        const status = ready ? fmtSize(m.file_size) : missing ? "файл удалён" : "загрузка…";
+        const status = ready ? fmtSize(m.file_size) : missing ? t("file.deleted") : t("file.loading");
         div.innerHTML = `
           <div class="file-card ${ready ? "" : missing ? "missing" : "pending"}" data-tid="${escapeAttr(m.file_transfer_id || "")}">
             <div class="file-icon">📄</div>
@@ -510,12 +755,12 @@
               <div class="file-size">${status}</div>
             </div>
             <div class="file-actions">
-              ${ready ? `<button type="button" class="file-dl" data-act="download" title="Скачать в Загрузки">Скачать</button>` : ""}
-              <button type="button" class="file-del" data-act="delete" title="Удалить из чата">×</button>
+              ${ready ? `<button type="button" class="file-dl" data-act="download" title="${t("file.downloadTitle")}">${t("file.download")}</button>` : ""}
+              <button type="button" class="file-del" data-act="delete" title="${t("file.deleteTitle")}">×</button>
             </div>
           </div>
           <div class="meta"><span></span><span></span></div>`;
-        div.querySelector(".file-name").textContent = m.file_name || "Файл";
+        div.querySelector(".file-name").textContent = m.file_name || t("file.fallback");
         const meta = div.querySelectorAll(".meta span");
         meta[0].textContent = m.timestamp || "";
         meta[1].textContent = m.outgoing ? deliveryMark(m.delivery) : "";
@@ -535,7 +780,7 @@
         if (del) {
           del.onclick = async (e) => {
             e.stopPropagation();
-            if (!window.confirm("Удалить файл из чата? Копия в Загрузках останется.")) return;
+            if (!window.confirm(t("confirm.deleteFile"))) return;
             try {
               applySnapshot(await invoke("delete_message", { messageId: m.id }), true);
             } catch (err) {
@@ -566,9 +811,9 @@
 
   function fmtSize(n) {
     const b = Number(n) || 0;
-    if (b < 1024) return `${b} Б`;
-    if (b < 1024 * 1024) return `${(b / 1024).toFixed(1)} КБ`;
-    return `${(b / (1024 * 1024)).toFixed(1)} МБ`;
+    if (b < 1024) return t("size.b", { n: b });
+    if (b < 1024 * 1024) return t("size.kb", { n: (b / 1024).toFixed(1) });
+    return t("size.mb", { n: (b / (1024 * 1024)).toFixed(1) });
   }
 
   function stopRecTimer() {
@@ -595,9 +840,8 @@
   }
 
   function stopPreviewAudio() {
-    if (previewAudio) {
+    if (previewAudio && typeof previewAudio.pause === "function") {
       previewAudio.pause();
-      previewAudio = null;
     }
     if (els.previewPlay) els.previewPlay.textContent = "▶";
   }
@@ -609,6 +853,7 @@
       els.voicePreview.hidden = true;
       lastPreviewPath = "";
       stopPreviewAudio();
+      previewAudio = null;
       return;
     }
     els.voicePreview.hidden = false;
@@ -617,29 +862,25 @@
     }
     lastPreviewPath = path;
     stopPreviewAudio();
+    previewAudio = createPcmPlayer();
     els.previewTime.textContent = `0:00 / ${fmtTime(dur)}`;
     els.previewSeek.value = "0";
-    const src = convertFileSrc(path);
+    previewAudio.ontimeupdate = (cur, total) => {
+      const d = total || dur;
+      if (!d) return;
+      els.previewSeek.value = String(Math.floor((cur / d) * 1000));
+      els.previewTime.textContent = `${fmtTime(cur)} / ${fmtTime(d)}`;
+    };
+    previewAudio.onended = () => {
+      els.previewPlay.textContent = "▶";
+      els.previewSeek.value = "0";
+    };
     els.previewPlay.onclick = async () => {
       try {
-        if (!previewAudio || previewAudio.src !== src) {
-          stopPreviewAudio();
-          previewAudio = new Audio(src);
-          previewAudio.addEventListener("timeupdate", () => {
-            if (!previewAudio?.duration) return;
-            els.previewSeek.value = String(
-              Math.floor((previewAudio.currentTime / previewAudio.duration) * 1000)
-            );
-            els.previewTime.textContent = `${fmtTime(previewAudio.currentTime)} / ${fmtTime(
-              previewAudio.duration || dur
-            )}`;
-          });
-          previewAudio.addEventListener("ended", () => {
-            els.previewPlay.textContent = "▶";
-            els.previewSeek.value = "0";
-          });
-        }
+        await previewAudio.load(path);
         if (previewAudio.paused) {
+          if (activeAudio && activeAudio !== previewAudio) activeAudio.pause();
+          activeAudio = previewAudio;
           await previewAudio.play();
           els.previewPlay.textContent = "❚❚";
         } else {
@@ -647,12 +888,13 @@
           els.previewPlay.textContent = "▶";
         }
       } catch (e) {
-        showToast(String(e));
+        showToast(t("toast.playFail", { err: e }));
       }
     };
     els.previewSeek.oninput = () => {
-      if (!previewAudio?.duration) return;
-      previewAudio.currentTime = (Number(els.previewSeek.value) / 1000) * previewAudio.duration;
+      const d = previewAudio?.duration || dur;
+      if (!d) return;
+      previewAudio.seek((Number(els.previewSeek.value) / 1000) * d);
     };
   }
 
@@ -661,49 +903,39 @@
     const playBtn = root.querySelector(".voice-play");
     const seek = root.querySelector(".voice-seek");
     const timeEl = root.querySelector(".voice-time");
-    const src = convertFileSrc(m.voice_path);
-    let audio = null;
-
-    const ensureAudio = () => {
-      if (audio) return audio;
-      audio = new Audio(src);
-      audio.preload = "metadata";
-      audio.addEventListener("timeupdate", () => {
-        if (!audio.duration) return;
-        seek.value = String(Math.floor((audio.currentTime / audio.duration) * 1000));
-        timeEl.textContent = `${fmtTime(audio.currentTime)} / ${fmtTime(audio.duration || m.voice_duration_secs || 0)}`;
-      });
-      audio.addEventListener("ended", () => {
-        playBtn.textContent = "▶";
-        seek.value = "0";
-      });
-      audio.addEventListener("play", () => {
-        playBtn.textContent = "❚❚";
-      });
-      audio.addEventListener("pause", () => {
-        playBtn.textContent = "▶";
-      });
-      return audio;
+    const player = createPcmPlayer();
+    player.ontimeupdate = (cur, total) => {
+      const d = total || m.voice_duration_secs || 0;
+      if (!d) return;
+      seek.value = String(Math.floor((cur / d) * 1000));
+      timeEl.textContent = `${fmtTime(cur)} / ${fmtTime(d)}`;
+    };
+    player.onended = () => {
+      playBtn.textContent = "▶";
+      seek.value = "0";
     };
 
     playBtn.onclick = async () => {
       try {
-        const a = ensureAudio();
-        if (activeAudio && activeAudio !== a) {
-          activeAudio.pause();
+        await player.load(m.voice_path);
+        if (activeAudio && activeAudio !== player) activeAudio.pause();
+        activeAudio = player;
+        if (player.paused) {
+          await player.play();
+          playBtn.textContent = "❚❚";
+        } else {
+          player.pause();
+          playBtn.textContent = "▶";
         }
-        activeAudio = a;
-        if (a.paused) await a.play();
-        else a.pause();
       } catch (e) {
-        showToast("Не удалось воспроизвести: " + e);
+        showToast(t("toast.playFail", { err: e }));
       }
     };
 
     seek.oninput = () => {
-      const a = ensureAudio();
-      if (!a.duration) return;
-      a.currentTime = (Number(seek.value) / 1000) * a.duration;
+      const d = player.duration || m.voice_duration_secs || 0;
+      if (!d) return;
+      player.seek((Number(seek.value) / 1000) * d);
     };
   }
 
@@ -714,10 +946,10 @@
       const row = document.createElement("div");
       row.className = "offer";
       row.innerHTML = `<span></span>`;
-      row.querySelector("span").textContent = `Файл: ${f.filename} (${f.total_size} байт)`;
+      row.querySelector("span").textContent = t("file.offer", { name: f.filename, size: f.total_size });
       const acc = document.createElement("button");
       acc.className = "btn primary";
-      acc.textContent = "Принять";
+      acc.textContent = t("file.accept");
       acc.onclick = async () => {
         try {
           let saveDir = null;
@@ -726,13 +958,13 @@
             const picked = await dialog.open({
               directory: true,
               multiple: false,
-              title: "Куда сохранить файл",
+              title: t("file.saveWhere"),
             });
             if (picked === null) saveDir = null;
             else saveDir = Array.isArray(picked) ? picked[0] : picked;
           }
           await invoke("accept_file", { transferId: f.transfer_id, saveDir });
-          showToast("Принято — ждём передачу…");
+          showToast(t("toast.fileAccepted"));
           applySnapshot(await invoke("get_snapshot"));
         } catch (e) {
           showToast(String(e));
@@ -740,7 +972,7 @@
       };
       const rej = document.createElement("button");
       rej.className = "btn";
-      rej.textContent = "Отклонить";
+      rej.textContent = t("file.reject");
       rej.onclick = async () => {
         await invoke("reject_file", { transferId: f.transfer_id });
         applySnapshot(await invoke("get_snapshot"));
@@ -753,10 +985,10 @@
   function menuNav(active) {
     return `
       <div class="menu-nav">
-        <button type="button" class="menu-tab ${active === "contacts" ? "active" : ""}" data-sec="contacts">Контакты</button>
-        <button type="button" class="menu-tab ${active === "groups" ? "active" : ""}" data-sec="groups">Группы</button>
-        <button type="button" class="menu-tab ${active === "network" ? "active" : ""}" data-sec="network">Сеть</button>
-        <button type="button" class="menu-tab ${active === "settings" ? "active" : ""}" data-sec="settings">Настройки</button>
+        <button type="button" class="menu-tab ${active === "contacts" ? "active" : ""}" data-sec="contacts" data-i18n="menu.contacts">${t("menu.contacts")}</button>
+        <button type="button" class="menu-tab ${active === "groups" ? "active" : ""}" data-sec="groups" data-i18n="menu.groups">${t("menu.groups")}</button>
+        <button type="button" class="menu-tab ${active === "network" ? "active" : ""}" data-sec="network" data-i18n="menu.network">${t("menu.network")}</button>
+        <button type="button" class="menu-tab ${active === "settings" ? "active" : ""}" data-sec="settings" data-i18n="menu.settings">${t("menu.settings")}</button>
       </div>`;
   }
 
@@ -774,71 +1006,78 @@
     let body = "";
     if (sec === "contacts") {
       body = `
-        <h4 class="menu-h">Контакты</h4>
-        <label class="field"><span>PeerId / multiaddr / IP</span><input id="m-peer" /></label>
-        <label class="field"><span>Имя</span><input id="m-name" placeholder="Необязательно" /></label>
-        <button class="btn primary" id="m-add">Добавить контакт</button>`;
+        <h4 class="menu-h">${t("menu.contacts")}</h4>
+        <label class="field"><span>${t("contacts.peerField")}</span><input id="m-peer" /></label>
+        <label class="field"><span>${t("contacts.name")}</span><input id="m-name" placeholder="${t("contacts.namePh")}" /></label>
+        <button class="btn primary" id="m-add">${t("contacts.add")}</button>`;
     } else if (sec === "groups") {
       const pick = contactPickerHtml([], snapshot?.peer_id);
       body = `
-        <h4 class="menu-h">Группы</h4>
-        <label class="field"><span>Название группы</span><input id="m-gname" /></label>
-        <p class="muted">Участники из контактов</p>
+        <h4 class="menu-h">${t("menu.groups")}</h4>
+        <label class="field"><span>${t("groups.name")}</span><input id="m-gname" /></label>
+        <p class="muted">${t("groups.membersHint")}</p>
         ${pick}
-        <button class="btn primary" id="m-gcreate">Создать группу</button>
+        <button class="btn primary" id="m-gcreate">${t("groups.create")}</button>
         <hr class="menu-hr" />
-        <label class="field"><span>Ссылка void://group/…</span><input id="m-glink" /></label>
-        <button class="btn" id="m-gjoin">Войти в группу</button>`;
+        <label class="field"><span>${t("groups.link")}</span><input id="m-glink" /></label>
+        <button class="btn" id="m-gjoin">${t("groups.join")}</button>`;
     } else if (sec === "network") {
       const boots =
         (snapshot?.bootstraps || []).map((b) => `<div>${escapeHtml(b)}</div>`).join("") ||
-        "<div>Пока пусто — войдите через IP ноды</div>";
+        `<div>${t("network.empty")}</div>`;
+      const hopLine = snapshot?.relay_reserved
+        ? t("network.hopOk")
+        : snapshot?.relay_hop_pending
+          ? t("network.hopWait")
+          : snapshot?.bootstrap_connected > 0
+            ? t("network.hopMailbox")
+            : t("network.hopNone");
+      const onlineList =
+        (snapshot?.contacts || [])
+          .filter((c) => c.online)
+          .map((c) => escapeHtml(c.display_name || c.peer_id.slice(0, 12)))
+          .join(", ") || "—";
       body = `
-        <h4 class="menu-h">Сеть VOID</h4>
-        <p class="muted">Ваш PeerId:</p>
+        <h4 class="menu-h">${t("network.title")}</h4>
+        <p class="muted">${t("network.yourPeer")}</p>
         <div class="bootstrap-list" style="user-select:all">${escapeHtml(snapshot?.peer_id || "—")}</div>
-        <p class="muted">Статус: ${
-          snapshot?.network_ok
-            ? `в сети (bootstrap ${snapshot?.bootstrap_connected || 0}, контакты ${snapshot?.connected_peers || 0})`
-            : "нет активного соединения"
-        }</p>
         <p class="muted">${
-          snapshot?.relay_reserved
-            ? "Hop OK — вас можно набрать из‑за NAT через relay."
-            : snapshot?.relay_hop_pending
-              ? "Hop… — запрос резервации отправлен, ждём Ack ноды."
-              : snapshot?.bootstrap_connected > 0
-                ? "нет Hop — нода на связи, чат идёт через ящик. Live-звонок из другой сети — после Hop."
-                : "Нет связи с нодой — сообщения наружу не уйдут."
+          snapshot?.network_ok
+            ? t("network.statusOk", {
+                boot: snapshot?.bootstrap_connected || 0,
+                peers: snapshot?.connected_peers || 0,
+              })
+            : t("network.statusOff")
         }</p>
-        <p class="muted">Сейчас online: ${
-          (snapshot?.contacts || [])
-            .filter((c) => c.online)
-            .map((c) => escapeHtml(c.display_name || c.peer_id.slice(0, 12)))
-            .join(", ") || "—"
-        }</p>
-        <label class="field"><span>IP / IP:PORT / multiaddr</span><input id="n-join" placeholder="например 1.2.3.4:50001" /></label>
-        <button class="btn primary" id="n-go">Войти в VOID</button>
-        <button class="btn" id="n-reload">Переподключить bootstrap</button>
-        <div><strong>Bootstrap (${snapshot?.bootstraps?.length || 0})</strong><div class="bootstrap-list">${boots}</div></div>`;
-    } else {
-      body = `
-        <h4 class="menu-h">Настройки</h4>
-        <label class="field"><span>Ник</span><input id="s-nick" value="${escapeAttr(snapshot?.nickname || "")}" /></label>
-        <label class="field"><span>Ваш Peer ID</span><input id="s-peer" readonly value="${escapeAttr(snapshot?.peer_id || "")}" /></label>
-        <p class="muted">Публичный IP: ${escapeHtml(snapshot?.public_ip || "—")}</p>
-        <button class="btn primary" id="s-save">Сохранить ник</button>
-        <button class="btn" id="s-copy">Копировать Peer ID</button>
-        <button class="btn" id="s-downloads">Открыть папку загрузок</button>
-        <button class="btn" id="s-quit">Полный выход</button>
+        <p class="muted">${hopLine}</p>
+        <p class="muted">${t("network.onlineNow", { list: onlineList })}</p>
+        <label class="field"><span>${t("network.joinField")}</span><input id="n-join" placeholder="${t("network.joinPh")}" /></label>
+        <button class="btn primary" id="n-go">${t("network.join")}</button>
+        <button class="btn" id="n-reload">${t("network.reload")}</button>
+        <div><strong>${t("network.bootstrap", { n: snapshot?.bootstraps?.length || 0 })}</strong><div class="bootstrap-list">${boots}</div></div>
         <hr class="menu-hr" />
-        <h4 class="menu-h">Маршрут onion</h4>
-        <p class="muted">Через какие ноды сейчас проходит информация — обновляется само.</p>
+        <h4 class="menu-h" data-i18n="settings.onion">${t("settings.onion")}</h4>
+        <p class="muted" data-i18n="settings.onionHint">${t("settings.onionHint")}</p>
         <div id="onion-live">${onionRouteHtml(snapshot)}</div>`;
+    } else {
+      const langOpts = window.VOID_I18N.LANGS.map(
+        (l) =>
+          `<option value="${l.id}"${l.id === window.VOID_I18N.lang() ? " selected" : ""}>${l.native}</option>`
+      ).join("");
+      body = `
+        <h4 class="menu-h" data-i18n="menu.settings">${t("menu.settings")}</h4>
+        <label class="field"><span data-i18n="settings.language">${t("settings.language")}</span><select id="s-lang">${langOpts}</select></label>
+        <label class="field"><span data-i18n="settings.nick">${t("settings.nick")}</span><input id="s-nick" value="${escapeAttr(snapshot?.nickname || "")}" /></label>
+        <label class="field"><span data-i18n="settings.peer">${t("settings.peer")}</span><input id="s-peer" readonly value="${escapeAttr(snapshot?.peer_id || "")}" /></label>
+        <p class="muted">${t("settings.publicIp", { ip: snapshot?.public_ip || "—" })}</p>
+        <button class="btn primary" id="s-save" data-i18n="settings.saveNick">${t("settings.saveNick")}</button>
+        <button class="btn" id="s-copy" data-i18n="settings.copyPeer">${t("settings.copyPeer")}</button>
+        <button class="btn" id="s-downloads" data-i18n="settings.downloads">${t("settings.downloads")}</button>
+        <button class="btn" id="s-quit" data-i18n="settings.quit">${t("settings.quit")}</button>`;
     }
 
     openModal(`
-      <h3>Меню</h3>
+      <h3>${t("menu.title")}</h3>
       ${menuNav(sec)}
       <div class="stack menu-section">${body}</div>`);
     wireMenuTabs();
@@ -849,7 +1088,7 @@
           const peer = sanitizePeerInput(document.getElementById("m-peer").value);
           const name = document.getElementById("m-name").value;
           if (!peer) {
-            showToast("Вставьте Peer ID собеседника");
+            showToast(t("toast.needPeer"));
             return;
           }
           const snap = await invoke("add_contact", {
@@ -859,7 +1098,7 @@
           });
           applySnapshot(snap, true);
           closeModal();
-          showToast("Контакт добавлен");
+          showToast(t("toast.contactAdded"));
         } catch (e) {
           showToast(String(e));
         }
@@ -897,14 +1136,14 @@
           applySnapshot(
             await invoke("join_via_node", { input: document.getElementById("n-join").value })
           );
-          showToast("Подключение…");
+          showToast(t("toast.connecting"));
         } catch (e) {
           showToast(String(e));
         }
       };
       document.getElementById("n-reload").onclick = async () => {
         applySnapshot(await invoke("reload_bootstraps"));
-        showToast("Bootstrap перезагружены");
+        showToast(t("toast.bootReloaded"));
       };
     } else if (sec === "settings") {
       document.getElementById("s-save").onclick = async () => {
@@ -920,9 +1159,9 @@
       document.getElementById("s-copy").onclick = async () => {
         try {
           await navigator.clipboard.writeText(snapshot?.peer_id || "");
-          showToast("Peer ID скопирован");
+          showToast(t("toast.peerCopied"));
         } catch {
-          showToast("Не удалось скопировать");
+          showToast(t("toast.copyFail"));
         }
       };
       document.getElementById("s-downloads").onclick = async () => {
@@ -935,6 +1174,14 @@
         }
       };
       document.getElementById("s-quit").onclick = () => invoke("quit_application");
+      const langSel = document.getElementById("s-lang");
+      if (langSel) {
+        langSel.onchange = () => {
+          window.VOID_I18N.setLang(langSel.value);
+          mainMenuModal();
+          window.VOID_I18N.applyDom();
+        };
+      }
     }
   }
 
@@ -947,7 +1194,7 @@
     if (alsoExclude) exclude.add(alsoExclude);
     const list = personContacts().filter((c) => !exclude.has(c.peer_id));
     if (!list.length) {
-      return `<p class="muted">Нет контактов для выбора — сначала добавьте людей в книгу.</p>`;
+      return `<p class="muted">${t("picker.empty")}</p>`;
     }
     return `<div class="contact-pick">${list
       .map(
@@ -955,7 +1202,7 @@
       <label class="check pick-row">
         <input type="checkbox" data-peer="${escapeAttr(c.peer_id)}" />
         <span>${escapeHtml(c.display_name || c.peer_id.slice(0, 12))}${
-          c.online ? " · в сети" : ""
+          c.online ? " · " + t("status.online") : ""
         }</span>
       </label>`
       )
@@ -978,36 +1225,36 @@
       const memberIds = (group?.members || []).map((m) => m.peer_id);
       const membersHtml = (group?.members || [])
         .map((m) => `<div>${escapeHtml(m.display_name || m.peer_id.slice(0, 12))}</div>`)
-        .join("") || "<div class=\"muted\">Нет участников</div>";
+        .join("") || `<div class="muted">${t("group.noMembers")}</div>`;
       openModal(`
-        <h3>Группа</h3>
+        <h3>${t("group.title")}</h3>
         <div class="stack">
           <p><strong>${escapeHtml(group?.name || c.display_name)}</strong></p>
-          <p class="muted">Участники (${group?.members?.length || 0})</p>
+          <p class="muted">${t("group.members", { n: group?.members?.length || 0 })}</p>
           <div class="bootstrap-list">${membersHtml}</div>
-          <button class="btn" id="gi-copy">Копировать invite-ссылку</button>
-          <p class="muted">Пригласить из контактов</p>
+          <button class="btn" id="gi-copy">${t("group.copyInvite")}</button>
+          <p class="muted">${t("group.inviteHint")}</p>
           ${contactPickerHtml(memberIds, snapshot?.peer_id)}
-          <button class="btn primary" id="gi-invite">Пригласить выбранных</button>
+          <button class="btn primary" id="gi-invite">${t("group.inviteBtn")}</button>
         </div>`);
       document.getElementById("gi-copy").onclick = async () => {
         const link = group?.invite_link || "";
         if (!link) {
-          showToast("Нет ссылки");
+          showToast(t("toast.noLink"));
           return;
         }
         try {
           await navigator.clipboard.writeText(link);
-          showToast("Ссылка скопирована");
+          showToast(t("toast.inviteCopied"));
         } catch {
-          showToast("Не удалось скопировать");
+          showToast(t("toast.copyFail"));
         }
       };
       document.getElementById("gi-invite").onclick = async () => {
         try {
           const members = selectedPickerPeers(els.modalBody);
           if (!members.length) {
-            showToast("Отметьте контакты");
+            showToast(t("toast.pickContacts"));
             return;
           }
           applySnapshot(
@@ -1019,7 +1266,7 @@
             }),
             true
           );
-          showToast("Приглашения отправлены");
+          showToast(t("toast.invited"));
           peerInfoModal();
         } catch (e) {
           showToast(String(e));
@@ -1028,43 +1275,60 @@
       return;
     }
     openModal(`
-      <h3>Собеседник</h3>
+      <h3>${t("peer.title")}</h3>
       <div class="stack">
         <div class="peer-info-avatar" style="background:${avatarColor(chat)}">${escapeHtml(
           (c?.display_name || "?").trim().charAt(0).toUpperCase()
         )}</div>
         <p><strong>${escapeHtml(c?.display_name || chat.slice(0, 16))}</strong></p>
-        <p class="muted">${c?.online ? "в сети" : "не в сети"}</p>
+        <p class="muted">${c?.online ? t("status.online") : t("peer.offline")}</p>
         <p class="muted">Peer ID</p>
         <div class="bootstrap-list" style="user-select:all">${escapeHtml(chat)}</div>
-        <button class="btn" id="pi-copy">Копировать Peer ID</button>
-        <button class="btn" id="pi-rename">Переименовать</button>
-        <button class="btn" id="pi-clear">Очистить чат</button>
-        <button class="btn danger-outline" id="pi-del">Удалить пир</button>
+        <button class="btn" id="pi-copy">${t("ctx.copyPeer")}</button>
+        <button class="btn" id="pi-rename">${t("peer.rename")}</button>
+        <button class="btn" id="pi-clear">${t("peer.clear")}</button>
+        <button class="btn danger-outline" id="pi-del">${t("peer.delete")}</button>
       </div>`);
     document.getElementById("pi-copy").onclick = async () => {
       await navigator.clipboard.writeText(chat);
-      showToast("Peer ID скопирован");
+      showToast(t("toast.peerCopied"));
     };
     document.getElementById("pi-rename").onclick = async () => {
-      const name = window.prompt("Новое имя", c?.display_name || "");
+      const name = window.prompt(t("prompt.rename"), c?.display_name || "");
       if (name == null || !name.trim()) return;
       applySnapshot(await invoke("rename_contact", { peerId: chat, name: name.trim() }));
       peerInfoModal();
     };
     document.getElementById("pi-clear").onclick = async () => {
-      if (!window.confirm("Очистить переписку?")) return;
+      if (!window.confirm(t("confirm.clearChat"))) return;
       applySnapshot(await invoke("clear_chat", { peerId: chat }));
       closeModal();
     };
     document.getElementById("pi-del").onclick = async () => {
-      if (!window.confirm("Удалить контакт?")) return;
+      if (!window.confirm(t("confirm.deletePeer"))) return;
       applySnapshot(await invoke("remove_contact", { peerId: chat }));
       closeModal();
     };
   }
 
   async function boot() {
+    window.VOID_I18N.applyDom();
+    window.addEventListener("void-lang", () => {
+      window.VOID_I18N.applyDom();
+      lastContactSig = "";
+      lastMsgSig = "";
+      if (!invoke) {
+        els.unlockSubtitle.textContent = t("unlock.needTauri");
+      } else if (!snapshot?.unlocked) {
+        els.unlockSubtitle.textContent =
+          vaultKind === "create_profile"
+            ? t("unlock.createVault")
+            : vaultKind === "migrate_plain_master"
+              ? t("unlock.migrateKey")
+              : t("unlock.enterVault");
+      }
+      if (snapshot) applySnapshotNow(snapshot);
+    });
     wireIcons();
     closeModal();
     hideCtx();
@@ -1073,7 +1337,7 @@
 
     invoke = resolveInvoke();
     if (!invoke) {
-      els.unlockSubtitle.textContent = "Откройте через Tauri (cargo tauri dev)";
+      els.unlockSubtitle.textContent = t("unlock.needTauri");
       return;
     }
 
@@ -1083,10 +1347,10 @@
     els.confirmWrap.hidden = !needConfirm;
     els.unlockSubtitle.textContent =
       vaultKind === "create_profile"
-        ? "Создайте пароль vault (Argon2id)"
+        ? t("unlock.createVault")
         : vaultKind === "migrate_plain_master"
-          ? "Задайте пароль для старого void.key"
-          : "Введите пароль vault";
+          ? t("unlock.migrateKey")
+          : t("unlock.enterVault");
 
     if (status.unlocked) {
       applySnapshot(await invoke("get_snapshot"));
@@ -1112,7 +1376,7 @@
       await listen("void://file-complete", (e) => {
         const p = e?.payload || {};
         if (p.filename && !/^void_voice_/i.test(p.filename || "")) {
-          showToast(`Файл получен: ${p.filename}`);
+          showToast(t("toast.fileReceived", { name: p.filename }));
         }
       });
     }
@@ -1163,13 +1427,28 @@
     els.contactFilter.addEventListener("input", () => {
       filter = els.contactFilter.value.trim();
       renderContacts();
+      lastContactSig = contactsSig(snapshot);
+    });
+    els.chatList.addEventListener("click", (e) => {
+      const item = e.target.closest(".chat-item");
+      if (!item || !els.chatList.contains(item)) return;
+      selectChat(item.dataset.id);
+    });
+    els.chatList.addEventListener("contextmenu", (e) => {
+      const item = e.target.closest(".chat-item");
+      if (!item || !els.chatList.contains(item)) return;
+      e.preventDefault();
+      const c = (snapshot?.contacts || []).find((x) => x.peer_id === item.dataset.id);
+      if (!c) return;
+      if (c.is_group) showGroupContextMenu(e.clientX, e.clientY, c);
+      else showContactContextMenu(e.clientX, e.clientY, c);
     });
 
     els.attachBtn.onclick = async () => {
       try {
         const dialog = window.__TAURI__?.dialog;
         if (!dialog?.open) {
-          showToast("Диалог файлов недоступен");
+          showToast(t("toast.noFileDialog"));
           return;
         }
         const selected = await dialog.open({ multiple: false });

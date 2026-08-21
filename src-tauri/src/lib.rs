@@ -1,4 +1,6 @@
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Mutex;
+use std::time::Duration;
 
 use p2p_messenger::bridge::{
     BridgeEvent, SnapshotDto, VaultStatusDto, VoidRuntime,
@@ -9,6 +11,9 @@ use tauri::{
     tray::{MouseButton, MouseButtonState, TrayIconBuilder, TrayIconEvent},
     AppHandle, Emitter, Manager, RunEvent, State, WindowEvent,
 };
+
+/// Set before a real quit so `ExitRequested` does not keep the process for the tray beacon.
+static QUITTING: AtomicBool = AtomicBool::new(false);
 
 struct AppState {
     runtime: VoidRuntime,
@@ -41,12 +46,27 @@ fn hide_to_beacon(app: &AppHandle) {
 }
 
 fn quit_app(app: &AppHandle) {
-    if let Some(st) = app.try_state::<Mutex<AppState>>() {
-        if let Ok(g) = st.lock() {
-            g.runtime.prepare_quit();
-        }
+    if QUITTING.swap(true, Ordering::SeqCst) {
+        return;
     }
-    app.exit(0);
+    // Tray/GTK menu callbacks run on the UI thread. Blocking there (outbox handoff)
+    // or calling exit() inline often never completes — especially on Linux.
+    let handle = app.clone();
+    let _ = std::thread::Builder::new()
+        .name("void-quit".into())
+        .spawn(move || {
+            if let Some(st) = handle.try_state::<Mutex<AppState>>() {
+                let g = st.lock().unwrap_or_else(|p| p.into_inner());
+                g.runtime.set_beacon_active(false);
+                g.runtime.prepare_quit();
+            }
+            for (_, w) in handle.webview_windows() {
+                let _ = w.destroy();
+            }
+            handle.exit(0);
+            std::thread::sleep(Duration::from_millis(800));
+            std::process::exit(0);
+        });
 }
 
 #[tauri::command]
@@ -351,6 +371,18 @@ fn stop_voice_send(state: State<'_, Mutex<AppState>>) -> Result<SnapshotDto, Str
 }
 
 #[tauri::command]
+fn read_voice_file(
+    state: State<'_, Mutex<AppState>>,
+    path: String,
+) -> Result<String, String> {
+    state
+        .lock()
+        .map_err(|e| e.to_string())?
+        .runtime
+        .read_voice_file(path)
+}
+
+#[tauri::command]
 fn create_group(
     state: State<'_, Mutex<AppState>>,
     name: String,
@@ -383,6 +415,31 @@ fn invite_to_group(
         .map_err(|e| e.to_string())?
         .runtime
         .invite_to_group(group_id, member_peer_ids)
+}
+
+#[tauri::command]
+fn rename_group(
+    state: State<'_, Mutex<AppState>>,
+    group_id: String,
+    name: String,
+) -> Result<SnapshotDto, String> {
+    state
+        .lock()
+        .map_err(|e| e.to_string())?
+        .runtime
+        .rename_group(group_id, name)
+}
+
+#[tauri::command]
+fn leave_group(
+    state: State<'_, Mutex<AppState>>,
+    group_id: String,
+) -> Result<SnapshotDto, String> {
+    state
+        .lock()
+        .map_err(|e| e.to_string())?
+        .runtime
+        .leave_group(group_id)
 }
 
 #[tauri::command]
@@ -592,9 +649,12 @@ pub fn run() {
             send_voice_preview,
             cancel_voice_preview,
             stop_voice_send,
+            read_voice_file,
             create_group,
             join_group,
             invite_to_group,
+            rename_group,
+            leave_group,
             quit_application,
             show_window,
         ])
@@ -602,6 +662,9 @@ pub fn run() {
         .expect("error while building tauri application")
         .run(|app_handle, event| {
             if let RunEvent::ExitRequested { api, .. } = event {
+                if QUITTING.load(Ordering::SeqCst) {
+                    return;
+                }
                 let beacon = app_handle
                     .try_state::<Mutex<AppState>>()
                     .map(|st| {
