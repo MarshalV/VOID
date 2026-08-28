@@ -74,9 +74,9 @@ fn onion_rt_set_keys(keys: HashMap<PeerId, [u8; 32]>, bootstraps: HashSet<PeerId
             None => (HashSet::new(), Vec::new(), Vec::new()),
         };
         *g = Some(OnionRuntime {
-            keys,
-            bootstraps,
-            local,
+        keys,
+        bootstraps,
+        local,
             relay_peers,
             traces,
             live_hops,
@@ -1040,8 +1040,8 @@ fn ensure_bootstrap_relay_listens(
         if relay_hop_listeners.contains_key(&relay_pid)
             || relay_hop_pending.contains(&relay_pid)
             || relay_listen_attempt_at.contains_key(&relay_pid)
-        {
-            continue;
+            {
+                continue;
         }
         if relay_listen_attempt_at
             .get(&relay_pid)
@@ -2733,10 +2733,10 @@ async fn resend_voice_offer(
     let offer = t.build_offer();
     let _ = send_e2ee_file_ctrl(swarm, sessions, recipient, &offer);
     if swarm.is_connected(&recipient) {
-        swarm
-            .behaviour_mut()
-            .file_rr
-            .send_request(&recipient, offer);
+    swarm
+        .behaviour_mut()
+        .file_rr
+        .send_request(&recipient, offer);
     }
     if let Some(t) = outgoing_transfers.get_mut(&transfer_id) {
         t.last_chunk_at = Instant::now();
@@ -2828,10 +2828,10 @@ async fn start_voice_file_transfer(
                 };
                 let _ = send_e2ee_file_ctrl(swarm, sessions, recipient, &offer);
                 if swarm.is_connected(&recipient) {
-                    swarm
-                        .behaviour_mut()
-                        .file_rr
-                        .send_request(&recipient, offer);
+                swarm
+                    .behaviour_mut()
+                    .file_rr
+                    .send_request(&recipient, offer);
                 }
 
                 let transfer = file_transfer::OutgoingTransfer {
@@ -2925,10 +2925,10 @@ async fn start_named_file_transfer(
             };
             let _ = send_e2ee_file_ctrl(swarm, sessions, recipient, &offer);
             if swarm.is_connected(&recipient) {
-                swarm
-                    .behaviour_mut()
-                    .file_rr
-                    .send_request(&recipient, offer);
+            swarm
+                .behaviour_mut()
+                .file_rr
+                .send_request(&recipient, offer);
             }
             outgoing_transfers.insert(
                 transfer_id,
@@ -4629,7 +4629,7 @@ pub async fn run_chat_network(
                                     std::path::Path::new(&path),
                                 );
                                 if let Some(mid) = message_id.clone() {
-                                    let msg = ChatMessage {
+                                        let msg = ChatMessage {
                                             id: mid,
                                             sender_id: local_peer_id.to_string(),
                                             sender_name: sender_name.clone(),
@@ -4666,8 +4666,8 @@ pub async fn run_chat_network(
                                                     recipient,
                                                     json_data,
                                                 );
-                                            }
                                         }
+                                    }
                                 }
                                 if !sessions.contains_key(&recipient) {
                                     let q = pending_named_files.entry(recipient).or_default();
@@ -4973,7 +4973,7 @@ pub async fn run_chat_network(
                                     &packet,
                                 );
                                 if swarm.is_connected(&from) {
-                                    swarm.behaviour_mut().file_rr.send_request(&from, packet);
+                                swarm.behaviour_mut().file_rr.send_request(&from, packet);
                                 }
                                 debug!(
                                     "✅ FILE: Accept transfer {:x?} от {} → {}",
@@ -4997,7 +4997,7 @@ pub async fn run_chat_network(
                                     &packet,
                                 );
                                 if swarm.is_connected(&from) {
-                                    swarm.behaviour_mut().file_rr.send_request(&from, packet);
+                                swarm.behaviour_mut().file_rr.send_request(&from, packet);
                                 }
                                 incoming_transfers.remove(&transfer_id);
                                 debug!(
@@ -5229,9 +5229,9 @@ pub async fn run_chat_network(
                     if let Some((hops, traces)) =
                         onion_rt_poll_ui(swarm.connected_peers().copied())
                     {
-                        let _ = event_tx
+                            let _ = event_tx
                             .send(NetworkEvent::OnionRoutes { hops, traces })
-                            .await;
+                                .await;
                     }
                     let now_h = Instant::now();
                     let due: Vec<PeerId> = hop_listen_after
@@ -7137,16 +7137,16 @@ pub async fn run_chat_network(
                                 let drop_extra = is_quic_ep
                                     || relay_circuit_reserved.contains(&peer_id);
                                 if drop_extra {
-                                    warn!(
+                                warn!(
                                         "drop extra bootstrap {:?} n={} quic={} hop={} peer={}",
-                                        connection_id,
-                                        num_established,
+                                    connection_id,
+                                    num_established,
                                         is_quic_ep,
                                         relay_circuit_reserved.contains(&peer_id),
-                                        &peer_id.to_string()[..8.min(peer_id.to_string().len())]
-                                    );
-                                    let _ = swarm.close_connection(connection_id);
-                                    continue;
+                                    &peer_id.to_string()[..8.min(peer_id.to_string().len())]
+                                );
+                                let _ = swarm.close_connection(connection_id);
+                                continue;
                                 }
                             }
                             debug!("✅ СОЕДИНЕНО: {}. Endpoint: {:?}. Всего пиров: {} (conn #{})", peer_id, endpoint, connected_count, num_established);
@@ -7441,8 +7441,8 @@ pub async fn run_chat_network(
                             );
                             if num_established == 0 {
                                 if let Some(address) = connected_point_remote_tcp(endpoint) {
-                                    bootstrap_ep_mark_live(address, false);
-                                }
+                                        bootstrap_ep_mark_live(address, false);
+                                    }
                                 if bootstrap_peer_ids.contains(&peer_id) {
                                     bootstrap_ep_mark_live(&void_node_tcp_addr(), false);
                                 }
@@ -8547,10 +8547,10 @@ pub async fn run_chat_network(
                                                 &accept,
                                             );
                                             if swarm.is_connected(&peer) {
-                                                swarm
-                                                    .behaviour_mut()
-                                                    .file_rr
-                                                    .send_request(&peer, accept);
+                                            swarm
+                                                .behaviour_mut()
+                                                .file_rr
+                                                .send_request(&peer, accept);
                                             }
 
                                             let _ = event_tx
