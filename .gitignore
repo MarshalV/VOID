@@ -21,3 +21,8 @@ check.out
 check_results.txt
 build.error
 src/_network_extract.txt
+
+# Draft funding applications — do not commit
+sovereign-tech-fund-application.md
+nlnet-restack-application.md
+nlnet-restack-application.ru.md
