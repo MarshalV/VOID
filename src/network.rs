@@ -28,8 +28,9 @@ use crate::shared_chat::SharedChatMessages;
 use crate::crypto;
 use crate::file_transfer;
 use crate::offline_mail::{
-    decode_mailbox, encode_mailbox, mailbox_record_key, prekey_record_key, seal_for_recipient,
-    OfflineEnvelope, MAILBOX_TTL_SECS, OFFLINE_VOICE_CHUNK_KIND,
+    decode_mailbox, encode_mailbox, encode_signed_prekey, mailbox_record_key, prekey_record_key,
+    seal_for_recipient, verify_signed_prekey, OfflineEnvelope, MAILBOX_TTL_SECS,
+    OFFLINE_VOICE_CHUNK_KIND,
 };
 use crate::relay_mailbox::RelayMailbox;
 use crate::offline_publish::{
@@ -1774,12 +1775,17 @@ fn dht_eligible_envelopes(envelopes: &[OfflineEnvelope]) -> Vec<OfflineEnvelope>
 
 fn publish_self_prekey(
     swarm: &mut libp2p::Swarm<ChatBehaviour>,
+    local_key: &libp2p::identity::Keypair,
     local_peer_id: PeerId,
     public_key: &[u8; 32],
 ) {
+    let Some(value) = encode_signed_prekey(local_key, &local_peer_id, public_key) else {
+        warn!("VOID: не удалось подписать prekey для DHT");
+        return;
+    };
     let record = kad::Record {
         key: prekey_record_key(local_peer_id),
-        value: public_key.to_vec(),
+        value,
         publisher: Some(local_peer_id),
         expires: Some(Instant::now() + Duration::from_secs(MAILBOX_TTL_SECS)),
     };
@@ -1849,6 +1855,7 @@ fn request_prekey_from_bootstraps(
 
 fn seal_and_publish_offline_batch(
     swarm: &mut libp2p::Swarm<ChatBehaviour>,
+    local_key: &libp2p::identity::Keypair,
     peer_prekeys: &mut HashMap<PeerId, [u8; 32]>,
     relay_mail_store: &mut HashMap<String, Vec<OfflineEnvelope>>,
     bootstrap_peer_ids: &HashSet<PeerId>,
@@ -1869,6 +1876,8 @@ fn seal_and_publish_offline_batch(
     let mut sealed = Vec::new();
     for item in items {
         if let Ok(env) = seal_for_recipient(
+            local_key,
+            &recipient,
             &pk,
             &local_peer_id,
             my_public_key_bytes,
@@ -3245,6 +3254,9 @@ pub async fn run_chat_network(
 
         let mut bootstrap_peer_ids = bootstrap_peer_ids_from(&void_bootstraps);
         let mut onion_keys: HashMap<PeerId, [u8; 32]> = HashMap::new();
+        // Hop'ы, объявившие `;onion=` в собственном Identify. Gossip сюда не пишет:
+        // только им разрешено доставлять OnionDrop.
+        let mut identified_onion_hops: HashSet<PeerId> = HashSet::new();
         onion_rt_set_keys(onion_keys.clone(), bootstrap_peer_ids.clone(), local_peer_id);
 
         let startup_status = if void_bootstraps.is_empty() {
@@ -3570,7 +3582,7 @@ pub async fn run_chat_network(
                 // ─── Tick: переобъявление себя в DHT (каждые 10 мин) ───────
                 _ = provider_tick.tick() => {
                     publish_self_in_dht(&mut swarm.behaviour_mut().kad, local_peer_id);
-                    publish_self_prekey(&mut swarm, local_peer_id, &my_public_key_bytes);
+                    publish_self_prekey(&mut swarm, &local_key, local_peer_id, &my_public_key_bytes);
                     publish_self_prekey_to_bootstraps(
                         &mut swarm,
                         local_peer_id,
@@ -5060,6 +5072,8 @@ pub async fn run_chat_network(
                                         let pk = crypto::PublicKey::from(*pk_bytes);
                                         for item in batch {
                                             match seal_for_recipient(
+                                                &local_key,
+                                                &recipient,
                                                 &pk,
                                                 &local_peer_id,
                                                 &my_public_key_bytes,
@@ -5448,8 +5462,29 @@ pub async fn run_chat_network(
                                             None,
                                             V1Packet::Ack,
                                         );
-                                        if let Ok(src_pid) = src.parse::<PeerId>() {
+                                        let from_hop = identified_onion_hops.contains(&peer)
+                                            && bootstrap_peer_ids.contains(&peer)
+                                            && onion_keys.contains_key(&peer);
+                                        let inner_allowed = matches!(
+                                            *packet,
+                                            V1Packet::Hello { .. }
+                                                | V1Packet::Encrypted { .. }
+                                                | V1Packet::Ack
+                                        );
+                                        if !from_hop || !inner_allowed {
+                                            warn!(
+                                                "[{}] 🧅 OnionDrop от {} отброшен ({})",
+                                                now,
+                                                &peer.to_string()[..8.min(peer.to_string().len())],
+                                                if from_hop {
+                                                    "недопустимый тип внутри"
+                                                } else {
+                                                    "отправитель не onion-hop"
+                                                }
+                                            );
+                                        } else if let Ok(src_pid) = src.parse::<PeerId>() {
                                             if src_pid != local_peer_id
+                                                && src_pid != peer
                                                 && !bootstrap_peer_ids.contains(&src_pid)
                                             {
                                                 if !matches!(*packet, V1Packet::Ack) {
@@ -6385,19 +6420,33 @@ pub async fn run_chat_network(
                                                     .ok()
                                                     .filter(|p| *p == recipient)
                                                     .is_some();
-                                                if parsed_ok && public_key != [0u8; 32] {
+                                                // Ключ с ноды не подписан владельцем: запечатываем
+                                                // только к ключу из проверенного Hello / подписанной
+                                                // DHT-записи. Параллельный DHT PrekeyForPublish сам
+                                                // закроет gate, поэтому здесь его не трогаем.
+                                                let pinned = peer_prekeys.get(&recipient).copied();
+                                                if parsed_ok && pinned.is_none() {
+                                                    warn!(
+                                                        "VOID: prekey {} с bootstrap {} без подписи владельца — не используем, ждём DHT/Hello",
+                                                        &recipient.to_string()
+                                                            [..8.min(recipient.to_string().len())],
+                                                        &peer.to_string()[..8.min(peer.to_string().len())]
+                                                    );
+                                                } else if let (true, Some(pinned)) = (parsed_ok, pinned) {
+                                                    if pinned != public_key {
+                                                        warn!(
+                                                            "VOID: bootstrap {} отдал для {} prekey, не совпадающий с проверенным — игнор",
+                                                            &peer.to_string()[..8.min(peer.to_string().len())],
+                                                            &recipient.to_string()
+                                                                [..8.min(recipient.to_string().len())]
+                                                        );
+                                                    }
                                                     // Drop sibling PrekeyGets for same recipient.
                                                     outbound_prekey_gets
                                                         .retain(|_, (r, _, _)| *r != recipient);
-                                                    remember_peer_prekey(
-                                                        &mut peer_prekeys,
-                                                        &event_tx,
-                                                        recipient,
-                                                        public_key,
-                                                    )
-                                                    .await;
                                                     let ok = seal_and_publish_offline_batch(
                                                         &mut swarm,
+                                                        &local_key,
                                                         &mut peer_prekeys,
                                                         &mut relay_mail_store,
                                                         &bootstrap_peer_ids,
@@ -6409,31 +6458,26 @@ pub async fn run_chat_network(
                                                         &mut outbound_mailbox_stores,
                                                         &mut pending_kad_mail,
                                                         recipient,
-                                                        public_key,
+                                                        pinned,
                                                         items,
                                                         done,
                                                     );
                                                     if ok {
                                                         let _ = event_tx
                                                             .send(NetworkEvent::Status(
-                                                                "📤 Офлайн → bootstrap (prekey с ноды)"
-                                                                    .into(),
+                                                                "📤 Офлайн → bootstrap".into(),
                                                             ))
                                                             .await;
                                                     }
                                                 } else {
                                                     signal_publish_done(&done, false);
                                                 }
-                                            } else if let Ok(pid) = peer_id.parse::<PeerId>() {
-                                                if public_key != [0u8; 32] {
-                                                    remember_peer_prekey(
-                                                        &mut peer_prekeys,
-                                                        &event_tx,
-                                                        pid,
-                                                        public_key,
-                                                    )
-                                                    .await;
-                                                }
+                                            } else {
+                                                // PrekeyOffer без нашего PrekeyGet — не доверяем.
+                                                debug!(
+                                                    "VOID: непрошеный PrekeyOffer от {} — игнор",
+                                                    &peer.to_string()[..8.min(peer.to_string().len())]
+                                                );
                                             }
                                         }
                                         V1Packet::OfflineMailboxDeliver { envelopes } => {
@@ -7686,6 +7730,7 @@ pub async fn run_chat_network(
                             let has_chat = peer_advertises_void_chat(&info);
                             let is_void_node = peer_is_void_bootstrap(&info);
                             if has_chat && !is_void_node {
+                                identified_onion_hops.remove(&peer_id);
                                 if bootstrap_peer_ids.remove(&peer_id) {
                                     onion_rt_set_keys(
                                         onion_keys.clone(),
@@ -7730,6 +7775,7 @@ pub async fn run_chat_network(
                                     crate::onion::parse_pk_from_agent(&info.agent_version)
                                 {
                                     onion_keys.insert(peer_id, pk);
+                                    identified_onion_hops.insert(peer_id);
                                     onion_rt_set_keys(
                                         onion_keys.clone(),
                                         bootstrap_peer_ids.clone(),
@@ -7740,6 +7786,8 @@ pub async fn run_chat_network(
                                         now,
                                         &peer_id.to_string()[..8.min(peer_id.to_string().len())]
                                     );
+                                } else {
+                                    identified_onion_hops.remove(&peer_id);
                                 }
                                 if swarm.is_connected(&peer_id)
                                     && bootstrap_identified.insert(peer_id)
@@ -8045,14 +8093,24 @@ pub async fn run_chat_network(
                                                     Some(peer_record.record.value.clone());
                                             }
                                             MailboxKadOp::PrekeyForPublish {
-                                                prekey_bytes, ..
-                                            } => {
-                                                *prekey_bytes =
-                                                    Some(peer_record.record.value.clone());
+                                                recipient: owner,
+                                                prekey_bytes,
+                                                ..
                                             }
-                                            MailboxKadOp::CachePrekey { prekey_bytes, .. } => {
-                                                *prekey_bytes =
-                                                    Some(peer_record.record.value.clone());
+                                            | MailboxKadOp::CachePrekey {
+                                                peer: owner,
+                                                prekey_bytes,
+                                            } => {
+                                                match verify_signed_prekey(
+                                                    owner,
+                                                    &peer_record.record.value,
+                                                ) {
+                                                    Some(pk) => *prekey_bytes = Some(pk.to_vec()),
+                                                    None => debug!(
+                                                        "VOID: DHT prekey {} без подписи владельца — игнор",
+                                                        &owner.to_string()[..8.min(owner.to_string().len())]
+                                                    ),
+                                                }
                                             }
                                             MailboxKadOp::AwaitPut { .. } => {}
                                         }
@@ -8111,6 +8169,8 @@ pub async fn run_chat_network(
                                                     let mut sealed = Vec::new();
                                                     for item in items {
                                                         if let Ok(env) = seal_for_recipient(
+                                                            &local_key,
+                                                            &recipient,
                                                             &pk,
                                                             &local_peer_id,
                                                             &my_public_key_bytes,

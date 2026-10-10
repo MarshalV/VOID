@@ -1063,22 +1063,36 @@ impl Inner {
             let Some(ref secret) = self.local_static else {
                 return;
             };
+            let Some(local_pid) = self.local_peer_id else {
+                return;
+            };
             for env in envelopes {
                 if self.offline_mail_processed.contains(&env.message_id) {
                     continue;
                 }
-                let Ok(plaintext) = open_envelope(secret, &env) else {
-                    warn!(
-                        "VOID: offline mail {} не расшифровался (чужой ключ/битый конверт)",
-                        &env.message_id[..8.min(env.message_id.len())]
-                    );
-                    continue;
+                let (from, plaintext) = match open_envelope(secret, &local_pid, &env) {
+                    Ok(p) => p,
+                    Err(e) => {
+                        warn!(
+                            "VOID: offline mail {} отброшен: {e}",
+                            &env.message_id[..8.min(env.message_id.len())]
+                        );
+                        continue;
+                    }
                 };
                 match env.kind.as_str() {
                     "dm" | "group" => {
                         let Ok(msg) = serde_json::from_slice::<ChatMessage>(&plaintext) else {
                             continue;
                         };
+                        if msg.sender_id != from.to_string() {
+                            warn!(
+                                "VOID: offline mail {}: sender_id не совпадает с подписью — отброшен",
+                                &env.message_id[..8.min(env.message_id.len())]
+                            );
+                            self.offline_mail_processed.insert(env.message_id);
+                            continue;
+                        }
                         let chat_id = msg
                             .group_id
                             .as_ref()
@@ -1120,15 +1134,7 @@ impl Inner {
                             members,
                         }) = parse_decrypted_chat_frame(&plaintext)
                         {
-                            if let Ok(from) = env.sender.parse::<PeerId>() {
-                                group_syncs.push((
-                                    from,
-                                    group_id,
-                                    group_name,
-                                    creator_id,
-                                    members,
-                                ));
-                            }
+                            group_syncs.push((from, group_id, group_name, creator_id, members));
                             self.offline_mail_processed.insert(env.message_id);
                         }
                     }

@@ -210,7 +210,7 @@ const VOID_HELLO_BIND_PREFIX: &[u8] = b"VOID_E2EE_HELLO_BIND_V1\0";
 const MAX_HELLO_TRANSPORT_PUBKEY_PB: usize = 4096;
 
 /// Inline multihash PeerId (Ed25519): извлечь транспортный `PublicKey` для проверки подписи Hello.
-fn void_peer_transport_public_key(peer: PeerId) -> Option<libp2p::identity::PublicKey> {
+pub(crate) fn void_peer_transport_public_key(peer: PeerId) -> Option<libp2p::identity::PublicKey> {
     const CODE_IDENTITY: u64 = 0;
     let mh = peer.as_ref();
     if mh.code() != CODE_IDENTITY {
@@ -220,7 +220,7 @@ fn void_peer_transport_public_key(peer: PeerId) -> Option<libp2p::identity::Publ
 }
 
 /// Ключ для проверки `transport_sig`: из identity-multihash или из protobuf в Hello (hashed PeerId).
-fn void_hello_signing_public_key(
+pub(crate) fn void_hello_signing_public_key(
     signer_peer_id: PeerId,
     transport_pubkey_pb: &[u8],
 ) -> Option<libp2p::identity::PublicKey> {
