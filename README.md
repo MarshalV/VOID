@@ -41,7 +41,7 @@ Bootstrap-нода нужна, чтобы **найти** собеседника,
 - **1-на-1 и группы** — группы с invite `void://group/…`, рассылка каждому участнику (не MLS).
 - **Голос** — запись, превью, WAV по E2EE; в чате плеер. Автоприём, без баннера «принять файл».
 - **Файлы** — до 512 МБ, в том числе пустые (0 байт). Чанки (`VfC1`) и оффер/accept (`VfP1`) идут в E2EE `/void/chat`. `/void/file/1.0.0` — запасной канал, если пир уже на живом TCP.
-- **Офлайн-почта** — store-and-forward на bootstrap (`OfflineMailboxStore` / `Query` / `Deliver`). `ct` непрозрачен; `sender` / `recipient` / `kind` на ноде открыты. TTL 7 суток.
+- **Офлайн-почта** — store-and-forward на bootstrap (`OfflineMailboxStore` / `Query` / `Deliver`). Конверт v2 подписан libp2p-ключом отправителя, конверты без подписи не принимаются. `ct` непрозрачен; `sender` / `recipient` / `kind` на ноде открыты. TTL 7 суток.
 - **Свой DHT** — Kademlia `/void/kad/1.0.0`, не IPFS. Текст чата в DHT не пишется.
 - **NAT** — рабочий путь: **Relay v2 Hop** (`listen_on(…/p2p-circuit)` → `ReservationReqAccepted`). DCUtR / AutoNAT / UPnP **выключены** (включаются `VOID_ENABLE_NAT=1`: второй dial к ноде рвёт TCP).
 - **Транспорт клиента** — listen только **TCP :50001**. К bootstrap — один TCP; `/p2p/` на dial снимается, реальный PeerId пишется в vault после Identify. QUIC к ноде клиент не поднимает.
@@ -50,7 +50,7 @@ Bootstrap-нода нужна, чтобы **найти** собеседника,
 - **Vault** — ник, ключи, контакты, группы в `vault.bin`; мастер-ключ в `void.key`. Журнал — `chat_journal.bin`, недоставленное — `outbox.bin`.
 - **Доставка** — ○ / ✓ / ✓✓; read receipt при открытом чате.
 - **Beacon** — закрытие окна прячет в трей, процесс живёт. В шапке UI — логотип `Image_programm.png`.
-- **Onion** — `VOID_ONION_v1`: 1 живая нода с ключом → 1 hop, 2 → оба, 3+ → до трёх. Живой путь виден в настройках.
+- **Onion** — `VOID_ONION_v1`: 1 живая нода с ключом → 1 hop, 2 → оба, 3+ → до трёх. Живой путь виден в настройках. Скрывает IP отправителя от выхода, но не пару собеседников — см. [onion](#anonymous-routing-void_onion_v1).
 
 ---
 
@@ -204,10 +204,10 @@ $env:VOID_BOOTSTRAP = "/ip4/147.78.64.22/tcp/4001/p2p/12D3KooW..."
 | `Encrypted` | Double Ratchet |
 | `Ack` | RR-ответ / пустой ящик |
 | `OfflineMailboxStore` / `Query` / `Deliver` | офлайн-почта на bootstrap |
-| `PrekeyPut` / `Get` / `Offer` | X25519 prekey для seal без живого Hello |
+| `PrekeyPut` / `Get` / `Offer` | X25519 prekey для seal без живого Hello. Ответ ноды без подписи владельца для seal не используется; непрошеный `Offer` игнорируется |
 | `BootstrapGossip` | обмен seed |
 | `DialBack` | «набери меня по circuit» |
-| `Onion` / `OnionDrop` | слои `VOID_ONION_v1` |
+| `Onion` / `OnionDrop` | слои `VOID_ONION_v1`. `OnionDrop` принимается только от bootstrap, объявившего `;onion=` в своём Identify; внутри — только `Hello` / `Encrypted` / `Ack` |
 
 JSON RR: запрос до 4 МиБ, ответ до 16 МиБ (голосовые офлайн-чанки).
 
@@ -225,13 +225,35 @@ JSON RR: запрос до 4 МиБ, ответ до 16 МиБ (голосовы
 | Память ключей | `zeroize` |
 | Skipped keys | до **4096** |
 
-Офлайн-конверт: `ct` на prekey получателя. На ноде открыты `sender`, `kind`, `message_id`.
+Офлайн-конверт v2 (`src/offline_mail.rs`):
+
+- `ct` — ChaCha20-Poly1305 на ключ из X25519(эфемерный, prekey получателя), HKDF с `eph` и ключом получателя;
+- внутри `ct` — подпись libp2p-ключа отправителя над `sender`, `recipient`, `sender_pk`, `message_id`, `kind`, `eph` и SHA-256 тела;
+- те же поля — AAD шифра: нода не может их переписать или перенаправить конверт другому получателю;
+- получатель принимает `dm` / `group` только если `sender_id` внутри совпадает с подписью; `group_sync` — от подписавшего;
+- конверты v1 (без подписи) отбрасываются. **Несовместимо со старыми клиентами** — обновлять всех участников.
+
+На ноде открыты `sender`, `recipient`, `kind`, `message_id`.
+
+### Prekey
+
+Prekey — статический X25519 контакта. Для seal используется только проверенный ключ:
+
+| Источник | Принимается |
+|----------|-------------|
+| `Hello` с подписью к `PeerId` | да |
+| DHT `/void/prekey/<peer>`: `pk[32]` + подпись libp2p-ключа владельца | да, если подпись верна |
+| DHT-запись без подписи (старый формат) | нет |
+| `PrekeyOffer` от bootstrap | нет — у ноды нет подписи владельца; только если совпадает с уже проверенным |
+| `PrekeyOffer` без своего `PrekeyGet` | нет |
+
+Первое офлайн-письмо контакту, с которым не было `Hello`, уходит только при подписанной записи в DHT. Иначе письмо ждёт в outbox, пока контакт появится в сети.
 
 ### Офлайн-почта
 
 Живой путь — **не DHT**, а RR к bootstrap:
 
-1. Получатель офлайн → `PrekeyGet` → `OfflineMailboxStore`.
+1. Получатель офлайн → проверенный prekey (`Hello` / подписанный DHT) → `OfflineMailboxStore`.
 2. Получатель online → `OfflineMailboxQuery`; нода отдаёт порцию (`take_batch` ≤ 512 КиБ plaintext) и **удаляет** её из `relay_mailbox.bin`.
 3. Клиент забирает остаток следующим Query, с паузой (без немедленного ре-query: иначе тот же batch крутится сотни раз в секунду и душит Hop).
 
@@ -251,6 +273,21 @@ Alice → Node A → [Node B → Node C] → Bob
 | 1 | один hop: нода после unwrap видит пару Alice↔Bob |
 | 2 | оба hop'а |
 | 3+ | до трёх случайных; entry не видит Bob, exit не видит IP Alice |
+
+Что видит каждый участник цепочки из трёх:
+
+| Участник | Видит |
+|----------|-------|
+| Entry | IP и PeerId Alice, следующий hop, размер |
+| Middle | соседние hop'ы, размер |
+| Exit | **PeerId Alice и PeerId Bob** (`OnionDrop.src`), тип пакета, размер |
+
+Ограничения `VOID_ONION_v1`:
+
+- exit знает пару Alice↔Bob; скрыт только IP Alice;
+- путь выбирается **заново для каждого пакета** — за разговор пару узнают многие exit;
+- onion не используется, если Bob уже подключён напрямую (LAN, circuit, DCUtR), и при ошибке обёртки (слишком большой пакет) — тогда пакет уходит **напрямую**;
+- размеры ячеек не выравниваются, ключи hop'ов не ротируются.
 
 Живой маршрут (PeerId hop'ов) показывается в настройках. Старые ноды без `;onion=` в цепочку не входят. Это не mixnet и не защита от глобального наблюдателя. DCUtR (если включён) может открыть прямой канал и снова связать IP.
 
@@ -412,7 +449,7 @@ cargo run --release --features egui-ui
 |------|-----------|
 | **Kademlia Server** | Вход в `/void/kad/1.0.0` |
 | **Circuit Relay v2** | Hop для клиентов за NAT; непрозрачные байты circuit |
-| **Офлайн-почта / prekey** | Store/query на `/void/chat`; выдача **порциями с удалением** (`take_batch`) |
+| **Офлайн-почта / prekey** | Store/query на `/void/chat`; выдача **порциями с удалением** (`take_batch`). Prekey с ноды клиент для seal не использует, пока нода не хранит подпись владельца |
 | **VOID-SEED** | `/void-seed/v1` на отдельном TCP — обмен списками **между нодами** |
 | **Onion hop** | Identify `void-bootstrap-node/…;onion=<pk>` — unwrap и forward |
 
@@ -485,6 +522,8 @@ QUIC-адрес ноды клиент в seed для dial не использу�
 - [x] Tauri UI (push-snapshot) + опциональный egui
 - [x] Трей / beacon, повторный запуск поднимает то же окно
 - [x] `VOID_ONION_v1` — 1/2/3 hop по числу нод с ключом; путь в настройках
+- [x] `OnionDrop` только от объявленных onion-hop'ов, внутри только `Hello` / `Encrypted` / `Ack`
+- [x] Офлайн-конверт v2 с подписью отправителя; prekey только из `Hello` или подписанной DHT-записи
 
 ### Опционально / не по умолчанию
 
