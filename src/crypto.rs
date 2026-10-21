@@ -1,6 +1,6 @@
 use anyhow::{anyhow, Result};
 use chacha20poly1305::{
-    aead::{Aead, KeyInit},
+    aead::{Aead, KeyInit, Payload},
     ChaCha20Poly1305, Nonce,
 };
 use hkdf::Hkdf;
@@ -21,7 +21,7 @@ fn hkdf_sha256_derive(salt: &[u8], ikm: &[u8], info: &[u8], output_len: usize) -
     okm
 }
 
-#[derive(Serialize, Deserialize, Zeroize, ZeroizeOnDrop)]
+#[derive(Clone, Serialize, Deserialize, Zeroize, ZeroizeOnDrop)]
 struct ChainKey {
     key: [u8; 32],
     index: u32,
@@ -58,7 +58,26 @@ pub struct MessageHeader {
     pub n: u32,  // Message index in current chain
 }
 
+impl MessageHeader {
+    fn aad(&self) -> [u8; 59] {
+        const DOMAIN: &[u8; 19] = b"VOID_RATCHET_HDR_V1";
+        let mut v = [0u8; 59];
+        v[..19].copy_from_slice(DOMAIN);
+        v[19..51].copy_from_slice(&self.dh_pub);
+        v[51..55].copy_from_slice(&self.pn.to_le_bytes());
+        v[55..59].copy_from_slice(&self.n.to_le_bytes());
+        v
+    }
+}
+
+fn header_nonce(n: u32) -> [u8; 12] {
+    let mut nonce = [0u8; 12];
+    nonce[..4].copy_from_slice(&n.to_le_bytes());
+    nonce
+}
+
 #[allow(dead_code)]
+#[derive(Clone)]
 pub struct SecureSession {
     dhs: StaticSecret, // Our DH ratchet key (private)
     dhr: PublicKey,    // Their DH ratchet key (public)
@@ -69,6 +88,10 @@ pub struct SecureSession {
     nr: u32, // Number of messages received in current chain
     pn: u32, // Number of messages in previous sending chain
     skipped_keys: HashMap<([u8; 32], u32), [u8; 32]>, // (DH_pub, index) -> MessageKey
+    // Заголовок в AAD: шлём, когда пир объявил поддержку (Hello caps) или сам
+    // прислал такой кадр. Принимаем без AAD, пока не пришёл первый кадр с AAD.
+    send_header_aad: bool,
+    require_header_aad: bool,
 }
 
 impl Zeroize for SecureSession {
@@ -124,6 +147,8 @@ impl SecureSession {
             nr: 0,
             pn: 0,
             skipped_keys: HashMap::new(),
+            send_header_aad: false,
+            require_header_aad: false,
         };
 
         // 1. Ratchet send: DH(e_alice, s_bob)
@@ -145,7 +170,24 @@ impl SecureSession {
             index: 0,
         });
 
+        // 3. Первый шаг DH ratchet. Без него обе стороны так и шлют с e_alice / e_bob:
+        // ключ меняется только при приёме чужого нового dh_pub, а его никто не создаёт.
+        // Ответчик (в том числе старый клиент) проходит шаг штатным dh_ratchet.
+        sess.dhs = StaticSecret::random_from_rng(OsRng);
+        let shared_kickoff = sess.dhs.diffie_hellman(&sess.dhr);
+        let (rk3, ck_send_key) = sess.kdf_rk(&shared_kickoff);
+        sess.rk = rk3;
+        sess.ck_send = Some(ChainKey {
+            key: ck_send_key,
+            index: 0,
+        });
+
         sess
+    }
+
+    /// Пир поддерживает заголовок в AAD (`HELLO_CAP_HEADER_AAD`).
+    pub fn enable_header_aad(&mut self) {
+        self.send_header_aad = true;
     }
 
     pub fn new_responder(
@@ -174,6 +216,8 @@ impl SecureSession {
             nr: 0,
             pn: 0,
             skipped_keys: HashMap::new(),
+            send_header_aad: false,
+            require_header_aad: false,
         };
 
         // 1. Ratchet recv: DH(s_bob, e_alice)
@@ -212,25 +256,54 @@ impl SecureSession {
         self.ns += 1;
 
         let cipher = ChaCha20Poly1305::new(mk.as_slice().into());
-        let mut nonce_bytes = [0u8; 12];
-        nonce_bytes[..4].copy_from_slice(&ns.to_le_bytes());
+        let nonce_bytes = header_nonce(ns);
         let nonce = Nonce::from_slice(&nonce_bytes);
-        let ciphertext = cipher
-            .encrypt(nonce, plaintext)
-            .map_err(|_| anyhow!("Encryption failed"))?;
+        let aad = header.aad();
+        let ciphertext = if self.send_header_aad {
+            cipher.encrypt(nonce, Payload { msg: plaintext, aad: &aad })
+        } else {
+            cipher.encrypt(nonce, plaintext)
+        }
+        .map_err(|_| anyhow!("Encryption failed"))?;
 
         Ok((header, ciphertext))
     }
 
+    /// Состояние меняется только при успешной проверке AEAD: поддельный или
+    /// повторённый кадр не сдвигает ratchet и не забивает skipped keys.
     pub fn decrypt_payload(
         &mut self,
         header: &MessageHeader,
         ciphertext: &[u8],
     ) -> Result<Vec<u8>> {
-        if let Some(mk) = self.skipped_keys.remove(&(header.dh_pub, header.n)) {
-            return self.decrypt_with_key(&mk, header.n, ciphertext);
+        if let Some(mk) = self.skipped_keys.get(&(header.dh_pub, header.n)).copied() {
+            let (plaintext, with_aad) = self.decrypt_with_key(&mk, header, ciphertext)?;
+            if let Some(mut used) = self.skipped_keys.remove(&(header.dh_pub, header.n)) {
+                used.zeroize();
+            }
+            self.note_header_aad(with_aad);
+            return Ok(plaintext);
         }
 
+        let mut trial = self.clone();
+        let (plaintext, with_aad) = trial.decrypt_advancing(header, ciphertext)?;
+        *self = trial;
+        self.note_header_aad(with_aad);
+        Ok(plaintext)
+    }
+
+    fn note_header_aad(&mut self, with_aad: bool) {
+        if with_aad {
+            self.require_header_aad = true;
+            self.send_header_aad = true;
+        }
+    }
+
+    fn decrypt_advancing(
+        &mut self,
+        header: &MessageHeader,
+        ciphertext: &[u8],
+    ) -> Result<(Vec<u8>, bool)> {
         if header.dh_pub != self.dhr.to_bytes() {
             self.skip_message_keys(header.pn)?;
             self.dh_ratchet(header)?;
@@ -245,16 +318,29 @@ impl SecureSession {
         let mk = ck.step();
         self.nr += 1;
 
-        self.decrypt_with_key(&mk, header.n, ciphertext)
+        self.decrypt_with_key(&mk, header, ciphertext)
     }
 
-    fn decrypt_with_key(&self, mk: &[u8; 32], n: u32, ciphertext: &[u8]) -> Result<Vec<u8>> {
+    /// `(plaintext, был ли заголовок в AAD)`.
+    fn decrypt_with_key(
+        &self,
+        mk: &[u8; 32],
+        header: &MessageHeader,
+        ciphertext: &[u8],
+    ) -> Result<(Vec<u8>, bool)> {
         let cipher = ChaCha20Poly1305::new(mk.as_slice().into());
-        let mut nonce_bytes = [0u8; 12];
-        nonce_bytes[..4].copy_from_slice(&n.to_le_bytes());
+        let nonce_bytes = header_nonce(header.n);
         let nonce = Nonce::from_slice(&nonce_bytes);
+        let aad = header.aad();
+        if let Ok(pt) = cipher.decrypt(nonce, Payload { msg: ciphertext, aad: &aad }) {
+            return Ok((pt, true));
+        }
+        if self.require_header_aad {
+            return Err(anyhow!("Decryption failed"));
+        }
         cipher
             .decrypt(nonce, ciphertext)
+            .map(|pt| (pt, false))
             .map_err(|_| anyhow!("Decryption failed"))
     }
 
@@ -337,5 +423,154 @@ mod tests {
         let (header, ciphertext) = alice_session.encrypt_payload(msg).unwrap();
         let decrypted = bob_session.decrypt_payload(&header, &ciphertext).unwrap();
         assert_eq!(msg, decrypted.as_slice());
+    }
+
+    fn pair() -> (SecureSession, SecureSession) {
+        let mut rng = OsRng;
+        let alice_static = StaticSecret::random_from_rng(&mut rng);
+        let bob_static = StaticSecret::random_from_rng(&mut rng);
+        let alice_ephem = StaticSecret::random_from_rng(&mut rng);
+        let bob_ephem = StaticSecret::random_from_rng(&mut rng);
+        let alice_ephem_pub = PublicKey::from(&alice_ephem);
+        let bob_ephem_pub = PublicKey::from(&bob_ephem);
+        let alice = SecureSession::new_initiator(
+            &alice_static,
+            &PublicKey::from(&bob_static),
+            alice_ephem,
+            &bob_ephem_pub,
+        );
+        let bob = SecureSession::new_responder(
+            &bob_static,
+            &PublicKey::from(&alice_static),
+            &alice_ephem_pub,
+            bob_ephem,
+        );
+        (alice, bob)
+    }
+
+    #[test]
+    fn forged_frames_do_not_break_session() {
+        let (mut alice, mut bob) = pair();
+        let forged = [
+            MessageHeader {
+                dh_pub: PublicKey::from(&StaticSecret::random_from_rng(OsRng)).to_bytes(),
+                pn: 10,
+                n: 0,
+            },
+            MessageHeader {
+                dh_pub: PublicKey::from(&alice.dhs).to_bytes(),
+                pn: 0,
+                n: 4095,
+            },
+        ];
+        for h in &forged {
+            assert!(bob.decrypt_payload(h, b"garbage-garbage-garbage").is_err());
+        }
+        assert!(bob.skipped_keys.is_empty());
+        let (h, ct) = alice.encrypt_payload(b"still works").unwrap();
+        assert_eq!(bob.decrypt_payload(&h, &ct).unwrap(), b"still works");
+    }
+
+    #[test]
+    fn replayed_frame_is_rejected_and_harmless() {
+        let (mut alice, mut bob) = pair();
+        let (h1, ct1) = alice.encrypt_payload(b"one").unwrap();
+        assert_eq!(bob.decrypt_payload(&h1, &ct1).unwrap(), b"one");
+        assert!(bob.decrypt_payload(&h1, &ct1).is_err());
+        let (h2, ct2) = alice.encrypt_payload(b"two").unwrap();
+        assert_eq!(bob.decrypt_payload(&h2, &ct2).unwrap(), b"two");
+    }
+
+    #[test]
+    fn skipped_key_survives_forged_attempt() {
+        let (mut alice, mut bob) = pair();
+        let (h1, ct1) = alice.encrypt_payload(b"late").unwrap();
+        let (h2, ct2) = alice.encrypt_payload(b"first").unwrap();
+        assert_eq!(bob.decrypt_payload(&h2, &ct2).unwrap(), b"first");
+        assert!(bob.decrypt_payload(&h1, b"forged-forged-forged").is_err());
+        assert_eq!(bob.decrypt_payload(&h1, &ct1).unwrap(), b"late");
+    }
+
+    #[test]
+    fn dh_ratchet_turns_every_round_trip() {
+        let (mut alice, mut bob) = pair();
+        let initial_alice = PublicKey::from(&alice.dhs).to_bytes();
+        let mut seen = std::collections::HashSet::new();
+        for round in 0..4u8 {
+            let (ha, ca) = alice.encrypt_payload(&[round]).unwrap();
+            assert_eq!(bob.decrypt_payload(&ha, &ca).unwrap(), [round]);
+            let (hb, cb) = bob.encrypt_payload(&[round, 1]).unwrap();
+            assert_eq!(alice.decrypt_payload(&hb, &cb).unwrap(), [round, 1]);
+            assert!(seen.insert(ha.dh_pub), "Alice reused a ratchet key");
+            assert!(seen.insert(hb.dh_pub), "Bob reused a ratchet key");
+        }
+        assert_ne!(PublicKey::from(&alice.dhs).to_bytes(), initial_alice);
+    }
+
+    #[test]
+    fn responder_may_speak_first() {
+        let (mut alice, mut bob) = pair();
+        let (hb, cb) = bob.encrypt_payload(b"bob first").unwrap();
+        let (ha, ca) = alice.encrypt_payload(b"alice crossing").unwrap();
+        assert_eq!(alice.decrypt_payload(&hb, &cb).unwrap(), b"bob first");
+        assert_eq!(bob.decrypt_payload(&ha, &ca).unwrap(), b"alice crossing");
+        let (hb2, cb2) = bob.encrypt_payload(b"after ratchet").unwrap();
+        assert_ne!(hb2.dh_pub, hb.dh_pub);
+        assert_eq!(alice.decrypt_payload(&hb2, &cb2).unwrap(), b"after ratchet");
+    }
+
+    #[test]
+    fn out_of_order_across_ratchet_steps() {
+        let (mut alice, mut bob) = pair();
+        let (h1, c1) = alice.encrypt_payload(b"a1").unwrap();
+        let (h2, c2) = alice.encrypt_payload(b"a2").unwrap();
+        assert_eq!(bob.decrypt_payload(&h2, &c2).unwrap(), b"a2");
+        let (hb, cb) = bob.encrypt_payload(b"b1").unwrap();
+        assert_eq!(alice.decrypt_payload(&hb, &cb).unwrap(), b"b1");
+        let (h3, c3) = alice.encrypt_payload(b"a3").unwrap();
+        assert_ne!(h3.dh_pub, h1.dh_pub);
+        assert_eq!(bob.decrypt_payload(&h3, &c3).unwrap(), b"a3");
+        assert_eq!(bob.decrypt_payload(&h1, &c1).unwrap(), b"a1");
+    }
+
+    #[test]
+    fn header_aad_rejects_tampered_header() {
+        let (mut alice, mut bob) = pair();
+        alice.enable_header_aad();
+        let (h1, c1) = alice.encrypt_payload(b"one").unwrap();
+        assert_eq!(bob.decrypt_payload(&h1, &c1).unwrap(), b"one");
+        assert!(bob.require_header_aad && bob.send_header_aad);
+
+        let (h2, c2) = alice.encrypt_payload(b"two").unwrap();
+        let mut tampered = h2.clone();
+        tampered.pn ^= 7;
+        assert!(bob.decrypt_payload(&tampered, &c2).is_err());
+        assert_eq!(bob.decrypt_payload(&h2, &c2).unwrap(), b"two");
+
+        let (hb, cb) = bob.encrypt_payload(b"reply").unwrap();
+        assert_eq!(alice.decrypt_payload(&hb, &cb).unwrap(), b"reply");
+        assert!(alice.require_header_aad);
+    }
+
+    #[test]
+    fn plain_frames_rejected_after_aad_seen() {
+        let (mut alice, mut bob) = pair();
+        let (h_plain, c_plain) = alice.encrypt_payload(b"plain").unwrap();
+        alice.enable_header_aad();
+        let (h_aad, c_aad) = alice.encrypt_payload(b"aad").unwrap();
+        assert_eq!(bob.decrypt_payload(&h_aad, &c_aad).unwrap(), b"aad");
+        assert!(bob.decrypt_payload(&h_plain, &c_plain).is_err());
+    }
+
+    #[test]
+    fn legacy_peer_without_aad_still_works() {
+        let (mut alice, mut bob) = pair();
+        for i in 0..3u8 {
+            let (h, c) = alice.encrypt_payload(&[i]).unwrap();
+            assert_eq!(bob.decrypt_payload(&h, &c).unwrap(), [i]);
+            let (h, c) = bob.encrypt_payload(&[i, i]).unwrap();
+            assert_eq!(alice.decrypt_payload(&h, &c).unwrap(), [i, i]);
+        }
+        assert!(!alice.send_header_aad && !bob.send_header_aad);
     }
 }

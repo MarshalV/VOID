@@ -137,14 +137,15 @@ mod tests {
 
     fn env(id: &str, ct_len: usize) -> OfflineEnvelope {
         OfflineEnvelope {
-            v: 1,
-            sender: "s".into(),
+            v: 3,
+            sender: String::new(),
             sender_pk: [0u8; 32],
             message_id: id.into(),
-            kind: "voice_chunk".into(),
+            kind: String::new(),
             eph: [0u8; 32],
             nonce: [0u8; 12],
             ct: vec![0u8; ct_len],
+            local_kind: "voice_chunk".into(),
         }
     }
 

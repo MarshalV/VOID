@@ -136,6 +136,15 @@ pub(crate) struct OfflineEnvelope {
     pub(crate) eph: [u8; 32],
     pub(crate) nonce: [u8; 12],
     pub(crate) ct: Vec<u8>,
+    /// Настоящий `kind` у отправителя (в v3 снаружи пусто); в сеть не уходит.
+    #[serde(skip)]
+    pub(crate) local_kind: String,
+}
+
+impl OfflineEnvelope {
+    pub(crate) fn is_voice_chunk(&self) -> bool {
+        self.local_kind == OFFLINE_VOICE_CHUNK_KIND || self.kind == OFFLINE_VOICE_CHUNK_KIND
+    }
 }
 
 pub(crate) fn prekey_record_key(peer: PeerId) -> kad::RecordKey {
@@ -168,12 +177,59 @@ pub(crate) fn decode_mailbox(bytes: &[u8]) -> Result<Vec<OfflineEnvelope>> {
     serde_json::from_slice(bytes).map_err(|e| anyhow!("mailbox decode: {e}"))
 }
 
-/// Версия конверта с подписью отправителя. v1 (без аутентификации) не принимается.
-pub(crate) const ENVELOPE_VERSION: u8 = 2;
+/// v3: отправитель, `kind` и `message_id` только внутри `ct`, снаружи — непрозрачный id.
+/// v2 (подписан, поля открыты) ещё принимается; v1 (без подписи) — нет.
+pub(crate) const ENVELOPE_VERSION: u8 = 3;
+const ENVELOPE_V2: u8 = 2;
 const OFFLINE_SIG_PREFIX: &[u8] = b"VOID_OFFLINE_SIG_V2\0";
 const OFFLINE_AAD_PREFIX: &[u8] = b"VOID_OFFLINE_AAD_V2\0";
+const OFFLINE_SIG_PREFIX_V3: &[u8] = b"VOID_OFFLINE_SIG_V3\0";
+const OFFLINE_AAD_PREFIX_V3: &[u8] = b"VOID_OFFLINE_AAD_V3\0";
+const OFFLINE_ID_PREFIX_V3: &[u8] = b"VOID_OFFLINE_ID_V3\0";
 const MAX_OFFLINE_SIG: usize = 256;
 const MAX_OFFLINE_PUBKEY_PB: usize = 4096;
+/// Тело v3 выравнивается до степени двойки (не меньше `MIN_PADDED_BODY`),
+/// крупнее `PAD_STEP` — до кратного `PAD_STEP` (голосовые чанки 24 КБ).
+const MIN_PADDED_BODY: usize = 512;
+const PAD_STEP: usize = 4096;
+
+/// Вскрытый и проверенный конверт.
+#[derive(Debug)]
+pub(crate) struct OpenedEnvelope {
+    pub(crate) sender: PeerId,
+    pub(crate) message_id: String,
+    pub(crate) kind: String,
+    pub(crate) body: Vec<u8>,
+}
+
+/// Внешний id v3: нода дедуплицирует повторы, но не видит настоящий `message_id`
+/// (`vchunk:<transfer>:<i>` и т.п.) и не связывает конверты разных получателей.
+fn outer_message_id(recipient: &PeerId, message_id: &str) -> String {
+    use sha2::{Digest, Sha256};
+    let mut h = Sha256::new();
+    h.update(OFFLINE_ID_PREFIX_V3);
+    h.update(recipient.to_bytes());
+    h.update(message_id.as_bytes());
+    h.finalize()[..16].iter().map(|b| format!("{b:02x}")).collect()
+}
+
+fn padded_len(n: usize) -> usize {
+    if n <= PAD_STEP {
+        n.max(MIN_PADDED_BODY).next_power_of_two()
+    } else {
+        n.div_ceil(PAD_STEP) * PAD_STEP
+    }
+}
+
+fn read_lp<'a>(b: &mut &'a [u8], max: usize) -> Option<&'a [u8]> {
+    let n = u32::from_le_bytes(b.get(0..4)?.try_into().ok()?) as usize;
+    if n > max || b.len() < 4 + n {
+        return None;
+    }
+    let out = &b[4..4 + n];
+    *b = &b[4 + n..];
+    Some(out)
+}
 
 fn push_lp(out: &mut Vec<u8>, bytes: &[u8]) {
     out.extend_from_slice(&(bytes.len() as u32).to_le_bytes());
@@ -182,8 +238,10 @@ fn push_lp(out: &mut Vec<u8>, bytes: &[u8]) {
 
 /// Заголовок конверта и получатель: AAD шифра и часть подписанного сообщения.
 /// Нода не может переписать `sender`/`kind`/`message_id` или перенаправить конверт другому.
+#[allow(clippy::too_many_arguments)]
 fn envelope_header_bytes(
     prefix: &[u8],
+    version: u8,
     sender: &PeerId,
     recipient: &PeerId,
     sender_pk: &[u8; 32],
@@ -193,7 +251,7 @@ fn envelope_header_bytes(
 ) -> Vec<u8> {
     let mut v = Vec::with_capacity(prefix.len() + 192 + message_id.len() + kind.len());
     v.extend_from_slice(prefix);
-    v.push(ENVELOPE_VERSION);
+    v.push(version);
     push_lp(&mut v, &sender.to_bytes());
     push_lp(&mut v, &recipient.to_bytes());
     v.extend_from_slice(sender_pk);
@@ -282,7 +340,97 @@ pub(crate) fn verify_signed_prekey(owner: &PeerId, value: &[u8]) -> Option<[u8; 
         .then_some(pk)
 }
 
-/// Запечатывает `plaintext` получателю и подписывает libp2p-ключом отправителя.
+/// X25519-ключ офлайн-почты, выведенный из Ed25519-ключа внутри PeerId
+/// (как `crypto_sign_ed25519_pk_to_curve25519`). Его не раздаёт ни нода, ни DHT —
+/// подменить нечего.
+pub(crate) fn identity_offline_public(peer: &PeerId) -> Option<PublicKey> {
+    let ed = crate::protocol::void_peer_transport_public_key(*peer)?
+        .try_into_ed25519()
+        .ok()?;
+    let point = curve25519_dalek::edwards::CompressedEdwardsY(ed.to_bytes()).decompress()?;
+    if point.is_small_order() {
+        return None;
+    }
+    Some(PublicKey::from(point.to_montgomery().to_bytes()))
+}
+
+/// Секрет к [`identity_offline_public`]: скаляр Ed25519 (первая половина SHA-512 от seed).
+pub(crate) fn identity_offline_secret(key: &libp2p::identity::Keypair) -> Option<StaticSecret> {
+    use sha2::{Digest, Sha512};
+    let ed = key.clone().try_into_ed25519().ok()?;
+    let pair = zeroize::Zeroizing::new(ed.to_bytes());
+    let mut h = Sha512::digest(&pair[..32]);
+    let mut scalar = zeroize::Zeroizing::new([0u8; 32]);
+    scalar.copy_from_slice(&h[..32]);
+    h.as_mut_slice().fill(0);
+    Some(StaticSecret::from(*scalar))
+}
+
+/// Ключ, к которому запечатывается офлайн-письмо: выведенный из PeerId получателя;
+/// `fallback` (prekey из `Hello`/подписанной DHT-записи) — только для не-Ed25519 PeerId.
+pub(crate) fn offline_seal_key(recipient: &PeerId, fallback: Option<[u8; 32]>) -> Option<PublicKey> {
+    identity_offline_public(recipient).or_else(|| fallback.map(PublicKey::from))
+}
+
+fn transport_pubkey_pb(transport: &libp2p::identity::Keypair, sender: &PeerId) -> Vec<u8> {
+    if crate::protocol::void_peer_transport_public_key(*sender).is_some() {
+        Vec::new()
+    } else {
+        transport.public().encode_protobuf()
+    }
+}
+
+fn v3_aad(recipient: &PeerId, outer_id: &str, eph: &[u8; 32]) -> Vec<u8> {
+    let mut v = OFFLINE_AAD_PREFIX_V3.to_vec();
+    v.push(ENVELOPE_VERSION);
+    push_lp(&mut v, &recipient.to_bytes());
+    push_lp(&mut v, outer_id.as_bytes());
+    v.extend_from_slice(eph);
+    v
+}
+
+/// Пробует каждый наш секрет: identity-ключ (новые письма) и static prekey (старые).
+fn decrypt_envelope(
+    recipient_secrets: &[&StaticSecret],
+    env: &OfflineEnvelope,
+    aad: &[u8],
+) -> Result<Vec<u8>> {
+    recipient_secrets
+        .iter()
+        .find_map(|secret| {
+            let recipient_pk = PublicKey::from(*secret);
+            let shared = secret.diffie_hellman(&PublicKey::from(env.eph));
+            let key = hkdf_offline(shared.as_bytes(), &env.eph, recipient_pk.as_bytes());
+            ChaCha20Poly1305::new(key.as_slice().into())
+                .decrypt(
+                    Nonce::from_slice(&env.nonce),
+                    Payload {
+                        msg: env.ct.as_ref(),
+                        aad,
+                    },
+                )
+                .ok()
+        })
+        .ok_or_else(|| anyhow!("offline open failed"))
+}
+
+fn verify_sender(
+    sender: PeerId,
+    pubkey_pb: &[u8],
+    header: &[u8],
+    body: &[u8],
+    sig: &[u8],
+) -> Result<()> {
+    let signer = crate::protocol::void_hello_signing_public_key(sender, pubkey_pb)
+        .ok_or_else(|| anyhow!("offline envelope: no signer key"))?;
+    if sig.is_empty() || !signer.verify(&signed_message(header, body), sig) {
+        return Err(anyhow!("offline envelope: bad sender signature"));
+    }
+    Ok(())
+}
+
+/// Запечатывает `plaintext` получателю (конверт v3) и подписывает libp2p-ключом отправителя.
+/// Нода видит только получателя (в `OfflineMailboxStore`), непрозрачный id и размер бакета.
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn seal_for_recipient(
     transport: &libp2p::identity::Keypair,
@@ -298,13 +446,13 @@ pub(crate) fn seal_for_recipient(
         return Err(anyhow!("offline seal: transport key ≠ sender"));
     }
     let eph_secret = StaticSecret::random_from_rng(&mut rand::rngs::OsRng);
-    let eph_pub = PublicKey::from(&eph_secret);
-    let eph = eph_pub.to_bytes();
+    let eph = PublicKey::from(&eph_secret).to_bytes();
     let shared = eph_secret.diffie_hellman(recipient_pk);
     let key = hkdf_offline(shared.as_bytes(), &eph, recipient_pk.as_bytes());
 
     let header = envelope_header_bytes(
-        OFFLINE_SIG_PREFIX,
+        OFFLINE_SIG_PREFIX_V3,
+        ENVELOPE_VERSION,
         sender,
         recipient,
         sender_pk,
@@ -315,26 +463,21 @@ pub(crate) fn seal_for_recipient(
     let sig = transport
         .sign(&signed_message(&header, plaintext))
         .map_err(|e| anyhow!("offline sign: {e}"))?;
-    let pubkey_pb = if crate::protocol::void_peer_transport_public_key(*sender).is_some() {
-        Vec::new()
-    } else {
-        transport.public().encode_protobuf()
-    };
-    let inner = encode_signed_inner(&sig, &pubkey_pb, plaintext);
 
-    let aad = envelope_header_bytes(
-        OFFLINE_AAD_PREFIX,
-        sender,
-        recipient,
-        sender_pk,
-        message_id,
-        kind,
-        &eph,
-    );
+    let mut fields = Vec::with_capacity(plaintext.len() + 128);
+    push_lp(&mut fields, &sender.to_bytes());
+    fields.extend_from_slice(sender_pk);
+    push_lp(&mut fields, message_id.as_bytes());
+    push_lp(&mut fields, kind.as_bytes());
+    push_lp(&mut fields, plaintext);
+    fields.resize(padded_len(fields.len()), 0);
+    let inner = encode_signed_inner(&sig, &transport_pubkey_pb(transport, sender), &fields);
+
+    let outer_id = outer_message_id(recipient, message_id);
+    let aad = v3_aad(recipient, &outer_id, &eph);
     let mut nonce = [0u8; 12];
     rand::thread_rng().fill_bytes(&mut nonce);
-    let cipher = ChaCha20Poly1305::new(key.as_slice().into());
-    let ct = cipher
+    let ct = ChaCha20Poly1305::new(key.as_slice().into())
         .encrypt(
             Nonce::from_slice(&nonce),
             Payload {
@@ -345,71 +488,102 @@ pub(crate) fn seal_for_recipient(
         .map_err(|_| anyhow!("offline seal failed"))?;
     Ok(OfflineEnvelope {
         v: ENVELOPE_VERSION,
-        sender: sender.to_string(),
-        sender_pk: *sender_pk,
-        message_id: message_id.to_string(),
-        kind: kind.to_string(),
+        sender: String::new(),
+        sender_pk: [0u8; 32],
+        message_id: outer_id,
+        kind: String::new(),
         eph,
         nonce,
         ct,
+        local_kind: kind.to_string(),
     })
 }
 
-/// Вскрывает конверт и проверяет подпись отправителя.
-/// Возвращает подтверждённый `PeerId` отправителя и плейнтекст.
+/// Вскрывает конверт (v3 или v2) и проверяет подпись отправителя.
+/// `recipient_secrets`: identity-секрет ([`identity_offline_secret`]) и static prekey.
 pub(crate) fn open_envelope(
-    recipient_secret: &StaticSecret,
+    recipient_secrets: &[&StaticSecret],
     recipient: &PeerId,
     env: &OfflineEnvelope,
-) -> Result<(PeerId, Vec<u8>)> {
-    if env.v != ENVELOPE_VERSION {
-        return Err(anyhow!("offline envelope v{} без подписи отправителя", env.v));
+) -> Result<OpenedEnvelope> {
+    match env.v {
+        ENVELOPE_VERSION => open_v3(recipient_secrets, recipient, env),
+        ENVELOPE_V2 => open_v2(recipient_secrets, recipient, env),
+        v => Err(anyhow!("offline envelope v{v} без подписи отправителя")),
     }
+}
+
+fn open_v3(
+    recipient_secrets: &[&StaticSecret],
+    recipient: &PeerId,
+    env: &OfflineEnvelope,
+) -> Result<OpenedEnvelope> {
+    let bad = || anyhow!("offline envelope: bad inner");
+    let inner = decrypt_envelope(recipient_secrets, env, &v3_aad(recipient, &env.message_id, &env.eph))?;
+    let (sig, pubkey_pb, mut rest) = decode_signed_inner(&inner).ok_or_else(bad)?;
+    let sender = PeerId::from_bytes(read_lp(&mut rest, 128).ok_or_else(bad)?).map_err(|_| bad())?;
+    let sender_pk: [u8; 32] = rest.get(..32).ok_or_else(bad)?.try_into().map_err(|_| bad())?;
+    rest = &rest[32..];
+    let message_id = std::str::from_utf8(read_lp(&mut rest, 1024).ok_or_else(bad)?)
+        .map_err(|_| bad())?
+        .to_string();
+    let kind = std::str::from_utf8(read_lp(&mut rest, 64).ok_or_else(bad)?)
+        .map_err(|_| bad())?
+        .to_string();
+    let body = read_lp(&mut rest, usize::MAX).ok_or_else(bad)?;
+    if env.message_id != outer_message_id(recipient, &message_id) {
+        return Err(anyhow!("offline envelope: outer id mismatch"));
+    }
+    let header = envelope_header_bytes(
+        OFFLINE_SIG_PREFIX_V3,
+        ENVELOPE_VERSION,
+        &sender,
+        recipient,
+        &sender_pk,
+        &message_id,
+        &kind,
+        &env.eph,
+    );
+    verify_sender(sender, pubkey_pb, &header, body, sig)?;
+    Ok(OpenedEnvelope {
+        sender,
+        message_id,
+        kind,
+        body: body.to_vec(),
+    })
+}
+
+fn open_v2(
+    recipient_secrets: &[&StaticSecret],
+    recipient: &PeerId,
+    env: &OfflineEnvelope,
+) -> Result<OpenedEnvelope> {
     let sender: PeerId = env
         .sender
         .parse()
         .map_err(|_| anyhow!("offline envelope: bad sender"))?;
-    let recipient_pk = PublicKey::from(recipient_secret);
-    let eph_pub = PublicKey::from(env.eph);
-    let shared = recipient_secret.diffie_hellman(&eph_pub);
-    let key = hkdf_offline(shared.as_bytes(), &env.eph, recipient_pk.as_bytes());
-    let aad = envelope_header_bytes(
-        OFFLINE_AAD_PREFIX,
-        &sender,
-        recipient,
-        &env.sender_pk,
-        &env.message_id,
-        &env.kind,
-        &env.eph,
-    );
-    let cipher = ChaCha20Poly1305::new(key.as_slice().into());
-    let inner = cipher
-        .decrypt(
-            Nonce::from_slice(&env.nonce),
-            Payload {
-                msg: env.ct.as_ref(),
-                aad: &aad,
-            },
+    let header_for = |prefix| {
+        envelope_header_bytes(
+            prefix,
+            ENVELOPE_V2,
+            &sender,
+            recipient,
+            &env.sender_pk,
+            &env.message_id,
+            &env.kind,
+            &env.eph,
         )
-        .map_err(|_| anyhow!("offline open failed"))?;
-
+    };
+    let inner = decrypt_envelope(recipient_secrets, env, &header_for(OFFLINE_AAD_PREFIX))?;
     let (sig, pubkey_pb, body) =
         decode_signed_inner(&inner).ok_or_else(|| anyhow!("offline envelope: bad inner"))?;
-    let signer = crate::protocol::void_hello_signing_public_key(sender, pubkey_pb)
-        .ok_or_else(|| anyhow!("offline envelope: no signer key"))?;
-    let header = envelope_header_bytes(
-        OFFLINE_SIG_PREFIX,
-        &sender,
-        recipient,
-        &env.sender_pk,
-        &env.message_id,
-        &env.kind,
-        &env.eph,
-    );
-    if sig.is_empty() || !signer.verify(&signed_message(&header, body), sig) {
-        return Err(anyhow!("offline envelope: bad sender signature"));
-    }
-    Ok((sender, body.to_vec()))
+    verify_sender(sender, pubkey_pb, &header_for(OFFLINE_SIG_PREFIX), body, sig)?;
+    Ok(OpenedEnvelope {
+        sender,
+        message_id: env.message_id.clone(),
+        kind: env.kind.clone(),
+        body: body.to_vec(),
+    })
 }
 
 fn hkdf_offline(shared: &[u8], eph: &[u8; 32], recipient_pk: &[u8; 32]) -> [u8; 32] {
@@ -455,16 +629,70 @@ mod tests {
         key: libp2p::identity::Keypair,
         pid: PeerId,
         static_sk: StaticSecret,
+        offline_sk: StaticSecret,
+    }
+
+    impl Party {
+        fn secrets(&self) -> [&StaticSecret; 2] {
+            [&self.offline_sk, &self.static_sk]
+        }
     }
 
     fn party() -> Party {
         let key = libp2p::identity::Keypair::generate_ed25519();
         let pid = PeerId::from(key.public());
+        let offline_sk = identity_offline_secret(&key).expect("ed25519");
         Party {
             key,
             pid,
             static_sk: StaticSecret::random_from_rng(rand::rngs::OsRng),
+            offline_sk,
         }
+    }
+
+    #[test]
+    fn identity_offline_key_matches_secret() {
+        for _ in 0..16 {
+            let p = party();
+            let derived = identity_offline_public(&p.pid).expect("derive");
+            assert_eq!(derived.as_bytes(), PublicKey::from(&p.offline_sk).as_bytes());
+        }
+    }
+
+    #[test]
+    fn seal_key_ignores_poisoned_fallback() {
+        let (bob, mallory) = (party(), party());
+        let evil = PublicKey::from(&mallory.static_sk).to_bytes();
+        let key = offline_seal_key(&bob.pid, Some(evil)).unwrap();
+        assert_ne!(key.as_bytes(), &evil);
+        assert_eq!(key.as_bytes(), PublicKey::from(&bob.offline_sk).as_bytes());
+    }
+
+    #[test]
+    fn envelope_only_opens_for_identity_owner() {
+        let (alice, bob, mallory) = (party(), party(), party());
+        let env = seal_from(&alice, &bob, b"hi");
+        assert!(open_envelope(&[&bob.static_sk], &bob.pid, &env).is_err());
+        assert!(open_envelope(&mallory.secrets(), &bob.pid, &env).is_err());
+        assert!(open_envelope(&[&bob.offline_sk], &bob.pid, &env).is_ok());
+    }
+
+    #[test]
+    fn legacy_static_prekey_envelope_still_opens() {
+        let (alice, bob) = (party(), party());
+        let sender_pk = PublicKey::from(&alice.static_sk).to_bytes();
+        let env = seal_for_recipient(
+            &alice.key,
+            &bob.pid,
+            &PublicKey::from(&bob.static_sk),
+            &alice.pid,
+            &sender_pk,
+            "m1",
+            "dm",
+            b"old",
+        )
+        .unwrap();
+        assert_eq!(open_envelope(&bob.secrets(), &bob.pid, &env).unwrap().body, b"old");
     }
 
     fn seal_from(from: &Party, to: &Party, body: &[u8]) -> OfflineEnvelope {
@@ -472,7 +700,7 @@ mod tests {
         seal_for_recipient(
             &from.key,
             &to.pid,
-            &PublicKey::from(&to.static_sk),
+            &offline_seal_key(&to.pid, None).expect("ed25519 pid"),
             &from.pid,
             &sender_pk,
             "m1",
@@ -486,32 +714,53 @@ mod tests {
     fn envelope_roundtrip_returns_signed_sender() {
         let (alice, bob) = (party(), party());
         let env = seal_from(&alice, &bob, b"hi");
-        let (from, body) = open_envelope(&bob.static_sk, &bob.pid, &env).expect("open");
-        assert_eq!(from, alice.pid);
-        assert_eq!(body, b"hi");
+        let opened = open_envelope(&bob.secrets(), &bob.pid, &env).expect("open");
+        assert_eq!(opened.sender, alice.pid);
+        assert_eq!(opened.message_id, "m1");
+        assert_eq!(opened.kind, "dm");
+        assert_eq!(opened.body, b"hi");
     }
 
     #[test]
-    fn envelope_rejects_rewritten_sender() {
-        let (alice, bob, mallory) = (party(), party(), party());
-        let mut env = seal_from(&mallory, &bob, b"fake");
-        env.sender = alice.pid.to_string();
-        assert!(open_envelope(&bob.static_sk, &bob.pid, &env).is_err());
+    fn envelope_hides_metadata_from_node() {
+        let (alice, bob, carol) = (party(), party(), party());
+        let env = seal_from(&alice, &bob, b"hi");
+        assert!(env.sender.is_empty() && env.kind.is_empty());
+        assert_eq!(env.sender_pk, [0u8; 32]);
+        assert_ne!(env.message_id, "m1");
+        assert_eq!(env.local_kind, "dm");
+        // Тот же id для другого получателя не связывается.
+        assert_ne!(env.message_id, seal_from(&alice, &carol, b"hi").message_id);
+        // Повтор того же сообщения — тот же внешний id (дедуп на ноде).
+        assert_eq!(env.message_id, seal_from(&alice, &bob, b"hi").message_id);
+        // Размер скрыт бакетом.
+        assert_eq!(env.ct.len(), seal_from(&alice, &bob, &[7u8; 300]).ct.len());
+        // `local_kind` не сериализуется.
+        let json = serde_json::to_string(&env).unwrap();
+        assert!(!json.contains("local_kind") && !json.contains("\"dm\""));
     }
 
     #[test]
-    fn envelope_rejects_rewritten_header() {
+    fn envelope_rejects_rewritten_outer_id() {
         let (alice, bob) = (party(), party());
         let mut env = seal_from(&alice, &bob, b"hi");
-        env.kind = "group_sync".into();
-        assert!(open_envelope(&bob.static_sk, &bob.pid, &env).is_err());
+        env.message_id = outer_message_id(&bob.pid, "m2");
+        assert!(open_envelope(&bob.secrets(), &bob.pid, &env).is_err());
+    }
+
+    #[test]
+    fn envelope_rejects_tampered_ct() {
+        let (alice, bob) = (party(), party());
+        let mut env = seal_from(&alice, &bob, b"hi");
+        env.ct[0] ^= 1;
+        assert!(open_envelope(&bob.secrets(), &bob.pid, &env).is_err());
     }
 
     #[test]
     fn envelope_rejects_wrong_recipient_id() {
         let (alice, bob, carol) = (party(), party(), party());
         let env = seal_from(&alice, &bob, b"hi");
-        assert!(open_envelope(&bob.static_sk, &carol.pid, &env).is_err());
+        assert!(open_envelope(&bob.secrets(), &carol.pid, &env).is_err());
     }
 
     #[test]
@@ -519,7 +768,7 @@ mod tests {
         let (alice, bob) = (party(), party());
         let mut env = seal_from(&alice, &bob, b"hi");
         env.v = 1;
-        assert!(open_envelope(&bob.static_sk, &bob.pid, &env).is_err());
+        assert!(open_envelope(&bob.secrets(), &bob.pid, &env).is_err());
     }
 
     #[test]

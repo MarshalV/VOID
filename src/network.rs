@@ -28,9 +28,9 @@ use crate::shared_chat::SharedChatMessages;
 use crate::crypto;
 use crate::file_transfer;
 use crate::offline_mail::{
-    decode_mailbox, encode_mailbox, encode_signed_prekey, mailbox_record_key, prekey_record_key,
-    seal_for_recipient, verify_signed_prekey, OfflineEnvelope, MAILBOX_TTL_SECS,
-    OFFLINE_VOICE_CHUNK_KIND,
+    decode_mailbox, encode_mailbox, encode_signed_prekey, mailbox_record_key, offline_seal_key,
+    prekey_record_key, seal_for_recipient, verify_signed_prekey, OfflineEnvelope,
+    MAILBOX_TTL_SECS,
 };
 use crate::relay_mailbox::RelayMailbox;
 use crate::offline_publish::{
@@ -43,7 +43,7 @@ use crate::protocol::{
     read_command_message_ids, verify_hello_transport_binding, validate_bootstrap_gossip_addrs,
     build_group_sync_json, build_group_leave_json, build_group_delete_json,
     transfer_id_to_hex, transfer_id_from_hex, per_peer_voice_transfer_id, ChatMessage,
-    wrap_onion_packet, OnionHopHint,
+    wrap_onion_packet, OnionHopHint, HELLO_CAP_HEADER_AAD,
     DecryptedChatFrame, FileMeta, OutgoingDeliveryStatus, VoiceMeta, V1Packet,
 };
 
@@ -1768,7 +1768,7 @@ fn once_publish_gate(inner: PublishDone) -> PublishDone {
 fn dht_eligible_envelopes(envelopes: &[OfflineEnvelope]) -> Vec<OfflineEnvelope> {
     envelopes
         .iter()
-        .filter(|e| e.kind != OFFLINE_VOICE_CHUNK_KIND)
+        .filter(|e| !e.is_voice_chunk())
         .cloned()
         .collect()
 }
@@ -1872,7 +1872,10 @@ fn seal_and_publish_offline_batch(
     done: Option<PublishDone>,
 ) -> bool {
     peer_prekeys.insert(recipient, pk_bytes);
-    let pk = crypto::PublicKey::from(pk_bytes);
+    let Some(pk) = offline_seal_key(&recipient, Some(pk_bytes)) else {
+        signal_publish_done(&done, false);
+        return false;
+    };
     let mut sealed = Vec::new();
     for item in items {
         if let Ok(env) = seal_for_recipient(
@@ -2025,11 +2028,11 @@ fn fanout_relay_mail(
     envelopes: &[OfflineEnvelope],
     store_track: &mut MailboxStoreTrack,
     handoff: &Option<Arc<ActiveHandoff>>,
-    // When false (bootstraps configured), ephemeral peer stores are best-effort
-    // cache only — their Ack must not settle durable handoff.
+    // true только в LAN-режиме без bootstrap: тогда соседи — единственное хранилище
+    // и их Ack закрывает handoff. С bootstrap копии обычным пирам не рассылаются.
     track_handoff: bool,
 ) {
-    if envelopes.is_empty() {
+    if envelopes.is_empty() || !track_handoff {
         return;
     }
     let peers: Vec<PeerId> = swarm
@@ -2125,8 +2128,8 @@ fn publish_relay_mail(
     store_track: &mut MailboxStoreTrack,
     handoff: &Option<Arc<ActiveHandoff>>,
 ) {
-    // With bootstraps: only their Store Ack is durable. Ephemeral peers still
-    // get a copy as cache, but must not settle the exit/publish gate.
+    // With bootstraps: mail goes only to them. Without (LAN): connected peers
+    // are the store, their Ack settles the gate.
     let track_ephemeral = bootstrap_peer_ids.is_empty();
     fanout_relay_mail(
         swarm,
@@ -3175,6 +3178,7 @@ pub async fn run_chat_network(
         let mut session_established_at: HashMap<PeerId, Instant> = HashMap::new();
         let mut pending_handshakes: HashMap<PeerId, crypto::StaticSecret> = HashMap::new();
         let mut handshake_started: HashMap<PeerId, Instant> = HashMap::new();
+        let mut hello_replay = crate::hello_replay::HelloReplayCache::load();
         let mut pending_messages: HashMap<PeerId, Vec<Vec<u8>>> = HashMap::new();
         let mut pending_voice_transfers: HashMap<PeerId, Vec<PendingVoiceTransfer>> =
             HashMap::new();
@@ -5068,8 +5072,10 @@ pub async fn run_chat_network(
                                         .unwrap_or_else(|| Arc::new(|_| {}) as PublishDone);
                                     let mut sealed: Vec<OfflineEnvelope> = Vec::new();
                                     let mut need_prekey: Vec<OfflineOutboxItem> = Vec::new();
-                                    if let Some(pk_bytes) = peer_prekeys.get(&recipient) {
-                                        let pk = crypto::PublicKey::from(*pk_bytes);
+                                    if let Some(pk) = offline_seal_key(
+                                        &recipient,
+                                        peer_prekeys.get(&recipient).copied(),
+                                    ) {
                                         for item in batch {
                                             match seal_for_recipient(
                                                 &local_key,
@@ -5598,13 +5604,21 @@ pub async fn run_chat_network(
                                             );
                                         }
                                         V1Packet::OfflineMailboxQuery { recipient } => {
+                                            // Выдача удаляет почту: только сам получатель
+                                            // (PeerId соединения подтверждён Noise).
                                             // Порциями: иначе один Deliver со всеми
                                             // voice_chunk не влезает в лимит JSON response.
-                                            let envs = RelayMailbox::take_batch(
-                                                &mut relay_mail_store,
-                                                &recipient,
-                                                crate::relay_mailbox::DELIVER_BATCH_PLAIN_BYTES,
-                                            );
+                                            let own = onion_reply.is_none()
+                                                && recipient.parse::<PeerId>().ok() == Some(peer);
+                                            let envs = if own {
+                                                RelayMailbox::take_batch(
+                                                    &mut relay_mail_store,
+                                                    &recipient,
+                                                    crate::relay_mailbox::DELIVER_BATCH_PLAIN_BYTES,
+                                                )
+                                            } else {
+                                                Vec::new()
+                                            };
                                             if !envs.is_empty() {
                                                 let _ = RelayMailbox::save(&relay_mail_store);
                                             }
@@ -5697,6 +5711,7 @@ pub async fn run_chat_network(
                                             ephemeral_key,
                                             transport_sig,
                                             transport_pubkey_pb,
+                                            caps,
                                         } => {
                                             if peer != local_peer_id {
                                                 if !verify_hello_transport_binding(
@@ -5718,6 +5733,18 @@ pub async fn run_chat_network(
                                                 onion_reply,
                                                 V1Packet::Ack,
                                             );
+                                                } else if !hello_replay.note_fresh(peer, &ephemeral_key) {
+                                                    warn!(
+                                                        "[{}] 🔁 E2EE: повтор Hello от {} (тот же эфемерный ключ) — игнор, сессию не трогаю",
+                                                        now,
+                                                        &peer.to_string()[..8]
+                                                    );
+                                                    rr_reply(
+                                                        &mut swarm,
+                                                        &mut channel,
+                                                        onion_reply,
+                                                        V1Packet::Ack,
+                                                    );
                                                 } else if let Some(local_ephem_secret) =
                                                     pending_handshakes.remove(&peer)
                                                 {
@@ -5738,12 +5765,15 @@ pub async fn run_chat_network(
                                                     .await;
                                                     let remote_ephem_pub =
                                                         crypto::PublicKey::from(ephemeral_key);
-                                                    let session = crypto::SecureSession::new_initiator(
+                                                    let mut session = crypto::SecureSession::new_initiator(
                                                         &local_static,
                                                         &remote_static_pub,
                                                         local_ephem_secret,
                                                         &remote_ephem_pub,
                                                     );
+                                                    if caps & HELLO_CAP_HEADER_AAD != 0 {
+                                                        session.enable_header_aad();
+                                                    }
                                                     put_e2ee_session(
                                                         &mut sessions,
                                                         &mut session_established_at,
@@ -5803,12 +5833,15 @@ pub async fn run_chat_network(
                                                 let remote_ephem_pub = crypto::PublicKey::from(ephemeral_key);
                                                 let local_ephem_secret = crypto::StaticSecret::random_from_rng(&mut rand::rngs::OsRng);
                                                 let local_ephem_pub = crypto::PublicKey::from(&local_ephem_secret);
-                                                let session = crypto::SecureSession::new_responder(
+                                                let mut session = crypto::SecureSession::new_responder(
                                                     &local_static,
                                                     &remote_static_pub,
                                                     &remote_ephem_pub,
                                                     local_ephem_secret,
                                                 );
+                                                if caps & HELLO_CAP_HEADER_AAD != 0 {
+                                                    session.enable_header_aad();
+                                                }
                                                 put_e2ee_session(
                                                     &mut sessions,
                                                     &mut session_established_at,
@@ -6161,12 +6194,13 @@ pub async fn run_chat_network(
                                                     }
                                                     Err(_) => {
                                                         if onion_reply.is_some() {
+                                                            // `src` в OnionDrop не аутентифицирован:
+                                                            // никаких ответов и flush на заявленного автора.
                                                             debug!(
-                                                                "[{}] ❌ E2EE: onion-кадр не расшифровался от {} — сессию не сбрасываю",
+                                                                "[{}] ❌ E2EE: onion-кадр не расшифровался от {} — игнор, сессию не трогаю",
                                                                 now,
                                                                 &peer.to_string()[..8]
                                                             );
-                                                            send_ack = true;
                                                         } else {
                                                         debug!(
                                                             "[{}] ❌ E2EE: Ошибка дешифровки от {}. Сбрасываю...",
@@ -6218,6 +6252,16 @@ pub async fn run_chat_network(
                                                         }
                                                     }
                                                 }
+                                            } else if onion_reply.is_some()
+                                                && !reconnect_targets.contains_key(&peer)
+                                            {
+                                                // Непроверенный `src` из OnionDrop: не начинаем
+                                                // handshake с произвольным PeerId по указке hop'а.
+                                                debug!(
+                                                    "[{}] ⏳ E2EE: onion-кадр от незнакомого {} без сессии — игнор",
+                                                    now,
+                                                    &peer.to_string()[..8]
+                                                );
                                             } else {
                                                 debug!(
                                                     "[{}] ⏳ E2EE: нет сессии с {} — отвечаем Hello (без Ack)",
@@ -6312,6 +6356,18 @@ pub async fn run_chat_network(
                                     } // onion / onion-drop unwrap
                                 }
                                 libp2p::request_response::Message::Response { request_id, response } => {
+                                    if !matches!(response, V1Packet::Ack) {
+                                        // Нода отказала (квота / частота): не Ack — не сдано.
+                                        if let Some((handoff, _recip, message_id)) =
+                                            outbound_mailbox_stores.remove(&request_id)
+                                        {
+                                            warn!(
+                                                "VOID: нода отказала в хранении офлайн-конверта {} — повторим позже",
+                                                &message_id[..8.min(message_id.len())]
+                                            );
+                                            handoff.note_fail();
+                                        }
+                                    }
                                     match response {
                                         V1Packet::Ack => {
                                             if let Some((handoff, _recip, message_id)) =
@@ -6498,6 +6554,7 @@ pub async fn run_chat_network(
                                             ephemeral_key,
                                             transport_sig,
                                             transport_pubkey_pb,
+                                            caps,
                                         } => {
                                             // Encrypted got Hello instead of Ack: peer has no
                                             // matching session. That Hello's ephem is disposable —
@@ -6659,12 +6716,15 @@ pub async fn run_chat_network(
                                                     .await;
                                                     let remote_ephem_pub =
                                                         crypto::PublicKey::from(ephemeral_key);
-                                                    let session = crypto::SecureSession::new_initiator(
+                                                    let mut session = crypto::SecureSession::new_initiator(
                                                         &local_static,
                                                         &remote_static_pub,
                                                         local_ephem_secret,
                                                         &remote_ephem_pub,
                                                     );
+                                                    if caps & HELLO_CAP_HEADER_AAD != 0 {
+                                                        session.enable_header_aad();
+                                                    }
                                                     put_e2ee_session(
                                                         &mut sessions,
                                                         &mut session_established_at,
@@ -8164,8 +8224,8 @@ pub async fn run_chat_network(
                                                             public_key: pk_bytes,
                                                         })
                                                         .await;
-                                                    let pk =
-                                                        crypto::PublicKey::from(pk_bytes);
+                                                    let pk = offline_seal_key(&recipient, Some(pk_bytes))
+                                                        .unwrap_or_else(|| crypto::PublicKey::from(pk_bytes));
                                                     let mut sealed = Vec::new();
                                                     for item in items {
                                                         if let Ok(env) = seal_for_recipient(

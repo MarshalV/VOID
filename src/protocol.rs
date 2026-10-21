@@ -607,6 +607,10 @@ pub(crate) enum V1Packet {
         /// Если PeerId не identity-multihash: protobuf `PublicKey` для проверки подписи.
         #[serde(default)]
         transport_pubkey_pb: Vec<u8>,
+        /// Возможности клиента (`HELLO_CAP_*`). Не подписаны: подмена даёт только
+        /// откат к прежнему режиму или отказ сессии, но не чтение.
+        #[serde(default)]
+        caps: u32,
     },
     /// Обмен известными VOID bootstrap-нодами между участниками (публичные multiaddr).
     BootstrapGossip {
@@ -711,8 +715,13 @@ pub(crate) fn build_v1_hello(
         ephemeral_key: ephem_b,
         transport_sig,
         transport_pubkey_pb,
+        caps: HELLO_CAPS,
     })
 }
+
+/// Заголовок Double Ratchet (`dh_pub`, `pn`, `n`) входит в AAD.
+pub(crate) const HELLO_CAP_HEADER_AAD: u32 = 1;
+pub(crate) const HELLO_CAPS: u32 = HELLO_CAP_HEADER_AAD;
 
 /// Прогресс активной передачи файла (для UI).
 #[cfg(feature = "egui-ui")]

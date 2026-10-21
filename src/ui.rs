@@ -1,4 +1,4 @@
-﻿//! Весь код VOID P2P, отвечающий за отрисовку интерфейса (egui/eframe).
+//! Весь код VOID P2P, отвечающий за отрисовку интерфейса (egui/eframe).
 //!
 //! Сюда вынесены: космическая палитра, helper'ы отрисовки (аватары,
 //! starfield, chat-bg), toast-уведомления, подстройка стиля egui и полный
@@ -1948,8 +1948,7 @@ impl eframe::App for App {
                 } => {
                     let me = self.local_peer_id.to_string();
                     let is_self = peer_id == me;
-                    self.handle_incoming_group_leave(group_id, peer_id);
-                    if !is_self {
+                    if self.handle_incoming_group_leave(from, group_id, peer_id) && !is_self {
                         let from_s = from.to_string();
                         let who = &from_s[..8.min(from_s.len())];
                         self.push_toast(
@@ -1960,14 +1959,15 @@ impl eframe::App for App {
                     }
                 }
                 NetworkEvent::GroupDelete { from, group_id } => {
-                    self.handle_incoming_group_delete(group_id);
-                    let from_s = from.to_string();
-                    let who = &from_s[..8.min(from_s.len())];
-                    self.push_toast(
-                        format!("Группа удалена ({who}…)"),
-                        ToastKind::Info,
-                        TOAST_TTL_SHORT,
-                    );
+                    if self.handle_incoming_group_delete(from, group_id) {
+                        let from_s = from.to_string();
+                        let who = &from_s[..8.min(from_s.len())];
+                        self.push_toast(
+                            format!("Группа удалена ({who}…)"),
+                            ToastKind::Info,
+                            TOAST_TTL_SHORT,
+                        );
+                    }
                 }
                 NetworkEvent::Status(msg) => {
                     self.add_status(msg);

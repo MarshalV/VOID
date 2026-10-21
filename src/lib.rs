@@ -8,6 +8,7 @@ pub(crate) mod chat_store;
 pub(crate) mod crypto;
 pub(crate) mod file_transfer;
 pub(crate) mod group;
+pub(crate) mod hello_replay;
 pub(crate) mod metadata_strip;
 pub(crate) mod network;
 pub(crate) mod onion;

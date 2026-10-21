@@ -5,7 +5,7 @@
 
 use std::collections::{HashMap, HashSet};
 use libp2p::PeerId;
-use crate::offline_mail::{OfflineEnvelope, OFFLINE_VOICE_CHUNK_KIND};
+use crate::offline_mail::OfflineEnvelope;
 
 /// DHT Put Ok как full handoff — только LAN без bootstrap (аварийный режим).
 /// С bootstrap-нодами всегда `false`: почта только через ноды.
@@ -17,7 +17,7 @@ pub(crate) fn accept_dht_as_full_handoff(
         && !envelopes.is_empty()
         && envelopes
             .iter()
-            .all(|e| e.kind != OFFLINE_VOICE_CHUNK_KIND)
+            .all(|e| !e.is_voice_chunk())
 }
 
 pub(crate) fn required_store_message_ids(envelopes: &[OfflineEnvelope]) -> HashSet<String> {
@@ -135,17 +135,19 @@ impl PendingRelayQueue {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::offline_mail::OFFLINE_VOICE_CHUNK_KIND;
 
     fn env(id: &str, kind: &str) -> OfflineEnvelope {
         OfflineEnvelope {
-            v: 1,
-            sender: "a".into(),
+            v: 3,
+            sender: String::new(),
             sender_pk: [0u8; 32],
             message_id: id.to_string(),
-            kind: kind.into(),
+            kind: String::new(),
             eph: [0u8; 32],
             nonce: [0u8; 12],
             ct: vec![1, 2, 3],
+            local_kind: kind.into(),
         }
     }
 

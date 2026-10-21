@@ -313,6 +313,8 @@ struct Inner {
     local_nickname: String,
     vault_master_key: Option<Zeroizing<[u8; 32]>>,
     local_static: Option<crypto::StaticSecret>,
+    /// Секрет офлайн-почты, выведенный из libp2p-ключа.
+    offline_identity: Option<crypto::StaticSecret>,
     command_tx: Option<mpsc::Sender<UICommand>>,
     messages: SharedChatMessages,
     known_peers: HashMap<PeerId, String>,
@@ -369,6 +371,7 @@ impl Inner {
             local_nickname: String::new(),
             vault_master_key: None,
             local_static: None,
+            offline_identity: None,
             command_tx: None,
             messages,
             known_peers: HashMap::new(),
@@ -1066,11 +1069,18 @@ impl Inner {
             let Some(local_pid) = self.local_peer_id else {
                 return;
             };
+            let secrets: Vec<&crypto::StaticSecret> =
+                self.offline_identity.iter().chain([secret]).collect();
             for env in envelopes {
                 if self.offline_mail_processed.contains(&env.message_id) {
                     continue;
                 }
-                let (from, plaintext) = match open_envelope(secret, &local_pid, &env) {
+                let crate::offline_mail::OpenedEnvelope {
+                    sender: from,
+                    message_id: mid,
+                    kind,
+                    body: plaintext,
+                } = match open_envelope(&secrets, &local_pid, &env) {
                     Ok(p) => p,
                     Err(e) => {
                         warn!(
@@ -1080,7 +1090,7 @@ impl Inner {
                         continue;
                     }
                 };
-                match env.kind.as_str() {
+                match kind.as_str() {
                     "dm" | "group" => {
                         let Ok(msg) = serde_json::from_slice::<ChatMessage>(&plaintext) else {
                             continue;
@@ -1088,7 +1098,7 @@ impl Inner {
                         if msg.sender_id != from.to_string() {
                             warn!(
                                 "VOID: offline mail {}: sender_id не совпадает с подписью — отброшен",
-                                &env.message_id[..8.min(env.message_id.len())]
+                                &mid[..8.min(mid.len())]
                             );
                             self.offline_mail_processed.insert(env.message_id);
                             continue;
@@ -1560,7 +1570,21 @@ impl Inner {
             return;
         };
         let me = local.to_string();
-        let mut members = dedupe_members(members);
+        let Some(group::AuthorizedGroupSync {
+            name,
+            creator_id,
+            mut members,
+        }) = group::authorize_group_sync(
+            self.groups.get(&group_id),
+            &from.to_string(),
+            &group_name,
+            &creator_id,
+            members,
+        )
+        else {
+            warn!("VOID: group_sync от {from} отклонён: нет прав на изменение группы");
+            return;
+        };
         if !members.iter().any(|m| m.peer_id == me) {
             return;
         }
@@ -1574,11 +1598,6 @@ impl Inner {
                     .unwrap_or_else(|| m.peer_id.chars().take(12).collect());
             }
         }
-        let creator_id = if creator_id.is_empty() {
-            from.to_string()
-        } else {
-            creator_id
-        };
         let created_at = self
             .groups
             .get(&group_id)
@@ -1588,14 +1607,6 @@ impl Inner {
                     .format("%Y-%m-%d %H:%M:%S")
                     .to_string()
             });
-        let name = if group_name.trim().is_empty() {
-            self.groups
-                .get(&group_id)
-                .map(|g| g.name.clone())
-                .unwrap_or_else(|| "Группа".into())
-        } else {
-            group_name
-        };
         let is_new = !self.groups.contains_key(&group_id);
         self.groups.insert(
             group_id.clone(),
@@ -2432,29 +2443,36 @@ impl VoidRuntime {
                             members,
                         } => {
                             let had = g.groups.contains_key(&group_id);
-                            let toast_name = group_name.clone();
                             g.merge_incoming_group_sync(
                                 from, group_id.clone(), group_name, creator_id, members,
                             );
-                            if !had && g.groups.contains_key(&group_id) {
+                            if let Some(added) = g.groups.get(&group_id).filter(|_| !had) {
                                 bridge_evs.push(BridgeEvent::Status {
-                                    text: format!("Вас добавили в группу «{toast_name}»"),
+                                    text: format!("Вас добавили в группу «{}»", added.name),
                                 });
                             }
                             emit_snapshot = true;
                         }
-                        NetworkEvent::GroupLeave { group_id, peer_id, .. } => {
+                        NetworkEvent::GroupLeave { from, group_id, peer_id } => {
                             if let Some(gchat) = g.groups.get_mut(&group_id) {
-                                gchat.members.retain(|m| m.peer_id != peer_id);
-                                g.persist_vault();
-                                emit_snapshot = true;
+                                if group::may_apply_group_leave(gchat, &from.to_string(), &peer_id) {
+                                    gchat.members.retain(|m| m.peer_id != peer_id);
+                                    g.persist_vault();
+                                    emit_snapshot = true;
+                                } else {
+                                    warn!("VOID: group_leave от {from} за {peer_id} отклонён");
+                                }
                             }
                         }
-                        NetworkEvent::GroupDelete { group_id, .. } => {
-                            g.groups.remove(&group_id);
-                            g.left_groups.insert(group_id);
-                            g.persist_vault();
-                            emit_snapshot = true;
+                        NetworkEvent::GroupDelete { from, group_id } => {
+                            if group::may_apply_group_delete(g.groups.get(&group_id), &from.to_string()) {
+                                g.groups.remove(&group_id);
+                                g.left_groups.insert(group_id);
+                                g.persist_vault();
+                                emit_snapshot = true;
+                            } else {
+                                warn!("VOID: group_delete от {from} отклонён: не создатель");
+                            }
                         }
                         _ => {}
                     }
@@ -2630,6 +2648,7 @@ impl VoidRuntime {
                 .map_err(|e| e.to_string())?;
                 let static_secret = crypto::StaticSecret::from(storage.static_secret_bytes);
                 let static_for_inner = crypto::StaticSecret::from(storage.static_secret_bytes);
+                let offline_identity = crate::offline_mail::identity_offline_secret(&local_key);
                 let my_id = PeerId::from(local_key.public());
 
                 let mut bootstraps = storage.void_bootstraps.clone();
@@ -2716,6 +2735,7 @@ impl VoidRuntime {
                     g.local_nickname = storage.nickname;
                     g.vault_master_key = Some(master_arr);
                     g.local_static = Some(static_for_inner);
+                    g.offline_identity = offline_identity.clone();
                     g.command_tx = Some(command_tx);
                     g.known_peers = book;
                     g.contact_addrs = addrs_map;
@@ -2800,6 +2820,7 @@ impl VoidRuntime {
                     g.local_nickname = storage.nickname;
                     g.vault_master_key = Some(master_arr);
                     g.local_static = Some(static_for_inner);
+                    g.offline_identity = offline_identity.clone();
                     g.known_peers = book;
                     g.contact_addrs = addrs_map;
                     g.void_bootstrap_strings = bootstraps;
@@ -2814,6 +2835,7 @@ impl VoidRuntime {
                 let static_secret =
                     crypto::StaticSecret::random_from_rng(&mut rand::rngs::OsRng);
                 let static_for_inner = crypto::StaticSecret::from(*static_secret.as_bytes());
+                let offline_identity = crate::offline_mail::identity_offline_secret(&local_key);
                 let my_id = PeerId::from(local_key.public());
                 let nickname = format!("User_{}", &my_id.to_string()[..4]);
                 Storage::save(
@@ -2850,6 +2872,7 @@ impl VoidRuntime {
                     g.local_nickname = nickname;
                     g.vault_master_key = Some(master_arr);
                     g.local_static = Some(static_for_inner);
+                    g.offline_identity = offline_identity.clone();
                     g.command_tx = Some(command_tx);
                     g.add_status("Профиль создан — войдите в сеть через IP ноды".into());
                 } else {
@@ -2860,6 +2883,7 @@ impl VoidRuntime {
                     g.local_nickname = nickname;
                     g.vault_master_key = Some(master_arr);
                     g.local_static = Some(static_for_inner);
+                    g.offline_identity = offline_identity.clone();
                 }
             }
         }

@@ -4730,6 +4730,7 @@ dependencies = [
  "chacha20poly1305",
  "chrono",
  "cpal",
+ "curve25519-dalek",
  "dirs",
  "futures",
  "hkdf",

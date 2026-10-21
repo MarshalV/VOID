@@ -280,14 +280,75 @@ pub(crate) fn auto_join_from_invite_message() -> bool {
     false
 }
 
-/// Invite-from-contacts: group_sync installs the group if the local peer is listed.
-#[cfg(any(feature = "egui-ui", test))]
-pub(crate) fn may_install_group_from_sync(_already_have_group: bool) -> bool {
-    true
+/// Принятое состояние группы после авторизации `group_sync`.
+#[derive(Debug, PartialEq)]
+pub(crate) struct AuthorizedGroupSync {
+    pub(crate) name: String,
+    pub(crate) creator_id: String,
+    pub(crate) members: Vec<GroupMember>,
 }
 
-/// Creator accepting a non-creator sync: only allow `from` to add/remove self.
-#[cfg(any(feature = "egui-ui", test))]
+/// Авторизация входящего `group_sync` от подтверждённого `from`; `None` — отклонить.
+/// - новую группу ставит только её создатель (приглашение из контактов);
+/// - создателя существующей группы сменить нельзя;
+/// - создатель задаёт имя и состав;
+/// - остальные могут только добавить/убрать себя и сменить своё имя.
+pub(crate) fn authorize_group_sync(
+    existing: Option<&GroupChat>,
+    from: &str,
+    group_name: &str,
+    creator_id: &str,
+    members: Vec<GroupMember>,
+) -> Option<AuthorizedGroupSync> {
+    let members = dedupe_members(members);
+    let Some(g) = existing else {
+        if !creator_id.is_empty() && creator_id != from {
+            return None;
+        }
+        let name = if group_name.trim().is_empty() {
+            "Группа".to_string()
+        } else {
+            group_name.to_string()
+        };
+        return Some(AuthorizedGroupSync {
+            name,
+            creator_id: from.to_string(),
+            members,
+        });
+    };
+    if !creator_id.is_empty() && creator_id != g.creator_id {
+        return None;
+    }
+    if from == g.creator_id {
+        let name = if group_name.trim().is_empty() {
+            g.name.clone()
+        } else {
+            group_name.to_string()
+        };
+        return Some(AuthorizedGroupSync {
+            name,
+            creator_id: g.creator_id.clone(),
+            members,
+        });
+    }
+    Some(AuthorizedGroupSync {
+        name: g.name.clone(),
+        creator_id: g.creator_id.clone(),
+        members: sanitize_sync_members_for_creator(&g.members, from, &members),
+    })
+}
+
+/// `GroupLeave` для `peer_id`: от самого уходящего или от создателя.
+pub(crate) fn may_apply_group_leave(group: &GroupChat, from: &str, peer_id: &str) -> bool {
+    from == peer_id || from == group.creator_id
+}
+
+/// `GroupDelete`: только от создателя известной группы.
+pub(crate) fn may_apply_group_delete(group: Option<&GroupChat>, from: &str) -> bool {
+    group.is_some_and(|g| g.creator_id == from)
+}
+
+/// Sync не от создателя: `from` может только добавить/убрать себя и сменить своё имя.
 pub(crate) fn sanitize_sync_members_for_creator(
     existing: &[GroupMember],
     from_peer_id: &str,
@@ -304,8 +365,8 @@ pub(crate) fn sanitize_sync_members_for_creator(
     } else {
         out.retain(|m| m.peer_id != from_peer_id);
     }
-    for m in &mut out {
-        if let Some(inc) = incoming.iter().find(|x| x.peer_id == m.peer_id) {
+    if let Some(inc) = incoming.iter().find(|x| x.peer_id == from_peer_id) {
+        if let Some(m) = out.iter_mut().find(|m| m.peer_id == from_peer_id) {
             if !inc.display_name.is_empty() {
                 m.display_name = inc.display_name.clone();
             }
@@ -353,10 +414,109 @@ mod tests {
         assert!(validate_group_chat(&g));
     }
 
+    fn member(id: &str) -> GroupMember {
+        GroupMember {
+            peer_id: id.into(),
+            display_name: id.to_uppercase(),
+        }
+    }
+
+    fn existing_group() -> GroupChat {
+        GroupChat {
+            id: "0123456789abcdef0123456789abcdef".into(),
+            name: "G".into(),
+            creator_id: "alice".into(),
+            members: vec![member("alice"), member("bob"), member("me")],
+            created_at: "now".into(),
+        }
+    }
+
     #[test]
-    fn sync_installs_listed_member() {
-        assert!(may_install_group_from_sync(false));
-        assert!(may_install_group_from_sync(true));
+    fn sync_new_group_only_from_its_creator() {
+        let ok = authorize_group_sync(None, "alice", "G", "alice", vec![member("me")]).unwrap();
+        assert_eq!(ok.creator_id, "alice");
+        let ok = authorize_group_sync(None, "alice", "", "", vec![member("me")]).unwrap();
+        assert_eq!(ok.creator_id, "alice");
+        assert!(authorize_group_sync(None, "mallory", "G", "alice", vec![member("me")]).is_none());
+    }
+
+    #[test]
+    fn sync_cannot_change_creator() {
+        let g = existing_group();
+        assert!(authorize_group_sync(Some(&g), "mallory", "X", "mallory", vec![]).is_none());
+        assert!(authorize_group_sync(Some(&g), "alice", "X", "mallory", vec![]).is_none());
+    }
+
+    #[test]
+    fn sync_from_creator_is_authoritative() {
+        let g = existing_group();
+        let out = authorize_group_sync(
+            Some(&g),
+            "alice",
+            "New",
+            "alice",
+            vec![member("alice"), member("me"), member("carol")],
+        )
+        .unwrap();
+        assert_eq!(out.name, "New");
+        assert_eq!(out.members.len(), 3);
+        assert!(!out.members.iter().any(|m| m.peer_id == "bob"));
+    }
+
+    #[test]
+    fn sync_from_member_changes_only_self() {
+        let g = existing_group();
+        // Bob пытается переименовать группу, выкинуть alice и добавить eve.
+        let out = authorize_group_sync(
+            Some(&g),
+            "bob",
+            "Hacked",
+            "",
+            vec![member("bob"), member("me"), member("eve")],
+        )
+        .unwrap();
+        assert_eq!(out.name, "G");
+        assert_eq!(out.creator_id, "alice");
+        let ids: Vec<_> = out.members.iter().map(|m| m.peer_id.as_str()).collect();
+        assert_eq!(ids, ["alice", "bob", "me"]);
+        // Bob выходит сам.
+        let out =
+            authorize_group_sync(Some(&g), "bob", "", "", vec![member("alice"), member("me")])
+                .unwrap();
+        assert!(!out.members.iter().any(|m| m.peer_id == "bob"));
+        // Новый участник по invite добавляет только себя.
+        let out = authorize_group_sync(
+            Some(&g),
+            "dave",
+            "",
+            "alice",
+            vec![member("alice"), member("dave"), member("eve")],
+        )
+        .unwrap();
+        assert!(out.members.iter().any(|m| m.peer_id == "dave"));
+        assert!(!out.members.iter().any(|m| m.peer_id == "eve"));
+        assert_eq!(out.members.len(), 4);
+    }
+
+    #[test]
+    fn member_sync_cannot_rename_others() {
+        let g = existing_group();
+        let mut fake = member("alice");
+        fake.display_name = "Impostor".into();
+        let out = authorize_group_sync(Some(&g), "bob", "", "", vec![fake, member("bob"), member("me")])
+            .unwrap();
+        assert_eq!(out.members[0].display_name, "ALICE");
+    }
+
+    #[test]
+    fn leave_and_delete_need_authority() {
+        let g = existing_group();
+        assert!(may_apply_group_leave(&g, "bob", "bob"));
+        assert!(may_apply_group_leave(&g, "alice", "bob"));
+        assert!(!may_apply_group_leave(&g, "bob", "me"));
+        assert!(may_apply_group_delete(Some(&g), "alice"));
+        assert!(!may_apply_group_delete(Some(&g), "bob"));
+        assert!(!may_apply_group_delete(None, "alice"));
     }
 
     #[test]

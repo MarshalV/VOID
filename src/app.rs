@@ -168,6 +168,8 @@ pub(crate) struct App {
     pub(crate) event_rx: mpsc::Receiver<NetworkEvent>,
     pub(crate) _sessions: HashMap<libp2p::PeerId, crypto::SecureSession>,
     pub(crate) _local_static: crypto::StaticSecret,
+    /// Секрет офлайн-почты, выведенный из libp2p-ключа.
+    pub(crate) offline_identity: Option<crypto::StaticSecret>,
     pub(crate) pending_sends: Vec<PendingSend>,
     pub(crate) pending_file_sends: Vec<PendingFileSend>,
     /// Прочитанные входящие — read receipt уже отправлен (не персистится).
@@ -318,6 +320,7 @@ impl App {
             event_rx,
             _sessions: HashMap::new(),
             _local_static: local_static,
+            offline_identity: None,
             pending_sends: Vec::new(),
             pending_file_sends: Vec::new(),
             read_receipts_sent: HashSet::new(),
@@ -762,6 +765,7 @@ impl App {
         master_arr: Zeroizing<[u8; 32]>,
     ) {
         self.local_peer_id = PeerId::from(local_key.public());
+        self.offline_identity = crate::offline_mail::identity_offline_secret(&local_key);
         self.local_nickname = nickname;
         self.known_peers = book;
         self.contact_addrs = addrs_map;
@@ -1217,26 +1221,37 @@ impl App {
         }
         let mut any = false;
         let mut decrypt_failed = 0u32;
+        let own_secrets: Vec<crypto::StaticSecret> = self
+            .offline_identity
+            .iter()
+            .chain([&self._local_static])
+            .cloned()
+            .collect();
+        let secrets: Vec<&crypto::StaticSecret> = own_secrets.iter().collect();
         for env in envelopes {
             if self.offline_mail_processed.contains(&env.message_id) {
                 continue;
             }
-            let (from, plaintext) =
-                match open_envelope(&self._local_static, &self.local_peer_id, &env) {
-                    Ok(p) => p,
-                    Err(e) => {
-                        warn!("VOID: offline mail отброшен: {e}");
-                        decrypt_failed += 1;
-                        continue;
-                    }
-                };
-            match env.kind.as_str() {
+            let crate::offline_mail::OpenedEnvelope {
+                sender: from,
+                message_id: mid,
+                kind,
+                body: plaintext,
+            } = match open_envelope(&secrets, &self.local_peer_id, &env) {
+                Ok(p) => p,
+                Err(e) => {
+                    warn!("VOID: offline mail отброшен: {e}");
+                    decrypt_failed += 1;
+                    continue;
+                }
+            };
+            match kind.as_str() {
                 "dm" | "group" => {
                     if let Ok(msg) = serde_json::from_slice::<ChatMessage>(&plaintext) {
                         if msg.sender_id != from.to_string() {
                             warn!(
                                 "VOID: offline mail {}: sender_id не совпадает с подписью — отброшен",
-                                &env.message_id[..8.min(env.message_id.len())]
+                                &mid[..8.min(mid.len())]
                             );
                             self.offline_mail_processed.insert(env.message_id.clone());
                             continue;
@@ -3329,9 +3344,23 @@ impl App {
         }
     }
 
-    pub(crate) fn handle_incoming_group_leave(&mut self, group_id: String, peer_id: String) {
+    /// `false` — отклонено (нет прав или группа неизвестна).
+    pub(crate) fn handle_incoming_group_leave(
+        &mut self,
+        from: PeerId,
+        group_id: String,
+        peer_id: String,
+    ) -> bool {
         if self.left_groups.contains(&group_id) {
-            return;
+            return false;
+        }
+        match self.groups.get(&group_id) {
+            Some(g) if group::may_apply_group_leave(g, &from.to_string(), &peer_id) => {}
+            Some(_) => {
+                warn!("VOID: group_leave от {from} за {peer_id} отклонён");
+                return false;
+            }
+            None => return false,
         }
         let me = self.local_peer_id.to_string();
         if peer_id == me {
@@ -3344,7 +3373,7 @@ impl App {
                 self.selected_chat.clear();
             }
             self.persist_vault();
-            return;
+            return true;
         }
         if let Some(group) = self.groups.get_mut(&group_id) {
             group.members.retain(|m| m.peer_id != peer_id);
@@ -3361,9 +3390,15 @@ impl App {
                 self.broadcast_group_sync(&g);
             }
         }
+        true
     }
 
-    pub(crate) fn handle_incoming_group_delete(&mut self, group_id: String) {
+    /// `false` — отклонено: удалить группу может только её создатель.
+    pub(crate) fn handle_incoming_group_delete(&mut self, from: PeerId, group_id: String) -> bool {
+        if !group::may_apply_group_delete(self.groups.get(&group_id), &from.to_string()) {
+            warn!("VOID: group_delete от {from} отклонён: не создатель");
+            return false;
+        }
         self.left_groups.insert(group_id.clone());
         self.groups.remove(&group_id);
         self.purge_group_outbox(&group_id);
@@ -3374,6 +3409,7 @@ impl App {
         }
         self.persist_vault();
         self.mark_chat_journal_dirty();
+        true
     }
 
     pub(crate) fn merge_incoming_group_sync(
@@ -3384,34 +3420,28 @@ impl App {
         creator_id: String,
         members: Vec<GroupMember>,
     ) {
-        if self.left_groups.contains(&group_id) {
-            return;
-        }
-        // Sync не создаёт группу с нуля — иначе invitee попадал бы в группу
-        // без клика по ссылке. Вступление только через join_group_from_invite.
-        if !group::may_install_group_from_sync(self.groups.contains_key(&group_id)) {
+        if self.left_groups.contains(&group_id) || !group::validate_group_id(&group_id) {
             return;
         }
         let me = self.local_peer_id.to_string();
-        if !members.iter().any(|m| m.peer_id == me) {
+        let Some(group::AuthorizedGroupSync {
+            name,
+            creator_id,
+            mut members,
+        }) = group::authorize_group_sync(
+            self.groups.get(&group_id),
+            &from.to_string(),
+            &group_name,
+            &creator_id,
+            members,
+        )
+        else {
+            warn!("VOID: group_sync от {from} отклонён: нет прав на изменение группы");
             return;
-        }
-        let creator_id = if creator_id.is_empty() {
-            from.to_string()
-        } else {
-            creator_id
         };
-        let mut members = dedupe_members(members);
         if let Some(departed) = self.group_departed_peers.get(&group_id) {
             members.retain(|m| !departed.contains(&m.peer_id));
         }
-        if !members.iter().any(|m| m.peer_id == me) {
-            return;
-        }
-
-        // Только создатель может расширять состав. Чужой sync не должен
-        // подмешивать в группу лишних людей («добавляет абсолютно всех»).
-        members = self.sanitize_group_sync_members(&group_id, from, &creator_id, members);
         if !members.iter().any(|m| m.peer_id == me) {
             return;
         }
@@ -3434,18 +3464,6 @@ impl App {
             .get(&group_id)
             .map(|g| g.created_at.clone())
             .unwrap_or_else(|| chrono::Local::now().format("%Y-%m-%d %H:%M").to_string());
-        let from_str = from.to_string();
-        let name = self
-            .groups
-            .get(&group_id)
-            .map(|g| {
-                if from_str == g.creator_id || from_str == creator_id {
-                    group_name.clone()
-                } else {
-                    g.name.clone()
-                }
-            })
-            .unwrap_or(group_name);
         let group = GroupChat {
             id: group_id.clone(),
             name,
@@ -3459,28 +3477,6 @@ impl App {
         } else {
             warn!("VOID: group_sync отклонён (некорректные данные)");
         }
-    }
-
-    /// Не-создатель не может добавлять участников через group_sync.
-    fn sanitize_group_sync_members(
-        &self,
-        group_id: &str,
-        from: PeerId,
-        creator_id: &str,
-        incoming: Vec<GroupMember>,
-    ) -> Vec<GroupMember> {
-        let me = self.local_peer_id.to_string();
-        let from_str = from.to_string();
-        let Some(existing) = self.groups.get(group_id) else {
-            return incoming;
-        };
-        let am_creator = existing.creator_id == me;
-        let from_is_creator = from_str == existing.creator_id || from_str == creator_id;
-        if !am_creator || from_is_creator {
-            return incoming;
-        }
-        // Принявший invite может добавить только себя; чужих из его sync не берём.
-        group::sanitize_sync_members_for_creator(&existing.members, &from_str, &incoming)
     }
 
     fn ensure_self_in_group(&self, group: &mut GroupChat) {
