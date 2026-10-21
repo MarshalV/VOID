@@ -8,6 +8,7 @@ use rand::rngs::OsRng;
 use sha2::Sha256;
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
+use std::time::{Duration, Instant};
 #[allow(dead_code)]
 pub use x25519_dalek::{PublicKey, SharedSecret, StaticSecret};
 use zeroize::{Zeroize, ZeroizeOnDrop};
@@ -28,25 +29,26 @@ struct ChainKey {
 }
 
 impl ChainKey {
-    fn step(&mut self) -> [u8; 32] {
+    fn step(&mut self) -> Result<[u8; 32]> {
         let message_key = hkdf_sha256_derive(
             self.key.as_slice(),
             b"message_key",
             &self.index.to_be_bytes(),
             32,
         );
-        self.key = hkdf_sha256_derive(
+        let next: [u8; 32] = hkdf_sha256_derive(
             self.key.as_slice(),
             b"chain_key",
             &self.index.to_be_bytes(),
             32,
         )
         .try_into()
-        .unwrap_or([0; 32]);
+        .map_err(|_| anyhow!("chain key KDF length"))?;
+        self.key = next;
         self.index += 1;
         let mut mk = [0u8; 32];
         mk.copy_from_slice(&message_key);
-        mk
+        Ok(mk)
     }
 }
 
@@ -59,15 +61,28 @@ pub struct MessageHeader {
 }
 
 impl MessageHeader {
-    fn aad(&self) -> [u8; 59] {
+    fn aad(&self, peers: &[u8]) -> Vec<u8> {
         const DOMAIN: &[u8; 19] = b"VOID_RATCHET_HDR_V1";
-        let mut v = [0u8; 59];
-        v[..19].copy_from_slice(DOMAIN);
-        v[19..51].copy_from_slice(&self.dh_pub);
-        v[51..55].copy_from_slice(&self.pn.to_le_bytes());
-        v[55..59].copy_from_slice(&self.n.to_le_bytes());
+        let mut v = Vec::with_capacity(DOMAIN.len() + 32 + 8 + peers.len());
+        v.extend_from_slice(DOMAIN);
+        v.extend_from_slice(&self.dh_pub);
+        v.extend_from_slice(&self.pn.to_le_bytes());
+        v.extend_from_slice(&self.n.to_le_bytes());
+        v.extend_from_slice(peers);
         v
     }
+}
+
+fn canonical_peer_aad(a: &[u8], b: &[u8]) -> Vec<u8> {
+    let mut v = Vec::with_capacity(a.len() + b.len());
+    if a <= b {
+        v.extend_from_slice(a);
+        v.extend_from_slice(b);
+    } else {
+        v.extend_from_slice(b);
+        v.extend_from_slice(a);
+    }
+    v
 }
 
 fn header_nonce(n: u32) -> [u8; 12] {
@@ -87,11 +102,12 @@ pub struct SecureSession {
     ns: u32, // Number of messages sent in current chain
     nr: u32, // Number of messages received in current chain
     pn: u32, // Number of messages in previous sending chain
-    skipped_keys: HashMap<([u8; 32], u32), [u8; 32]>, // (DH_pub, index) -> MessageKey
-    // Заголовок в AAD: шлём, когда пир объявил поддержку (Hello caps) или сам
-    // прислал такой кадр. Принимаем без AAD, пока не пришёл первый кадр с AAD.
+    skipped_keys: HashMap<([u8; 32], u32), ([u8; 32], Instant)>, // (DH_pub, n) -> (mk, when)
+    // Заголовок + PeerId обеих сторон в AAD: шлём, когда пир объявил поддержку
+    // (Hello caps) или сам прислал такой кадр. Без AAD — пока не пришёл первый кадр с AAD.
     send_header_aad: bool,
     require_header_aad: bool,
+    peer_aad: Vec<u8>,
 }
 
 impl Zeroize for SecureSession {
@@ -104,10 +120,11 @@ impl Zeroize for SecureSession {
         self.pn.zeroize();
         // Manually zeroize every message key stored for out-of-order delivery,
         // then clear the map so the (DH_pub, index) slots are also released.
-        for mk in self.skipped_keys.values_mut() {
+        for (mk, _) in self.skipped_keys.values_mut() {
             mk.zeroize();
         }
         self.skipped_keys.clear();
+        self.peer_aad.zeroize();
         // dhs (StaticSecret) is ZeroizeOnDrop — zeroed when it is dropped.
         // dhr (PublicKey) is non-secret public material.
     }
@@ -149,6 +166,7 @@ impl SecureSession {
             skipped_keys: HashMap::new(),
             send_header_aad: false,
             require_header_aad: false,
+            peer_aad: Vec::new(),
         };
 
         // 1. Ratchet send: DH(e_alice, s_bob)
@@ -190,6 +208,11 @@ impl SecureSession {
         self.send_header_aad = true;
     }
 
+    /// Привязать кадры к PeerId обеих сторон (канонический порядок, одинаковый у обоих).
+    pub fn bind_peers(&mut self, local: &[u8], remote: &[u8]) {
+        self.peer_aad = canonical_peer_aad(local, remote);
+    }
+
     pub fn new_responder(
         local_static: &StaticSecret,
         remote_static: &PublicKey,
@@ -218,6 +241,7 @@ impl SecureSession {
             skipped_keys: HashMap::new(),
             send_header_aad: false,
             require_header_aad: false,
+            peer_aad: Vec::new(),
         };
 
         // 1. Ratchet recv: DH(s_bob, e_alice)
@@ -246,7 +270,7 @@ impl SecureSession {
             .ck_send
             .as_mut()
             .ok_or_else(|| anyhow!("No sending chain"))?;
-        let mk = ck.step();
+        let mk = ck.step()?;
         let ns = self.ns;
         let header = MessageHeader {
             dh_pub: PublicKey::from(&self.dhs).to_bytes(),
@@ -258,7 +282,7 @@ impl SecureSession {
         let cipher = ChaCha20Poly1305::new(mk.as_slice().into());
         let nonce_bytes = header_nonce(ns);
         let nonce = Nonce::from_slice(&nonce_bytes);
-        let aad = header.aad();
+        let aad = header.aad(&self.peer_aad);
         let ciphertext = if self.send_header_aad {
             cipher.encrypt(nonce, Payload { msg: plaintext, aad: &aad })
         } else {
@@ -276,9 +300,10 @@ impl SecureSession {
         header: &MessageHeader,
         ciphertext: &[u8],
     ) -> Result<Vec<u8>> {
-        if let Some(mk) = self.skipped_keys.get(&(header.dh_pub, header.n)).copied() {
+        self.purge_stale_skipped();
+        if let Some(&(mk, _)) = self.skipped_keys.get(&(header.dh_pub, header.n)) {
             let (plaintext, with_aad) = self.decrypt_with_key(&mk, header, ciphertext)?;
-            if let Some(mut used) = self.skipped_keys.remove(&(header.dh_pub, header.n)) {
+            if let Some((mut used, _)) = self.skipped_keys.remove(&(header.dh_pub, header.n)) {
                 used.zeroize();
             }
             self.note_header_aad(with_aad);
@@ -315,7 +340,7 @@ impl SecureSession {
             .ck_recv
             .as_mut()
             .ok_or_else(|| anyhow!("No receiving chain"))?;
-        let mk = ck.step();
+        let mk = ck.step()?;
         self.nr += 1;
 
         self.decrypt_with_key(&mk, header, ciphertext)
@@ -331,7 +356,7 @@ impl SecureSession {
         let cipher = ChaCha20Poly1305::new(mk.as_slice().into());
         let nonce_bytes = header_nonce(header.n);
         let nonce = Nonce::from_slice(&nonce_bytes);
-        let aad = header.aad();
+        let aad = header.aad(&self.peer_aad);
         if let Ok(pt) = cipher.decrypt(nonce, Payload { msg: ciphertext, aad: &aad }) {
             return Ok((pt, true));
         }
@@ -380,19 +405,35 @@ impl SecureSession {
     }
 
     fn skip_message_keys(&mut self, until: u32) -> Result<()> {
-        // Верхняя граница буфера out-of-order ключей (память ~N×64 B); выше — сброс сессии у пира.
         const MAX_SKIPPED_MESSAGE_KEYS: usize = 4096;
+        const MAX_SKIP_PER_HEADER: u32 = 1000;
         if let Some(ck) = self.ck_recv.as_mut() {
+            if until > ck.index && until - ck.index > MAX_SKIP_PER_HEADER {
+                return Err(anyhow!("Skip jump too large"));
+            }
             while ck.index < until {
                 if self.skipped_keys.len() >= MAX_SKIPPED_MESSAGE_KEYS {
                     return Err(anyhow!("Too many skipped keys"));
                 }
-                let mk = ck.step();
+                let mk = ck.step()?;
                 self.skipped_keys
-                    .insert((self.dhr.to_bytes(), ck.index - 1), mk);
+                    .insert((self.dhr.to_bytes(), ck.index - 1), (mk, Instant::now()));
             }
         }
         Ok(())
+    }
+
+    fn purge_stale_skipped(&mut self) {
+        const TTL: Duration = Duration::from_secs(3600);
+        let now = Instant::now();
+        self.skipped_keys.retain(|_, (mk, at)| {
+            if now.saturating_duration_since(*at) <= TTL {
+                true
+            } else {
+                mk.zeroize();
+                false
+            }
+        });
     }
 }
 
@@ -572,5 +613,33 @@ mod tests {
             assert_eq!(alice.decrypt_payload(&h, &c).unwrap(), [i, i]);
         }
         assert!(!alice.send_header_aad && !bob.send_header_aad);
+    }
+
+    #[test]
+    fn skip_jump_over_one_header_limit_is_rejected() {
+        let (mut alice, mut bob) = pair();
+        let (h, c) = alice.encrypt_payload(b"ok").unwrap();
+        let mut huge = h.clone();
+        huge.n = 1001;
+        assert!(bob.decrypt_payload(&huge, b"garbage-garbage-garbage").is_err());
+        assert!(bob.skipped_keys.is_empty());
+        assert_eq!(bob.decrypt_payload(&h, &c).unwrap(), b"ok");
+    }
+
+    #[test]
+    fn peer_aad_must_match_on_both_sides() {
+        let (mut alice, mut bob) = pair();
+        alice.bind_peers(b"alice", b"bob");
+        bob.bind_peers(b"bob", b"alice");
+        alice.enable_header_aad();
+        let (h, c) = alice.encrypt_payload(b"bound").unwrap();
+        assert_eq!(bob.decrypt_payload(&h, &c).unwrap(), b"bound");
+
+        let (mut alice2, mut bob2) = pair();
+        alice2.bind_peers(b"alice", b"bob");
+        bob2.bind_peers(b"alice", b"eve");
+        alice2.enable_header_aad();
+        let (h, c) = alice2.encrypt_payload(b"nope").unwrap();
+        assert!(bob2.decrypt_payload(&h, &c).is_err());
     }
 }

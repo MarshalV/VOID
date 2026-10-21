@@ -3,7 +3,7 @@
 use std::error::Error;
 
 use aes_gcm::{
-    aead::{Aead, KeyInit},
+    aead::{Aead, KeyInit, Payload},
     Aes256Gcm, Key, Nonce,
 };
 use argon2::{Algorithm, Argon2, Params, Version};
@@ -74,13 +74,23 @@ impl Storage {
     const FILE_TMP: &'static str = "vault.bin.tmp";
     const FILE_BAK: &'static str = "vault.bin.bak";
     pub(crate) const KEY_FILE: &'static str = "void.key";
-    /// Магия и размер обёртки `void.key` v2: Argon2id KDF + AES-256-GCM над сыром мастер-ключом vault.
-    const KEY_WRAP_MAGIC: &'static [u8; 8] = b"VOIDKEY2";
+    /// Магия обёртки `void.key` v2: Argon2id 32 МиБ, AES-GCM без AAD (чтение старых файлов).
+    const KEY_WRAP_MAGIC_V2: &'static [u8; 8] = b"VOIDKEY2";
+    /// v3: Argon2id 64 МиБ, AES-GCM с AAD `VOIDKEY3`.
+    const KEY_WRAP_MAGIC: &'static [u8; 8] = b"VOIDKEY3";
+    const KEY_WRAP_AAD: &'static [u8] = b"VOIDKEY3";
     const WRAP_SALT_LEN: usize = 32;
     const WRAP_NONCE_LEN: usize = 12;
+    const WRAP_M_COST_KIB_V3: u32 = 65536;
+    const WRAP_M_COST_KIB_V2: u32 = 32768;
+    const VAULT_AAD: &'static [u8] = b"VOID_VAULT.bin\0v2";
 
-    fn derive_wrap_key(password: &[u8], salt: &[u8]) -> Result<[u8; 32], Box<dyn Error>> {
-        let params = Params::new(32768, 3, 4, Some(32)).map_err(|e| e.to_string())?;
+    fn derive_wrap_key(
+        password: &[u8],
+        salt: &[u8],
+        m_cost_kib: u32,
+    ) -> Result<[u8; 32], Box<dyn Error>> {
+        let params = Params::new(m_cost_kib, 3, 4, Some(32)).map_err(|e| e.to_string())?;
         let argon = Argon2::new(Algorithm::Argon2id, Version::V0x13, params);
         let mut key = [0u8; 32];
         argon
@@ -96,12 +106,18 @@ impl Storage {
     ) -> Result<(), Box<dyn Error>> {
         let mut salt = vec![0u8; Self::WRAP_SALT_LEN];
         rand::thread_rng().fill_bytes(&mut salt);
-        let wrap_key = Self::derive_wrap_key(password.as_bytes(), &salt)?;
+        let wrap_key = Self::derive_wrap_key(password.as_bytes(), &salt, Self::WRAP_M_COST_KIB_V3)?;
         let cipher = Aes256Gcm::new(Key::<Aes256Gcm>::from_slice(&wrap_key));
         let mut nonce = [0u8; Self::WRAP_NONCE_LEN];
         rand::thread_rng().fill_bytes(&mut nonce);
         let ct = cipher
-            .encrypt(Nonce::from_slice(&nonce), master_plain.as_ref())
+            .encrypt(
+                Nonce::from_slice(&nonce),
+                Payload {
+                    msg: master_plain.as_ref(),
+                    aad: Self::KEY_WRAP_AAD,
+                },
+            )
             .map_err(|e| format!("wrap key encrypt: {}", e))?;
         let mut blob = Vec::with_capacity(8 + salt.len() + nonce.len() + ct.len());
         blob.extend_from_slice(Self::KEY_WRAP_MAGIC);
@@ -125,18 +141,26 @@ impl Storage {
             return Err("void.key слишком короткий или повреждён".into());
         }
         let (magic, rest) = blob.split_at(Self::KEY_WRAP_MAGIC.len());
-        if magic != Self::KEY_WRAP_MAGIC.as_slice() {
+        let (m_cost, aad): (u32, &[u8]) = if magic == Self::KEY_WRAP_MAGIC.as_slice() {
+            (Self::WRAP_M_COST_KIB_V3, Self::KEY_WRAP_AAD)
+        } else if magic == Self::KEY_WRAP_MAGIC_V2.as_slice() {
+            (Self::WRAP_M_COST_KIB_V2, b"")
+        } else {
             return Err(
-                "void.key без магии VOIDKEY2 (ожидается формат с паролём)".into(),
+                "void.key без магии VOIDKEY3/VOIDKEY2 (ожидается формат с паролём)".into(),
             );
-        }
+        };
         let (salt, rest) = rest.split_at(Self::WRAP_SALT_LEN);
         let (nonce, ct) = rest.split_at(Self::WRAP_NONCE_LEN);
-        let wrap_key = Self::derive_wrap_key(password.as_bytes(), salt)?;
+        let wrap_key = Self::derive_wrap_key(password.as_bytes(), salt, m_cost)?;
         let cipher = Aes256Gcm::new(Key::<Aes256Gcm>::from_slice(&wrap_key));
-        let plain = cipher
-            .decrypt(Nonce::from_slice(nonce), ct.as_ref())
-            .map_err(|_| "Неверный пароль или повреждённый void.key".to_string())?;
+        let nonce_g = Nonce::from_slice(nonce);
+        let plain = if aad.is_empty() {
+            cipher.decrypt(nonce_g, ct.as_ref())
+        } else {
+            cipher.decrypt(nonce_g, Payload { msg: ct, aad })
+        }
+        .map_err(|_| "Неверный пароль или повреждённый void.key".to_string())?;
         if plain.len() != 32 {
             return Err("void.key: некорректная длина мастер-ключа".into());
         }
@@ -151,7 +175,8 @@ impl Storage {
 
     pub(crate) fn is_wrapped_keyfile(raw: &[u8]) -> bool {
         raw.len() >= Self::KEY_WRAP_MAGIC.len()
-            && &raw[..Self::KEY_WRAP_MAGIC.len()] == Self::KEY_WRAP_MAGIC.as_slice()
+            && (&raw[..Self::KEY_WRAP_MAGIC.len()] == Self::KEY_WRAP_MAGIC.as_slice()
+                || &raw[..Self::KEY_WRAP_MAGIC.len()] == Self::KEY_WRAP_MAGIC_V2.as_slice())
     }
 
     pub(crate) fn save(
@@ -245,7 +270,13 @@ impl Storage {
         let nonce = Nonce::from_slice(&nonce_bytes);
 
         let ciphertext = cipher
-            .encrypt(nonce, plaintext.as_ref())
+            .encrypt(
+                nonce,
+                Payload {
+                    msg: plaintext.as_ref(),
+                    aad: Self::VAULT_AAD,
+                },
+            )
             .map_err(|e| format!("Encryption error: {}", e))?;
 
         let mut final_data = nonce_bytes.to_vec();
@@ -379,7 +410,14 @@ impl Storage {
         let nonce = Nonce::from_slice(nonce_bytes);
 
         let plaintext = cipher
-            .decrypt(nonce, ciphertext)
+            .decrypt(
+                nonce,
+                Payload {
+                    msg: ciphertext,
+                    aad: Self::VAULT_AAD,
+                },
+            )
+            .or_else(|_| cipher.decrypt(nonce, ciphertext))
             .map_err(|e| format!("Decryption error: {}", e))?;
 
         if plaintext.len() > Self::VAULT_PLAINTEXT_JSON_MAX {
@@ -641,7 +679,7 @@ pub(crate) fn detect_vault_unlock_kind() -> Result<VaultUnlockKind, String> {
         }
         (true, false, _) if Storage::is_wrapped_keyfile(&raw_key) => Ok(VaultUnlockKind::OpenWrappedKey),
         (true, false, _) => Err(
-            "void.key неизвестного формата (ни 32 байта, ни VOIDKEY2).".into(),
+            "void.key неизвестного формата (ни 32 байта, ни VOIDKEY3/VOIDKEY2).".into(),
         ),
     }
 }

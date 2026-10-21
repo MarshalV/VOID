@@ -5712,6 +5712,8 @@ pub async fn run_chat_network(
                                             transport_sig,
                                             transport_pubkey_pb,
                                             caps,
+                                            ts,
+                                            nonce,
                                         } => {
                                             if peer != local_peer_id {
                                                 if !verify_hello_transport_binding(
@@ -5721,6 +5723,8 @@ pub async fn run_chat_network(
                                                     &ephemeral_key,
                                                     transport_sig.as_slice(),
                                                     transport_pubkey_pb.as_slice(),
+                                                    ts,
+                                                    &nonce,
                                                 ) {
                                                     debug!(
                                                         "[{}] ❌ E2EE: Hello от {} без привязки к libp2p identity — игнор.",
@@ -5770,6 +5774,10 @@ pub async fn run_chat_network(
                                                         &remote_static_pub,
                                                         local_ephem_secret,
                                                         &remote_ephem_pub,
+                                                    );
+                                                    session.bind_peers(
+                                                        &local_peer_id.to_bytes(),
+                                                        &peer.to_bytes(),
                                                     );
                                                     if caps & HELLO_CAP_HEADER_AAD != 0 {
                                                         session.enable_header_aad();
@@ -5838,6 +5846,10 @@ pub async fn run_chat_network(
                                                     &remote_static_pub,
                                                     &remote_ephem_pub,
                                                     local_ephem_secret,
+                                                );
+                                                session.bind_peers(
+                                                    &local_peer_id.to_bytes(),
+                                                    &peer.to_bytes(),
                                                 );
                                                 if caps & HELLO_CAP_HEADER_AAD != 0 {
                                                     session.enable_header_aad();
@@ -6555,6 +6567,8 @@ pub async fn run_chat_network(
                                             transport_sig,
                                             transport_pubkey_pb,
                                             caps,
+                                            ts,
+                                            nonce,
                                         } => {
                                             // Encrypted got Hello instead of Ack: peer has no
                                             // matching session. That Hello's ephem is disposable —
@@ -6684,6 +6698,8 @@ pub async fn run_chat_network(
                                                     &ephemeral_key,
                                                     transport_sig.as_slice(),
                                                     transport_pubkey_pb.as_slice(),
+                                                    ts,
+                                                    &nonce,
                                                 ) {
                                                     debug!(
                                                         "[{}] ❌ E2EE: Hello (ответ) от {} без привязки к libp2p identity — игнор.",
@@ -6721,6 +6737,10 @@ pub async fn run_chat_network(
                                                         &remote_static_pub,
                                                         local_ephem_secret,
                                                         &remote_ephem_pub,
+                                                    );
+                                                    session.bind_peers(
+                                                        &local_peer_id.to_bytes(),
+                                                        &peer.to_bytes(),
                                                     );
                                                     if caps & HELLO_CAP_HEADER_AAD != 0 {
                                                         session.enable_header_aad();

@@ -206,6 +206,8 @@ const MAX_CHAT_TEXT_BYTES: usize = 16 * 1024;
 const MAX_CHAT_TIMESTAMP_BYTES: usize = 64;
 
 const VOID_HELLO_BIND_PREFIX: &[u8] = b"VOID_E2EE_HELLO_BIND_V1\0";
+const VOID_HELLO_BIND_PREFIX_V2: &[u8] = b"VOID_E2EE_HELLO_BIND_V2\0";
+const HELLO_FRESHNESS_SECS: u64 = 10 * 60;
 
 const MAX_HELLO_TRANSPORT_PUBKEY_PB: usize = 4096;
 
@@ -237,7 +239,7 @@ pub(crate) fn void_hello_signing_public_key(
     void_peer_transport_public_key(signer_peer_id)
 }
 
-fn hello_bind_message(
+fn hello_bind_message_v1(
     signer_peer: PeerId,
     recipient_peer: PeerId,
     x25519_static: &[u8; 32],
@@ -252,6 +254,32 @@ fn hello_bind_message(
     v
 }
 
+fn hello_bind_message_v2(
+    signer_peer: PeerId,
+    recipient_peer: PeerId,
+    x25519_static: &[u8; 32],
+    x25519_ephemeral: &[u8; 32],
+    ts: u64,
+    nonce: &[u8; 16],
+) -> Vec<u8> {
+    let mut v = Vec::with_capacity(96 + VOID_HELLO_BIND_PREFIX_V2.len() + 24);
+    v.extend_from_slice(VOID_HELLO_BIND_PREFIX_V2);
+    v.extend_from_slice(&signer_peer.to_bytes());
+    v.extend_from_slice(&recipient_peer.to_bytes());
+    v.extend_from_slice(x25519_static.as_slice());
+    v.extend_from_slice(x25519_ephemeral.as_slice());
+    v.extend_from_slice(&ts.to_le_bytes());
+    v.extend_from_slice(nonce);
+    v
+}
+
+fn hello_now_secs() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0)
+}
+
 pub(crate) fn verify_hello_transport_binding(
     signer_peer_id: PeerId,
     recipient_peer_id: PeerId,
@@ -259,6 +287,8 @@ pub(crate) fn verify_hello_transport_binding(
     x25519_ephemeral: &[u8; 32],
     transport_sig: &[u8],
     transport_pubkey_pb: &[u8],
+    ts: u64,
+    nonce: &[u8; 16],
 ) -> bool {
     const MAX_SIG: usize = 256;
     if transport_sig.is_empty() || transport_sig.len() > MAX_SIG {
@@ -267,12 +297,29 @@ pub(crate) fn verify_hello_transport_binding(
     let Some(pubkey) = void_hello_signing_public_key(signer_peer_id, transport_pubkey_pb) else {
         return false;
     };
-    let msg = hello_bind_message(
-        signer_peer_id,
-        recipient_peer_id,
-        x25519_static,
-        x25519_ephemeral,
-    );
+    let fresh = ts != 0 || nonce.iter().any(|b| *b != 0);
+    let msg = if fresh {
+        let now = hello_now_secs();
+        let skew = now.abs_diff(ts);
+        if skew > HELLO_FRESHNESS_SECS || nonce.iter().all(|b| *b == 0) {
+            return false;
+        }
+        hello_bind_message_v2(
+            signer_peer_id,
+            recipient_peer_id,
+            x25519_static,
+            x25519_ephemeral,
+            ts,
+            nonce,
+        )
+    } else {
+        hello_bind_message_v1(
+            signer_peer_id,
+            recipient_peer_id,
+            x25519_static,
+            x25519_ephemeral,
+        )
+    };
     pubkey.verify(&msg, transport_sig)
 }
 
@@ -282,8 +329,17 @@ fn sign_hello_transport_binding(
     recipient_peer: PeerId,
     x25519_static: &[u8; 32],
     x25519_ephemeral: &[u8; 32],
+    ts: u64,
+    nonce: &[u8; 16],
 ) -> Option<Vec<u8>> {
-    let msg = hello_bind_message(signer_peer, recipient_peer, x25519_static, x25519_ephemeral);
+    let msg = hello_bind_message_v2(
+        signer_peer,
+        recipient_peer,
+        x25519_static,
+        x25519_ephemeral,
+        ts,
+        nonce,
+    );
     transport.sign(&msg).ok()
 }
 
@@ -601,7 +657,7 @@ pub(crate) enum V1Packet {
     Hello {
         public_key: [u8; 32],
         ephemeral_key: [u8; 32],
-        /// Подпись Ed25519 (libp2p identity) над `VOID_E2EE_HELLO_BIND_V1` + peerId||peerId||x25519||ephem.
+        /// Подпись Ed25519 (libp2p identity): v2 — bind + `ts` + `nonce`; v1 — без них (старые клиенты).
         #[serde(default)]
         transport_sig: Vec<u8>,
         /// Если PeerId не identity-multihash: protobuf `PublicKey` для проверки подписи.
@@ -611,6 +667,12 @@ pub(crate) enum V1Packet {
         /// откат к прежнему режиму или отказ сессии, но не чтение.
         #[serde(default)]
         caps: u32,
+        /// Unix-секунды. Старые клиенты шлют 0 — принимается по подписи v1.
+        #[serde(default)]
+        ts: u64,
+        /// Случайные 16 байт; вместе с `ts` входят в подпись v2.
+        #[serde(default)]
+        nonce: [u8; 16],
     },
     /// Обмен известными VOID bootstrap-нодами между участниками (публичные multiaddr).
     BootstrapGossip {
@@ -698,12 +760,17 @@ pub(crate) fn build_v1_hello(
 ) -> Option<V1Packet> {
     let static_b = x25519_static_pubkey.to_bytes();
     let ephem_b = x25519_ephem_pubkey.to_bytes();
+    let ts = hello_now_secs();
+    let mut nonce = [0u8; 16];
+    rand::thread_rng().fill_bytes(&mut nonce);
     let transport_sig = sign_hello_transport_binding(
         transport,
         signer_peer,
         recipient_peer,
         &static_b,
         &ephem_b,
+        ts,
+        &nonce,
     )?;
     let transport_pubkey_pb = if void_peer_transport_public_key(signer_peer).is_some() {
         Vec::new()
@@ -716,6 +783,8 @@ pub(crate) fn build_v1_hello(
         transport_sig,
         transport_pubkey_pb,
         caps: HELLO_CAPS,
+        ts,
+        nonce,
     })
 }
 
@@ -735,4 +804,83 @@ pub(crate) struct FileTransferProgress {
     pub saved_to: String,
     pub peer: PeerId,
     pub kind: file_transfer::FileKind,
+}
+
+#[cfg(test)]
+mod hello_freshness_tests {
+    use super::*;
+    use crate::crypto::{PublicKey, StaticSecret};
+    use libp2p::identity::Keypair;
+
+    #[test]
+    fn v2_signature_roundtrip() {
+        let kp = Keypair::generate_ed25519();
+        let signer = kp.public().to_peer_id();
+        let recipient = Keypair::generate_ed25519().public().to_peer_id();
+        let static_b = PublicKey::from(&StaticSecret::random_from_rng(rand::rngs::OsRng)).to_bytes();
+        let ephem_b = PublicKey::from(&StaticSecret::random_from_rng(rand::rngs::OsRng)).to_bytes();
+        let hello = build_v1_hello(
+            &kp,
+            signer,
+            recipient,
+            PublicKey::from(static_b),
+            PublicKey::from(ephem_b),
+        )
+        .unwrap();
+        let V1Packet::Hello {
+            public_key,
+            ephemeral_key,
+            transport_sig,
+            transport_pubkey_pb,
+            ts,
+            nonce,
+            ..
+        } = hello
+        else {
+            panic!("not hello");
+        };
+        assert!(ts != 0);
+        assert!(nonce.iter().any(|b| *b != 0));
+        assert!(verify_hello_transport_binding(
+            signer,
+            recipient,
+            &public_key,
+            &ephemeral_key,
+            &transport_sig,
+            &transport_pubkey_pb,
+            ts,
+            &nonce,
+        ));
+        assert!(!verify_hello_transport_binding(
+            signer,
+            recipient,
+            &public_key,
+            &ephemeral_key,
+            &transport_sig,
+            &transport_pubkey_pb,
+            ts.saturating_sub(HELLO_FRESHNESS_SECS + 1),
+            &nonce,
+        ));
+    }
+
+    #[test]
+    fn legacy_hello_without_ts_still_verifies() {
+        let kp = Keypair::generate_ed25519();
+        let signer = kp.public().to_peer_id();
+        let recipient = Keypair::generate_ed25519().public().to_peer_id();
+        let static_b = PublicKey::from(&StaticSecret::random_from_rng(rand::rngs::OsRng)).to_bytes();
+        let ephem_b = PublicKey::from(&StaticSecret::random_from_rng(rand::rngs::OsRng)).to_bytes();
+        let msg = hello_bind_message_v1(signer, recipient, &static_b, &ephem_b);
+        let sig = kp.sign(&msg).unwrap();
+        assert!(verify_hello_transport_binding(
+            signer,
+            recipient,
+            &static_b,
+            &ephem_b,
+            &sig,
+            &[],
+            0,
+            &[0u8; 16],
+        ));
+    }
 }
