@@ -4,10 +4,10 @@
 
 # VOID — P2P Messenger
 
-**Децентрализованный, сквозно-шифрованный мессенджер.**
-В репозитории не только приложение: здесь семейство протоколов `/void/…` и десктоп поверх него.
-Без регистрации и облачного аккаунта. Содержимое чата читают только собеседники.
-Поиск в сети и прохождение NAT идут через публичные bootstrap/relay-узлы — это не сервер чата, но и не анонимайзер.
+**A decentralized, end-to-end encrypted messenger.**
+This repository is not only an app: it holds the `/void/…` protocol family and a desktop client on top of it.
+No sign-up, no cloud account. Chat content is readable only by the peers in the conversation.
+Discovery and NAT traversal go through public bootstrap/relay nodes — not a chat server, and not an anonymizer.
 
 <p>
   <img alt="Rust"         src="https://img.shields.io/badge/Rust-2021-CE422B?logo=rust&logoColor=white">
@@ -24,52 +24,52 @@
 
 ---
 
-## Что это
+## What this is
 
-**VOID** (Verified Open Independent Dispatcher) — открытый протокол доставки и P2P-приложение на Rust поверх него. Оба слоя лежат в этом репозитории. Протокол — правила потоков и кадры в `src/` (`protocol`, `crypto`, `network`, `onion`, офлайн-конверт). Приложение — десктоп, который эти правила исполняет для человека. Живой чат идёт **между пирами** по `libp2p`: напрямую в LAN или через **Circuit Relay Hop** на bootstrap-ноде, если оба за NAT. Текст, голос и файлы шифруются **Double Ratchet**. Идентичность — `PeerId` из локального vault, без телефона и почты.
+**VOID** (Verified Open Independent Dispatcher) is an open delivery protocol and a Rust P2P app on top of it. Both layers live in this repository. The protocol is the stream rules and frames in `src/` (`protocol`, `crypto`, `network`, `onion`, offline envelope). The app is the desktop that runs those rules for a person. Live chat goes **peer to peer** over `libp2p`: directly on LAN, or through a **Circuit Relay Hop** on a bootstrap node when both sides are behind NAT. Text, voice, and files are encrypted with **Double Ratchet**. Identity is a `PeerId` from the local vault — no phone number, no email.
 
-Bootstrap-нода нужна, чтобы **найти** собеседника, **зарезервировать Hop** и **хранить офлайн-конверты**. Она не расшифровывает сообщения, но **видит метаданные**: IP, PeerId, кто с кем строит circuit, кому и когда лежит офлайн-почта и какого она размера. Подробнее — [Приватность](#приватность-и-модель-угроз).
+A bootstrap node is needed to **find** a peer, **reserve a Hop**, and **store offline envelopes**. It does not decrypt messages, but it **sees metadata**: IP, PeerId, who builds a circuit with whom, and for whom offline mail sits, when, and how large it is. Details: [Privacy and threat model](#privacy-and-threat-model).
 
-Основной десктоп — **Tauri 2** (`frontend/` + `src-tauri/`). Опционально — нативный UI на **egui** (`cargo run --release --features egui-ui`).
-
----
-
-## Ключевые возможности
-
-- **P2P-чат** — `/void/chat/1.0.0` (request-response). Полезная нагрузка — E2EE (`V1Packet::Encrypted`), поверх — опциональный onion (`VOID_ONION_v1`).
-- **E2EE** — транспорт **Noise**, затем `Hello` (X25519 + подпись Ed25519 к `PeerId`), далее **Double Ratchet** с DH-шагом на каждой смене говорящего и заголовком в AAD.
-- **1-на-1 и группы** — группы с invite `void://group/…`, рассылка каждому участнику (не MLS).
-- **Голос** — запись, превью, WAV по E2EE; в чате плеер. Автоприём, без баннера «принять файл».
-- **Файлы** — до 512 МБ, в том числе пустые (0 байт). Чанки (`VfC1`) и оффер/accept (`VfP1`) идут в E2EE `/void/chat`. `/void/file/1.0.0` — запасной канал, если пир уже на живом TCP.
-- **Офлайн-почта** — store-and-forward на bootstrap (`OfflineMailboxStore` / `Query` / `Deliver`). Конверт v3 подписан libp2p-ключом отправителя, отправитель и тип — внутри `ct`; конверты без подписи не принимаются. На ноде открыт только получатель. Забрать почту может только сам получатель. TTL 7 суток, квоты на отправителя и лимит частоты на ноде.
-- **Свой DHT** — Kademlia `/void/kad/1.0.0`, не IPFS. Текст чата в DHT не пишется.
-- **NAT** — рабочий путь: **Relay v2 Hop** (`listen_on(…/p2p-circuit)` → `ReservationReqAccepted`). DCUtR / AutoNAT / UPnP **выключены** (включаются `VOID_ENABLE_NAT=1`: второй dial к ноде рвёт TCP).
-- **Транспорт клиента** — listen только **TCP :50001**. К bootstrap — один TCP; `/p2p/` на dial снимается, реальный PeerId пишется в vault после Identify. QUIC к ноде клиент не поднимает.
-- **LAN** — mDNS (отключается `VOID_DISABLE_MDNS`).
-- **Один процесс** — `void.instance.lock` + порт TCP `50001`; в Tauri повторный запуск (ярлык, пока окно в трее) поднимает уже работающее окно (`tauri-plugin-single-instance`), а не вторую копию.
-- **Vault** — ник, ключи, контакты, группы в `vault.bin`; мастер-ключ в `void.key`. Журнал — `chat_journal.bin`, недоставленное — `outbox.bin`.
-- **Доставка** — ○ / ✓ / ✓✓; read receipt при открытом чате.
-- **Beacon** — закрытие окна прячет в трей, процесс живёт. В шапке UI — логотип `Image_programm.png`.
-- **Onion** — `VOID_ONION_v1`: 1 живая нода с ключом → 1 hop, 2 → оба, 3+ → до трёх. Живой путь виден в настройках. Скрывает IP отправителя от выхода, но не пару собеседников — см. [onion](#anonymous-routing-void_onion_v1).
+The main desktop is **Tauri 2** (`frontend/` + `src-tauri/`). Optionally a native **egui** UI (`cargo run --release --features egui-ui`).
 
 ---
 
-## Архитектура
+## Features
 
-### Слои приложения
+- **P2P chat** — `/void/chat/1.0.0` (request-response). Payload is E2EE (`V1Packet::Encrypted`), optionally wrapped in onion (`VOID_ONION_v1`).
+- **E2EE** — **Noise** on the transport, then `Hello` (X25519 + Ed25519 signature bound to `PeerId`, freshness `ts`/`nonce`), then **Double Ratchet** with a DH step on every speaker change; the header and both PeerIds go into AAD.
+- **1-to-1 and groups** — groups with invite `void://group/…`, fan-out to each member (not MLS).
+- **Voice** — record, preview, WAV over E2EE; in-chat player. Auto-accept, no “accept file” banner.
+- **Files** — up to 512 MB, including empty (0-byte) files. Chunks (`VfC1`) and offer/accept (`VfP1`) go in E2EE `/void/chat`. `/void/file/1.0.0` is a fallback channel when the peer already has a live TCP connection.
+- **Offline mail** — store-and-forward on bootstrap (`OfflineMailboxStore` / `Query` / `Deliver`). Envelope v3 is signed with the sender’s libp2p key; sender and type sit inside `ct`; unsigned envelopes are rejected. On the node only the recipient is visible. Only the recipient can fetch mail. TTL 7 days, per-uploader quotas and a store rate limit on the node.
+- **Own DHT** — Kademlia `/void/kad/1.0.0`, not IPFS. Chat text is not written to the DHT.
+- **NAT** — working path: **Relay v2 Hop** (`listen_on(…/p2p-circuit)` → `ReservationReqAccepted`). DCUtR / AutoNAT / UPnP are **off** (enable with `VOID_ENABLE_NAT=1`: a second dial to the node tears down TCP).
+- **Client transport** — listen on **TCP :50001** only. One TCP to bootstrap; `/p2p/` is stripped on dial; the real PeerId is written to the vault after Identify. The client does not open QUIC to the node.
+- **LAN** — mDNS (disable with `VOID_DISABLE_MDNS`).
+- **Single process** — `void.instance.lock` + TCP port `50001`; in Tauri a second launch (shortcut while the window is in the tray) raises the running window (`tauri-plugin-single-instance`) instead of a second copy.
+- **Vault** — nickname, keys, contacts, groups in `vault.bin`; master key in `void.key`. Journal — `chat_journal.bin`, undelivered — `outbox.bin`.
+- **Delivery** — ○ / ✓ / ✓✓; read receipt when the chat is open.
+- **Beacon** — closing the window hides to tray; the process stays up. UI header uses `Image_programm.png`.
+- **Onion** — `VOID_ONION_v1`: 1 live node with a key → 1 hop, 2 → both, 3+ → up to three. The live path is shown in settings. Hides the sender IP from the exit, not the pair of peers — see [onion](#anonymous-routing-void_onion_v1).
+
+---
+
+## Architecture
+
+### Application layers
 
 ```
 ┌─────────────────────────────────────────────────────────────┐
 │  frontend/          HTML / CSS / JS (webview)               │
-│  события: void://snapshot (~120 мс), void://message, …      │
+│  events: void://snapshot (~120 ms), void://message, …       │
 └────────────────────────────┬────────────────────────────────┘
                              │ Tauri commands
 ┌────────────────────────────▼────────────────────────────────┐
-│  src-tauri/         окно, трей, emit в JS                   │
+│  src-tauri/         window, tray, emit to JS                │
 └────────────────────────────┬────────────────────────────────┘
                              │ VoidRuntime
 ┌────────────────────────────▼────────────────────────────────┐
-│  src/bridge.rs      vault, журнал, outbox, SnapshotDto      │
+│  src/bridge.rs      vault, journal, outbox, SnapshotDto     │
 │                     UICommand ──►  NetworkEvent ◄── swarm   │
 └────────────────────────────┬────────────────────────────────┘
                              │
@@ -80,425 +80,425 @@ Bootstrap-нода нужна, чтобы **найти** собеседника,
 └─────────────────────────────────────────────────────────────┘
 ```
 
-| Модуль | Роль |
+| Module | Role |
 |--------|------|
-| `src/network.rs` | Swarm, dial bootstrap, Hop, RR-чат, mailbox, gossip |
-| `src/bridge.rs` | Головаless runtime для Tauri: snapshot push, не poll |
+| `src/network.rs` | Swarm, dial bootstrap, Hop, RR chat, mailbox, gossip |
+| `src/bridge.rs` | Headless runtime for Tauri: snapshot push, not poll |
 | `src/protocol.rs` | `V1Packet` (`Hello`, `Encrypted`, mailbox, onion, …) |
-| `src/crypto.rs` | Handshake + Double Ratchet (DH-шаг, заголовок в AAD) |
-| `src/onion.rs` | Слои onion на живых bootstrap с `;onion=` в Identify |
-| `src/offline_mail.rs` | Seal конверта на ключ из PeerId получателя |
-| `src/relay_mailbox.rs` | Локальный ящик для LAN без bootstrap: клиент хранит письма соседей и отдаёт их владельцу по Query |
-| `src/hello_replay.rs` | Кэш эфемерных ключей принятых `Hello` (повтор не сбрасывает сессию) |
-| `src/vault.rs` / `paths.rs` | Vault, каталог данных, instance lock |
-| `src/bootstrap.rs` | Склейка seed: vault, env, HTTP, вшитый список |
-| `src/file_transfer.rs` / `voice.rs` / `group.rs` | Файлы, голос, группы |
+| `src/crypto.rs` | Handshake + Double Ratchet (DH step, header and PeerId in AAD) |
+| `src/onion.rs` | Onion layers over live bootstraps with `;onion=` in Identify |
+| `src/offline_mail.rs` | Seal envelope to a key derived from the recipient PeerId |
+| `src/relay_mailbox.rs` | Local mailbox for LAN without bootstrap: the client stores neighbours’ mail and serves it to the owner on Query |
+| `src/hello_replay.rs` | Cache of accepted `Hello` ephemeral keys; together with `ts`/`nonce` in the signature, a replay cannot reset the session |
+| `src/vault.rs` / `paths.rs` | Vault, data directory, instance lock |
+| `src/bootstrap.rs` | Seed merge: vault, env, HTTP, built-in list |
+| `src/file_transfer.rs` / `voice.rs` / `group.rs` | Files, voice, groups |
 
-UI **не** крутит `get_snapshot` по таймеру в обычном режиме. Состояние уходит событием `void://snapshot` (флашер ~120 мс, `revision` монотонный). Пока в статусе `Hop…`, UI дополнительно опрашивает снимок, чтобы не зависнуть на «ждём Ack».
+The UI does **not** poll `get_snapshot` on a timer in normal mode. State goes out as `void://snapshot` (flusher ~120 ms, monotonic `revision`). While status is `Hop…`, the UI also polls the snapshot so it does not stick on “waiting for Ack”.
 
-### Строка статуса
+### Status line
 
-Пример: `в сети · Hop OK · 12D3KooW… · live 1 · контакты 0 · bootstrap 1/2`
+Example: `online · Hop OK · 12D3KooW… · live 1 · contacts 0 · bootstrap 1/2`
 
-Пока Hop нет, к «в сети» добавляется `через ноду` (чат ящиком). Пока ждём Ack — ещё `Hop…`.
+Until Hop exists, `via node` is appended (mailbox chat). While waiting for Ack — also `Hop…`.
 
-| Кусок | Смысл |
-|-------|--------|
-| `в сети` | Есть TCP хотя бы к одной bootstrap-ноде |
-| `через ноду` | Нода жива, **Hop ещё нет** (чат ящиком, live-circuit нет) |
-| `Hop…` | `listen_on(…/p2p-circuit)` ушёл, ждём Ack |
-| `Hop OK` | Резервация принята (или UI подтвердил её ~2.5 с спустя, если событие Ack не всплыло) |
-| `нет Hop` | Нода есть, запрос резервации не висит |
-| `live N` | Число живых TCP: bootstrap + контакты |
-| `контакты N` | Живые чат-пиры (**без** bootstrap) |
-| `bootstrap A/B` | `A` — сколько seed сейчас на TCP; `B` — сколько адресов в vault. `1/2` = одна нода жива из двух в списке |
+| Fragment | Meaning |
+|----------|---------|
+| `online` | TCP to at least one bootstrap node |
+| `via node` | Node is alive, **Hop not yet** (mailbox chat, no live circuit) |
+| `Hop…` | `listen_on(…/p2p-circuit)` sent, waiting for Ack |
+| `Hop OK` | Reservation accepted (or the UI confirmed it ~2.5 s later if the Ack event did not surface) |
+| `no Hop` | Node is there, no reservation request pending |
+| `live N` | Live TCP count: bootstrap + contacts |
+| `contacts N` | Live chat peers (**excluding** bootstrap) |
+| `bootstrap A/B` | `A` — how many seeds currently on TCP; `B` — how many addresses in the vault. `1/2` = one node live out of two in the list |
 
-`1/2` — не ошибка: клиент сначала держит **одну** основную ноду (`147.78.64.22:4001`), вторую добирает после Hop. Для NAT и ящика достаточно одной с `Hop OK`.
+`1/2` is not an error: the client first holds **one** primary node (`147.78.64.22:4001`) and picks up the second after Hop. One node with `Hop OK` is enough for NAT and the mailbox.
 
-### Как два клиента встречаются
+### How two clients meet
 
 ```
 Alice                         Bootstrap                         Bob
-  │ TCP :4001 (без проверки /p2p/)  │
+  │ TCP :4001 (no /p2p/ check)      │
   │ Identify /void/v1               │
-  │ vault: реальный PeerId ноды     │
+  │ vault: live node PeerId         │
   │ listen …/p2p/<node>/p2p-circuit │
   │ ◄── ReservationReqAccepted ──── │
-  │          «Hop OK»               │
+  │          “Hop OK”               │
   │                                 │
   │  dial …/p2p-circuit/p2p/<Bob>   │
-  │  (после Hop; LAN/mDNS отдельно) │
+  │  (after Hop; LAN/mDNS separate) │
   │                                 │
   │ Hello → Double Ratchet          │
-  │ Encrypted  (опц. Onion-обёртка) │
+  │ Encrypted  (optional onion wrap)│
 ```
 
-1. Один TCP на `IP:4001`. `/p2p/` с dial снимается (`DialOpts::unknown_peer_id()`), иначе старый PeerId в vault рвёт Noise за 1 мс.
-2. После Identify клиент переписывает bootstrap в vault на **живой** PeerId ноды.
-3. Hop: один `listen_on(/ip4/…/tcp/4001/p2p/<node>/p2p-circuit)` **после Identify** (~1.5 с). Повтор только если Hop всё ещё pending (cooldown ~3 с), без спама Reserve. В статусе **Hop OK** после `ReservationReqAccepted`; если событие не дошло до UI — через ~2.5 с при живом TCP.
-4. Circuit к контакту — **после** Hop (пауза ~8 с после Ack), один адрес живого relay, при `NoReservation` пауза ~45 с. LAN/mDNS — отдельно, без подмешивания circuit в тот же dial.
-5. `DialBack` просит собеседника набрать нас по circuit (асимметрия NAT).
-6. Пока Hop нет, почта на bootstrap не долбит HOP-стримы (откладывается до Ack или ~90 с).
+1. One TCP to `IP:4001`. `/p2p/` is stripped from the dial (`DialOpts::unknown_peer_id()`); otherwise a stale PeerId in the vault breaks Noise in 1 ms.
+2. After Identify the client rewrites the bootstrap in the vault to the node’s **live** PeerId.
+3. Hop: one `listen_on(/ip4/…/tcp/4001/p2p/<node>/p2p-circuit)` **after Identify** (~1.5 s). Retry only if Hop is still pending (cooldown ~3 s), no Reserve spam. Status is **Hop OK** after `ReservationReqAccepted`; if the event never reached the UI — after ~2.5 s with live TCP.
+4. Circuit to a contact — **after** Hop (pause ~8 s after Ack), one address of the live relay; on `NoReservation` pause ~45 s. LAN/mDNS is separate, not mixed into the same dial.
+5. `DialBack` asks the peer to dial us over circuit (NAT asymmetry).
+6. Until Hop exists, mail to bootstrap does not hammer HOP streams (deferred until Ack or ~90 s).
 
-Две копии VOID с одним vault дают два TCP на одну ноду — оба сразу `yamux Closed`. Поэтому instance lock, отказ если `:50001` занят, и в Tauri — один экземпляр окна.
+Two VOID copies on one vault open two TCPs to the same node — both go `yamux Closed` immediately. Hence the instance lock, refuse if `:50001` is taken, and in Tauri a single window.
 
-### Сетевой стек (`libp2p`)
+### Network stack (`libp2p`)
 
-| Слой | Как сейчас |
-|------|------------|
-| Listen клиента | TCP `0.0.0.0:50001`. QUIC listen **нет** |
-| Dial bootstrap | один TCP на `host/tcp/port`; QUIC к ноде отфильтрован |
-| Мультиплексор | Yamux (до 512 стримов на клиенте; на ноде Hop чувствителен к спаму RR) |
-| Канал | Noise |
-| Identify | `/void/v1`; bootstrap узнаётся по `agent_version` `void-bootstrap-node…` |
-| Чат | `/void/chat/1.0.0` |
-| Файлы (оффер, fallback) | `/void/file/1.0.0` |
-| Оффер/чанки файла и голоса | E2EE-кадры `VfP1` / `VfC1` внутри `/void/chat` |
-| DHT | `/void/kad/1.0.0`, `Mode::Server`, k-bucket **Manual** (адреса после живого TCP) |
-| Discovery | mDNS + Kademlia + список bootstrap |
-| Relay | клиент: `relay::client`; Hop = `ReservationReqAccepted` |
-| DCUtR / AutoNAT / UPnP | `Toggle::off`, пока нет `VOID_ENABLE_NAT=1` |
+| Layer | Current |
+|-------|---------|
+| Client listen | TCP `0.0.0.0:50001`. **No** QUIC listen |
+| Dial bootstrap | one TCP to `host/tcp/port`; QUIC to the node is filtered out |
+| Multiplexer | Yamux (up to 512 streams on the client; Hop on the node is sensitive to RR spam) |
+| Channel | Noise |
+| Identify | `/void/v1`; bootstrap is recognized by `agent_version` `void-bootstrap-node…` |
+| Chat | `/void/chat/1.0.0` |
+| Files (offer, fallback) | `/void/file/1.0.0` |
+| File/voice offer and chunks | E2EE frames `VfP1` / `VfC1` inside `/void/chat` |
+| DHT | `/void/kad/1.0.0`, `Mode::Server`, k-bucket **Manual** (addresses after live TCP) |
+| Discovery | mDNS + Kademlia + bootstrap list |
+| Relay | client: `relay::client`; Hop = `ReservationReqAccepted` |
+| DCUtR / AutoNAT / UPnP | `Toggle::off` until `VOID_ENABLE_NAT=1` |
 
-Выделенного сервера переписки нет. Relay таскает непрозрачные байты circuit. Офлайн-конверты **лежат на ноде** до выдачи (`take_batch`) или TTL.
+There is no dedicated chat server. Relay carries opaque circuit bytes. Offline envelopes **sit on the node** until fetch (`take_batch`) or TTL.
 
-Kademlia `start_providing` — после Identify с чат-пиром (не с bootstrap). `kad.bootstrap()` — ~30 с **после** Hop Ack, не в момент первого TCP (иначе второй dial убивает сессию).
+Kademlia `start_providing` — after Identify with a chat peer (not bootstrap). `kad.bootstrap()` — ~30 s **after** Hop Ack, not at first TCP (otherwise a second dial kills the session).
 
-#### Надёжность
+#### Reliability
 
-| Механизм | Поведение |
-|----------|-----------|
-| Dial bootstrap | один endpoint (`host/tcp/port`), cooldown, без параллельного QUIC |
-| Автореконнект контакта | тик ~5 с; circuit только после Hop, backoff ~45 с после `NoReservation` |
-| Hop | один `listen_on` после Identify (~1.5 с); повтор только если pending (cooldown ~3 с) |
-| KAD | `kad.bootstrap()` ~30 с **после** Hop Ack, затем periodic 5 мин |
-| E2EE Hello | при `ConnectionEstablished` с контактом (не с bootstrap) |
-| Ретрай исходящих | `RESEND_GRACE` 1 с, экспоненциально до 300 с |
-| Групповой голос | fan-out + повтор `SendGroupMessage` (~8 с), пока WAV не уйдёт |
-| Недоставленное | `outbox.bin` → `OfflineMailboxStore` на bootstrap (Ack ноды = handoff; отказ ноды — письмо остаётся в `outbox.bin`) |
-| Офлайн-ящик | Query к bootstrap после Hop; не чаще ~750 мс; остаток порции — через ~500 мс |
+| Mechanism | Behaviour |
+|-----------|-----------|
+| Dial bootstrap | one endpoint (`host/tcp/port`), cooldown, no parallel QUIC |
+| Contact reconnect | tick ~5 s; circuit only after Hop, backoff ~45 s after `NoReservation` |
+| Hop | one `listen_on` after Identify (~1.5 s); retry only if pending (cooldown ~3 s) |
+| KAD | `kad.bootstrap()` ~30 s **after** Hop Ack, then every 5 min |
+| E2EE Hello | on `ConnectionEstablished` with a contact (not bootstrap) |
+| Outbound retry | `RESEND_GRACE` 1 s, exponential up to 300 s |
+| Group voice | fan-out + retry `SendGroupMessage` (~8 s) until the WAV is gone |
+| Undelivered | `outbox.bin` → `OfflineMailboxStore` on bootstrap (node Ack = handoff; node refusal — the letter stays in `outbox.bin`) |
+| Offline mailbox | Query bootstrap after Hop; at most ~750 ms; remainder of a batch ~500 ms later |
 
-### Поиск собеседника
+### Finding a peer
 
-Нужны **bootstrap multiaddr** с `/p2p/<PeerId>` в vault (после первого успешного Identify PeerId ноды подставляется сам). Вшитый seed: `/ip4/147.78.64.22/tcp/4001/p2p/12D3KooWCAH8ykDMThNRRVLAM6LnuVrJeoZrQADzHC2x6ddhZxyG`. Референс ноды: [`MarshalV/bootstrap_node`](https://github.com/MarshalV/bootstrap_node).
+You need **bootstrap multiaddrs** with `/p2p/<PeerId>` in the vault (after the first successful Identify the node PeerId is filled in). Built-in seed: `/ip4/147.78.64.22/tcp/4001/p2p/12D3KooWCAH8ykDMThNRRVLAM6LnuVrJeoZrQADzHC2x6ddhZxyG`. Reference node: [`MarshalV/bootstrap_node`](https://github.com/MarshalV/bootstrap_node).
 
-Источники (склеиваются, дедуп):
+Sources (merged, deduped):
 
-1. Вшитые (`BUILTIN_VOID_BOOTSTRAP` / `VOID_BUILTIN_BOOTSTRAP`).
-2. HTTP(S) список (`VOID_BOOTSTRAP_URL` / `VOID_BOOTSTRAP_PUBLIC_LIST_URL`), ~256 KiB. Опционально `VOID_BOOTSTRAP_TRUSTED_HOSTS`, pin `VOID_BOOTSTRAP_TLS_LEAF_SHA256`.
-3. `VOID_BOOTSTRAP` — multiaddr через запятую.
-4. Разовый импорт `void-bootstrap.txt` рядом с бинарём → vault. Опционально Ed25519 (`VOID_BOOTSTRAP_SIGNING_PUB_HEX`).
-5. UI: настройки bootstrap.
+1. Built-in (`BUILTIN_VOID_BOOTSTRAP` / `VOID_BUILTIN_BOOTSTRAP`).
+2. HTTP(S) list (`VOID_BOOTSTRAP_URL` / `VOID_BOOTSTRAP_PUBLIC_LIST_URL`), ~256 KiB. Optional `VOID_BOOTSTRAP_TRUSTED_HOSTS`, pin `VOID_BOOTSTRAP_TLS_LEAF_SHA256`.
+3. `VOID_BOOTSTRAP` — comma-separated multiaddrs.
+4. One-shot import of `void-bootstrap.txt` next to the binary → vault. Optional Ed25519 (`VOID_BOOTSTRAP_SIGNING_PUB_HEX`).
+5. UI: bootstrap settings.
 
-Клиенты ещё **гоняют** публичные seed друг другу (`BootstrapGossip`, до 32 адресов).
+Clients also **gossip** public seeds to each other (`BootstrapGossip`, up to 32 addresses).
 
 ```powershell
 $env:VOID_BOOTSTRAP = "/ip4/147.78.64.22/tcp/4001/p2p/12D3KooW..."
 ```
 
-В поле подключения: `multiaddr`, `IP` или `IP:PORT`. Для bootstrap в списке seed обязателен суффикс `/p2p/<PeerId>` (после коннекта он должен совпасть с Identify ноды).
+In the connect field: `multiaddr`, `IP`, or `IP:PORT`. A bootstrap in the seed list must have `/p2p/<PeerId>` (after connect it must match the node’s Identify).
 
-### Протокол `/void/chat/1.0.0`
+### Protocol `/void/chat/1.0.0`
 
-| Пакет | Назначение |
-|-------|------------|
-| `Hello` | X25519 + подпись identity; `caps` — возможности (`1` = заголовок ratchet в AAD); `ts` + `nonce` входят в подпись (окно ±10 мин). Старые клиенты без `ts` принимаются по подписи v1 |
+| Packet | Purpose |
+|--------|---------|
+| `Hello` | X25519 + identity signature; `caps` — capabilities (`1` = ratchet header in AAD); `ts` + `nonce` are in the signature (±10 min window). Old clients without `ts` are accepted under v1 signature |
 | `Encrypted` | Double Ratchet |
-| `Ack` | RR-ответ / пустой ящик / письмо принято нодой |
-| `OfflineMailboxStore` / `Query` / `Deliver` | офлайн-почта на bootstrap; `Query` выполняется только для собственного PeerId; пустой `Deliver` в ответ на `Store` — отказ |
-| `PrekeyPut` / `Get` / `Offer` | Каталог X25519 prekey. Для Ed25519 PeerId не нужен (ключ выводится из PeerId); ответ ноды без подписи владельца для seal не используется; непрошеный `Offer` игнорируется |
-| `BootstrapGossip` | обмен seed |
-| `DialBack` | «набери меня по circuit» |
-| `Onion` / `OnionDrop` | слои `VOID_ONION_v1`. `OnionDrop` принимается только от bootstrap, объявившего `;onion=` в своём Identify; внутри — только `Hello` / `Encrypted` / `Ack` |
+| `Ack` | RR reply / empty mailbox / node accepted the letter |
+| `OfflineMailboxStore` / `Query` / `Deliver` | offline mail on bootstrap; `Query` runs only for own PeerId; empty `Deliver` in reply to `Store` is a refusal |
+| `PrekeyPut` / `Get` / `Offer` | X25519 prekey directory. Not needed for Ed25519 PeerId (key is derived from PeerId); a node reply without the owner’s signature is not used for seal; unsolicited `Offer` is ignored |
+| `BootstrapGossip` | seed exchange |
+| `DialBack` | “dial me over circuit” |
+| `Onion` / `OnionDrop` | `VOID_ONION_v1` layers. `OnionDrop` is accepted only from a bootstrap that advertised `;onion=` in its own Identify; inside — only `Hello` / `Encrypted` / `Ack` |
 
-JSON RR: запрос до 4 МиБ, ответ до 16 МиБ (голосовые офлайн-чанки).
+JSON RR: request up to 4 MiB, response up to 16 MiB (offline voice chunks).
 
-### Сквозное шифрование (`src/crypto.rs`)
+### End-to-end encryption (`src/crypto.rs`)
 
-| Этап | Алгоритм |
-|------|----------|
-| Транспорт | **Noise** |
-| Handshake | статический + эфемерный **X25519** в `Hello`, **Ed25519** к `PeerId` |
-| Ratchet | **Double Ratchet**: первый DH-шаг делает инициатор сразу после `Hello`, дальше новый DH-ключ на каждую смену говорящего; заголовок (`dh_pub`, `pn`, `n`) и PeerId обеих сторон — AAD, если оба клиента объявили это в `Hello.caps` |
+| Stage | Algorithm |
+|-------|-----------|
+| Transport | **Noise** |
+| Handshake | static + ephemeral **X25519** in `Hello`, **Ed25519** bound to `PeerId` |
+| Ratchet | **Double Ratchet**: the initiator takes the first DH step right after `Hello`, then a new DH key on every speaker change; header (`dh_pub`, `pn`, `n`) and both PeerIds are AAD if both clients advertised this in `Hello.caps` |
 | KDF | **HKDF-SHA256** |
-| AEAD чата / onion / офлайн `ct` | **ChaCha20-Poly1305** |
-| Vault / журнал / кэш файлов | **AES-256-GCM** |
-| Целостность файла | **BLAKE2b-512** (первые 32 байта) |
-| Память ключей | `zeroize` |
-| Skipped keys | до **4096** всего, не больше **1000** на один заголовок, TTL 1 ч |
+| AEAD for chat / onion / offline `ct` | **ChaCha20-Poly1305** |
+| Vault / journal / file cache | **AES-256-GCM** |
+| File integrity | **BLAKE2b-512** (first 32 bytes) |
+| Key memory | `zeroize` |
+| Skipped keys | up to **4096** total, at most **1000** per header, TTL 1 h |
 
-Со старым клиентом сессия жива: DH-шаг не крутится, кадры без AAD. Со старой нодой на onion поле `caps` теряется — то же самое, без поломки. Новую ноду лучше обновить вместе с клиентом.
+A session with an old client still works: no DH step, frames without AAD, `Hello` without `ts` accepted under v1 signature. **Update the node together with the client:** an old node on the onion path drops `ts`/`nonce`/`caps`, and a new `Hello` over onion will fail. Seed between an old and a new node will not complete either.
 
-Офлайн-конверт v3 (`src/offline_mail.rs`):
+Offline envelope v3 (`src/offline_mail.rs`):
 
-- `ct` — ChaCha20-Poly1305 на ключ из X25519(эфемерный, ключ получателя из его PeerId — см. [Prekey](#prekey)), HKDF с `eph` и ключом получателя;
-- внутри `ct` — отправитель, `sender_pk`, `message_id`, `kind`, тело и подпись libp2p-ключа отправителя над ними, получателем и `eph`; тело выравнивается (степень двойки от 512 Б до 4 КиБ, дальше кратно 4 КиБ);
-- снаружи `sender` и `kind` пустые, `sender_pk` нулевой, `message_id` — хэш от получателя и настоящего id (нода дедуплицирует повторы, но не связывает письма разных получателей);
-- внешний id, получатель и `eph` — AAD шифра: нода не может переписать id или перенаправить конверт;
-- получатель принимает `dm` / `group` только если `sender_id` внутри совпадает с подписью; `group_sync` — от подписавшего;
-- принимаются v3 и v2 (подписанный, поля открыты); v1 (без подписи) отбрасывается. **Несовместимо со старыми клиентами** — обновлять всех участников.
+- `ct` — ChaCha20-Poly1305 to a key from X25519(ephemeral, recipient key from their PeerId — see [Prekey](#prekey)), HKDF with `eph` and the recipient key;
+- inside `ct` — sender, `sender_pk`, `message_id`, `kind`, body, and a signature of the sender’s libp2p key over those, the recipient, and `eph`; body is padded (power of two from 512 B to 4 KiB, then multiples of 4 KiB);
+- outside, `sender` and `kind` are empty, `sender_pk` is zero, `message_id` is a hash of the recipient and the real id (the node can dedupe repeats but cannot link letters of different recipients);
+- external id, recipient, and `eph` are cipher AAD: the node cannot rewrite the id or redirect the envelope;
+- the recipient accepts `dm` / `group` only if inner `sender_id` matches the signature; `group_sync` is from the signer;
+- v3 and v2 (signed, fields in the clear) are accepted; v1 (unsigned) is dropped. **Incompatible with old clients** — update every participant.
 
-Нода видит получателя (ключ ящика), время и размер с точностью до бакета.
+The node sees the recipient (mailbox slot), time, and size to bucket accuracy.
 
 ### Prekey
 
-Офлайн-письмо запечатывается к X25519-ключу, **выведенному из PeerId получателя**: PeerId содержит Ed25519-ключ, он переводится в X25519 (Edwards → Montgomery, как `crypto_sign_ed25519_pk_to_curve25519` в libsodium). Секрет — скаляр того же Ed25519-ключа. Ключ нигде не раздаётся, поэтому подменить его нельзя — ни ноде, ни участнику DHT, ни контакту. Первое письмо уходит сразу, без `Hello` и без каталога.
+An offline letter is sealed to an X25519 key **derived from the recipient PeerId**: the PeerId contains an Ed25519 key, converted to X25519 (Edwards → Montgomery, same as `crypto_sign_ed25519_pk_to_curve25519` in libsodium). The secret is the scalar of that same Ed25519 key. The key is never distributed, so it cannot be swapped — not by the node, not by a DHT participant, not by a contact. The first letter goes out immediately, without `Hello` and without a directory.
 
-Получатель пробует identity-секрет и старый static prekey (письма, запечатанные до обновления).
+The recipient tries the identity secret and the old static prekey (letters sealed before the upgrade).
 
-Каталог prekey (`PrekeyPut` на bootstrap, DHT `/void/prekey/<peer>` с подписью владельца) клиент по-прежнему публикует, но для запечатывания использует только для не-Ed25519 PeerId:
+The prekey directory (`PrekeyPut` on bootstrap, DHT `/void/prekey/<peer>` with the owner’s signature) is still published, but used for sealing only for non-Ed25519 PeerIds:
 
-| Источник | Принимается (только не-Ed25519 PeerId) |
-|----------|-------------|
-| `Hello` с подписью к `PeerId` | да |
-| DHT `/void/prekey/<peer>`: `pk[32]` + подпись libp2p-ключа владельца | да, если подпись верна |
-| DHT-запись без подписи (старый формат) | нет |
-| `PrekeyOffer` от bootstrap | нет — у ноды нет подписи владельца |
-| `PrekeyOffer` без своего `PrekeyGet` | нет |
+| Source | Accepted (non-Ed25519 PeerId only) |
+|--------|-------------|
+| `Hello` signed to `PeerId` | yes |
+| DHT `/void/prekey/<peer>`: `pk[32]` + owner libp2p signature | yes, if the signature verifies |
+| DHT record without a signature (old format) | no |
+| `PrekeyOffer` from bootstrap | no — the node has no owner signature |
+| `PrekeyOffer` without our own `PrekeyGet` | no |
 
-Ключ долгоживущий: утечка libp2p-ключа раскрывает лежащую в ящиках офлайн-почту (прямой секретности у офлайн-почты нет).
+The key is long-lived: leaking the libp2p key reveals offline mail sitting in mailboxes (offline mail has no forward secrecy).
 
-### Офлайн-почта
+### Offline mail
 
-Живой путь — **не DHT**, а RR к bootstrap:
+The live path is **not DHT**, it is RR to bootstrap:
 
-1. Получатель офлайн → ключ из его PeerId → `OfflineMailboxStore`. Нода отвечает `Ack`, если сохранила; пустой `Deliver` — отказ по квоте или частоте, письмо остаётся в очереди и уйдёт позже.
-2. Получатель online → `OfflineMailboxQuery`; нода отдаёт порцию (`take_batch` ≤ 512 КиБ plaintext) и **удаляет** её из `relay_mailbox.bin`. Почту выдают только самому получателю: PeerId соединения должен совпасть с `recipient`.
-3. Клиент забирает остаток следующим Query, с паузой (без немедленного ре-query: иначе тот же batch крутится сотни раз в секунду и душит Hop).
+1. Recipient offline → key from their PeerId → `OfflineMailboxStore`. The node replies `Ack` if it stored; empty `Deliver` is a quota/rate refusal — the letter stays queued and will retry later.
+2. Recipient online → `OfflineMailboxQuery`; the node returns a batch (`take_batch` ≤ 512 KiB plaintext) and **deletes** it from `relay_mailbox.bin`. Mail is given only to the recipient: the connection PeerId must match `recipient`.
+3. The client fetches the rest with the next Query, with a pause (no immediate re-query: otherwise the same batch spins hundreds of times per second and chokes Hop).
 
-Лимиты ноды: срок жизни конверта 7 суток, до 256 конвертов / 8 МиБ от одного отправителя в одном ящике, `Store` не чаще 600 запросов в минуту с пира.
+Node limits: envelope lifetime 7 days, up to 256 envelopes / 8 MiB from one sender in one mailbox, `Store` at most 600 requests per minute per peer.
 
-При настроенных bootstrap письма уходят только на них. Без bootstrap (LAN) копии получают подключённые пиры — тогда клиент сам отвечает на Query из локального `relay_mailbox.bin`, тоже только владельцу ящика.
+With bootstraps configured, letters go only to them. Without bootstrap (LAN), connected peers get copies — then the client itself answers Query from local `relay_mailbox.bin`, also only to the mailbox owner.
 
 ### Anonymous routing (`VOID_ONION_v1`)
 
-Слой **поверх** libp2p и E2EE. Ключ hop'а — `onion=<64 hex>` в Identify `agent_version` ноды.
+A layer **on top of** libp2p and E2EE. Hop key is `onion=<64 hex>` in the node Identify `agent_version`.
 
 ```
 Alice → Node A → [Node B → Node C] → Bob
 ```
 
-| Живые ноды с onion-ключом | Цепочка |
-|---------------------------|---------|
-| 0 | onion нет — circuit / прямой RR |
-| 1 | один hop: нода после unwrap видит пару Alice↔Bob |
-| 2 | оба hop'а |
-| 3+ | до трёх случайных; entry не видит Bob, exit не видит IP Alice |
+| Live nodes with an onion key | Chain |
+|------------------------------|-------|
+| 0 | no onion — circuit / direct RR |
+| 1 | one hop: after unwrap the node sees the Alice↔Bob pair |
+| 2 | both hops |
+| 3+ | up to three random; entry does not see Bob, exit does not see Alice’s IP |
 
-Что видит каждый участник цепочки из трёх:
+What each party in a three-hop chain sees:
 
-| Участник | Видит |
-|----------|-------|
-| Entry | IP и PeerId Alice, следующий hop, размер |
-| Middle | соседние hop'ы, размер |
-| Exit | **PeerId Alice и PeerId Bob** (`OnionDrop.src`), тип пакета, размер |
+| Party | Sees |
+|-------|------|
+| Entry | Alice’s IP and PeerId, next hop, size |
+| Middle | neighbouring hops, size |
+| Exit | **Alice’s PeerId and Bob’s PeerId** (`OnionDrop.src`), packet type, size |
 
-Ограничения `VOID_ONION_v1`:
+Limits of `VOID_ONION_v1`:
 
-- exit знает пару Alice↔Bob; скрыт только IP Alice;
-- путь выбирается **заново для каждого пакета** — за разговор пару узнают многие exit;
-- onion не используется, если Bob уже подключён напрямую (LAN, circuit, DCUtR), и при ошибке обёртки (слишком большой пакет) — тогда пакет уходит **напрямую**;
-- размеры ячеек не выравниваются, ключи hop'ов не ротируются.
+- exit knows the Alice↔Bob pair; only Alice’s IP is hidden;
+- the path is chosen **anew for every packet** — over a conversation many exits learn the pair;
+- onion is not used if Bob is already connected directly (LAN, circuit, DCUtR), or if wrap fails (packet too large) — then the packet goes **direct**;
+- cell sizes are not padded, hop keys are not rotated.
 
-Живой маршрут (PeerId hop'ов) показывается в настройках. Старые ноды без `;onion=` в цепочку не входят. Это не mixnet и не защита от глобального наблюдателя. DCUtR (если включён) может открыть прямой канал и снова связать IP.
+The live route (hop PeerIds) is shown in settings. Old nodes without `;onion=` are not put in the chain. This is not a mixnet and not protection against a global observer. DCUtR (if enabled) can open a direct channel and link IPs again.
 
-### Файлы (`src/file_transfer.rs`)
+### Files (`src/file_transfer.rs`)
 
-| Параметр | Значение |
-|----------|----------|
-| Чанк | 32 КБ |
-| Макс. размер | 512 МБ (0 байт разрешён) |
-| Оффер / Accept | E2EE `VfP1` в `/void/chat`; `/void/file` если пир уже connected |
-| Чанки | E2EE `VfC1` в `/void/chat` |
-| Кэш | `%APPDATA%\VOID\files` (и аналоги) — AES-256-GCM, `*.vfc` |
-| Ключ кэша | HKDF-SHA256 от мастер-ключа (`VOID_FILE_CACHE_v1`) |
-| «Скачать» | копия в `Загрузки/VOID Messenger/` |
-| Удаление из чата | только кэш |
-| Через circuit | ~64 КБ/с |
+| Parameter | Value |
+|-----------|-------|
+| Chunk | 32 KB |
+| Max size | 512 MB (0 bytes allowed) |
+| Offer / Accept | E2EE `VfP1` in `/void/chat`; `/void/file` if the peer is already connected |
+| Chunks | E2EE `VfC1` in `/void/chat` |
+| Cache | `%APPDATA%\VOID\files` (and equivalents) — AES-256-GCM, `*.vfc` |
+| Cache key | HKDF-SHA256 from the master key (`VOID_FILE_CACHE_v1`) |
+| “Download” | copy to `Downloads/VOID Messenger/` |
+| Delete from chat | cache only |
+| Over circuit | ~64 KB/s |
 
-Имя файла в оффере видит тот, кто терминирует соединение (собеседник; при `/void/file` — ещё и кто видит этот substream). Через relay без E2EE-оффера метаданные не должны светиться на ноде.
+The filename in the offer is seen by whoever terminates the connection (the peer; with `/void/file` — also whoever sees that substream). Over relay without an E2EE offer, metadata should not leak to the node.
 
-### Голосовые (`src/voice.rs`)
+### Voice (`src/voice.rs`)
 
-WAV mono 48 kHz 16-bit PCM, до 5 мин. Запись — дочерний процесс `--voice-record` (`cpal`). В чат — `VoiceMeta`; WAV как файл с автоприёмом. Офлайн: чанки `voice_chunk` через тот же mailbox. Метаданные по возможности снимаются (`metadata_strip`).
+WAV mono 48 kHz 16-bit PCM, up to 5 min. Recording is a child process `--voice-record` (`cpal`). Into chat — `VoiceMeta`; WAV as a file with auto-accept. Offline: `voice_chunk` pieces through the same mailbox. Metadata is stripped when possible (`metadata_strip`).
 
-### Группы (`src/group.rs`)
+### Groups (`src/group.rs`)
 
-Список участников в vault + тред `group:<id>`. Сообщение/файл/голос — fan-out каждому (у файла и голоса свой `transfer_id` на пира). Голос в группе ставится в очередь и повторяется, пока WAV не уйдёт. Invite: `void://group/…`. Права (`group::authorize_group_sync`): новую группу по `group_sync` ставит только её создатель, создателя не сменить, имя и состав задаёт создатель, остальные могут только вступить или выйти сами; `group_leave` — от самого участника или создателя, `group_delete` — только от создателя. Версии и подписи состояния нет. **Не MLS**: компрометация участника раскрывает то, что он получил.
+Member list in the vault + thread `group:<id>`. Message/file/voice is fan-out to each member (file and voice get a per-peer `transfer_id`). Group voice is queued and retried until the WAV is gone. Invite: `void://group/…`. Rights (`group::authorize_group_sync`): only the creator can install a new group via `group_sync`, the creator cannot be changed, name and roster are set by the creator, others may only join or leave themselves; `group_leave` — from the member or the creator, `group_delete` — creator only. No state version or signature. **Not MLS**: compromising a member reveals what they received.
 
-### Локальное хранилище
+### Local storage
 
-Каталог (переопределяется `VOID_DATA_DIR`):
+Directory (override with `VOID_DATA_DIR`):
 
-| ОС | Путь |
+| OS | Path |
 |----|------|
 | Windows | `%APPDATA%\VOID` |
 | Linux | `~/.local/share/VOID` |
 | macOS | `~/Library/Application Support/VOID` |
 
-| Файл / папка | Содержимое | Защита |
-|--------------|------------|--------|
-| `void.key` | Обёрнутый мастер-ключ (`VOIDKEY3`, старый `VOIDKEY2` читается) | Пароль + Argon2id (64 МиБ) + AES-GCM, AAD = тип файла |
-| `vault.bin` | Ник, ключи, контакты, группы, bootstrap | AES-256-GCM |
-| `chat_journal.bin` | Переписки | AES-256-GCM |
-| `outbox.bin` | Недоставленное | AES-256-GCM |
-| `files/` | Кэш вложений `*.vfc` | AES-256-GCM |
-| `voice/` | WAV | каталог данных |
-| `void.pwd` | «Запомнить пароль» | Windows: Credential Manager + файл; иначе файл |
-| `void.instance.lock` | Один процесс на vault | эксклюзивный open |
-| `hello_seen.bin` | Эфемерные ключи принятых `Hello` (повтор не сбрасывает сессию) | на диске |
-| `relay_mailbox.bin` | Локальный ящик только в LAN без bootstrap | на диске, без печати (в отличие от ноды) |
+| File / folder | Contents | Protection |
+|---------------|----------|------------|
+| `void.key` | Wrapped master key (`VOIDKEY3`, old `VOIDKEY2` still opens) | Password + Argon2id (64 MiB) + AES-GCM, AAD = file type |
+| `vault.bin` | Nickname, keys, contacts, groups, bootstrap | AES-256-GCM |
+| `chat_journal.bin` | Conversations | AES-256-GCM |
+| `outbox.bin` | Undelivered | AES-256-GCM |
+| `files/` | Attachment cache `*.vfc` | AES-256-GCM |
+| `voice/` | WAV | data directory |
+| `void.pwd` | “Remember password” | Windows: Credential Manager + file; otherwise file |
+| `void.instance.lock` | One process per vault | exclusive open |
+| `hello_seen.bin` | Ephemeral keys of accepted `Hello` (replay does not reset the session) | on disk |
+| `relay_mailbox.bin` | Local mailbox only on LAN without bootstrap | on disk, unsealed (unlike the node) |
 
-> Никогда не отдавайте пароль vault вместе с `void.key` и `vault.bin`.
+> Never give the vault password together with `void.key` and `vault.bin`.
 
 ---
 
-## Приватность и модель угроз
+## Privacy and threat model
 
-VOID **скрывает содержимое** от сети и от bootstrap. VOID **не скрывает**, что вы в сети и с какого IP подключились к ноде.
+VOID **hides content** from the network and from bootstrap. VOID **does not hide** that you are online or which IP you used to reach the node.
 
-Типичный маршрут за NAT — один Hop (или LAN):
+Typical path behind NAT is one Hop (or LAN):
 
 ```
 Alice ──E2EE──► Relay/Bootstrap ──► Bob
 ```
 
-Relay не видит plaintext, но **может** сопоставить IP↔PeerId, пару circuit `src→dst`, объём/время, получателя офлайн-почты.
+Relay does not see plaintext, but **can** match IP↔PeerId, the circuit pair `src→dst`, volume/time, and the offline-mail recipient.
 
-| Наблюдатель | Текст / файлы / голос | IP отправителя | Кто вы |
-|-------------|------------------------|----------------|--------|
-| Собеседник | Да | Да, если канал прямой (LAN). Через один relay — обычно нет | PeerId + ник |
-| Владелец bootstrap | Нет | **Да** | PeerId, circuit, mailbox-метаданные |
-| Другой пир в DHT | Нет | Нет (кроме mDNS в LAN) | иногда publisher prekey |
+| Observer | Text / files / voice | Sender IP | Who you are |
+|----------|----------------------|-----------|-------------|
+| Peer | Yes | Yes if the channel is direct (LAN). Through one relay — usually not | PeerId + nickname |
+| Bootstrap operator | No | **Yes** | PeerId, circuit, mailbox metadata |
+| Another DHT peer | No | No (except mDNS on LAN) | sometimes a prekey publisher |
 
-Стабильный идентификатор — **PeerId** (пока живёт vault). Это **псевдонимный E2EE**, не Tor. Не используйте VOID, если модель угроз — «нода не должна знать, кто кому писал».
+The stable identifier is **PeerId** (as long as the vault lives). This is **pseudonymous E2EE**, not Tor. Do not use VOID if the threat model is “the node must not know who wrote to whom”.
 
-Одна нода для текущего VOID — нормальный режим (discovery, Hop, mailbox). Анонимности маршрутизации она не даёт — см. [onion](#anonymous-routing-void_onion_v1).
-
----
-
-## Стек
-
-- **Язык:** Rust 2021
-- **Сеть:** libp2p 0.56
-- **Десктоп:** Tauri 2.6 (`frontend/` + `src-tauri/`); опционально egui 0.29 (`egui-ui`)
-- **Аудио:** cpal + hound; WinMM fallback на Windows
-- **Крипто:** x25519-dalek, chacha20poly1305, aes-gcm, argon2, hkdf, blake2, zeroize
-
-Tauri-пакет (`src-tauri`) подключает `p2p-messenger` с `default-features = false` — без egui.
+One node is the normal mode for current VOID (discovery, Hop, mailbox). It does not give routing anonymity — see [onion](#anonymous-routing-void_onion_v1).
 
 ---
 
-## Установка и запуск
+## Stack
 
-Нужен **Rust** ≥ 1.77.2 (`stable`) и [Tauri CLI](https://v2.tauri.app/start/prerequisites/).
+- **Language:** Rust 2021
+- **Network:** libp2p 0.56
+- **Desktop:** Tauri 2.6 (`frontend/` + `src-tauri/`); optional egui 0.29 (`egui-ui`)
+- **Audio:** cpal + hound; WinMM fallback on Windows
+- **Crypto:** x25519-dalek, chacha20poly1305, aes-gcm, argon2, hkdf, blake2, zeroize
 
-### Tauri (основной клиент)
+The Tauri package (`src-tauri`) depends on `p2p-messenger` with `default-features = false` — no egui.
+
+---
+
+## Install and run
+
+You need **Rust** ≥ 1.77.2 (`stable`) and [Tauri CLI](https://v2.tauri.app/start/prerequisites/).
+
+### Tauri (main client)
 
 ```bash
 git clone https://github.com/MarshalV/p2p-messenger.git
 cd p2p-messenger
 cargo tauri dev
-# релиз (MSI/NSIS/deb/dmg):
+# release (MSI/NSIS/deb/dmg):
 cargo tauri build
 ```
 
-Скрипты кладут установщики в корневой `target/`: `build.bat` (Windows, перед линковкой гасит запущенный `app.exe` / `VOID-P2P-Messenger.exe`), `./build.sh` (Linux), `./build_mac.sh` (macOS).
+Scripts put installers in the root `target/`: `build.bat` (Windows, kills running `app.exe` / `VOID-P2P-Messenger.exe` before linking), `./build.sh` (Linux), `./build_mac.sh` (macOS).
 
-На одном vault — **одна** копия процесса. Вторая не стартует (`void.instance.lock` / порт 50001). Если VOID уже в трее, ярлык открывает то же окно.
+One vault — **one** process. A second copy will not start (`void.instance.lock` / port 50001). If VOID is already in the tray, the shortcut opens the same window.
 
-### egui (опционально)
+### egui (optional)
 
 ```bash
 cargo run --release --features egui-ui
 ```
 
-На Linux для egui могут понадобиться `libxcb`, `libxkbcommon`, `libwayland-dev`.
+On Linux, egui may need `libxcb`, `libxkbcommon`, `libwayland-dev`.
 
-При первом запуске задаёте пароль vault. Ник вида `User_1A2B` можно сменить в настройках.
+On first launch you set a vault password. A nickname like `User_1A2B` can be changed in settings.
 
-### Подключение
+### Connecting
 
-1. Свой Peer ID — в настройках.
-2. Контакт — по Peer ID (не голый IP без `/p2p/<PeerId>`).
-3. Bootstrap в списке seed; в статусе `bootstrap 1/N` и **Hop OK** (не вечный `Hop…`). `1/2` значит жива одна нода из двух в vault — для чата этого достаточно.
-
----
-
-## Конфигурация клиента
-
-| Переменная | Назначение |
-|------------|-----------|
-| `VOID_DATA_DIR` | Каталог данных вместо `%APPDATA%\VOID` |
-| `VOID_BOOTSTRAP` | multiaddr через запятую |
-| `VOID_BOOTSTRAP_URL` | URL текстового списка seed |
-| `VOID_BOOTSTRAP_PUBLIC_LIST_URL` | Публичный URL из сборки |
-| `VOID_SKIP_PUBLIC_BOOTSTRAP_LIST` | Не грузить вшитый публичный список |
-| `VOID_BOOTSTRAP_TRUSTED_HOSTS` | Разрешённые хосты для URL-списка |
-| `VOID_BOOTSTRAP_TLS_LEAF_SHA256` | Pin SHA-256 DER листа HTTPS |
-| `VOID_BOOTSTRAP_SIGNING_PUB_HEX` | Ed25519 для подписи списка |
-| `VOID_BOOTSTRAP_URL_SIG_HEX` | Подпись тела URL-списка |
-| `VOID_DISABLE_MDNS` | Выключить LAN-discovery |
-| `VOID_ENABLE_NAT` | `1` — включить DCUtR, AutoNAT, UPnP (по умолчанию выкл.) |
-| `VOID_APPLY_FIREWALL_RULE` | Разрешить правку файрвола (Windows/macOS) |
-| `VOID_SKIP_SUBNETS` | Доп. CIDR «мусорных» listen-адресов |
-| `VOID_BUILTIN_BOOTSTRAP` | Вшить seed при сборке |
-| `RUST_LOG` | По умолчанию **warn**; `void_net=debug` — адреса в логах |
-
-Инвентаризация того, что нода всё ещё видит: [Приватность](#приватность-и-модель-угроз).
+1. Your Peer ID is in settings.
+2. A contact is by Peer ID (not a bare IP without `/p2p/<PeerId>`).
+3. Bootstrap in the seed list; status `bootstrap 1/N` and **Hop OK** (not a stuck `Hop…`). `1/2` means one of two vault nodes is live — enough for chat.
 
 ---
 
-## Развёртывание своей инфраструктуры
+## Client configuration
 
-Собственные bootstrap/relay ускоряют поиск и NAT.
+| Variable | Purpose |
+|----------|---------|
+| `VOID_DATA_DIR` | Data directory instead of `%APPDATA%\VOID` |
+| `VOID_BOOTSTRAP` | comma-separated multiaddrs |
+| `VOID_BOOTSTRAP_URL` | URL of a text seed list |
+| `VOID_BOOTSTRAP_PUBLIC_LIST_URL` | Public URL baked into the build |
+| `VOID_SKIP_PUBLIC_BOOTSTRAP_LIST` | Do not fetch the built-in public list |
+| `VOID_BOOTSTRAP_TRUSTED_HOSTS` | Allowed hosts for the URL list |
+| `VOID_BOOTSTRAP_TLS_LEAF_SHA256` | Pin SHA-256 of the HTTPS leaf DER |
+| `VOID_BOOTSTRAP_SIGNING_PUB_HEX` | Ed25519 for list signature |
+| `VOID_BOOTSTRAP_URL_SIG_HEX` | Signature of the URL-list body |
+| `VOID_DISABLE_MDNS` | Disable LAN discovery |
+| `VOID_ENABLE_NAT` | `1` — enable DCUtR, AutoNAT, UPnP (off by default) |
+| `VOID_APPLY_FIREWALL_RULE` | Allow firewall edits (Windows/macOS) |
+| `VOID_SKIP_SUBNETS` | Extra CIDRs of “junk” listen addresses |
+| `VOID_BUILTIN_BOOTSTRAP` | Bake seeds in at build time |
+| `RUST_LOG` | Default **warn**; `void_net=debug` — addresses in logs |
 
-### Референс: `void-bootstrap-node`
+What the node still sees: [Privacy](#privacy-and-threat-model).
+
+---
+
+## Running your own infrastructure
+
+Your own bootstrap/relay nodes speed up discovery and NAT.
+
+### Reference: `void-bootstrap-node`
 
 > 🔗 **[github.com/MarshalV/bootstrap_node](https://github.com/MarshalV/bootstrap_node)**
 
-| Роль | Что делает |
-|------|-----------|
-| **Kademlia Server** | Вход в `/void/kad/1.0.0` |
-| **Circuit Relay v2** | Hop для клиентов за NAT; непрозрачные байты circuit |
-| **Офлайн-почта / prekey** | Store/query на `/void/chat`; выдача **только владельцу** ящика, порциями с удалением (`take_batch`). Файл `relay_mailbox.bin` зашифрован. TTL 7 суток, квоты на отправителя, отказ пустым `Deliver`. Prekey с ноды клиент для seal не использует — ключ берётся из PeerId получателя |
-| **VOID-SEED** | `/void-seed/v1` на отдельном TCP — обмен списками **между нодами** |
-| **Onion hop** | Identify `void-bootstrap-node/…;onion=<pk>` — unwrap и forward |
+| Role | What it does |
+|------|----------------|
+| **Kademlia Server** | Entry into `/void/kad/1.0.0` |
+| **Circuit Relay v2** | Hop for clients behind NAT; opaque circuit bytes |
+| **Offline mail / prekey** | Store/query on `/void/chat`; delivery **only to the mailbox owner**, in batches with deletion (`take_batch`). `relay_mailbox.bin` is encrypted. TTL 7 days, per-uploader quotas, refusal via empty `Deliver`. The client does not use node prekeys for seal — the key comes from the recipient PeerId |
+| **VOID-SEED** | `/void-seed/v1` on a separate TCP — list exchange **between nodes** |
+| **Onion hop** | Identify `void-bootstrap-node/…;onion=<pk>` — unwrap and forward |
 
-Живой `V1Packet::Encrypted` нода **не форвардит** как сервер чата. Circuit и mailbox — отдельные пути. Onion — ещё один: нода видит следующий hop, не plaintext.
+Live `V1Packet::Encrypted` is **not** forwarded as a chat server. Circuit and mailbox are separate paths. Onion is another: the node sees the next hop, not plaintext.
 
-#### Libp2p ноды
+#### Node libp2p
 
-| Компонент | Настройка |
-|-----------|-----------|
-| Транспорты | TCP + QUIC, `LISTEN_PORT` (4001) |
-| Identify | `/void/v1`, `void-bootstrap-node/…` (+ `;onion=` если сборка с onion) |
+| Component | Setup |
+|-----------|-------|
+| Transports | TCP + QUIC, `LISTEN_PORT` (4001) |
+| Identify | `/void/v1`, `void-bootstrap-node/…` (+ `;onion=` if built with onion) |
 | Kademlia | `/void/kad/1.0.0`, **Mode::Server** |
-| Relay | Default + лимиты под NAT |
-| Логи | `RUST_LOG` по умолчанию **info** (IP в `endpoint`) |
+| Relay | Default + NAT-oriented limits |
+| Logs | `RUST_LOG` default **info** (IP in `endpoint`) |
 
-Клиенту в vault нужен **актуальный** `/p2p/<PeerId>` этой ноды (баннер при старте процесса). Старый ключ ноды + старый `/p2p/` в клиенте = TCP 1 мс и тишина.
+The client vault needs the **current** `/p2p/<PeerId>` of this node (banner at process start). Stale node key + stale `/p2p/` in the client = TCP for 1 ms and silence.
 
-#### Протокол `/void-seed/v1`
+#### Protocol `/void-seed/v1`
 
-Обмен списками нод (не клиентский чат): X25519 PFS, HKDF-SHA-512, ChaCha20-Poly1305, Ed25519 той же пары, что libp2p `PeerId`. Сервер пишет фактический IP TCP в `known_nodes.json`.
+Node-to-node list exchange (not client chat): X25519 PFS, HKDF-SHA-512, ChaCha20-Poly1305, Ed25519 of the same pair as the libp2p `PeerId`. The signature covers direction, both ephemeral keys, the signer’s PeerId, timestamp, and (on the client) the server PeerId. `protocol_version` inside AEAD is a version marker, not access control. The server writes the actual TCP IP into `known_nodes.json`. An old node will not complete handshake with this one — update all of them.
 
-#### Состояние ноды
+#### Node state
 
-| Файл | Что | Делиться |
-|------|-----|----------|
-| `bootstrap_peer.key` | Идентичность ноды | **нет** |
-| `known_nodes.json` | Другие bootstrap | да (публичные адреса) |
-| `relay_mailbox.bin` | Офлайн-конверты (зашифрованы ключом из `bootstrap_peer.key`; слоты — хэши) | **нет** |
+| File | What | Share |
+|------|------|-------|
+| `bootstrap_peer.key` | Node identity | **no** |
+| `known_nodes.json` | Other bootstraps | yes (public addresses) |
+| `relay_mailbox.bin` | Offline envelopes (encrypted with a key from `bootstrap_peer.key`; slots are hashes) | **no** |
 
-#### Переменные ноды
+#### Node environment
 
-| Переменная | По умолчанию | Назначение |
-|-----------|-------------|-----------|
+| Variable | Default | Purpose |
+|----------|---------|---------|
 | `LISTEN_PORT` | `4001` | libp2p TCP+QUIC |
 | `SEED_PORT` | `4010` | `/void-seed/v1` |
-| `SEED_BIND` | `0.0.0.0:$SEED_PORT` | bind seed |
-| `PUBLIC_HOST` | пусто | рекламируемый хост |
-| `RUST_LOG` | `info` | логи |
+| `SEED_BIND` | `0.0.0.0:$SEED_PORT` | seed bind |
+| `PUBLIC_HOST` | empty | advertised host |
+| `RUST_LOG` | `info` | logs |
 
 ```bash
 git clone https://github.com/MarshalV/bootstrap_node
@@ -506,127 +506,129 @@ cd bootstrap_node
 cargo run --release
 ```
 
-Проброс: **TCP 4001**, **UDP 4001**; **TCP 4010** только для других bootstrap-нод.
+Forward: **TCP 4001**, **UDP 4001**; **TCP 4010** only for other bootstrap nodes.
 
 ```
-/ip4/<ПУБЛИЧНЫЙ_IP>/tcp/4001/p2p/<PEER_ID>
+/ip4/<PUBLIC_IP>/tcp/4001/p2p/<PEER_ID>
 ```
 
-QUIC-адрес ноды клиент в seed для dial не использует (ломает живой TCP). Одна нода сводит двух за NAT (Hop + mailbox). Для устойчивости сети — **2–3 ноды в разных сетях**. Для анонимности маршрутизации одной мало.
+The client does not use the node’s QUIC address in seed for dial (it breaks live TCP). One node can introduce two peers behind NAT (Hop + mailbox). For network resilience — **2–3 nodes in different networks**. One is not enough for routing anonymity.
 
 ---
 
-## Статус
+## Status
 
-**Alpha.** Формат vault/журнала ещё может меняться.
+**Alpha.** Vault/journal format may still change.
 
-### Есть
+### Done
 
-- [x] P2P + Double Ratchet + Noise + Hello к identity
-- [x] Kademlia `/void/kad/1.0.0` после Hop (`kad.bootstrap` ~30 с)
+- [x] P2P + Double Ratchet + Noise + Hello bound to identity
+- [x] Kademlia `/void/kad/1.0.0` after Hop (`kad.bootstrap` ~30 s)
 - [x] Relay v2 Hop (`ReservationReqAccepted` / UI `Hop OK`)
-- [x] Vault, журнал, outbox, один процесс на vault + single-instance в Tauri
-- [x] Личные чаты и группы (голос в группе с ретраем)
-- [x] Офлайн-почта через bootstrap (порции + удаление на ноде)
-- [x] Доставка и read receipt
-- [x] Голос и файлы (E2EE `VfP1`/`VfC1`, пустые файлы, кэш, Загрузки)
-- [x] Tauri UI (push-snapshot) + опциональный egui
-- [x] Трей / beacon, повторный запуск поднимает то же окно
-- [x] `VOID_ONION_v1` — 1/2/3 hop по числу нод с ключом; путь в настройках
-- [x] `OnionDrop` только от объявленных onion-hop'ов, внутри только `Hello` / `Encrypted` / `Ack`
-- [x] Офлайн-конверт v3: подпись отправителя, метаданные внутри шифртекста; ключ получателя выводится из его PeerId (prekey не подменить)
-- [x] Query офлайн-почты только владельцу ящика; на ноде TTL 7 суток, квоты и лимит частоты `Store`; при bootstrap копии обычным пирам не рассылаются
-- [x] Double Ratchet с DH-шагом на каждой смене говорящего; заголовок кадра в AAD, если оба клиента объявили это в `Hello.caps`
-- [x] Права в группах: состав и имя меняет создатель, участник — только себя; удаление группы — только создатель
+- [x] Vault, journal, outbox, one process per vault + single-instance in Tauri
+- [x] Direct chats and groups (group voice with retry)
+- [x] Offline mail via bootstrap (batches + deletion on the node)
+- [x] Delivery and read receipt
+- [x] Voice and files (E2EE `VfP1`/`VfC1`, empty files, cache, Downloads)
+- [x] Tauri UI (push-snapshot) + optional egui
+- [x] Tray / beacon; a second launch raises the same window
+- [x] `VOID_ONION_v1` — 1/2/3 hops by number of nodes with a key; path in settings
+- [x] `OnionDrop` only from advertised onion hops, inside only `Hello` / `Encrypted` / `Ack`
+- [x] Offline envelope v3: sender signature, metadata inside ciphertext; recipient key derived from their PeerId (prekey cannot be poisoned)
+- [x] Offline-mail Query only for the mailbox owner; on the node TTL 7 days, quotas and `Store` rate limit; with bootstrap, copies are not sent to ordinary peers
+- [x] Double Ratchet with a DH step on every speaker change; frame header and both PeerIds in AAD if both clients advertised it in `Hello.caps`
+- [x] `Hello` freshness: `ts` (±10 min) and `nonce` in the signature; replaying an ephemeral key does not reset the session
+- [x] Vault: Argon2id 64 MiB, AES-GCM with AAD (`VOIDKEY3`; old `VOIDKEY2` still opens)
+- [x] Group rights: roster and name are set by the creator, a member may only change themselves; group delete — creator only
 
-### Опционально / не по умолчанию
+### Optional / not default
 
-- [ ] DCUtR, AutoNAT, UPnP — только `VOID_ENABLE_NAT=1`
+- [ ] DCUtR, AutoNAT, UPnP — only `VOID_ENABLE_NAT=1`
 
-### План протокола
+### Protocol plan
 
-Ближайшая работа — вынуть договор доставки, который уже исполняет это приложение, в спецификацию и крейты. Протокол и десктоп сейчас в одном дереве: потоки в `src/`, окно — `frontend/` и `src-tauri/`. Tauri остаётся одним потребителем крейтов. Цель: другая реализация говорит на тех же потоках по спецификации и векторам, без этого репозитория как образца интерфейса.
+Next work is to lift the delivery contract this app already implements into a specification and crates. Protocol and desktop currently share one tree: streams in `src/`, the window in `frontend/` and `src-tauri/`. Tauri remains one consumer of the crates. Goal: another implementation speaks the same streams from the spec and test vectors, without this repository as a UI sample.
 
-Код по-прежнему [MIT](./LICENSE). Текст спецификации — CC BY 4.0.
+The code stays [MIT](./LICENSE). Specification text — CC BY 4.0.
 
-В норматив попадает только то, без чего второй узел не сойдётся с первым. Вне спецификации, как местный выбор этого клиента: раскладка vault, Tauri и egui, listen TCP `:50001`, один TCP к bootstrap, таймауты реконнекта и Hop. У потоков своя версия: смена `format_version` vault не меняет байты на проводе.
+Only what a second node needs to interoperate goes into the spec. Out of spec, as this client’s local choices: vault layout, Tauri and egui, listen TCP `:50001`, one TCP to bootstrap, reconnect and Hop timeouts. Streams have their own version: changing vault `format_version` does not change bytes on the wire.
 
-Порядок фиксированный: спецификация, затем крейты, затем векторы, затем форма конверта. Векторы пишутся уже по крейтам из задачи 2.
+Fixed order: specification, then crates, then vectors, then envelope form. Vectors are written against the crates from task 2.
 
-#### 1. Нормативная спецификация
+#### 1. Normative specification
 
-Отделить уже реализованные правила от поведения этого клиента. Один диспетчер встречу видит; onion это не отменяет, пока на пути нет нескольких независимых узлов. Kademlia — индекс обнаружения; текст разговора в DHT спецификация запрещает, а не оставляет комментарием в клиенте.
+Separate already implemented rules from this client’s behaviour. One dispatcher sees the meeting; onion does not cancel that until several independent nodes are on the path. Kademlia is a discovery index; the spec forbids chat text in the DHT rather than leaving it as a client comment.
 
-| Документ | Что фиксирует |
+| Document | What it pins |
 |----------|----------------|
-| Личность | PeerId как ключ участника, не аккаунт |
-| Hello | Подпись, которая связывает ключи сессии с PeerId обеих сторон |
-| Сессия | Кадры Double Ratchet внутри `/void/chat/1.0.0` |
-| Вложения | Файлы и голос (`VfP1` / `VfC1`) внутри этой сессии; `/void/file/1.0.0` — запасной канал |
-| Конверт | `OfflineMailboxStore` / `Query` / `Deliver`, prekey; что диспетчер хранит и что ещё видит (получатель, время, размер бакета — см. задачу 4) |
-| Поиск | `/void/kad/1.0.0` без текста чата |
-| Встреча | Какая резервация Hop нужна пиру от диспетчера |
-| Seed | `/void-seed/v1` между диспетчерами |
-| Onion | `VOID_ONION_v1`: 1 / 2 / 3 hop, что видит каждый hop |
+| Identity | PeerId as the participant key, not an account |
+| Hello | Signature that binds session keys to both PeerIds |
+| Session | Double Ratchet frames inside `/void/chat/1.0.0` |
+| Attachments | Files and voice (`VfP1` / `VfC1`) inside that session; `/void/file/1.0.0` is a fallback |
+| Envelope | `OfflineMailboxStore` / `Query` / `Deliver`, prekey; what the dispatcher stores and still sees (recipient, time, size bucket — see task 4) |
+| Discovery | `/void/kad/1.0.0` without chat text |
+| Meeting | Which Hop reservation a peer needs from the dispatcher |
+| Seed | `/void-seed/v1` between dispatchers |
+| Onion | `VOID_ONION_v1`: 1 / 2 / 3 hops, what each hop sees |
 
-Эталонный диспетчер — [`MarshalV/bootstrap_node`](https://github.com/MarshalV/bootstrap_node). Seed и ящик описываются здесь, даже если код ноды лежит в том репозитории. В тексте спецификации нет внутренних типов десктопной оболочки.
+Reference dispatcher — [`MarshalV/bootstrap_node`](https://github.com/MarshalV/bootstrap_node). Seed and mailbox are described here even if the node code lives in that repository. The specification text has no internal types of the desktop shell.
 
-#### 2. Библиотеки без интерфейса
+#### 2. Libraries without a UI
 
-Вынести протокол из клиента в крейты. Десктоп их подключает. Вторым потребителем становится harness из задачи 3.
+Extract the protocol from the client into crates. The desktop depends on them. The second consumer is the harness from task 3.
 
-| Крейт | Содержимое |
-|-------|------------|
-| Кадры | Типы кадров и пределы длины |
-| Сессия | Signed Hello и Double Ratchet |
-| Конверт | Seal и open офлайн-почты |
-| Onion | Wrap и unwrap `VOID_ONION_v1` |
+| Crate | Contents |
+|-------|----------|
+| Frames | Frame types and length limits |
+| Session | Signed Hello and Double Ratchet |
+| Envelope | Seal and open of offline mail |
+| Onion | Wrap and unwrap `VOID_ONION_v1` |
 
-Оболочка Tauri результатом этой работы не является.
+The Tauri shell is not a deliverable of this work.
 
-#### 3. Тесты соответствия
+#### 3. Conformance tests
 
-Машиночитаемые векторы, по которым протокол можно реализовать без чтения UI:
+Machine-readable vectors so the protocol can be implemented without reading the UI:
 
-- Hello принят и Hello отвергнут
-- Пропущенные ключи ratchet в пределах текущего потолка **4096**
-- Seal и open конверта
-- Onion на 1, 2 и 3 hop
+- Hello accepted and Hello rejected
+- Skipped ratchet keys within the current cap of **4096**
+- Seal and open of an envelope
+- Onion on 1, 2, and 3 hops
 
-Harness — два процесса, без графического окна. Тест, который зелёный только против десктопной программы, считается провалом спецификации.
+The harness is two processes, no GUI window. A test that is green only against the desktop program is a specification failure.
 
-#### 4. Конверт без постоянного открытого `sender`
+#### 4. Envelope without a stable cleartext `sender`
 
-Статус: в клиенте сделано (конверт v3) — `sender` и `kind` внутри `ct`, внешний id непрозрачен, размер выровнен. Осталось описать это в спецификации.
+Status: done in the client (envelope v3) — `sender` and `kind` inside `ct`, external id opaque, size padded. Still to write this into the specification.
 
-До v3 диспетчер хранил непрозрачный `ct` и видел стабильные `sender`, `recipient` и `kind`. Новая форма конверта: нода по-прежнему просрочивает запись и отдаёт её получателю, но без постоянного отправителя открытым текстом.
+Before v3 the dispatcher stored opaque `ct` and saw stable `sender`, `recipient`, and `kind`. New envelope form: the node still expires the record and hands it to the recipient, but without a stable sender in the clear.
 
-В спецификации явно остаётся то, что маршрут всё ещё показывает: размер, время и идентификатор, без которого выдачу сделать нельзя. Если открытым остаётся получатель, это пишется как есть. Называть форму анонимностью нельзя: один диспетчер встречу видит; размеры onion не выравниваются; наблюдатель всего пути связывает вход и выход.
+The spec still states what the route still shows: size, time, and an identifier without which delivery cannot be done. If the recipient stays in the clear, that is written as-is. Calling the form anonymity is not allowed: one dispatcher sees the meeting; onion sizes are not padded; an observer of the whole path links entry and exit.
 
-К этой форме — свои векторы.
+This form gets its own vectors.
 
-### Вне этого плана
+### Outside this plan
 
-- [ ] Групповой ratchet. Сейчас группы — fan-out попарных сессий, без групповой прямой секретности. Спецификация так и описывает этот предел. Следующий шаг, если он будет, — OpenMLS или явный отказ от него, не второй самодельный ratchet
-- [ ] Мобильные сборки
-- [ ] Подписанные релизы и reproducible builds
-- [ ] Внешний разбор композиции Hello + ratchet + seal конверта — по уже готовым спецификации и векторам, не вместо них
-
----
-
-## Безопасность
-
-Уязвимости — **не в публичный issue**. Напишите автору приватно.
-
-Проект **не проходил внешний аудит**. Не используйте VOID для защиты жизни или свободы людей.
-
-Практика в коде: только E2EE в чате; Hello привязан к identity; заголовок ratchet в AAD; Query ящика только владельцу; лимиты JSON/HTTP/vault/файлов; кэш вложений под ключом vault. Остаточные риски (IP на ноде, PeerId, получатель офлайн-почты, Identify, gossip onion-ключей) — в [Приватность](#приватность-и-модель-угроз).
+- [ ] Group ratchet. Groups today are fan-out of pairwise sessions, with no group forward secrecy. The spec will state that limit. Next step, if any, is OpenMLS or an explicit refusal — not a second homemade ratchet
+- [ ] Mobile builds
+- [ ] Signed releases and reproducible builds
+- [ ] External review of Hello + ratchet + envelope seal — against the finished spec and vectors, not instead of them
 
 ---
 
-## Лицензия
+## Security
 
-[MIT](./LICENSE). Без гарантий.
+Do **not** file vulnerabilities as a public issue. Write to the author privately.
+
+The project has **not had an external audit**. Do not use VOID to protect people’s lives or freedom.
+
+Practice in the code: E2EE only in chat; Hello bound to identity and fresh (`ts`/`nonce`); ratchet header and PeerId in AAD; mailbox Query only for the owner; JSON/HTTP/vault/file limits; attachment cache under the vault key. Residual risks (IP at the node, PeerId, offline-mail recipient, Identify, onion-key gossip) — in [Privacy](#privacy-and-threat-model).
+
+---
+
+## License
+
+[MIT](./LICENSE). No warranty.
 
 ---
 
