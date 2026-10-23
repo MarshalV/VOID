@@ -3074,6 +3074,48 @@ async fn flush_pending_read_receipts(
     }
 }
 
+/// Нет живой E2EE к участнику группы: Hello если уже connected, иначе
+/// circuit-dial как у `SendGroupSync` / `EnsureChatSession`. Без dial
+/// `pending_messages` висит навсегда — групповые текст/файл не уходят.
+async fn kick_group_peer_path(
+    swarm: &mut libp2p::Swarm<ChatBehaviour>,
+    local_key: &libp2p::identity::Keypair,
+    local_peer_id: PeerId,
+    my_public_key: crypto::PublicKey,
+    peer_id: PeerId,
+    sessions: &HashMap<PeerId, crypto::SecureSession>,
+    pending_handshakes: &mut HashMap<PeerId, crypto::StaticSecret>,
+    handshake_started: &mut HashMap<PeerId, Instant>,
+    reconnect_targets: &mut HashMap<PeerId, Vec<Multiaddr>>,
+    bootstrap_peer_ids: &HashSet<PeerId>,
+    void_bootstraps: &[Multiaddr],
+    now: &str,
+) {
+    if swarm.is_connected(&peer_id) {
+        let _ = ensure_e2ee_handshake_started(
+            swarm,
+            local_key,
+            local_peer_id,
+            my_public_key,
+            peer_id,
+            sessions,
+            pending_handshakes,
+            handshake_started,
+            now,
+            false,
+        )
+        .await;
+    } else {
+        watch_contact_peer(
+            reconnect_targets,
+            peer_id,
+            bootstrap_peer_ids,
+            local_peer_id,
+        );
+        dial_peer_live_circuits(swarm, peer_id, void_bootstraps, false);
+    }
+}
+
 /// Запускает E2EE Hello, если сессии ещё нет. `force` сбрасывает «зависший»
 /// pending-handshake (например после DialFailure, когда пир был офлайн).
 /// Без force повтор разрешён только если Hello «завис» дольше ~20 с —
@@ -4386,21 +4428,21 @@ pub async fn run_chat_network(
                                             .await;
                                         }
                                     } else {
-                                        if swarm.is_connected(&peer_id) {
-                                            let _ = ensure_e2ee_handshake_started(
-                                                &mut swarm,
-                                                &local_key,
-                                                local_peer_id,
-                                                my_public_key,
-                                                peer_id,
-                                                &sessions,
-                                                &mut pending_handshakes,
-                                                &mut handshake_started,
-                                                &now,
-                                                false,
-                                            )
-                                            .await;
-                                        }
+                                        kick_group_peer_path(
+                                            &mut swarm,
+                                            &local_key,
+                                            local_peer_id,
+                                            my_public_key,
+                                            peer_id,
+                                            &sessions,
+                                            &mut pending_handshakes,
+                                            &mut handshake_started,
+                                            &mut reconnect_targets,
+                                            &bootstrap_peer_ids,
+                                            &void_bootstraps,
+                                            &now,
+                                        )
+                                        .await;
                                         if send_chat {
                                             let queue =
                                                 pending_messages.entry(peer_id).or_default();
@@ -4794,21 +4836,21 @@ pub async fn run_chat_network(
                                         )
                                         .await;
                                     } else {
-                                        if swarm.is_connected(&peer_id) {
-                                            let _ = ensure_e2ee_handshake_started(
-                                                &mut swarm,
-                                                &local_key,
-                                                local_peer_id,
-                                                my_public_key,
-                                                peer_id,
-                                                &sessions,
-                                                &mut pending_handshakes,
-                                                &mut handshake_started,
-                                                &now,
-                                                false,
-                                            )
-                                            .await;
-                                        }
+                                        kick_group_peer_path(
+                                            &mut swarm,
+                                            &local_key,
+                                            local_peer_id,
+                                            my_public_key,
+                                            peer_id,
+                                            &sessions,
+                                            &mut pending_handshakes,
+                                            &mut handshake_started,
+                                            &mut reconnect_targets,
+                                            &bootstrap_peer_ids,
+                                            &void_bootstraps,
+                                            &now,
+                                        )
+                                        .await;
                                         requeue_pending_chat_json(
                                             &mut pending_messages,
                                             peer_id,

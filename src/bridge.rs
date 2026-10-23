@@ -150,6 +150,18 @@ struct PendingGroupVoice {
     attempts: u32,
 }
 
+#[derive(Clone)]
+struct PendingGroupFile {
+    group_id: String,
+    members: Vec<PeerId>,
+    path: String,
+    message_id: String,
+    transfer_id: [u8; 16],
+    filename: String,
+    last_attempt: Instant,
+    attempts: u32,
+}
+
 fn bootstrap_peer_ids(bootstraps: &[String]) -> HashSet<PeerId> {
     bootstraps
         .iter()
@@ -339,6 +351,7 @@ struct Inner {
     pending_file_sends: Vec<PendingFileSend>,
     pending_voice_sends: Vec<PendingVoiceSend>,
     pending_group_voices: Vec<PendingGroupVoice>,
+    pending_group_files: Vec<PendingGroupFile>,
     /// transfer_id hex → absolute WAV path for in-chat playback.
     voice_audio_paths: HashMap<String, String>,
     /// transfer_id hex → local file path for in-chat download/open.
@@ -396,6 +409,7 @@ impl Inner {
             pending_file_sends: Vec::new(),
             pending_voice_sends: Vec::new(),
             pending_group_voices: Vec::new(),
+            pending_group_files: Vec::new(),
             voice_audio_paths: HashMap::new(),
             file_paths: HashMap::new(),
             expecting_files: HashSet::new(),
@@ -467,6 +481,52 @@ impl Inner {
         self.pending_sends
             .retain(|p| !(p.peer == peer && p.message_id == message_id));
         self.remove_outbox_direct(&peer.to_string(), message_id);
+        self.note_group_message_delivered(peer, message_id);
+    }
+
+    fn note_group_message_delivered(&mut self, peer: PeerId, message_id: &str) {
+        let peer_str = peer.to_string();
+        let local = self.local_peer_id.map(|p| p.to_string());
+        let mut empty = false;
+        for e in &mut self.outbox_entries {
+            if let OutboxEntry::GroupMessage {
+                message_id: id,
+                members,
+                ..
+            } = e
+            {
+                if id != message_id {
+                    continue;
+                }
+                members.retain(|m| m != &peer_str);
+                empty = members
+                    .iter()
+                    .all(|m| local.as_ref().is_some_and(|me| m == me) || m.is_empty());
+            }
+        }
+        if empty {
+            self.outbox_entries.retain(|e| {
+                !matches!(
+                    e,
+                    OutboxEntry::GroupMessage { message_id: id, .. } if id == message_id
+                )
+            });
+            self.persist_outbox();
+        }
+    }
+
+    fn note_group_file_delivered(&mut self, peer: PeerId, transfer_id: &[u8; 16]) {
+        for item in &mut self.pending_group_files {
+            let peer_tid = per_peer_voice_transfer_id(&item.transfer_id, peer);
+            if peer_tid == *transfer_id || item.transfer_id == *transfer_id {
+                item.members.retain(|p| *p != peer);
+            }
+        }
+        self.pending_group_files.retain(|p| {
+            p.members
+                .iter()
+                .any(|m| self.local_peer_id != Some(*m))
+        });
     }
 
     fn build_offline_publish_items(&self) -> Vec<OfflineOutboxItem> {
@@ -1038,6 +1098,88 @@ impl Inner {
         }
     }
 
+    fn kick_pending_group_for_peer(&mut self, peer: PeerId) {
+        if self.local_peer_id == Some(peer) {
+            return;
+        }
+        let nick = self.local_nickname.clone();
+        let local = self.local_peer_id;
+        let peer_str = peer.to_string();
+        let msgs: Vec<(String, String, String, Vec<PeerId>)> = self
+            .outbox_entries
+            .iter()
+            .filter_map(|e| {
+                let OutboxEntry::GroupMessage {
+                    group_id,
+                    message_id,
+                    text,
+                    members,
+                } = e
+                else {
+                    return None;
+                };
+                if self.left_groups.contains(group_id) {
+                    return None;
+                }
+                if !members.iter().any(|m| m == &peer_str) {
+                    return None;
+                }
+                let pids: Vec<PeerId> = members
+                    .iter()
+                    .filter_map(|s| s.parse().ok())
+                    .filter(|p| Some(*p) != local)
+                    .collect();
+                if pids.is_empty() {
+                    return None;
+                }
+                Some((
+                    group_id.clone(),
+                    message_id.clone(),
+                    text.clone(),
+                    pids,
+                ))
+            })
+            .collect();
+        let files: Vec<PendingGroupFile> = self
+            .pending_group_files
+            .iter()
+            .filter(|p| p.members.contains(&peer) && !self.left_groups.contains(&p.group_id))
+            .cloned()
+            .collect();
+        if msgs.is_empty() && files.is_empty() {
+            return;
+        }
+        self.ensure_peer_routed(peer);
+        if let Some(tx) = &self.command_tx {
+            for (group_id, message_id, text, members) in msgs {
+                let _ = tx.try_send(UICommand::SendGroupMessage {
+                    sender_name: nick.clone(),
+                    text,
+                    group_id,
+                    members,
+                    message_id: Some(message_id),
+                    is_retry: true,
+                    voice_path: None,
+                    voice_duration_secs: 0.0,
+                    voice_transfer_id: None,
+                    voice_only_members: Vec::new(),
+                });
+            }
+            for item in files {
+                let _ = tx.try_send(UICommand::SendGroupFile {
+                    sender_name: nick.clone(),
+                    group_id: item.group_id,
+                    members: item.members,
+                    path: item.path,
+                    message_id: item.message_id,
+                    transfer_id: item.transfer_id,
+                    is_retry: true,
+                    filename: item.filename,
+                });
+            }
+        }
+    }
+
     fn push_pending_send(&mut self, peer: PeerId, text: String, message_id: String) {
         if self
             .pending_sends
@@ -1379,6 +1521,66 @@ impl Inner {
         }
     }
 
+    fn tick_pending_group_files(&mut self) {
+        const RETRY: Duration = Duration::from_secs(8);
+        let now = Instant::now();
+        let due: Vec<PendingGroupFile> = self
+            .pending_group_files
+            .iter()
+            .filter(|p| now.duration_since(p.last_attempt) >= RETRY)
+            .cloned()
+            .collect();
+        let nick = self.local_nickname.clone();
+        let local = self.local_peer_id;
+        for item in due {
+            let too_old = if let Some(slot) = self
+                .pending_group_files
+                .iter_mut()
+                .find(|p| p.message_id == item.message_id)
+            {
+                slot.last_attempt = now;
+                slot.attempts = slot.attempts.saturating_add(1);
+                slot.attempts >= 24
+            } else {
+                false
+            };
+            if too_old {
+                self.pending_group_files
+                    .retain(|p| p.message_id != item.message_id);
+                continue;
+            }
+            if self.left_groups.contains(&item.group_id) {
+                self.pending_group_files
+                    .retain(|p| p.message_id != item.message_id);
+                continue;
+            }
+            let members: Vec<PeerId> = item
+                .members
+                .iter()
+                .copied()
+                .filter(|p| Some(*p) != local)
+                .collect();
+            if members.is_empty() {
+                continue;
+            }
+            if let Some(tx) = &self.command_tx {
+                for peer in &members {
+                    self.ensure_peer_routed(*peer);
+                }
+                let _ = tx.try_send(UICommand::SendGroupFile {
+                    sender_name: nick.clone(),
+                    group_id: item.group_id,
+                    members,
+                    path: item.path,
+                    message_id: item.message_id,
+                    transfer_id: item.transfer_id,
+                    is_retry: true,
+                    filename: item.filename,
+                });
+            }
+        }
+    }
+
     fn tick_voice_recorder(&mut self) {
         let became_ready = self.voice_recorder.poll();
         if became_ready {
@@ -1463,6 +1665,28 @@ impl Inner {
         if let Err(e) = Outbox::save(key, &self.outbox_entries) {
             warn!("VOID bridge: persist outbox: {e}");
         }
+    }
+
+    fn queue_outbox_group_message(
+        &mut self,
+        group_id: String,
+        message_id: String,
+        text: String,
+        members: &[PeerId],
+    ) {
+        self.outbox_entries.retain(|e| {
+            !matches!(
+                e,
+                OutboxEntry::GroupMessage { message_id: id, .. } if id == &message_id
+            )
+        });
+        self.outbox_entries.push(OutboxEntry::GroupMessage {
+            group_id,
+            message_id,
+            text,
+            members: members.iter().map(|p| p.to_string()).collect(),
+        });
+        self.persist_outbox();
     }
 
     fn queue_outbox_group_sync(&mut self, group: &GroupChat, recipient: PeerId) {
@@ -1668,7 +1892,41 @@ impl Inner {
                 ))
             })
             .collect();
-        if jobs.is_empty() {
+        let local = self.local_peer_id;
+        let nick = self.local_nickname.clone();
+        let text_jobs: Vec<(String, String, String, Vec<PeerId>)> = self
+            .outbox_entries
+            .iter()
+            .filter_map(|e| {
+                let OutboxEntry::GroupMessage {
+                    group_id,
+                    message_id,
+                    text,
+                    members,
+                } = e
+                else {
+                    return None;
+                };
+                if self.left_groups.contains(group_id) {
+                    return None;
+                }
+                let pids: Vec<PeerId> = members
+                    .iter()
+                    .filter_map(|s| s.parse().ok())
+                    .filter(|p| Some(*p) != local)
+                    .collect();
+                if pids.is_empty() {
+                    return None;
+                }
+                Some((
+                    group_id.clone(),
+                    message_id.clone(),
+                    text.clone(),
+                    pids,
+                ))
+            })
+            .collect();
+        if jobs.is_empty() && text_jobs.is_empty() {
             return;
         }
         self.last_group_sync_retry = Some(now);
@@ -1681,6 +1939,25 @@ impl Inner {
                     creator_id,
                     members,
                     recipients: vec![pid],
+                });
+            }
+        }
+        if let Some(tx) = &self.command_tx {
+            for (group_id, message_id, text, members) in text_jobs {
+                for pid in &members {
+                    self.ensure_peer_routed(*pid);
+                }
+                let _ = tx.try_send(UICommand::SendGroupMessage {
+                    sender_name: nick.clone(),
+                    text,
+                    group_id,
+                    members,
+                    message_id: Some(message_id),
+                    is_retry: true,
+                    voice_path: None,
+                    voice_duration_secs: 0.0,
+                    voice_transfer_id: None,
+                    voice_only_members: Vec::new(),
                 });
             }
         }
@@ -1996,6 +2273,7 @@ impl VoidRuntime {
                                 }
                             }
                             g.sync_groups_to_peer(pid);
+                            g.kick_pending_group_for_peer(pid);
                             emit_snapshot = true;
                         }
                         NetworkEvent::Disconnected(pid) | NetworkEvent::MdnsExpired(pid) => {
@@ -2297,6 +2575,7 @@ impl VoidRuntime {
                                 }
                                 g.pending_file_sends.retain(|p| p.peer != peer);
                                 if is_outgoing {
+                                    g.note_group_file_delivered(peer, &transfer_id);
                                     g.add_status(format!("✅ Файл «{filename}» доставлен"));
                                 }
                                 bridge_evs.push(BridgeEvent::FileComplete {
@@ -2361,31 +2640,35 @@ impl VoidRuntime {
                             path,
                             kind,
                         } => {
-                            if !g
-                                .pending_file_sends
-                                .iter()
-                                .any(|p| p.peer == recipient && p.path == path)
-                            {
-                                let filename = g.public_name_for_path(&path);
-                                g.pending_file_sends.push(PendingFileSend {
-                                    peer: recipient,
-                                    path: path.clone(),
-                                    kind,
-                                    last_attempt: Instant::now(),
-                                    message_id: None,
-                                    transfer_id: None,
-                                    sender_name: String::new(),
-                                    filename,
-                                });
+                            if g.pending_group_files.iter().any(|p| p.path == path) {
+                                g.ensure_peer_routed(recipient);
+                            } else {
+                                if !g
+                                    .pending_file_sends
+                                    .iter()
+                                    .any(|p| p.peer == recipient && p.path == path)
+                                {
+                                    let filename = g.public_name_for_path(&path);
+                                    g.pending_file_sends.push(PendingFileSend {
+                                        peer: recipient,
+                                        path: path.clone(),
+                                        kind,
+                                        last_attempt: Instant::now(),
+                                        message_id: None,
+                                        transfer_id: None,
+                                        sender_name: String::new(),
+                                        filename,
+                                    });
+                                }
+                                g.ensure_peer_routed(recipient);
+                                if let Some(tx) = &g.command_tx {
+                                    let _ = tx.try_send(UICommand::EnsureChatSession(recipient));
+                                }
+                                g.add_status(format!(
+                                    "⏳ Файл в очереди — ждём E2EE с {}",
+                                    &recipient.to_string()[..8.min(recipient.to_string().len())]
+                                ));
                             }
-                            g.ensure_peer_routed(recipient);
-                            if let Some(tx) = &g.command_tx {
-                                let _ = tx.try_send(UICommand::EnsureChatSession(recipient));
-                            }
-                            g.add_status(format!(
-                                "⏳ Файл в очереди — ждём E2EE с {}",
-                                &recipient.to_string()[..8.min(recipient.to_string().len())]
-                            ));
                         }
                         NetworkEvent::VoiceSendDeferred {
                             recipient,
@@ -2523,6 +2806,7 @@ impl VoidRuntime {
                     g.tick_pending_file_sends();
                     g.tick_pending_voice_sends();
                     g.tick_pending_group_voices();
+                    g.tick_pending_group_files();
                     g.tick_voice_recorder();
                     g.tick_group_sync_outbox();
                 }
@@ -2792,6 +3076,15 @@ impl VoidRuntime {
                                     }
                                 }
                             }
+                            OutboxEntry::GroupMessage { members, .. } => {
+                                for m in members {
+                                    if let Ok(pid) = m.parse::<PeerId>() {
+                                        if g.local_peer_id != Some(pid) {
+                                            g.ensure_peer_routed(pid);
+                                        }
+                                    }
+                                }
+                            }
                             _ => {}
                         }
                     }
@@ -2959,6 +3252,14 @@ impl VoidRuntime {
                 return Err("Группа не найдена".into());
             };
             let members = group.member_peer_ids();
+            let targets: Vec<PeerId> = members
+                .iter()
+                .copied()
+                .filter(|p| *p != local)
+                .collect();
+            if targets.is_empty() {
+                return Err("В группе нет других участников".into());
+            }
             let msg = ChatMessage {
                 id: mid.clone(),
                 sender_id: local.to_string(),
@@ -2974,12 +3275,18 @@ impl VoidRuntime {
             g.messages.lock().entry(chat).or_default().push(msg);
             g.messages.mark_dirty();
             g.persist_journal();
+            for pid in &targets {
+                g.ensure_peer_routed(*pid);
+            }
+            g.queue_outbox_group_message(gid.clone(), mid.clone(), text.clone(), &members);
+            g.schedule_offline_publish();
+            g.publish_outbox_to_dht();
             if let Some(tx) = &g.command_tx {
                 let _ = tx.try_send(UICommand::SendGroupMessage {
                     sender_name: nick,
                     text,
                     group_id: gid,
-                    members,
+                    members: targets,
                     message_id: Some(mid),
                     is_retry: false,
                     voice_path: None,
@@ -3277,6 +3584,14 @@ impl VoidRuntime {
                 return Err("Группа не найдена".into());
             };
             let members = group.member_peer_ids();
+            let targets: Vec<PeerId> = members
+                .iter()
+                .copied()
+                .filter(|p| *p != local)
+                .collect();
+            if targets.is_empty() {
+                return Err("В группе нет других участников".into());
+            }
             let msg = ChatMessage {
                 id: mid.clone(),
                 sender_id: local.to_string(),
@@ -3292,21 +3607,35 @@ impl VoidRuntime {
             g.messages.lock().entry(chat).or_default().push(msg);
             g.messages.mark_dirty();
             g.persist_journal();
-            for pid in &members {
-                if *pid != local {
-                    g.ensure_peer_routed(*pid);
-                }
+            for pid in &targets {
+                g.ensure_peer_routed(*pid);
             }
             if let Some(tx) = &g.command_tx {
                 let _ = tx.try_send(UICommand::SendGroupFile {
-                    sender_name: nick,
-                    group_id: gid,
-                    members,
+                    sender_name: nick.clone(),
+                    group_id: gid.clone(),
+                    members: targets.clone(),
                     path: path.clone(),
-                    message_id: mid,
+                    message_id: mid.clone(),
                     transfer_id: tid,
                     is_retry: false,
                     filename: filename.clone(),
+                });
+            }
+            if !g
+                .pending_group_files
+                .iter()
+                .any(|p| p.message_id == mid)
+            {
+                g.pending_group_files.push(PendingGroupFile {
+                    group_id: gid,
+                    members: targets,
+                    path,
+                    message_id: mid,
+                    transfer_id: tid,
+                    filename,
+                    last_attempt: Instant::now(),
+                    attempts: 0,
                 });
             }
         } else {
@@ -3911,6 +4240,7 @@ impl VoidRuntime {
             _ => true,
         });
         g.pending_group_voices.retain(|p| p.group_id != gid);
+        g.pending_group_files.retain(|p| p.group_id != gid);
         g.persist_outbox();
         let thread = group_thread_key(&gid);
         let msgs = g.messages.lock().remove(&thread).unwrap_or_default();
