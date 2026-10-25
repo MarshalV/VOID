@@ -12,7 +12,7 @@ use serde::{Deserialize, Serialize};
 use crate::paths;
 
 const FILE: &str = "hello_seen.bin";
-const PER_PEER: usize = 64;
+const PER_PEER: usize = 256;
 const MAX_PEERS: usize = 4096;
 
 #[derive(Default, Serialize, Deserialize)]
@@ -86,8 +86,11 @@ mod tests {
     fn per_peer_window_is_bounded() {
         let mut c = HelloReplayCache::default();
         let a = PeerId::random();
-        for i in 0..(PER_PEER as u8 + 1) {
-            assert!(c.insert(a, &[i; 32]));
+        for i in 0..=PER_PEER {
+            let mut eph = [0u8; 32];
+            eph[0] = (i % 256) as u8;
+            eph[1] = (i / 256) as u8;
+            assert!(c.insert(a, &eph));
         }
         assert_eq!(c.by_peer[&a.to_string()].len(), PER_PEER);
     }

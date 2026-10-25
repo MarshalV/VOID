@@ -3,60 +3,62 @@
 use rand::RngCore;
 use serde::{Deserialize, Serialize};
 
-pub(crate) const GROUP_THREAD_PREFIX: &str = "group:";
+pub const GROUP_THREAD_PREFIX: &str = "group:";
 const GROUP_ID_HEX_LEN: usize = 32;
 const MAX_GROUP_NAME_BYTES: usize = 128;
 const MAX_GROUP_MEMBERS: usize = 256;
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
-pub(crate) struct GroupMember {
-    pub(crate) peer_id: String,
-    pub(crate) display_name: String,
+pub struct GroupMember {
+    pub peer_id: String,
+    pub display_name: String,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
-pub(crate) struct GroupChat {
-    pub(crate) id: String,
-    pub(crate) name: String,
-    pub(crate) creator_id: String,
-    pub(crate) members: Vec<GroupMember>,
-    pub(crate) created_at: String,
+pub struct GroupChat {
+    pub id: String,
+    pub name: String,
+    pub creator_id: String,
+    pub members: Vec<GroupMember>,
+    pub created_at: String,
+    /// Монотонная версия подписанного состава. 0 — группа ещё без подписи создателя.
+    #[serde(default)]
+    pub version: u64,
 }
 
 impl GroupChat {
-    pub(crate) fn member_peer_ids(&self) -> Vec<libp2p::PeerId> {
+    pub fn member_peer_ids(&self) -> Vec<libp2p::PeerId> {
         self.members
             .iter()
             .filter_map(|m| m.peer_id.parse().ok())
             .collect()
     }
 
-    #[cfg(any(feature = "egui-ui", test))]
-    pub(crate) fn includes_peer(&self, peer_id: &libp2p::PeerId) -> bool {
+        pub fn includes_peer(&self, peer_id: &libp2p::PeerId) -> bool {
         let s = peer_id.to_string();
         self.members.iter().any(|m| m.peer_id == s)
     }
 }
 
-pub(crate) fn new_group_id() -> String {
+pub fn new_group_id() -> String {
     let mut bytes = [0u8; 16];
     rand::thread_rng().fill_bytes(&mut bytes);
     bytes.iter().map(|b| format!("{:02x}", b)).collect()
 }
 
-pub(crate) fn validate_group_id(id: &str) -> bool {
+pub fn validate_group_id(id: &str) -> bool {
     id.len() == GROUP_ID_HEX_LEN && id.chars().all(|c| c.is_ascii_hexdigit())
 }
 
-pub(crate) fn group_thread_key(group_id: &str) -> String {
+pub fn group_thread_key(group_id: &str) -> String {
     format!("{GROUP_THREAD_PREFIX}{group_id}")
 }
 
-pub(crate) fn is_group_thread(key: &str) -> bool {
+pub fn is_group_thread(key: &str) -> bool {
     key.starts_with(GROUP_THREAD_PREFIX)
 }
 
-pub(crate) fn parse_group_thread_key(key: &str) -> Option<&str> {
+pub fn parse_group_thread_key(key: &str) -> Option<&str> {
     let id = key.strip_prefix(GROUP_THREAD_PREFIX)?;
     if validate_group_id(id) {
         Some(id)
@@ -65,7 +67,7 @@ pub(crate) fn parse_group_thread_key(key: &str) -> Option<&str> {
     }
 }
 
-pub(crate) fn dedupe_members(members: Vec<GroupMember>) -> Vec<GroupMember> {
+pub fn dedupe_members(members: Vec<GroupMember>) -> Vec<GroupMember> {
     let mut seen = std::collections::HashSet::new();
     members
         .into_iter()
@@ -73,7 +75,7 @@ pub(crate) fn dedupe_members(members: Vec<GroupMember>) -> Vec<GroupMember> {
         .collect()
 }
 
-pub(crate) fn validate_group_chat(g: &GroupChat) -> bool {
+pub fn validate_group_chat(g: &GroupChat) -> bool {
     validate_group_id(&g.id)
         && !g.name.is_empty()
         && g.name.len() <= MAX_GROUP_NAME_BYTES
@@ -88,8 +90,7 @@ pub(crate) fn validate_group_chat(g: &GroupChat) -> bool {
 }
 
 /// Извлекает все invite-ссылки из текста сообщения.
-#[cfg(any(feature = "egui-ui", test))]
-pub(crate) fn extract_invite_links(text: &str) -> Vec<String> {
+pub fn extract_invite_links(text: &str) -> Vec<String> {
     let mut links = Vec::new();
     let mut search_from = 0usize;
     while let Some(rel) = text[search_from..].find("void://group/") {
@@ -119,7 +120,7 @@ pub(crate) fn extract_invite_links(text: &str) -> Vec<String> {
 }
 
 /// `void://group/{id}?name=…&m=peer1,peer2,…&creator=…`
-pub(crate) fn build_invite_link(group: &GroupChat) -> String {
+pub fn build_invite_link(group: &GroupChat) -> String {
     let name_enc = url_encode(&group.name);
     let members: String = group
         .members
@@ -134,7 +135,7 @@ pub(crate) fn build_invite_link(group: &GroupChat) -> String {
 }
 
 /// Разбор invite-ссылки или голого `void://group/{id}?…`.
-pub(crate) fn parse_invite_link(input: &str) -> Option<GroupChat> {
+pub fn parse_invite_link(input: &str) -> Option<GroupChat> {
     let s = input.trim();
     let rest = s.strip_prefix("void://group/")?;
     let (id_part, query) = match rest.split_once('?') {
@@ -204,6 +205,7 @@ pub(crate) fn parse_invite_link(input: &str) -> Option<GroupChat> {
         creator_id,
         members,
         created_at: chrono::Local::now().format("%Y-%m-%d %H:%M").to_string(),
+        version: 0,
     };
     if validate_group_chat(&group) {
         Some(group)
@@ -262,8 +264,7 @@ fn hex_nibble(c: u8) -> Option<u8> {
 
 /// Members right after create: creator only. Invitees join only via explicit
 /// `join_group_from_invite` (click / paste), never from DM text or sync.
-#[cfg(any(feature = "egui-ui", test))]
-pub(crate) fn members_on_group_create(
+pub fn members_on_group_create(
     creator_id: &str,
     creator_name: &str,
     _invitee_peer_ids: &[String],
@@ -276,16 +277,95 @@ pub(crate) fn members_on_group_create(
 
 /// Receiving invite text in chat must never auto-install the group.
 #[cfg(test)]
-pub(crate) fn auto_join_from_invite_message() -> bool {
+pub fn auto_join_from_invite_message() -> bool {
     false
+}
+
+/// Следующая версия подписанного состава. Ноль становится единицей.
+pub fn next_group_version(current: u64) -> u64 {
+    current.saturating_add(1).max(1)
+}
+
+/// Живое или офлайн-сообщение группы: мы в составе, и отправитель тоже.
+pub fn member_may_post(group: &GroupChat, local_id: &str, sender_id: &str) -> bool {
+    let local_in = group.members.iter().any(|m| m.peer_id == local_id);
+    let sender_in =
+        sender_id == local_id || group.members.iter().any(|m| m.peer_id == sender_id);
+    local_in && sender_in
+}
+
+/// Канонические байты подписи создателя: `group_id ‖ version ‖ name ‖ members`.
+/// Участники сортируются по `peer_id`, чтобы порядок в JSON не менял подпись.
+pub fn group_sync_message(
+    group_id: &str,
+    version: u64,
+    name: &str,
+    members: &[GroupMember],
+) -> Vec<u8> {
+    let mut ordered: Vec<&GroupMember> = members.iter().collect();
+    ordered.sort_by(|a, b| a.peer_id.cmp(&b.peer_id).then(a.display_name.cmp(&b.display_name)));
+    let mut v = Vec::with_capacity(64 + name.len());
+    v.extend_from_slice(b"VOID_GROUP_SYNC_V1\0");
+    push_lp16(&mut v, group_id.as_bytes());
+    v.extend_from_slice(&version.to_le_bytes());
+    push_lp16(&mut v, name.as_bytes());
+    v.extend_from_slice(&(ordered.len() as u32).to_le_bytes());
+    for m in ordered {
+        push_lp16(&mut v, m.peer_id.as_bytes());
+        push_lp16(&mut v, m.display_name.as_bytes());
+    }
+    v
+}
+
+fn push_lp16(out: &mut Vec<u8>, bytes: &[u8]) {
+    let n = bytes.len().min(u16::MAX as usize);
+    out.extend_from_slice(&(n as u16).to_le_bytes());
+    out.extend_from_slice(&bytes[..n]);
 }
 
 /// Принятое состояние группы после авторизации `group_sync`.
 #[derive(Debug, PartialEq)]
-pub(crate) struct AuthorizedGroupSync {
-    pub(crate) name: String,
-    pub(crate) creator_id: String,
-    pub(crate) members: Vec<GroupMember>,
+pub struct AuthorizedGroupSync {
+    pub name: String,
+    pub creator_id: String,
+    pub members: Vec<GroupMember>,
+    pub version: u64,
+}
+
+/// Подписанный снимок создателя: только `version` строго больше локальной
+/// и с верной подписью. Без подписи создательский sync отклоняется (откат
+/// старым `group_sync`). Чужой unsigned sync по-прежнему может только
+/// добавить или убрать отправителя — версию он не двигает.
+pub fn admit_group_sync(
+    existing: Option<&GroupChat>,
+    from: &str,
+    group_name: &str,
+    creator_id: &str,
+    members: Vec<GroupMember>,
+    version: u64,
+    signed_by_creator: bool,
+) -> Option<AuthorizedGroupSync> {
+    let local_v = existing.map(|g| g.version).unwrap_or(0);
+    if signed_by_creator {
+        if version <= local_v {
+            return None;
+        }
+        let mut auth = authorize_group_sync(
+            existing,
+            creator_id,
+            group_name,
+            creator_id,
+            members,
+        )?;
+        auth.version = version;
+        return Some(auth);
+    }
+    if from == creator_id || existing.is_some_and(|g| from == g.creator_id) {
+        return None;
+    }
+    let mut auth = authorize_group_sync(existing, from, group_name, creator_id, members)?;
+    auth.version = local_v;
+    Some(auth)
 }
 
 /// Авторизация входящего `group_sync` от подтверждённого `from`; `None` — отклонить.
@@ -293,7 +373,7 @@ pub(crate) struct AuthorizedGroupSync {
 /// - создателя существующей группы сменить нельзя;
 /// - создатель задаёт имя и состав;
 /// - остальные могут только добавить/убрать себя и сменить своё имя.
-pub(crate) fn authorize_group_sync(
+pub fn authorize_group_sync(
     existing: Option<&GroupChat>,
     from: &str,
     group_name: &str,
@@ -314,6 +394,7 @@ pub(crate) fn authorize_group_sync(
             name,
             creator_id: from.to_string(),
             members,
+            version: 0,
         });
     };
     if !creator_id.is_empty() && creator_id != g.creator_id {
@@ -329,27 +410,29 @@ pub(crate) fn authorize_group_sync(
             name,
             creator_id: g.creator_id.clone(),
             members,
+            version: g.version,
         });
     }
     Some(AuthorizedGroupSync {
         name: g.name.clone(),
         creator_id: g.creator_id.clone(),
         members: sanitize_sync_members_for_creator(&g.members, from, &members),
+        version: g.version,
     })
 }
 
 /// `GroupLeave` для `peer_id`: от самого уходящего или от создателя.
-pub(crate) fn may_apply_group_leave(group: &GroupChat, from: &str, peer_id: &str) -> bool {
+pub fn may_apply_group_leave(group: &GroupChat, from: &str, peer_id: &str) -> bool {
     from == peer_id || from == group.creator_id
 }
 
 /// `GroupDelete`: только от создателя известной группы.
-pub(crate) fn may_apply_group_delete(group: Option<&GroupChat>, from: &str) -> bool {
+pub fn may_apply_group_delete(group: Option<&GroupChat>, from: &str) -> bool {
     group.is_some_and(|g| g.creator_id == from)
 }
 
 /// Sync не от создателя: `from` может только добавить/убрать себя и сменить своё имя.
-pub(crate) fn sanitize_sync_members_for_creator(
+pub fn sanitize_sync_members_for_creator(
     existing: &[GroupMember],
     from_peer_id: &str,
     incoming: &[GroupMember],
@@ -428,6 +511,7 @@ mod tests {
             creator_id: "alice".into(),
             members: vec![member("alice"), member("bob"), member("me")],
             created_at: "now".into(),
+            version: 1,
         }
     }
 
@@ -527,6 +611,7 @@ mod tests {
             creator_id: "creatorpeer".into(),
             members: members_on_group_create("creatorpeer", "Alice", &["bob".into()]),
             created_at: "now".into(),
+            version: 1,
         };
         let link = build_invite_link(&g);
         let parsed = parse_invite_link(&link).expect("parse");
@@ -567,5 +652,47 @@ mod tests {
         let out = sanitize_sync_members_for_creator(&existing, "bob", &incoming);
         assert!(out.iter().any(|m| m.peer_id == "bob"));
         assert!(!out.iter().any(|m| m.peer_id == "eve"));
+    }
+
+    #[test]
+    fn creator_replay_does_not_roll_back_version() {
+        let mut g = existing_group();
+        g.version = 3;
+        assert!(admit_group_sync(Some(&g), "alice", "Old", "alice", vec![member("alice")], 2, true).is_none());
+        assert!(admit_group_sync(Some(&g), "alice", "Old", "alice", vec![member("alice")], 3, true).is_none());
+        assert!(admit_group_sync(Some(&g), "alice", "Same", "alice", vec![member("alice")], 0, false).is_none());
+        let ok = admit_group_sync(
+            Some(&g),
+            "alice",
+            "New",
+            "alice",
+            vec![member("alice"), member("carol")],
+            4,
+            true,
+        )
+        .unwrap();
+        assert_eq!(ok.version, 4);
+        assert_eq!(ok.name, "New");
+        let self_edit = admit_group_sync(
+            Some(&g),
+            "bob",
+            "Hacked",
+            "alice",
+            vec![member("alice"), member("me")],
+            0,
+            false,
+        )
+        .unwrap();
+        assert_eq!(self_edit.version, 3);
+        assert!(!self_edit.members.iter().any(|m| m.peer_id == "bob"));
+    }
+
+    #[test]
+    fn group_sync_message_ignores_member_order() {
+        let a = group_sync_message("id", 2, "N", &[member("b"), member("a")]);
+        let b = group_sync_message("id", 2, "N", &[member("a"), member("b")]);
+        assert_eq!(a, b);
+        let c = group_sync_message("id", 3, "N", &[member("a"), member("b")]);
+        assert_ne!(a, c);
     }
 }

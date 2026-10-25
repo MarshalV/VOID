@@ -30,9 +30,10 @@ use crate::outbox::{Outbox, OutboxEntry};
 use crate::protocol::{
     build_group_sync_json, new_message_id, parse_decrypted_chat_frame,
     per_peer_voice_transfer_id, transfer_id_from_hex, transfer_id_to_hex, ChatMessage,
-    DecryptedChatFrame, FileTransferProgress, OutgoingDeliveryStatus, VoiceMeta,
+    DecryptedChatFrame, OutgoingDeliveryStatus, VoiceMeta,
 };
 use crate::ui::{setup_custom_style, Toast, ToastKind, TOAST_TTL_LONG, TOAST_TTL_SHORT};
+use crate::FileTransferProgress;
 use crate::vault::{
     clear_remembered_password, save_remembered_password, AddressBookEntry, Storage,
     VaultUnlockKind, VaultUnlockState,
@@ -170,6 +171,10 @@ pub(crate) struct App {
     pub(crate) _local_static: crypto::StaticSecret,
     /// Секрет офлайн-почты, выведенный из libp2p-ключа.
     pub(crate) offline_identity: Option<crypto::StaticSecret>,
+    /// Identity-ключ: подпись group_sync в офлайн-очереди.
+    identity_key: Option<libp2p::identity::Keypair>,
+    /// Текущий и предыдущий prekey, пока не истёк `not_after`.
+    offline_prekey_secrets: Vec<crypto::StaticSecret>,
     pub(crate) pending_sends: Vec<PendingSend>,
     pub(crate) pending_file_sends: Vec<PendingFileSend>,
     /// Прочитанные входящие — read receipt уже отправлен (не персистится).
@@ -321,6 +326,8 @@ impl App {
             _sessions: HashMap::new(),
             _local_static: local_static,
             offline_identity: None,
+            identity_key: None,
+            offline_prekey_secrets: Vec::new(),
             pending_sends: Vec::new(),
             pending_file_sends: Vec::new(),
             read_receipts_sent: HashSet::new(),
@@ -668,6 +675,10 @@ impl App {
                         groups_map.insert(g.id.clone(), g);
                     }
                 }
+                let _ = crate::offline_mail::load_local_prekeys(
+                    &local_key,
+                    &crate::paths::data_file(crate::offline_mail::PREKEY_FILE),
+                );
                 tokio::spawn(run_chat_network(
                     dn_sp.command_rx,
                     dn_sp.event_tx,
@@ -724,6 +735,10 @@ impl App {
                 }
 
                 self.void_bootstrap_strings = Vec::new();
+                let _ = crate::offline_mail::load_local_prekeys(
+                    &local_key,
+                    &crate::paths::data_file(crate::offline_mail::PREKEY_FILE),
+                );
                 tokio::spawn(run_chat_network(
                     dn_sp.command_rx,
                     dn_sp.event_tx,
@@ -766,6 +781,13 @@ impl App {
     ) {
         self.local_peer_id = PeerId::from(local_key.public());
         self.offline_identity = crate::offline_mail::identity_offline_secret(&local_key);
+        if let Some(pre) = crate::offline_mail::load_local_prekeys(
+            &local_key,
+            &crate::paths::data_file(crate::offline_mail::PREKEY_FILE),
+        ) {
+            self.offline_prekey_secrets = pre.secrets;
+        }
+        self.identity_key = Some(local_key);
         self.local_nickname = nickname;
         self.known_peers = book;
         self.contact_addrs = addrs_map;
@@ -1157,14 +1179,17 @@ impl App {
                     creator_id,
                     members,
                     recipient,
+                    version,
                 } => {
                     let Ok(pid) = recipient.parse::<PeerId>() else {
                         continue;
                     };
                     if let Some(payload) = build_group_sync_json(
+                        self.identity_key.as_ref(),
                         group_id,
                         group_name,
                         creator_id,
+                        *version,
                         members,
                     ) {
                         items.push(OfflineOutboxItem {
@@ -1225,6 +1250,7 @@ impl App {
             .offline_identity
             .iter()
             .chain([&self._local_static])
+            .chain(self.offline_prekey_secrets.iter())
             .cloned()
             .collect();
         let secrets: Vec<&crypto::StaticSecret> = own_secrets.iter().collect();
@@ -1273,6 +1299,9 @@ impl App {
                         group_name,
                         creator_id,
                         members,
+                        version,
+                        sig,
+                        creator_pubkey_pb,
                     }) = parse_decrypted_chat_frame(&plaintext)
                     {
                         self.merge_incoming_group_sync(
@@ -1281,6 +1310,9 @@ impl App {
                             group_name,
                             creator_id,
                             members,
+                            version,
+                            sig,
+                            creator_pubkey_pb,
                         );
                         self.offline_mail_processed.insert(env.message_id.clone());
                         any = true;
@@ -1523,6 +1555,7 @@ impl App {
             creator_id: group.creator_id.clone(),
             members: group.members.clone(),
             recipient: recipient.to_string(),
+            version: group.version,
         });
     }
 
@@ -1758,10 +1791,8 @@ impl App {
                 }
                 OutboxEntry::GroupSync {
                     group_id,
-                    group_name: _,
-                    creator_id: _,
-                    members: _,
                     recipient,
+                    ..
                 } => {
                     if self.left_groups.contains(&group_id)
                         || !self.is_active_group_member(&group_id)
@@ -1787,6 +1818,7 @@ impl App {
                         creator_id: group.creator_id.clone(),
                         members,
                         recipients: vec![pid],
+                        version: group.version,
                     });
                 }
             }
@@ -1837,15 +1869,15 @@ impl App {
         let voice_tid = msg.voice.as_ref().map(|v| v.transfer_id.clone());
 
         let bucket = if let Some(ref gid) = msg.group_id {
-            if group::validate_group_id(gid) {
-                if self.is_active_group_member(gid) {
-                    Some(group_thread_key(gid))
-                } else if msg.voice.is_some() || msg.file.is_some() {
-                    // Голос/файл могут прийти до group_sync — сохраняем в поток группы.
-                    Some(group_thread_key(gid))
-                } else {
-                    None
-                }
+            let me = self.local_peer_id.to_string();
+            if group::validate_group_id(gid)
+                && self.is_active_group_member(gid)
+                && self
+                    .groups
+                    .get(gid)
+                    .is_some_and(|g| group::member_may_post(g, &me, &msg.sender_id))
+            {
+                Some(group_thread_key(gid))
             } else {
                 None
             }
@@ -2968,6 +3000,7 @@ impl App {
                 &invitee_ids,
             ),
             created_at: chrono::Local::now().format("%Y-%m-%d %H:%M").to_string(),
+            version: 1,
         };
         if !group::validate_group_chat(&group) {
             return None;
@@ -3164,7 +3197,7 @@ impl App {
     pub(crate) fn try_process_invite_message(&mut self, _message_id: &str, _text: &str) {}
 
     fn refresh_outbox_group_sync_snapshots(&mut self) {
-        let snapshots: Vec<(String, String, String, Vec<GroupMember>)> = self
+        let snapshots: Vec<(String, String, String, Vec<GroupMember>, u64)> = self
             .outbox_entries
             .iter()
             .filter_map(|e| {
@@ -3184,6 +3217,7 @@ impl App {
                     group.name.clone(),
                     group.creator_id.clone(),
                     members,
+                    group.version,
                 ))
             })
             .collect();
@@ -3197,17 +3231,19 @@ impl App {
                 group_name,
                 creator_id,
                 members,
+                version,
                 ..
             } = entry
             else {
                 continue;
             };
-            if let Some((_, name, creator, synced)) =
-                snapshots.iter().find(|(gid, _, _, _)| gid == group_id)
+            if let Some((_, name, creator, synced, ver)) =
+                snapshots.iter().find(|(gid, _, _, _, _)| gid == group_id)
             {
                 *group_name = name.clone();
                 *creator_id = creator.clone();
                 *members = synced.clone();
+                *version = *ver;
                 changed = true;
             }
         }
@@ -3378,6 +3414,9 @@ impl App {
         if let Some(group) = self.groups.get_mut(&group_id) {
             group.members.retain(|m| m.peer_id != peer_id);
             group.members = dedupe_members(group.members.clone());
+            if group.creator_id == me {
+                group.version = group::next_group_version(group.version);
+            }
             let g = group.clone();
             let empty = g.members.is_empty();
             if empty {
@@ -3419,24 +3458,39 @@ impl App {
         group_name: String,
         creator_id: String,
         members: Vec<GroupMember>,
+        version: u64,
+        sig: Vec<u8>,
+        creator_pubkey_pb: Vec<u8>,
     ) {
         if self.left_groups.contains(&group_id) || !group::validate_group_id(&group_id) {
             return;
         }
         let me = self.local_peer_id.to_string();
+        let signed = crate::protocol::verify_group_sync_signature(
+            &group_id,
+            &creator_id,
+            version,
+            &group_name,
+            &members,
+            &sig,
+            &creator_pubkey_pb,
+        );
         let Some(group::AuthorizedGroupSync {
             name,
             creator_id,
             mut members,
-        }) = group::authorize_group_sync(
+            version,
+        }) = group::admit_group_sync(
             self.groups.get(&group_id),
             &from.to_string(),
             &group_name,
             &creator_id,
             members,
+            version,
+            signed,
         )
         else {
-            warn!("VOID: group_sync от {from} отклонён: нет прав на изменение группы");
+            warn!("VOID: group_sync от {from} отклонён: нет прав или устаревшая версия");
             return;
         };
         if let Some(departed) = self.group_departed_peers.get(&group_id) {
@@ -3470,6 +3524,7 @@ impl App {
             creator_id,
             members,
             created_at,
+            version,
         };
         if group::validate_group_chat(&group) {
             self.groups.insert(group_id, group);
@@ -3514,6 +3569,7 @@ impl App {
         }
         let mut sync_group = group.clone();
         sync_group.members = members.clone();
+        self.sign_legacy_creator_version(&mut sync_group);
         let recipients: Vec<PeerId> = sync_group
             .member_peer_ids()
             .into_iter()
@@ -3531,7 +3587,27 @@ impl App {
             creator_id: sync_group.creator_id.clone(),
             members,
             recipients,
+            version: sync_group.version,
         });
+    }
+
+    /// Группа создателя без подписи (version 0) получает 1 один раз.
+    fn sign_legacy_creator_version(&mut self, group: &mut GroupChat) {
+        let me = self.local_peer_id.to_string();
+        if group.creator_id != me || group.version != 0 {
+            return;
+        }
+        group.version = 1;
+        let mut persist = false;
+        if let Some(stored) = self.groups.get_mut(&group.id) {
+            if stored.version == 0 {
+                stored.version = 1;
+                persist = true;
+            }
+        }
+        if persist {
+            self.persist_vault();
+        }
     }
 
     /// Отправляет group_sync пиру при подключении (повторяет при каждом reconnect).
@@ -3559,6 +3635,7 @@ impl App {
             }
             let mut sync_group = group.clone();
             sync_group.members = members.clone();
+            self.sign_legacy_creator_version(&mut sync_group);
             self.queue_outbox_group_sync(&sync_group, peer);
             let _ = self.command_tx.try_send(UICommand::SendGroupSync {
                 group_id: sync_group.id.clone(),
@@ -3566,6 +3643,7 @@ impl App {
                 creator_id: sync_group.creator_id.clone(),
                 members,
                 recipients: vec![peer],
+                version: sync_group.version,
             });
         }
     }
@@ -3658,10 +3736,8 @@ impl App {
                 }
                 OutboxEntry::GroupSync {
                     group_id,
-                    group_name: _,
-                    creator_id: _,
-                    members: _,
                     recipient,
+                    ..
                 } if recipient == peer_str => {
                     if self.left_groups.contains(&group_id)
                         || !self.is_active_group_member(&group_id)
@@ -3681,6 +3757,7 @@ impl App {
                         creator_id: group.creator_id.clone(),
                         members,
                         recipients: vec![peer],
+                        version: group.version,
                     });
                 }
                 OutboxEntry::GroupMessage {

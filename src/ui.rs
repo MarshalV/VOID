@@ -1927,6 +1927,9 @@ impl eframe::App for App {
                     group_name,
                     creator_id,
                     members,
+                    version,
+                    sig,
+                    creator_pubkey_pb,
                 } => {
                     self.merge_incoming_group_sync(
                         from,
@@ -1934,6 +1937,9 @@ impl eframe::App for App {
                         group_name,
                         creator_id,
                         members,
+                        version,
+                        sig,
+                        creator_pubkey_pb,
                     );
                     self.push_toast(
                         "Обновлён состав группы".into(),

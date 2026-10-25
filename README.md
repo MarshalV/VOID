@@ -36,7 +36,7 @@ The main desktop is **Tauri 2** (`frontend/` + `src-tauri/`). Optionally a nativ
 
 ## Features
 
-- **P2P chat** — `/void/chat/1.0.0` (request-response). Payload is E2EE (`V1Packet::Encrypted`), optionally wrapped in onion (`VOID_ONION_v1`).
+- **P2P chat** — `/void/chat/1.0.0` (request-response). Payload is E2EE (`V1Packet::Encrypted`), optionally wrapped in onion (`VOID_ONION_v2`, or v1 if a hop has no descriptor).
 - **E2EE** — **Noise** on the transport, then `Hello` (X25519 + Ed25519 signature bound to `PeerId`, freshness `ts`/`nonce`), then **Double Ratchet** with a DH step on every speaker change; the header and both PeerIds go into AAD.
 - **1-to-1 and groups** — groups with invite `void://group/…`, fan-out to each member (not MLS).
 - **Voice** — record, preview, WAV over E2EE; in-chat player. Auto-accept, no “accept file” banner.
@@ -50,7 +50,7 @@ The main desktop is **Tauri 2** (`frontend/` + `src-tauri/`). Optionally a nativ
 - **Vault** — nickname, keys, contacts, groups in `vault.bin`; master key in `void.key`. Journal — `chat_journal.bin`, undelivered — `outbox.bin`.
 - **Delivery** — ○ / ✓ / ✓✓; read receipt when the chat is open.
 - **Beacon** — closing the window hides to tray; the process stays up. UI header uses `Image_programm.png`.
-- **Onion** — `VOID_ONION_v1`: 1 live node with a key → 1 hop, 2 → both, 3+ → up to three. The live path is shown in settings. Hides the sender IP from the exit, not the pair of peers — see [onion](#anonymous-routing-void_onion_v1).
+- **Onion** — `VOID_ONION_v2` when every hop has a fresh descriptor, otherwise `VOID_ONION_v1`. 1 live node → 1 hop, 2 → both, 3+ → up to three. The live path is shown in settings. A v2 exit does not see the sender; one node or two hops still link the path — see [onion](#onion-void_onion_v2).
 
 ---
 
@@ -75,8 +75,10 @@ The main desktop is **Tauri 2** (`frontend/` + `src-tauri/`). Optionally a nativ
                              │
 ┌────────────────────────────▼────────────────────────────────┐
 │  src/network.rs     libp2p Swarm (ChatBehaviour)            │
-│  src/onion.rs       VOID_ONION_v1                           │
-│  src/crypto.rs      Double Ratchet                          │
+└────────────────────────────┬────────────────────────────────┘
+                             │ crate void-protocol
+┌────────────────────────────▼────────────────────────────────┐
+│  protocol/          frames, session, onion, offline mail    │
 └─────────────────────────────────────────────────────────────┘
 ```
 
@@ -84,15 +86,17 @@ The main desktop is **Tauri 2** (`frontend/` + `src-tauri/`). Optionally a nativ
 |--------|------|
 | `src/network.rs` | Swarm, dial bootstrap, Hop, RR chat, mailbox, gossip |
 | `src/bridge.rs` | Headless runtime for Tauri: snapshot push, not poll |
-| `src/protocol.rs` | `V1Packet` (`Hello`, `Encrypted`, mailbox, onion, …) |
-| `src/crypto.rs` | Handshake + Double Ratchet (DH step, header and PeerId in AAD) |
-| `src/onion.rs` | Onion layers over live bootstraps with `;onion=` in Identify |
-| `src/offline_mail.rs` | Seal envelope to a key derived from the recipient PeerId |
+| `protocol/src/protocol.rs` | `V1Packet` (`Hello`, `Encrypted`, mailbox, onion, …) |
+| `protocol/src/crypto.rs` | Handshake + Double Ratchet (DH step, header and PeerId in AAD) |
+| `protocol/src/onion.rs` | Onion v2 when every hop has a descriptor, otherwise v1 |
+| `protocol/src/offline_mail.rs` | Seal envelope to the recipient’s rotating prekey, or to the key derived from their PeerId if none is published |
+| `protocol/src/kad_store.rs` | Kademlia `put`: signed unexpired prekey, or a v3 mailbox. Other keys are refused |
 | `src/relay_mailbox.rs` | Local mailbox for LAN without bootstrap: the client stores neighbours’ mail and serves it to the owner on Query |
-| `src/hello_replay.rs` | Cache of accepted `Hello` ephemeral keys; together with `ts`/`nonce` in the signature, a replay cannot reset the session |
+| `src/hello_replay.rs` | Cache of accepted `Hello` ephemeral keys (256 per peer). A `Hello` with `ts == 0` does not reset a live session |
 | `src/vault.rs` / `paths.rs` | Vault, data directory, instance lock |
 | `src/bootstrap.rs` | Seed merge: vault, env, HTTP, built-in list |
-| `src/file_transfer.rs` / `voice.rs` / `group.rs` | Files, voice, groups |
+| `src/file_transfer.rs` / `src/voice.rs` | Files and voice |
+| `protocol/src/group.rs` | Group roster, invite, creator-signed version |
 
 The UI does **not** poll `get_snapshot` on a timer in normal mode. State goes out as `void://snapshot` (flusher ~120 ms, monotonic `revision`). While status is `Hop…`, the UI also polls the snapshot so it does not stick on “waiting for Ack”.
 
@@ -201,18 +205,19 @@ In the connect field: `multiaddr`, `IP`, or `IP:PORT`. A bootstrap in the seed l
 
 | Packet | Purpose |
 |--------|---------|
-| `Hello` | X25519 + identity signature; `caps` — capabilities (`1` = ratchet header in AAD); `ts` + `nonce` are in the signature (±10 min window). Old clients without `ts` are accepted under v1 signature |
+| `Hello` | X25519 + identity signature. New clients sign bind v3: `ts`, `nonce`, and `caps` (±10 min). `caps` bit `1` puts the ratchet header in AAD. An onion Hello is accepted only as v3 with that bit set. A direct Hello with `ts == 0` can still open a session and does not reset one that is already live |
 | `Encrypted` | Double Ratchet |
 | `Ack` | RR reply / empty mailbox / node accepted the letter |
 | `OfflineMailboxStore` / `Query` / `Deliver` | offline mail on bootstrap; `Query` runs only for own PeerId; empty `Deliver` in reply to `Store` is a refusal |
-| `PrekeyPut` / `Get` / `Offer` | X25519 prekey directory. Not needed for Ed25519 PeerId (key is derived from PeerId); a node reply without the owner’s signature is not used for seal; unsolicited `Offer` is ignored |
+| `PrekeyPut` / `Get` / `Offer` | Rotating X25519 prekey: `{public_key, not_after, sig}`. The node stores a put only from the Noise peer who owns the PeerId, with a valid signature and `not_after` within 30 days. An offer is used for seal only when that signature and expiry check out. An unsolicited `Offer` is ignored |
 | `BootstrapGossip` | seed exchange |
 | `DialBack` | “dial me over circuit” |
-| `Onion` / `OnionDrop` | `VOID_ONION_v1` layers. `OnionDrop` is accepted only from a bootstrap that advertised `;onion=` in its own Identify; inside — only `Hello` / `Encrypted` / `Ack` |
+| `Onion` / `OnionDrop` | `VOID_ONION_v1`. `OnionDrop` is accepted only from a bootstrap that advertised `;onion=` in its own Identify; inside — only `Hello` / `Encrypted` / `Ack`. The last layer still carries `src` |
+| `Onion2` / `OnionDeliver` | `VOID_ONION_v2`. Fixed-size cell. The exit forwards an opaque body sealed to the recipient’s identity key. No `src`. Used only when every hop on the path has a fresh descriptor |
 
 JSON RR: request up to 4 MiB, response up to 16 MiB (offline voice chunks).
 
-### End-to-end encryption (`src/crypto.rs`)
+### End-to-end encryption (`protocol/src/crypto.rs`)
 
 | Stage | Algorithm |
 |-------|-----------|
@@ -226,11 +231,11 @@ JSON RR: request up to 4 MiB, response up to 16 MiB (offline voice chunks).
 | Key memory | `zeroize` |
 | Skipped keys | up to **4096** total, at most **1000** per header, TTL 1 h |
 
-A session with an old client still works: no DH step, frames without AAD, `Hello` without `ts` accepted under v1 signature. **Update the node together with the client:** an old node on the onion path drops `ts`/`nonce`/`caps`, and a new `Hello` over onion will fail. Seed between an old and a new node will not complete either.
+A direct session with an old client still works: no DH step, frames without AAD, `Hello` without `ts` under a v1 signature, and that Hello does not reset a live session. An onion Hello from an old client is refused until it signs v3 with `HELLO_CAP_HEADER_AAD`. **Update the node together with the client:** an old node on the onion path drops `ts`/`nonce`/`caps`, and a new `Hello` over onion will fail. Seed between an old and a new node will not complete either.
 
-Offline envelope v3 (`src/offline_mail.rs`):
+Offline envelope v3 (`protocol/src/offline_mail.rs`):
 
-- `ct` — ChaCha20-Poly1305 to a key from X25519(ephemeral, recipient key from their PeerId — see [Prekey](#prekey)), HKDF with `eph` and the recipient key;
+- `ct` — ChaCha20-Poly1305 to a key from X25519(ephemeral, recipient prekey — see [Prekey](#prekey)), HKDF with `eph` and that key;
 - inside `ct` — sender, `sender_pk`, `message_id`, `kind`, body, and a signature of the sender’s libp2p key over those, the recipient, and `eph`; body is padded (power of two from 512 B to 4 KiB, then multiples of 4 KiB);
 - outside, `sender` and `kind` are empty, `sender_pk` is zero, `message_id` is a hash of the recipient and the real id (the node can dedupe repeats but cannot link letters of different recipients);
 - external id, recipient, and `eph` are cipher AAD: the node cannot rewrite the id or redirect the envelope;
@@ -241,37 +246,29 @@ The node sees the recipient (mailbox slot), time, and size to bucket accuracy.
 
 ### Prekey
 
-An offline letter is sealed to an X25519 key **derived from the recipient PeerId**: the PeerId contains an Ed25519 key, converted to X25519 (Edwards → Montgomery, same as `crypto_sign_ed25519_pk_to_curve25519` in libsodium). The secret is the scalar of that same Ed25519 key. The key is never distributed, so it cannot be swapped — not by the node, not by a DHT participant, not by a contact. The first letter goes out immediately, without `Hello` and without a directory.
+A new offline letter is sealed to the recipient’s **rotating X25519 prekey**, not to the long-lived chat static key. The prekey lives 7 days and is rotated when less than 24 hours remain. The previous secret is kept until its own `not_after`, then dropped. The client publishes it on the bootstrap (`PrekeyPut`) and in DHT `/void/prekey/<peer>`.
 
-The recipient tries the identity secret and the old static prekey (letters sealed before the upgrade).
+DHT value v2: `pk[32] || 0x02 || not_after[8] ||` owner signature. v1 (no expiry) still verifies and is not used for seal. The node accepts `PrekeyPut` only when the Noise peer is the claimed owner, the signature matches the identity key inside the PeerId, and `not_after` is in the future and at most 30 days out. An unsigned put is refused. `PrekeyOffer` is used only if the same signature and expiry check out, and only in answer to our own `PrekeyGet`.
 
-The prekey directory (`PrekeyPut` on bootstrap, DHT `/void/prekey/<peer>` with the owner’s signature) is still published, but used for sealing only for non-Ed25519 PeerIds:
+If no sealable prekey comes back, the letter is sealed to the X25519 key **derived from the recipient PeerId** (Ed25519 inside the PeerId, Edwards → Montgomery, same as `crypto_sign_ed25519_pk_to_curve25519`). That key is never distributed. The recipient opens a letter with the current prekey secret, the previous one, and this identity secret, so mail sealed before the upgrade still opens.
 
-| Source | Accepted (non-Ed25519 PeerId only) |
-|--------|-------------|
-| `Hello` signed to `PeerId` | yes |
-| DHT `/void/prekey/<peer>`: `pk[32]` + owner libp2p signature | yes, if the signature verifies |
-| DHT record without a signature (old format) | no |
-| `PrekeyOffer` from bootstrap | no — the node has no owner signature |
-| `PrekeyOffer` without our own `PrekeyGet` | no |
-
-The key is long-lived: leaking the libp2p key reveals offline mail sitting in mailboxes (offline mail has no forward secrecy).
+Leaking the libp2p identity still opens letters that were sealed to it. Letters sealed only to a prekey that has already been dropped do not.
 
 ### Offline mail
 
 The live path is **not DHT**, it is RR to bootstrap:
 
-1. Recipient offline → key from their PeerId → `OfflineMailboxStore`. The node replies `Ack` if it stored; empty `Deliver` is a quota/rate refusal — the letter stays queued and will retry later.
+1. Recipient offline → their prekey, or the PeerId key if none is published → `OfflineMailboxStore`. The node replies `Ack` if it stored; empty `Deliver` is a quota, rate, or mailbox-ceiling refusal — the letter stays queued and will retry later.
 2. Recipient online → `OfflineMailboxQuery`; the node returns a batch (`take_batch` ≤ 512 KiB plaintext) and **deletes** it from `relay_mailbox.bin`. Mail is given only to the recipient: the connection PeerId must match `recipient`.
 3. The client fetches the rest with the next Query, with a pause (no immediate re-query: otherwise the same batch spins hundreds of times per second and chokes Hop).
 
-Node limits: envelope lifetime 7 days, up to 256 envelopes / 8 MiB from one sender in one mailbox, `Store` at most 600 requests per minute per peer.
+Node limits: at most 4096 mailboxes (a new slot past that is refused), envelope lifetime 7 days, up to 256 envelopes / 8 MiB from one sender in one mailbox, `Store` at most 600 requests, 600 envelopes, and 48 MiB per minute per peer.
 
-With bootstraps configured, letters go only to them. Without bootstrap (LAN), connected peers get copies — then the client itself answers Query from local `relay_mailbox.bin`, also only to the mailbox owner.
+With bootstraps configured, letters go only to them, and the client refuses `Store` from anyone else. Without bootstrap (LAN), connected peers get copies — then the client itself answers Query from local `relay_mailbox.bin`, also only to the mailbox owner, with the same per-uploader rate and volume as the node. Kademlia accepts a mailbox record only as a bincode list of v3 envelopes under `/void/mailbox/<PeerId>`.
 
-### Anonymous routing (`VOID_ONION_v1`)
+### Onion (`VOID_ONION_v2`)
 
-A layer **on top of** libp2p and E2EE. Hop key is `onion=<64 hex>` in the node Identify `agent_version`.
+A layer **on top of** libp2p and E2EE. This is not a hidden route: one node, or two hops, still links the ends. The settings line still says the route is not anonymous when fewer than three hops are live.
 
 ```
 Alice → Node A → [Node B → Node C] → Bob
@@ -280,26 +277,31 @@ Alice → Node A → [Node B → Node C] → Bob
 | Live nodes with an onion key | Chain |
 |------------------------------|-------|
 | 0 | no onion — circuit / direct RR |
-| 1 | one hop: after unwrap the node sees the Alice↔Bob pair |
+| 1 | one hop |
 | 2 | both hops |
-| 3+ | up to three random; entry does not see Bob, exit does not see Alice’s IP |
+| 3+ | up to three; entry is a guard kept for 14 days |
 
-What each party in a three-hop chain sees:
+v2 is wrapped only when every hop has a descriptor `{peer_id, onion_pk, epoch, not_after, operator, sig}` that is still inside its week and not more than 30 days ahead. Otherwise the client wraps v1.
+
+What a hop sees on a **v2** cell:
 
 | Party | Sees |
 |-------|------|
-| Entry | Alice’s IP and PeerId, next hop, size |
-| Middle | neighbouring hops, size |
-| Exit | **Alice’s PeerId and Bob’s PeerId** (`OnionDrop.src`), packet type, size |
+| Entry | Alice’s IP and PeerId, the next hop, one of the buckets 2 / 16 / 64 KiB |
+| Middle | neighbouring hops, the same bucket |
+| Exit | Bob’s PeerId, the same bucket, the length of the sealed body. Not Alice’s PeerId |
 
-Limits of `VOID_ONION_v1`:
+The body is sealed to the X25519 key derived from Bob’s PeerId. `Hello` and `Ack` carry Alice’s PeerId inside that seal. `Encrypted` is demultiplexed by trying the live session. The reply is a new onion to that session peer. A v1 cell still puts Alice in `OnionDrop.src`, so an old hop on the path brings the pair back.
 
-- exit knows the Alice↔Bob pair; only Alice’s IP is hidden;
-- the path is chosen **anew for every packet** — over a conversation many exits learn the pair;
-- onion is not used if Bob is already connected directly (LAN, circuit, DCUtR), or if wrap fails (packet too large) — then the packet goes **direct**;
-- cell sizes are not padded, hop keys are not rotated.
+Other limits:
 
-The live route (hop PeerIds) is shown in settings. Old nodes without `;onion=` are not put in the chain. This is not a mixnet and not protection against a global observer. DCUtR (if enabled) can open a direct channel and link IPs again.
+- files and large chunks stay on the live channel or in the mailbox, not in an onion cell;
+- the guard is sticky for 14 days; middle and exit rotate with the 15-minute path and prefer a different IPv4 `/16`, a different IPv6 `/32`, and a different `VOID_OPERATOR` when that label is set;
+- the same node is not used as both entry and exit;
+- a hop key rotates every 7 days. The previous secret decrypts for one more day, then it is erased. A higher `epoch` with a valid signature replaces the key the client already stored;
+- onion is not used for a packet that is already on a direct channel to Bob.
+
+The live route (hop PeerIds) is shown in settings. Old nodes without `;onion=` are not put in the chain. A hop forwards the inner frame only after Identify, parses `next` as a PeerId, and rate-limits forwarding (600/min from the previous hop, 6000/min overall). Logs do not record `next` or `src`. This is not a mixnet and not protection against a global observer. DCUtR (if enabled) can open a direct channel and link IPs again.
 
 ### Files (`src/file_transfer.rs`)
 
@@ -321,9 +323,9 @@ The filename in the offer is seen by whoever terminates the connection (the peer
 
 WAV mono 48 kHz 16-bit PCM, up to 5 min. Recording is a child process `--voice-record` (`cpal`). Into chat — `VoiceMeta`; WAV as a file with auto-accept. Offline: `voice_chunk` pieces through the same mailbox. Metadata is stripped when possible (`metadata_strip`).
 
-### Groups (`src/group.rs`)
+### Groups (`protocol/src/group.rs`)
 
-Member list in the vault + thread `group:<id>`. Message/file/voice is fan-out to each member (file and voice get a per-peer `transfer_id`). Group voice is queued and retried until the WAV is gone. Invite: `void://group/…`. Rights (`group::authorize_group_sync`): only the creator can install a new group via `group_sync`, the creator cannot be changed, name and roster are set by the creator, others may only join or leave themselves; `group_leave` — from the member or the creator, `group_delete` — creator only. No state version or signature. **Not MLS**: compromising a member reveals what they received.
+Member list in the vault + thread `group:<id>`. Message/file/voice is fan-out to each member (file and voice get a per-peer `transfer_id`). Group voice is queued and retried until the WAV is gone. Invite: `void://group/…`. The creator signs the roster: `version` plus a signature over `group_id ‖ version ‖ name ‖ members`. A snapshot is applied only when `version` is greater than the local one and the signature checks out. An unsigned sync from the creator is refused. Anyone else may only add or remove themselves, and that does not move `version`. `group_leave` — from the member or the creator, `group_delete` — creator only. A live or offline message is stored only when both we and the sender are in the roster. **Not MLS**: compromising a member reveals what they received.
 
 ### Local storage
 
@@ -345,7 +347,8 @@ Directory (override with `VOID_DATA_DIR`):
 | `voice/` | WAV | data directory |
 | `void.pwd` | “Remember password” | Windows: Credential Manager + file; otherwise file |
 | `void.instance.lock` | One process per vault | exclusive open |
-| `hello_seen.bin` | Ephemeral keys of accepted `Hello` (replay does not reset the session) | on disk |
+| `hello_seen.bin` | Last 256 ephemeral keys of accepted `Hello` per peer. A `Hello` with `ts == 0` does not reset a live session | on disk |
+| `offline_prekey.bin` | Current and previous offline-mail prekey secrets | on disk |
 | `relay_mailbox.bin` | Local mailbox only on LAN without bootstrap | on disk, unsealed (unlike the node) |
 
 > Never give the vault password together with `void.key` and `vault.bin`.
@@ -372,7 +375,7 @@ Relay does not see plaintext, but **can** match IP↔PeerId, the circuit pair `s
 
 The stable identifier is **PeerId** (as long as the vault lives). This is **pseudonymous E2EE**, not Tor. Do not use VOID if the threat model is “the node must not know who wrote to whom”.
 
-One node is the normal mode for current VOID (discovery, Hop, mailbox). It does not give routing anonymity — see [onion](#anonymous-routing-void_onion_v1).
+One node is the normal mode for current VOID (discovery, Hop, mailbox). It does not hide who met whom — see [onion](#onion-void_onion_v2).
 
 ---
 
@@ -460,9 +463,9 @@ Your own bootstrap/relay nodes speed up discovery and NAT.
 |------|----------------|
 | **Kademlia Server** | Entry into `/void/kad/1.0.0` |
 | **Circuit Relay v2** | Hop for clients behind NAT; opaque circuit bytes |
-| **Offline mail / prekey** | Store/query on `/void/chat`; delivery **only to the mailbox owner**, in batches with deletion (`take_batch`). `relay_mailbox.bin` is encrypted. TTL 7 days, per-uploader quotas, refusal via empty `Deliver`. The client does not use node prekeys for seal — the key comes from the recipient PeerId |
+| **Offline mail / prekey** | Store/query on `/void/chat`; delivery **only to the mailbox owner**, in batches with deletion (`take_batch`). `relay_mailbox.bin` is encrypted. At most 4096 mailboxes, TTL 7 days, per-uploader quotas, refusal via empty `Deliver`. `PrekeyPut` is stored only with the owner’s signature and an expiry within 30 days. Kademlia `put` keeps a signed unexpired prekey or a v3 mailbox and drops anything else |
 | **VOID-SEED** | `/void-seed/v1` on a separate TCP — list exchange **between nodes** |
-| **Onion hop** | Identify `void-bootstrap-node/…;onion=<pk>` — unwrap and forward |
+| **Onion hop** | Identify `void-bootstrap-node/…;onion=<pk>;osig=…;epoch=…;until=…;op=…;osig2=…`. Unwrap v2 (fixed cell) or v1 (JSON) and forward only after the next hop’s Identify. The hop key rotates weekly; the previous secret lasts one more day. `next` is a PeerId. Forward is limited to 600/min per previous hop and 6000/min overall. Logs do not record `next` or `src` |
 
 Live `V1Packet::Encrypted` is **not** forwarded as a chat server. Circuit and mailbox are separate paths. Onion is another: the node sees the next hop, not plaintext.
 
@@ -472,7 +475,7 @@ Live `V1Packet::Encrypted` is **not** forwarded as a chat server. Circuit and ma
 |-----------|-------|
 | Transports | TCP + QUIC, `LISTEN_PORT` (4001) |
 | Identify | `/void/v1`, `void-bootstrap-node/…` (+ `;onion=` if built with onion) |
-| Kademlia | `/void/kad/1.0.0`, **Mode::Server** |
+| Kademlia | `/void/kad/1.0.0`, **Mode::Server**. `put` accepts `/void/prekey/*` (owner signature, expiry ≤ 30 days) and `/void/mailbox/*` (v3 envelopes). Any other key is refused |
 | Relay | Default + NAT-oriented limits |
 | Logs | `RUST_LOG` default **info** (IP in `endpoint`) |
 
@@ -532,14 +535,16 @@ The client does not use the node’s QUIC address in seed for dial (it breaks li
 - [x] Voice and files (E2EE `VfP1`/`VfC1`, empty files, cache, Downloads)
 - [x] Tauri UI (push-snapshot) + optional egui
 - [x] Tray / beacon; a second launch raises the same window
-- [x] `VOID_ONION_v1` — 1/2/3 hops by number of nodes with a key; path in settings
+- [x] `VOID_ONION_v2` when every hop has a fresh descriptor (fixed 2/16/64 KiB cell, no sender in the last layer, weekly hop key, 14-day guard). v1 remains for a path that still has an old hop
 - [x] `OnionDrop` only from advertised onion hops, inside only `Hello` / `Encrypted` / `Ack`
-- [x] Offline envelope v3: sender signature, metadata inside ciphertext; recipient key derived from their PeerId (prekey cannot be poisoned)
-- [x] Offline-mail Query only for the mailbox owner; on the node TTL 7 days, quotas and `Store` rate limit; with bootstrap, copies are not sent to ordinary peers
-- [x] Double Ratchet with a DH step on every speaker change; frame header and both PeerIds in AAD if both clients advertised it in `Hello.caps`
-- [x] `Hello` freshness: `ts` (±10 min) and `nonce` in the signature; replaying an ephemeral key does not reset the session
+- [x] Offline envelope v3: sender signature, metadata inside ciphertext. Seal goes to a rotating prekey; the PeerId-derived key remains the fallback
+- [x] Offline-mail Query only for the mailbox owner; on the node at most 4096 mailboxes, TTL 7 days, quotas and `Store` rate limit; with bootstrap, the client does not accept `Store` from ordinary peers
+- [x] Double Ratchet with a DH step on every speaker change; frame header and both PeerIds in AAD if both clients advertised it in `Hello.caps`. New clients sign `caps` in Hello bind v3; an onion Hello without that flag is refused
+- [x] `Hello` freshness: `ts` (±10 min) and `nonce` in the signature. A `Hello` with `ts == 0` does not reset a live session
 - [x] Vault: Argon2id 64 MiB, AES-GCM with AAD (`VOIDKEY3`; old `VOIDKEY2` still opens)
-- [x] Group rights: roster and name are set by the creator, a member may only change themselves; group delete — creator only
+- [x] Group roster has a creator-signed `version`. A replay of an older `group_sync` does not roll membership back. A message is stored only if the sender is in the roster
+- [x] Kademlia `put` on the client and the node keeps only a signed unexpired prekey or a v3 mailbox
+- [x] A hop forwards an onion cell only after Identify, with a forward rate limit, and does not log `next` or `src`
 
 ### Optional / not default
 
@@ -547,7 +552,7 @@ The client does not use the node’s QUIC address in seed for dial (it breaks li
 
 ### Protocol plan
 
-Next work is to lift the delivery contract this app already implements into a specification and crates. Protocol and desktop currently share one tree: streams in `src/`, the window in `frontend/` and `src-tauri/`. Tauri remains one consumer of the crates. Goal: another implementation speaks the same streams from the spec and test vectors, without this repository as a UI sample.
+The wire protocol lives in `protocol/` (crate `void-protocol`): frames, the session, offline envelopes, onion cells, groups, and the Kademlia record check. The desktop stays in `src/`, `frontend/`, and `src-tauri/`, and depends on that crate. Tauri is still one consumer. Next work is a specification and test vectors, so another implementation can speak the same streams without this repository as a UI sample.
 
 The code stays [MIT](./LICENSE). Specification text — CC BY 4.0.
 
@@ -569,20 +574,20 @@ Separate already implemented rules from this client’s behaviour. One dispatche
 | Discovery | `/void/kad/1.0.0` without chat text |
 | Meeting | Which Hop reservation a peer needs from the dispatcher |
 | Seed | `/void-seed/v1` between dispatchers |
-| Onion | `VOID_ONION_v1`: 1 / 2 / 3 hops, what each hop sees |
+| Onion | `VOID_ONION_v2` when every hop has a descriptor, else v1: 1 / 2 / 3 hops, what each hop sees |
 
 Reference dispatcher — [`MarshalV/bootstrap_node`](https://github.com/MarshalV/bootstrap_node). Seed and mailbox are described here even if the node code lives in that repository. The specification text has no internal types of the desktop shell.
 
 #### 2. Libraries without a UI
 
-Extract the protocol from the client into crates. The desktop depends on them. The second consumer is the harness from task 3.
+`protocol/` is the first crate the desktop depends on. Splitting it into frames, session, envelope, and onion, then the harness from task 3, is still ahead.
 
 | Crate | Contents |
 |-------|----------|
 | Frames | Frame types and length limits |
 | Session | Signed Hello and Double Ratchet |
 | Envelope | Seal and open of offline mail |
-| Onion | Wrap and unwrap `VOID_ONION_v1` |
+| Onion | Wrap and unwrap `VOID_ONION_v2`, and v1 when a hop has no descriptor |
 
 The Tauri shell is not a deliverable of this work.
 
@@ -603,7 +608,7 @@ Status: done in the client (envelope v3) — `sender` and `kind` inside `ct`, ex
 
 Before v3 the dispatcher stored opaque `ct` and saw stable `sender`, `recipient`, and `kind`. New envelope form: the node still expires the record and hands it to the recipient, but without a stable sender in the clear.
 
-The spec still states what the route still shows: size, time, and an identifier without which delivery cannot be done. If the recipient stays in the clear, that is written as-is. Calling the form anonymity is not allowed: one dispatcher sees the meeting; onion sizes are not padded; an observer of the whole path links entry and exit.
+The spec still states what the route still shows: size bucket, time, and the recipient on the last hop. Calling the form anonymity is not allowed: one dispatcher sees the meeting; a v2 cell has three size buckets; an observer of the whole path links entry and exit. A path that still contains a v1 hop also shows the sender.
 
 This form gets its own vectors.
 
@@ -622,7 +627,7 @@ Do **not** file vulnerabilities as a public issue. Write to the author privately
 
 The project has **not had an external audit**. Do not use VOID to protect people’s lives or freedom.
 
-Practice in the code: E2EE only in chat; Hello bound to identity and fresh (`ts`/`nonce`); ratchet header and PeerId in AAD; mailbox Query only for the owner; JSON/HTTP/vault/file limits; attachment cache under the vault key. Residual risks (IP at the node, PeerId, offline-mail recipient, Identify, onion-key gossip) — in [Privacy](#privacy-and-threat-model).
+Practice in the code: E2EE only in chat; Hello bound to identity, with `ts`/`nonce`/`caps` in the v3 signature; a `Hello` without `ts` does not reset a live session; ratchet header and PeerId in AAD; mailbox Query only for the owner and at most 4096 boxes on the node; offline mail sealed to a rotating prekey; group roster signed and monotonic; Kademlia refuses unsigned records; a hop forwards only after Identify. A v2 onion cell hides the sender from the exit; a v1 cell on a mixed path does not. Residual risks (IP at the node, PeerId, offline-mail recipient, Identify, onion-key gossip, a path shorter than three independent hops) — in [Privacy](#privacy-and-threat-model).
 
 ---
 

@@ -5,13 +5,14 @@ use rand::RngCore;
 use serde::{Deserialize, Serialize};
 
 use crate::crypto;
-use crate::file_transfer;
 use crate::group::{self, GroupMember};
+
+const MAX_CHAT_FILE_BYTES: u64 = 512 * 1024 * 1024;
 
 /// Статус доставки исходящего сообщения (галочки в UI).
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, Default)]
 #[serde(rename_all = "snake_case")]
-pub(crate) enum OutgoingDeliveryStatus {
+pub enum OutgoingDeliveryStatus {
     /// ○ — в очереди / ожидает подтверждения доставки.
     #[default]
     Pending,
@@ -23,28 +24,28 @@ pub(crate) enum OutgoingDeliveryStatus {
 
 /// Метаданные голосового сообщения (аудио передаётся отдельным file-transfer).
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
-pub(crate) struct VoiceMeta {
+pub struct VoiceMeta {
     /// 32 hex-символа (16 байт transfer_id).
-    pub(crate) transfer_id: String,
-    pub(crate) duration_secs: f32,
+    pub transfer_id: String,
+    pub duration_secs: f32,
 }
 
 /// Файл в чате (байты идут file-transfer, в пузырьке — имя и локальный путь).
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
-pub(crate) struct FileMeta {
-    pub(crate) transfer_id: String,
-    pub(crate) filename: String,
-    pub(crate) size: u64,
+pub struct FileMeta {
+    pub transfer_id: String,
+    pub filename: String,
+    pub size: u64,
     /// Локальный путь после приёма/отправки. На провод не уходит (очищается при разборе).
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub(crate) local_path: Option<String>,
+    pub local_path: Option<String>,
 }
 
-pub(crate) fn transfer_id_to_hex(tid: &[u8; 16]) -> String {
+pub fn transfer_id_to_hex(tid: &[u8; 16]) -> String {
     tid.iter().map(|b| format!("{:02x}", b)).collect()
 }
 
-pub(crate) fn transfer_id_from_hex(hex: &str) -> Option<[u8; 16]> {
+pub fn transfer_id_from_hex(hex: &str) -> Option<[u8; 16]> {
     let hex = hex.trim();
     if hex.len() != 32 || !hex.chars().all(|c| c.is_ascii_hexdigit()) {
         return None;
@@ -60,7 +61,7 @@ pub(crate) fn transfer_id_from_hex(hex: &str) -> Option<[u8; 16]> {
 }
 
 /// Уникальный transfer_id file-transfer для каждого участника группы (один base id в UI).
-pub(crate) fn per_peer_voice_transfer_id(base: &[u8; 16], peer: PeerId) -> [u8; 16] {
+pub fn per_peer_voice_transfer_id(base: &[u8; 16], peer: PeerId) -> [u8; 16] {
     use blake2::digest::{Digest, FixedOutput};
     let mut h = blake2::Blake2b::<blake2::digest::consts::U16>::new();
     h.update(b"VOID_GROUP_VOICE_V1");
@@ -76,7 +77,7 @@ fn validate_file_meta(f: &FileMeta) -> bool {
         && f.filename.len() <= 256
         && !f.filename.contains('/')
         && !f.filename.contains('\\')
-        && f.size <= file_transfer::MAX_FILE_SIZE
+        && f.size <= MAX_CHAT_FILE_BYTES
 }
 
 fn validate_voice_meta(v: &VoiceMeta) -> bool {
@@ -88,29 +89,29 @@ fn validate_voice_meta(v: &VoiceMeta) -> bool {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
-pub(crate) struct ChatMessage {
+pub struct ChatMessage {
     #[serde(default)]
-    pub(crate) id: String,
-    pub(crate) sender_id: String,
-    pub(crate) sender_name: String,
-    pub(crate) recipient_id: Option<String>,
-    pub(crate) text: String,
-    pub(crate) timestamp: String,
+    pub id: String,
+    pub sender_id: String,
+    pub sender_name: String,
+    pub recipient_id: Option<String>,
+    pub text: String,
+    pub timestamp: String,
     /// Только для исходящих: ○ / ✓ / ✓✓.
     #[serde(default)]
-    pub(crate) delivery: OutgoingDeliveryStatus,
+    pub delivery: OutgoingDeliveryStatus,
     /// Голосовое сообщение: аудио по `transfer_id` в file sub-протоколе.
     #[serde(default)]
-    pub(crate) voice: Option<VoiceMeta>,
+    pub voice: Option<VoiceMeta>,
     /// Файл в ленте чата (как голосовое: пузырёк + file-transfer).
     #[serde(default)]
-    pub(crate) file: Option<FileMeta>,
+    pub file: Option<FileMeta>,
     /// Групповой чат: 32 hex-символа id группы.
     #[serde(default)]
-    pub(crate) group_id: Option<String>,
+    pub group_id: Option<String>,
 }
 
-pub(crate) fn new_message_id() -> String {
+pub fn new_message_id() -> String {
     let mut bytes = [0u8; 16];
     rand::thread_rng().fill_bytes(&mut bytes);
     bytes.iter().map(|b| format!("{:02x}", b)).collect()
@@ -157,6 +158,15 @@ struct GroupSyncCommand {
     group_name: String,
     creator_id: String,
     members: Vec<GroupMember>,
+    /// Монотонная версия состава. Старые клиенты поле не шлют (0).
+    #[serde(default)]
+    version: u64,
+    /// Подпись создателя над `group_id ‖ version ‖ name ‖ members`.
+    #[serde(default)]
+    sig: Vec<u8>,
+    /// Protobuf identity, если PeerId создателя не identity-multihash.
+    #[serde(default)]
+    creator_pubkey_pb: Vec<u8>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -172,16 +182,20 @@ struct GroupDeleteCommand {
     group_id: String,
 }
 
-pub(crate) enum DecryptedChatFrame {
+pub enum DecryptedChatFrame {
     Message(ChatMessage),
     Delete { message_ids: Vec<String> },
     DeleteAck,
     Read { message_ids: Vec<String> },
+    Delivered { message_ids: Vec<String> },
     GroupSync {
         group_id: String,
         group_name: String,
         creator_id: String,
         members: Vec<GroupMember>,
+        version: u64,
+        sig: Vec<u8>,
+        creator_pubkey_pb: Vec<u8>,
     },
     GroupLeave {
         group_id: String,
@@ -207,12 +221,21 @@ const MAX_CHAT_TIMESTAMP_BYTES: usize = 64;
 
 const VOID_HELLO_BIND_PREFIX: &[u8] = b"VOID_E2EE_HELLO_BIND_V1\0";
 const VOID_HELLO_BIND_PREFIX_V2: &[u8] = b"VOID_E2EE_HELLO_BIND_V2\0";
+const VOID_HELLO_BIND_PREFIX_V3: &[u8] = b"VOID_E2EE_HELLO_BIND_V3\0";
 const HELLO_FRESHNESS_SECS: u64 = 10 * 60;
+
+/// Какая подпись Hello сошлась. `V3` вяжет `caps` — hop не может вырезать флаг.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum HelloBind {
+    V1,
+    V2,
+    V3,
+}
 
 const MAX_HELLO_TRANSPORT_PUBKEY_PB: usize = 4096;
 
 /// Inline multihash PeerId (Ed25519): извлечь транспортный `PublicKey` для проверки подписи Hello.
-pub(crate) fn void_peer_transport_public_key(peer: PeerId) -> Option<libp2p::identity::PublicKey> {
+pub fn void_peer_transport_public_key(peer: PeerId) -> Option<libp2p::identity::PublicKey> {
     const CODE_IDENTITY: u64 = 0;
     let mh = peer.as_ref();
     if mh.code() != CODE_IDENTITY {
@@ -222,7 +245,7 @@ pub(crate) fn void_peer_transport_public_key(peer: PeerId) -> Option<libp2p::ide
 }
 
 /// Ключ для проверки `transport_sig`: из identity-multihash или из protobuf в Hello (hashed PeerId).
-pub(crate) fn void_hello_signing_public_key(
+pub fn void_hello_signing_public_key(
     signer_peer_id: PeerId,
     transport_pubkey_pb: &[u8],
 ) -> Option<libp2p::identity::PublicKey> {
@@ -273,6 +296,27 @@ fn hello_bind_message_v2(
     v
 }
 
+fn hello_bind_message_v3(
+    signer_peer: PeerId,
+    recipient_peer: PeerId,
+    x25519_static: &[u8; 32],
+    x25519_ephemeral: &[u8; 32],
+    ts: u64,
+    nonce: &[u8; 16],
+    caps: u32,
+) -> Vec<u8> {
+    let mut v = Vec::with_capacity(96 + VOID_HELLO_BIND_PREFIX_V3.len() + 28);
+    v.extend_from_slice(VOID_HELLO_BIND_PREFIX_V3);
+    v.extend_from_slice(&signer_peer.to_bytes());
+    v.extend_from_slice(&recipient_peer.to_bytes());
+    v.extend_from_slice(x25519_static.as_slice());
+    v.extend_from_slice(x25519_ephemeral.as_slice());
+    v.extend_from_slice(&ts.to_le_bytes());
+    v.extend_from_slice(nonce);
+    v.extend_from_slice(&caps.to_le_bytes());
+    v
+}
+
 fn hello_now_secs() -> u64 {
     std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
@@ -280,7 +324,7 @@ fn hello_now_secs() -> u64 {
         .unwrap_or(0)
 }
 
-pub(crate) fn verify_hello_transport_binding(
+pub fn verify_hello_transport_binding(
     signer_peer_id: PeerId,
     recipient_peer_id: PeerId,
     x25519_static: &[u8; 32],
@@ -289,38 +333,61 @@ pub(crate) fn verify_hello_transport_binding(
     transport_pubkey_pb: &[u8],
     ts: u64,
     nonce: &[u8; 16],
-) -> bool {
+    caps: u32,
+) -> Option<HelloBind> {
     const MAX_SIG: usize = 256;
     if transport_sig.is_empty() || transport_sig.len() > MAX_SIG {
-        return false;
+        return None;
     }
-    let Some(pubkey) = void_hello_signing_public_key(signer_peer_id, transport_pubkey_pb) else {
-        return false;
-    };
+    let pubkey = void_hello_signing_public_key(signer_peer_id, transport_pubkey_pb)?;
     let fresh = ts != 0 || nonce.iter().any(|b| *b != 0);
-    let msg = if fresh {
+    if fresh {
         let now = hello_now_secs();
-        let skew = now.abs_diff(ts);
-        if skew > HELLO_FRESHNESS_SECS || nonce.iter().all(|b| *b == 0) {
-            return false;
+        if now.abs_diff(ts) > HELLO_FRESHNESS_SECS || nonce.iter().all(|b| *b == 0) {
+            return None;
         }
-        hello_bind_message_v2(
+        let v3 = hello_bind_message_v3(
             signer_peer_id,
             recipient_peer_id,
             x25519_static,
             x25519_ephemeral,
             ts,
             nonce,
-        )
-    } else {
-        hello_bind_message_v1(
+            caps,
+        );
+        if pubkey.verify(&v3, transport_sig) {
+            return Some(HelloBind::V3);
+        }
+        let v2 = hello_bind_message_v2(
             signer_peer_id,
             recipient_peer_id,
             x25519_static,
             x25519_ephemeral,
-        )
-    };
-    pubkey.verify(&msg, transport_sig)
+            ts,
+            nonce,
+        );
+        if pubkey.verify(&v2, transport_sig) {
+            return Some(HelloBind::V2);
+        }
+        return None;
+    }
+    let v1 = hello_bind_message_v1(
+        signer_peer_id,
+        recipient_peer_id,
+        x25519_static,
+        x25519_ephemeral,
+    );
+    pubkey.verify(&v1, transport_sig).then_some(HelloBind::V1)
+}
+
+/// Onion-Hello принимаем только с `caps` внутри подписи v3 и флагом AAD.
+/// Иначе exit вырезает флаг, и кадры идут без AAD.
+pub fn hello_bind_ok(bind: HelloBind, caps: u32, via_onion: bool) -> bool {
+    if via_onion {
+        bind == HelloBind::V3 && caps & HELLO_CAP_HEADER_AAD != 0
+    } else {
+        true
+    }
 }
 
 fn sign_hello_transport_binding(
@@ -331,14 +398,16 @@ fn sign_hello_transport_binding(
     x25519_ephemeral: &[u8; 32],
     ts: u64,
     nonce: &[u8; 16],
+    caps: u32,
 ) -> Option<Vec<u8>> {
-    let msg = hello_bind_message_v2(
+    let msg = hello_bind_message_v3(
         signer_peer,
         recipient_peer,
         x25519_static,
         x25519_ephemeral,
         ts,
         nonce,
+        caps,
     );
     transport.sign(&msg).ok()
 }
@@ -353,11 +422,11 @@ fn validate_delete_ids(ids: &[String]) -> bool {
         && ids.iter().all(|id| validate_message_id(id))
 }
 
-pub(crate) fn is_delete_command_json(plaintext: &[u8]) -> bool {
+pub fn is_delete_command_json(plaintext: &[u8]) -> bool {
     delete_command_message_ids(plaintext).is_some()
 }
 
-pub(crate) fn delete_command_message_ids(plaintext: &[u8]) -> Option<Vec<String>> {
+pub fn delete_command_message_ids(plaintext: &[u8]) -> Option<Vec<String>> {
     if plaintext.first() != Some(&b'{') {
         return None;
     }
@@ -369,7 +438,7 @@ pub(crate) fn delete_command_message_ids(plaintext: &[u8]) -> Option<Vec<String>
     }
 }
 
-pub(crate) fn read_command_message_ids(plaintext: &[u8]) -> Option<Vec<String>> {
+pub fn read_command_message_ids(plaintext: &[u8]) -> Option<Vec<String>> {
     if plaintext.first() != Some(&b'{') {
         return None;
     }
@@ -381,11 +450,11 @@ pub(crate) fn read_command_message_ids(plaintext: &[u8]) -> Option<Vec<String>> 
     }
 }
 
-pub(crate) fn is_read_command_json(plaintext: &[u8]) -> bool {
+pub fn is_read_command_json(plaintext: &[u8]) -> bool {
     read_command_message_ids(plaintext).is_some()
 }
 
-pub(crate) fn build_read_receipt_json(message_ids: &[String]) -> Option<Vec<u8>> {
+pub fn build_read_receipt_json(message_ids: &[String]) -> Option<Vec<u8>> {
     if message_ids.is_empty() || !validate_delete_ids(message_ids) {
         return None;
     }
@@ -396,7 +465,34 @@ pub(crate) fn build_read_receipt_json(message_ids: &[String]) -> Option<Vec<u8>>
     serde_json::to_vec(&cmd).ok()
 }
 
-pub(crate) fn build_voice_ack_json(transfer_id: &str, ok: bool) -> Option<Vec<u8>> {
+pub fn delivered_command_message_ids(plaintext: &[u8]) -> Option<Vec<String>> {
+    if plaintext.first() != Some(&b'{') {
+        return None;
+    }
+    let cmd = serde_json::from_slice::<ChatReadCommand>(plaintext).ok()?;
+    if cmd.kind == "delivered" && validate_delete_ids(&cmd.message_ids) {
+        Some(cmd.message_ids)
+    } else {
+        None
+    }
+}
+
+pub fn is_delivered_command_json(plaintext: &[u8]) -> bool {
+    delivered_command_message_ids(plaintext).is_some()
+}
+
+pub fn build_delivered_receipt_json(message_ids: &[String]) -> Option<Vec<u8>> {
+    if message_ids.is_empty() || !validate_delete_ids(message_ids) {
+        return None;
+    }
+    let cmd = ChatReadCommand {
+        kind: "delivered".into(),
+        message_ids: message_ids.to_vec(),
+    };
+    serde_json::to_vec(&cmd).ok()
+}
+
+pub fn build_voice_ack_json(transfer_id: &str, ok: bool) -> Option<Vec<u8>> {
     let tid = transfer_id_from_hex(transfer_id)?;
     let cmd = VoiceAckCommand {
         kind: "voice_ack".into(),
@@ -406,7 +502,7 @@ pub(crate) fn build_voice_ack_json(transfer_id: &str, ok: bool) -> Option<Vec<u8
     serde_json::to_vec(&cmd).ok()
 }
 
-pub(crate) fn chat_message_id_from_json(plaintext: &[u8]) -> Option<String> {
+pub fn chat_message_id_from_json(plaintext: &[u8]) -> Option<String> {
     if plaintext.first() != Some(&b'{') {
         return None;
     }
@@ -418,7 +514,7 @@ pub(crate) fn chat_message_id_from_json(plaintext: &[u8]) -> Option<String> {
     }
 }
 
-pub(crate) fn parse_decrypted_chat_frame(plaintext: &[u8]) -> Option<DecryptedChatFrame> {
+pub fn parse_decrypted_chat_frame(plaintext: &[u8]) -> Option<DecryptedChatFrame> {
     if plaintext.len() > MAX_CHAT_JSON_BYTES {
         return None;
     }
@@ -451,6 +547,11 @@ pub(crate) fn parse_decrypted_chat_frame(plaintext: &[u8]) -> Option<DecryptedCh
                 message_ids: cmd.message_ids,
             });
         }
+        if cmd.kind == "delivered" && validate_delete_ids(&cmd.message_ids) {
+            return Some(DecryptedChatFrame::Delivered {
+                message_ids: cmd.message_ids,
+            });
+        }
     }
     if let Ok(cmd) = serde_json::from_slice::<VoiceAckCommand>(plaintext) {
         if cmd.kind == "voice_ack" && transfer_id_from_hex(&cmd.transfer_id).is_some() {
@@ -473,6 +574,9 @@ pub(crate) fn parse_decrypted_chat_frame(plaintext: &[u8]) -> Option<DecryptedCh
                 group_name: cmd.group_name,
                 creator_id: cmd.creator_id,
                 members: cmd.members,
+                version: cmd.version,
+                sig: cmd.sig,
+                creator_pubkey_pb: cmd.creator_pubkey_pb,
             });
         }
     }
@@ -498,7 +602,7 @@ pub(crate) fn parse_decrypted_chat_frame(plaintext: &[u8]) -> Option<DecryptedCh
     parse_decrypted_chat_json(plaintext).map(DecryptedChatFrame::Message)
 }
 
-pub(crate) fn build_group_leave_json(group_id: &str, peer_id: &str) -> Option<Vec<u8>> {
+pub fn build_group_leave_json(group_id: &str, peer_id: &str) -> Option<Vec<u8>> {
     if !group::validate_group_id(group_id) || peer_id.is_empty() || peer_id.len() > 512 {
         return None;
     }
@@ -510,7 +614,7 @@ pub(crate) fn build_group_leave_json(group_id: &str, peer_id: &str) -> Option<Ve
     serde_json::to_vec(&cmd).ok()
 }
 
-pub(crate) fn build_group_delete_json(group_id: &str) -> Option<Vec<u8>> {
+pub fn build_group_delete_json(group_id: &str) -> Option<Vec<u8>> {
     if !group::validate_group_id(group_id) {
         return None;
     }
@@ -521,10 +625,12 @@ pub(crate) fn build_group_delete_json(group_id: &str) -> Option<Vec<u8>> {
     serde_json::to_vec(&cmd).ok()
 }
 
-pub(crate) fn build_group_sync_json(
+pub fn build_group_sync_json(
+    transport: Option<&libp2p::identity::Keypair>,
     group_id: &str,
     group_name: &str,
     creator_id: &str,
+    version: u64,
     members: &[GroupMember],
 ) -> Option<Vec<u8>> {
     if !group::validate_group_id(group_id)
@@ -536,17 +642,55 @@ pub(crate) fn build_group_sync_json(
     {
         return None;
     }
+    let (sig, creator_pubkey_pb) = match transport {
+        Some(kp) if kp.public().to_peer_id().to_string() == creator_id && version > 0 => {
+            let msg = group::group_sync_message(group_id, version, group_name, members);
+            let sig = kp.sign(&msg).ok()?;
+            let pb = if void_peer_transport_public_key(kp.public().to_peer_id()).is_some() {
+                Vec::new()
+            } else {
+                kp.public().encode_protobuf()
+            };
+            (sig, pb)
+        }
+        _ => (Vec::new(), Vec::new()),
+    };
     let cmd = GroupSyncCommand {
         kind: "group_sync".into(),
         group_id: group_id.to_string(),
         group_name: group_name.to_string(),
         creator_id: creator_id.to_string(),
         members: members.to_vec(),
+        version,
+        sig,
+        creator_pubkey_pb,
     };
     serde_json::to_vec(&cmd).ok()
 }
 
-pub(crate) fn build_delete_ack_json(
+pub fn verify_group_sync_signature(
+    group_id: &str,
+    creator_id: &str,
+    version: u64,
+    name: &str,
+    members: &[GroupMember],
+    sig: &[u8],
+    creator_pubkey_pb: &[u8],
+) -> bool {
+    if sig.is_empty() || version == 0 || sig.len() > 256 || creator_pubkey_pb.len() > 4096 {
+        return false;
+    }
+    let Ok(creator) = creator_id.parse::<PeerId>() else {
+        return false;
+    };
+    let Some(pubkey) = void_hello_signing_public_key(creator, creator_pubkey_pb) else {
+        return false;
+    };
+    let msg = group::group_sync_message(group_id, version, name, members);
+    pubkey.verify(&msg, sig)
+}
+
+pub fn build_delete_ack_json(
     deleted: &[String],
     missing: &[String],
 ) -> Option<Vec<u8>> {
@@ -565,7 +709,7 @@ pub(crate) fn build_delete_ack_json(
 }
 
 /// Разбор JSON чата после DR: верхняя граница буфера и длины полей.
-pub(crate) fn parse_decrypted_chat_json(plaintext: &[u8]) -> Option<ChatMessage> {
+pub fn parse_decrypted_chat_json(plaintext: &[u8]) -> Option<ChatMessage> {
     if plaintext.len() > MAX_CHAT_JSON_BYTES {
         return None;
     }
@@ -615,7 +759,7 @@ const MAX_BOOTSTRAP_GOSSIP_ADDRS: usize = 32;
 const MAX_BOOTSTRAP_ADDR_LEN: usize = 512;
 
 /// Проверяет список bootstrap multiaddr из gossip-обмена между участниками.
-pub(crate) fn validate_bootstrap_gossip_addrs(addrs: &[String]) -> Option<Vec<String>> {
+pub fn validate_bootstrap_gossip_addrs(addrs: &[String]) -> Option<Vec<String>> {
     if addrs.is_empty() || addrs.len() > MAX_BOOTSTRAP_GOSSIP_ADDRS {
         return None;
     }
@@ -626,7 +770,7 @@ pub(crate) fn validate_bootstrap_gossip_addrs(addrs: &[String]) -> Option<Vec<St
             continue;
         }
         if let Ok(ma) = t.parse::<libp2p::Multiaddr>() {
-            if let Some(c) = crate::bootstrap::canonicalize_bootstrap_ma(&ma) {
+            if let Some(c) = canonicalize_bootstrap_ma(&ma) {
                 let normalized = c.to_string();
                 if !out.contains(&normalized) {
                     out.push(normalized);
@@ -643,17 +787,27 @@ pub(crate) fn validate_bootstrap_gossip_addrs(addrs: &[String]) -> Option<Vec<St
 
 /// Публичный onion-hop соседней VOID-ноды (gossip / каталог bootstrap).
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
-pub(crate) struct OnionHopHint {
+pub struct OnionHopHint {
     #[serde(default)]
-    pub(crate) peer_id: String,
+    pub peer_id: String,
     #[serde(default)]
-    pub(crate) pk_hex: String,
+    pub pk_hex: String,
     #[serde(default)]
-    pub(crate) addrs: Vec<String>,
+    pub addrs: Vec<String>,
+    #[serde(default)]
+    pub sig_hex: String,
+    #[serde(default)]
+    pub epoch: u64,
+    #[serde(default)]
+    pub not_after: u64,
+    #[serde(default)]
+    pub operator: String,
+    #[serde(default)]
+    pub sig2_hex: String,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
-pub(crate) enum V1Packet {
+pub enum V1Packet {
     Hello {
         public_key: [u8; 32],
         ephemeral_key: [u8; 32],
@@ -663,8 +817,7 @@ pub(crate) enum V1Packet {
         /// Если PeerId не identity-multihash: protobuf `PublicKey` для проверки подписи.
         #[serde(default)]
         transport_pubkey_pb: Vec<u8>,
-        /// Возможности клиента (`HELLO_CAP_*`). Не подписаны: подмена даёт только
-        /// откат к прежнему режиму или отказ сессии, но не чтение.
+        /// Возможности клиента (`HELLO_CAP_*`). С v3 входят в подпись.
         #[serde(default)]
         caps: u32,
         /// Unix-секунды. Старые клиенты шлют 0 — принимается по подписи v1.
@@ -703,6 +856,12 @@ pub(crate) enum V1Packet {
     PrekeyPut {
         peer_id: String,
         public_key: [u8; 32],
+        /// Unix-секунды, до которых prekey годен. 0 — старый клиент без срока.
+        #[serde(default)]
+        not_after: u64,
+        /// Подпись identity над `VOID_PREKEY_SIG_V2`.
+        #[serde(default)]
+        sig: Vec<u8>,
     },
     /// Запросить prekey контакта у bootstrap.
     PrekeyGet {
@@ -712,6 +871,10 @@ pub(crate) enum V1Packet {
     PrekeyOffer {
         peer_id: String,
         public_key: [u8; 32],
+        #[serde(default)]
+        not_after: u64,
+        #[serde(default)]
+        sig: Vec<u8>,
     },
     Encrypted {
         header: crypto::MessageHeader,
@@ -723,24 +886,133 @@ pub(crate) enum V1Packet {
         nonce: [u8; 12],
         ct: Vec<u8>,
     },
-    /// Exit hop → recipient. `src` is the logical sender (E2EE Hello still binds identity).
+    /// Exit hop → recipient. `src` is the logical sender (v1 only).
     OnionDrop {
         src: String,
         packet: Box<V1Packet>,
     },
+    /// Фиксированная ячейка v2 (base64). Нода снимает один слот и пересылает.
+    Onion2 {
+        cell_b64: String,
+    },
+    /// Тело после exit. Отправителя нет: печать на identity получателя.
+    OnionDeliver {
+        body_b64: String,
+    },
     Ack,
+}
+
+/// Письмо внутри печати v2. Hello/Ack несут PeerId отправителя; Encrypted — только заголовок сессии.
+pub enum V2Mail {
+    Directed { from: PeerId, packet: V1Packet },
+    Encrypted {
+        header: crypto::MessageHeader,
+        ciphertext: Vec<u8>,
+    },
+}
+
+fn encode_v2_mail(src: PeerId, packet: &V1Packet) -> Option<Vec<u8>> {
+    match packet {
+        V1Packet::Hello { .. } => {
+            let id = src.to_bytes();
+            if id.len() > 255 {
+                return None;
+            }
+            let json = serde_json::to_vec(packet).ok()?;
+            let mut v = Vec::with_capacity(2 + id.len() + json.len());
+            v.push(1);
+            v.push(id.len() as u8);
+            v.extend_from_slice(&id);
+            v.extend_from_slice(&json);
+            Some(v)
+        }
+        V1Packet::Ack => {
+            let id = src.to_bytes();
+            if id.len() > 255 {
+                return None;
+            }
+            let mut v = Vec::with_capacity(2 + id.len());
+            v.push(3);
+            v.push(id.len() as u8);
+            v.extend_from_slice(&id);
+            Some(v)
+        }
+        V1Packet::Encrypted { header, ciphertext } => {
+            let mut v = Vec::with_capacity(41 + ciphertext.len());
+            v.push(2);
+            v.extend_from_slice(&header.dh_pub);
+            v.extend_from_slice(&header.pn.to_le_bytes());
+            v.extend_from_slice(&header.n.to_le_bytes());
+            v.extend_from_slice(ciphertext);
+            Some(v)
+        }
+        _ => None,
+    }
+}
+
+pub fn decode_v2_mail(buf: &[u8]) -> Option<V2Mail> {
+    let tag = *buf.first()?;
+    match tag {
+        1 | 3 => {
+            let n = *buf.get(1)? as usize;
+            if buf.len() < 2 + n {
+                return None;
+            }
+            let from = PeerId::from_bytes(&buf[2..2 + n]).ok()?;
+            if tag == 3 {
+                if buf.len() != 2 + n {
+                    return None;
+                }
+                return Some(V2Mail::Directed {
+                    from,
+                    packet: V1Packet::Ack,
+                });
+            }
+            let packet: V1Packet = serde_json::from_slice(&buf[2 + n..]).ok()?;
+            if !matches!(packet, V1Packet::Hello { .. }) {
+                return None;
+            }
+            Some(V2Mail::Directed { from, packet })
+        }
+        2 => {
+            if buf.len() < 41 {
+                return None;
+            }
+            let mut dh_pub = [0u8; 32];
+            dh_pub.copy_from_slice(&buf[1..33]);
+            let pn = u32::from_le_bytes(buf[33..37].try_into().ok()?);
+            let n = u32::from_le_bytes(buf[37..41].try_into().ok()?);
+            Some(V2Mail::Encrypted {
+                header: crypto::MessageHeader { dh_pub, pn, n },
+                ciphertext: buf[41..].to_vec(),
+            })
+        }
+        _ => None,
+    }
 }
 
 /// Wrap `inner` for `dest` through live onion hops:
 /// 1 node → 1 hop, 2 nodes → both, 3+ → three random (entry is connected).
-pub(crate) fn wrap_onion_packet(
+pub fn wrap_onion_packet(
     hops: &[(PeerId, [u8; 32])],
     src: PeerId,
     dest: PeerId,
     inner: V1Packet,
+    v2: bool,
 ) -> Option<V1Packet> {
     if hops.is_empty() {
         return None;
+    }
+    if v2 {
+        if let Some(mail) = encode_v2_mail(src, &inner) {
+            if let Ok(sealed) = crate::onion::seal_deliver(&dest, &mail) {
+                if let Ok(cell) = crate::onion::wrap_v2(hops, dest, &sealed) {
+                    return Some(V1Packet::Onion2 {
+                        cell_b64: crate::onion::b64_encode(&cell),
+                    });
+                }
+            }
+        }
     }
     let drop = V1Packet::OnionDrop {
         src: src.to_string(),
@@ -751,7 +1023,7 @@ pub(crate) fn wrap_onion_packet(
     Some(V1Packet::Onion { eph, nonce, ct })
 }
 
-pub(crate) fn build_v1_hello(
+pub fn build_v1_hello(
     transport: &libp2p::identity::Keypair,
     signer_peer: PeerId,
     recipient_peer: PeerId,
@@ -771,6 +1043,7 @@ pub(crate) fn build_v1_hello(
         &ephem_b,
         ts,
         &nonce,
+        HELLO_CAPS,
     )?;
     let transport_pubkey_pb = if void_peer_transport_public_key(signer_peer).is_some() {
         Vec::new()
@@ -789,21 +1062,96 @@ pub(crate) fn build_v1_hello(
 }
 
 /// Заголовок Double Ratchet (`dh_pub`, `pn`, `n`) входит в AAD.
-pub(crate) const HELLO_CAP_HEADER_AAD: u32 = 1;
-pub(crate) const HELLO_CAPS: u32 = HELLO_CAP_HEADER_AAD;
+pub const HELLO_CAP_HEADER_AAD: u32 = 1;
+pub const HELLO_CAPS: u32 = HELLO_CAP_HEADER_AAD;
 
-/// Прогресс активной передачи файла (для UI).
-#[cfg(feature = "egui-ui")]
-pub(crate) struct FileTransferProgress {
-    pub filename: String,
-    pub total_size: u64,
-    pub sent_chunks: u32,
-    pub total_chunks: u32,
-    pub is_outgoing: bool,
-    pub completed: bool,
-    pub saved_to: String,
-    pub peer: PeerId,
-    pub kind: file_transfer::FileKind,
+pub fn verify_onion_pk_sig(peer: PeerId, pk: &[u8; 32], sig: &[u8]) -> bool {
+    let Some(pubk) = void_peer_transport_public_key(peer) else {
+        return false;
+    };
+    pubk.verify(&crate::onion::onion_pk_bind_message(peer, pk), sig)
+}
+
+pub fn onion_desc_fresh(epoch: u64, not_after: u64, now: u64) -> bool {
+    epoch > 0 && not_after > now && not_after <= now.saturating_add(30 * 24 * 60 * 60)
+}
+
+pub fn verify_onion_desc(
+    peer: PeerId,
+    pk: &[u8; 32],
+    epoch: u64,
+    not_after: u64,
+    operator: &str,
+    sig: &[u8],
+) -> bool {
+    if operator.len() > 32 || operator.as_bytes().iter().any(|b| *b < 0x20 || *b == b';') {
+        return false;
+    }
+    let Some(pubk) = void_peer_transport_public_key(peer) else {
+        return false;
+    };
+    pubk.verify(
+        &crate::onion::desc_message(peer, pk, epoch, not_after, operator),
+        sig,
+    )
+}
+
+fn addr_is_quic_v1(ma: &libp2p::Multiaddr) -> bool {
+    use libp2p::multiaddr::Protocol;
+    ma.iter().any(|p| matches!(p, Protocol::Udp(_))) && ma.to_string().contains("quic-v1")
+}
+
+pub fn bootstrap_tcp_dial_addr(ma: &libp2p::Multiaddr) -> Option<libp2p::Multiaddr> {
+    use libp2p::multiaddr::Protocol;
+    use libp2p::Multiaddr;
+    if addr_is_quic_v1(ma) {
+        return None;
+    }
+    let mut out = Multiaddr::empty();
+    let mut have_ip = false;
+    let mut have_tcp = false;
+    for p in ma.iter() {
+        match p {
+            Protocol::Ip4(_) | Protocol::Ip6(_) if !have_ip => {
+                out.push(p);
+                have_ip = true;
+            }
+            Protocol::Tcp(_) if !have_tcp => {
+                out.push(p);
+                have_tcp = true;
+            }
+            _ => {}
+        }
+    }
+    if have_ip && have_tcp {
+        Some(out)
+    } else {
+        None
+    }
+}
+
+pub fn canonicalize_bootstrap_ma(ma: &libp2p::Multiaddr) -> Option<libp2p::Multiaddr> {
+    use libp2p::multiaddr::Protocol;
+    let tcp = bootstrap_tcp_dial_addr(ma)?;
+    let mut peer_before_circuit = None;
+    let mut seen_circuit = false;
+    let mut last_p2p = None;
+    for p in ma.iter() {
+        match p {
+            Protocol::P2pCircuit => seen_circuit = true,
+            Protocol::P2p(id) => {
+                if !seen_circuit {
+                    peer_before_circuit = Some(id);
+                }
+                last_p2p = Some(id);
+            }
+            _ => {}
+        }
+    }
+    let pid = peer_before_circuit.or(last_p2p)?;
+    let mut out = tcp;
+    out.push(Protocol::P2p(pid));
+    Some(out)
 }
 
 #[cfg(test)]
@@ -832,15 +1180,41 @@ mod hello_freshness_tests {
             ephemeral_key,
             transport_sig,
             transport_pubkey_pb,
+            caps,
             ts,
             nonce,
-            ..
         } = hello
         else {
             panic!("not hello");
         };
         assert!(ts != 0);
         assert!(nonce.iter().any(|b| *b != 0));
+        assert_eq!(
+            verify_hello_transport_binding(
+                signer,
+                recipient,
+                &public_key,
+                &ephemeral_key,
+                &transport_sig,
+                &transport_pubkey_pb,
+                ts,
+                &nonce,
+                caps,
+            ),
+            Some(HelloBind::V3)
+        );
+        assert!(verify_hello_transport_binding(
+            signer,
+            recipient,
+            &public_key,
+            &ephemeral_key,
+            &transport_sig,
+            &transport_pubkey_pb,
+            ts.saturating_sub(HELLO_FRESHNESS_SECS + 1),
+            &nonce,
+            caps,
+        )
+        .is_none());
         assert!(verify_hello_transport_binding(
             signer,
             recipient,
@@ -850,17 +1224,12 @@ mod hello_freshness_tests {
             &transport_pubkey_pb,
             ts,
             &nonce,
-        ));
-        assert!(!verify_hello_transport_binding(
-            signer,
-            recipient,
-            &public_key,
-            &ephemeral_key,
-            &transport_sig,
-            &transport_pubkey_pb,
-            ts.saturating_sub(HELLO_FRESHNESS_SECS + 1),
-            &nonce,
-        ));
+            caps ^ 1,
+        )
+        .is_none());
+        assert!(hello_bind_ok(HelloBind::V3, caps, true));
+        assert!(!hello_bind_ok(HelloBind::V2, caps, true));
+        assert!(!hello_bind_ok(HelloBind::V3, 0, true));
     }
 
     #[test]
@@ -872,15 +1241,21 @@ mod hello_freshness_tests {
         let ephem_b = PublicKey::from(&StaticSecret::random_from_rng(rand::rngs::OsRng)).to_bytes();
         let msg = hello_bind_message_v1(signer, recipient, &static_b, &ephem_b);
         let sig = kp.sign(&msg).unwrap();
-        assert!(verify_hello_transport_binding(
-            signer,
-            recipient,
-            &static_b,
-            &ephem_b,
-            &sig,
-            &[],
-            0,
-            &[0u8; 16],
-        ));
+        assert_eq!(
+            verify_hello_transport_binding(
+                signer,
+                recipient,
+                &static_b,
+                &ephem_b,
+                &sig,
+                &[],
+                0,
+                &[0u8; 16],
+                0,
+            ),
+            Some(HelloBind::V1)
+        );
+        assert!(hello_bind_ok(HelloBind::V1, 0, false));
+        assert!(!hello_bind_ok(HelloBind::V1, 0, true));
     }
 }
