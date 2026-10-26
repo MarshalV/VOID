@@ -1,0 +1,79 @@
+{
+  "alice_ephemeral_sk": "767778797a7b7c7d7e7f808182838485868788898a8b8c8d8e8f909192939495",
+  "alice_peer_id": "12D3KooWKhhttMjKRhZd3dqiLBZHqWzMNRWh8gi72e4VWK3LsCYF",
+  "alice_ratchet_seed": "feff000102030405060708090a0b0c0d0e0f101112131415161718191a1b1c1d",
+  "alice_static_sk": "5455565758595a5b5c5d5e5f606162636465666768696a6b6c6d6e6f70717273",
+  "bob_ephemeral_sk": "8788898a8b8c8d8e8f909192939495969798999a9b9c9d9e9fa0a1a2a3a4a5a6",
+  "bob_peer_id": "12D3KooWSorJuft86biG79pen2eP6WSyEFt6TfyaSMsqECHWVVVD",
+  "bob_ratchet_seed": "0f101112131415161718191a1b1c1d1e1f202122232425262728292a2b2c2d2e",
+  "bob_static_sk": "65666768696a6b6c6d6e6f707172737475767778797a7b7c7d7e7f8081828384",
+  "dh_pub_changes_each_turn": true,
+  "header_aad": true,
+  "messages": [
+    {
+      "ct": "5798a4f872e0792d18718aafe95c9eb6fc48",
+      "dh_pub": "11a7be4663ea5e4fc728c9292b9dbdff215696d285c920bd262627f9a3c8811c",
+      "from": "alice",
+      "n": 0,
+      "plaintext": "a0",
+      "pn": 0
+    },
+    {
+      "ct": "e5f8d42b17c1939c52863d0421d50c9905a8",
+      "dh_pub": "8cc4f65e93799c3f8d736431c6a3e7bd096dcd550012e9cbea6582a31758100d",
+      "from": "bob",
+      "n": 0,
+      "plaintext": "b0",
+      "pn": 0
+    },
+    {
+      "ct": "60c909068411ebcd59cb0ee61ae2697c90b8",
+      "dh_pub": "2c149c57bfc9bcd7d5563c1155b5da319605e78d523d9c5cbcbe4314e0a2485a",
+      "from": "alice",
+      "n": 0,
+      "plaintext": "a1",
+      "pn": 1
+    },
+    {
+      "ct": "78b5ce20e819cce0467071c2ecf22648152c",
+      "dh_pub": "7c77245ec903d2805380aea00fb41e078d14420818e6d4bd0455ab05d9968267",
+      "from": "bob",
+      "n": 0,
+      "plaintext": "b1",
+      "pn": 1
+    },
+    {
+      "ct": "d174c9f270437ea552a3d41bafe4005701b3",
+      "dh_pub": "1dfc8559ef1aa95645e30c15d2cd2c0efe2733cfc73b2b12f4950e0c2ccb887c",
+      "from": "alice",
+      "n": 0,
+      "plaintext": "a2",
+      "pn": 1
+    },
+    {
+      "ct": "7bc72a24eb5cf629ff9981605658460dcfd3",
+      "dh_pub": "104de5817f7af32489a8a1ea992296fb552d453adb229c9b169ab1f85379727f",
+      "from": "bob",
+      "n": 0,
+      "plaintext": "b2",
+      "pn": 1
+    },
+    {
+      "ct": "d70cb88ba2cf9b3c3dc650b6a07664b015a4",
+      "dh_pub": "4beeb8a08444818bbf9adb7ba807011f5137e9bf648f38cb0393ddc172de8470",
+      "from": "alice",
+      "n": 0,
+      "plaintext": "a3",
+      "pn": 1
+    },
+    {
+      "ct": "ffa48063d928a6d13599f290fb2673904c6b",
+      "dh_pub": "efe7a8b9f29a910952e91fb62d6d7c40561ff5256d3639a64e76ab327a020e41",
+      "from": "bob",
+      "n": 0,
+      "plaintext": "b3",
+      "pn": 1
+    }
+  ],
+  "round_trips": 4
+}

@@ -34,7 +34,7 @@ impl GroupChat {
             .collect()
     }
 
-        pub fn includes_peer(&self, peer_id: &libp2p::PeerId) -> bool {
+    pub fn includes_peer(&self, peer_id: &libp2p::PeerId) -> bool {
         let s = peer_id.to_string();
         self.members.iter().any(|m| m.peer_id == s)
     }
@@ -96,9 +96,7 @@ pub fn extract_invite_links(text: &str) -> Vec<String> {
     while let Some(rel) = text[search_from..].find("void://group/") {
         let start = search_from + rel;
         let tail = &text[start..];
-        let end = tail
-            .find(|c: char| c.is_whitespace())
-            .unwrap_or(tail.len());
+        let end = tail.find(|c: char| c.is_whitespace()).unwrap_or(tail.len());
         let mut link = tail[..end].to_string();
         // Хвост из пунктуации в конце строки/предложения.
         while link
@@ -289,8 +287,7 @@ pub fn next_group_version(current: u64) -> u64 {
 /// Живое или офлайн-сообщение группы: мы в составе, и отправитель тоже.
 pub fn member_may_post(group: &GroupChat, local_id: &str, sender_id: &str) -> bool {
     let local_in = group.members.iter().any(|m| m.peer_id == local_id);
-    let sender_in =
-        sender_id == local_id || group.members.iter().any(|m| m.peer_id == sender_id);
+    let sender_in = sender_id == local_id || group.members.iter().any(|m| m.peer_id == sender_id);
     local_in && sender_in
 }
 
@@ -303,7 +300,11 @@ pub fn group_sync_message(
     members: &[GroupMember],
 ) -> Vec<u8> {
     let mut ordered: Vec<&GroupMember> = members.iter().collect();
-    ordered.sort_by(|a, b| a.peer_id.cmp(&b.peer_id).then(a.display_name.cmp(&b.display_name)));
+    ordered.sort_by(|a, b| {
+        a.peer_id
+            .cmp(&b.peer_id)
+            .then(a.display_name.cmp(&b.display_name))
+    });
     let mut v = Vec::with_capacity(64 + name.len());
     v.extend_from_slice(b"VOID_GROUP_SYNC_V1\0");
     push_lp16(&mut v, group_id.as_bytes());
@@ -350,13 +351,7 @@ pub fn admit_group_sync(
         if version <= local_v {
             return None;
         }
-        let mut auth = authorize_group_sync(
-            existing,
-            creator_id,
-            group_name,
-            creator_id,
-            members,
-        )?;
+        let mut auth = authorize_group_sync(existing, creator_id, group_name, creator_id, members)?;
         auth.version = version;
         return Some(auth);
     }
@@ -464,11 +459,7 @@ mod tests {
 
     #[test]
     fn create_group_members_exclude_invitees() {
-        let members = members_on_group_create(
-            "creator",
-            "Alice",
-            &["bob".into(), "carol".into()],
-        );
+        let members = members_on_group_create("creator", "Alice", &["bob".into(), "carol".into()]);
         assert_eq!(members.len(), 1);
         assert_eq!(members[0].peer_id, "creator");
         assert!(!members.iter().any(|m| m.peer_id == "bob"));
@@ -587,8 +578,14 @@ mod tests {
         let g = existing_group();
         let mut fake = member("alice");
         fake.display_name = "Impostor".into();
-        let out = authorize_group_sync(Some(&g), "bob", "", "", vec![fake, member("bob"), member("me")])
-            .unwrap();
+        let out = authorize_group_sync(
+            Some(&g),
+            "bob",
+            "",
+            "",
+            vec![fake, member("bob"), member("me")],
+        )
+        .unwrap();
         assert_eq!(out.members[0].display_name, "ALICE");
     }
 
@@ -622,8 +619,7 @@ mod tests {
 
     #[test]
     fn extract_invite_from_dm_text() {
-        let text =
-            "invite:\nvoid://group/0123456789abcdef0123456789abcdef?name=G&m=c&creator=c";
+        let text = "invite:\nvoid://group/0123456789abcdef0123456789abcdef?name=G&m=c&creator=c";
         let links = extract_invite_links(text);
         assert_eq!(links.len(), 1);
         assert!(links[0].starts_with("void://group/"));
@@ -658,9 +654,36 @@ mod tests {
     fn creator_replay_does_not_roll_back_version() {
         let mut g = existing_group();
         g.version = 3;
-        assert!(admit_group_sync(Some(&g), "alice", "Old", "alice", vec![member("alice")], 2, true).is_none());
-        assert!(admit_group_sync(Some(&g), "alice", "Old", "alice", vec![member("alice")], 3, true).is_none());
-        assert!(admit_group_sync(Some(&g), "alice", "Same", "alice", vec![member("alice")], 0, false).is_none());
+        assert!(admit_group_sync(
+            Some(&g),
+            "alice",
+            "Old",
+            "alice",
+            vec![member("alice")],
+            2,
+            true
+        )
+        .is_none());
+        assert!(admit_group_sync(
+            Some(&g),
+            "alice",
+            "Old",
+            "alice",
+            vec![member("alice")],
+            3,
+            true
+        )
+        .is_none());
+        assert!(admit_group_sync(
+            Some(&g),
+            "alice",
+            "Same",
+            "alice",
+            vec![member("alice")],
+            0,
+            false
+        )
+        .is_none());
         let ok = admit_group_sync(
             Some(&g),
             "alice",

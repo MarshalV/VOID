@@ -13,7 +13,7 @@ use chacha20poly1305::{
 };
 use hkdf::Hkdf;
 use libp2p::{multiaddr::Protocol, Multiaddr, PeerId};
-use rand::RngCore;
+use rand::{CryptoRng, RngCore};
 use serde::{Deserialize, Serialize};
 use sha2::Sha256;
 use std::collections::{HashMap, HashSet};
@@ -407,15 +407,20 @@ fn read_peer(plain: &[u8]) -> Option<PeerId> {
     PeerId::from_bytes(&plain[3..3 + n]).ok()
 }
 
-fn seal_slot(hop_pk: &[u8; 32], next: PeerId, deliver: bool) -> Result<([u8; V2_SLOT_LEN], [u8; 32])> {
+fn seal_slot<R: RngCore + CryptoRng>(
+    rng: &mut R,
+    hop_pk: &[u8; 32],
+    next: PeerId,
+    deliver: bool,
+) -> Result<([u8; V2_SLOT_LEN], [u8; 32])> {
     let hop = PublicKey::from(*hop_pk);
-    let eph_sk = StaticSecret::random_from_rng(rand::rngs::OsRng);
+    let eph_sk = StaticSecret::random_from_rng(&mut *rng);
     let eph = PublicKey::from(&eph_sk).to_bytes();
     let shared = eph_sk.diffie_hellman(&hop);
     let hdr_key = v2_okm(shared.as_bytes(), &eph, hop_pk, b"HDR")?;
     let stream_key = v2_okm(shared.as_bytes(), &eph, hop_pk, b"STREAM")?;
     let mut plain = [0u8; V2_SLOT_PLAIN];
-    rand::thread_rng().fill_bytes(&mut plain);
+    rng.fill_bytes(&mut plain);
     plain[0] = 2;
     plain[1] = u8::from(deliver);
     if !write_peer(&mut plain, next) {
@@ -423,7 +428,7 @@ fn seal_slot(hop_pk: &[u8; 32], next: PeerId, deliver: bool) -> Result<([u8; V2_
     }
     let cipher = ChaCha20Poly1305::new_from_slice(&hdr_key).map_err(|e| anyhow!("{e}"))?;
     let mut nonce = [0u8; 12];
-    rand::thread_rng().fill_bytes(&mut nonce);
+    rng.fill_bytes(&mut nonce);
     let ct = cipher
         .encrypt(Nonce::from_slice(&nonce), plain.as_ref())
         .map_err(|_| anyhow!("onion v2 slot"))?;
@@ -445,6 +450,15 @@ fn bucket_for(body_payload: usize) -> Option<usize> {
 
 /// `body` is the opaque deliver blob (already sealed to the recipient).
 pub fn wrap_v2(hops: &[(PeerId, [u8; 32])], dest: PeerId, body: &[u8]) -> Result<Vec<u8>> {
+    wrap_v2_rng(&mut rand::rngs::OsRng, hops, dest, body)
+}
+
+pub(crate) fn wrap_v2_rng<R: RngCore + CryptoRng>(
+    rng: &mut R,
+    hops: &[(PeerId, [u8; 32])],
+    dest: PeerId,
+    body: &[u8],
+) -> Result<Vec<u8>> {
     if hops.is_empty() || hops.len() > V2_SLOTS {
         return Err(anyhow!("onion v2 hops"));
     }
@@ -455,19 +469,19 @@ pub fn wrap_v2(hops: &[(PeerId, [u8; 32])], dest: PeerId, body: &[u8]) -> Result
     let bucket = bucket_for(need).ok_or_else(|| anyhow!("onion v2 too large"))?;
     let body_len = bucket - V2_HEADER_LEN;
     let mut plain_body = vec![0u8; body_len];
-    rand::thread_rng().fill_bytes(&mut plain_body);
+    rng.fill_bytes(&mut plain_body);
     plain_body[..4].copy_from_slice(&(body.len() as u32).to_le_bytes());
     plain_body[4..4 + body.len()].copy_from_slice(body);
     let mut slots = vec![[0u8; V2_SLOT_LEN]; V2_SLOTS];
     for i in (0..hops.len()).rev() {
         let deliver = i + 1 == hops.len();
         let next = if deliver { dest } else { hops[i + 1].0 };
-        let (slot, stream) = seal_slot(&hops[i].1, next, deliver)?;
+        let (slot, stream) = seal_slot(rng, &hops[i].1, next, deliver)?;
         xor_stream(&stream, &mut plain_body);
         slots[i] = slot;
     }
     for slot in slots.iter_mut().skip(hops.len()) {
-        rand::thread_rng().fill_bytes(slot);
+        rng.fill_bytes(slot);
     }
     let mut cell = Vec::with_capacity(bucket);
     for slot in &slots {
@@ -543,9 +557,17 @@ pub fn deliver_bytes(body: &[u8]) -> Option<&[u8]> {
 }
 
 pub fn seal_deliver(recipient: &PeerId, payload: &[u8]) -> Result<Vec<u8>> {
+    seal_deliver_rng(&mut rand::rngs::OsRng, recipient, payload)
+}
+
+pub(crate) fn seal_deliver_rng<R: RngCore + CryptoRng>(
+    rng: &mut R,
+    recipient: &PeerId,
+    payload: &[u8],
+) -> Result<Vec<u8>> {
     let bob = crate::offline_mail::identity_offline_public(recipient)
         .ok_or_else(|| anyhow!("onion seal: no identity key"))?;
-    let eph_sk = StaticSecret::random_from_rng(rand::rngs::OsRng);
+    let eph_sk = StaticSecret::random_from_rng(&mut *rng);
     let eph = PublicKey::from(&eph_sk).to_bytes();
     let shared = eph_sk.diffie_hellman(&bob);
     let mut info = Vec::with_capacity(SEAL_INFO.len() + 64);
@@ -558,7 +580,7 @@ pub fn seal_deliver(recipient: &PeerId, payload: &[u8]) -> Result<Vec<u8>> {
         .map_err(|_| anyhow!("onion seal hkdf"))?;
     let cipher = ChaCha20Poly1305::new_from_slice(&key).map_err(|e| anyhow!("{e}"))?;
     let mut nonce = [0u8; 12];
-    rand::thread_rng().fill_bytes(&mut nonce);
+    rng.fill_bytes(&mut nonce);
     let mut plain = Vec::with_capacity(4 + payload.len());
     plain.extend_from_slice(&(payload.len() as u32).to_le_bytes());
     plain.extend_from_slice(payload);
@@ -593,8 +615,13 @@ pub fn open_deliver(recipient_sk: &StaticSecret, body: &[u8]) -> Result<Vec<u8>>
     let plain = cipher
         .decrypt(Nonce::from_slice(&nonce), ct)
         .map_err(|_| anyhow!("onion deliver open"))?;
-    let n = u32::from_le_bytes(plain.get(..4).ok_or_else(|| anyhow!("onion deliver len"))?.try_into().unwrap())
-        as usize;
+    let n = u32::from_le_bytes(
+        plain
+            .get(..4)
+            .ok_or_else(|| anyhow!("onion deliver len"))?
+            .try_into()
+            .unwrap(),
+    ) as usize;
     if plain.len() < 4 + n {
         return Err(anyhow!("onion deliver len"));
     }
@@ -615,7 +642,11 @@ pub fn b64_encode(data: &[u8]) -> String {
     }
     if i < data.len() {
         let b0 = data[i] as u32;
-        let b1 = if i + 1 < data.len() { data[i + 1] as u32 } else { 0 };
+        let b1 = if i + 1 < data.len() {
+            data[i + 1] as u32
+        } else {
+            0
+        };
         let n = (b0 << 16) | (b1 << 8);
         out.push(T[((n >> 18) & 63) as usize] as char);
         out.push(T[((n >> 12) & 63) as usize] as char);
@@ -651,8 +682,16 @@ pub fn b64_decode(s: &str) -> Option<Vec<u8>> {
         let pad = (bytes[i + 2] == b'=') as usize + (bytes[i + 3] == b'=') as usize;
         let a = val(bytes[i])?;
         let b = val(bytes[i + 1])?;
-        let c = if bytes[i + 2] == b'=' { 0 } else { val(bytes[i + 2])? };
-        let d = if bytes[i + 3] == b'=' { 0 } else { val(bytes[i + 3])? };
+        let c = if bytes[i + 2] == b'=' {
+            0
+        } else {
+            val(bytes[i + 2])?
+        };
+        let d = if bytes[i + 3] == b'=' {
+            0
+        } else {
+            val(bytes[i + 3])?
+        };
         let n = ((a as u32) << 18) | ((b as u32) << 12) | ((c as u32) << 6) | d as u32;
         out.push((n >> 16) as u8);
         if pad < 2 {
@@ -666,7 +705,13 @@ pub fn b64_decode(s: &str) -> Option<Vec<u8>> {
     Some(out)
 }
 
-pub fn desc_message(peer: PeerId, pk: &[u8; 32], epoch: u64, not_after: u64, operator: &str) -> Vec<u8> {
+pub fn desc_message(
+    peer: PeerId,
+    pk: &[u8; 32],
+    epoch: u64,
+    not_after: u64,
+    operator: &str,
+) -> Vec<u8> {
     let mut v = b"VOID_ONION_DESC_V2\0".to_vec();
     let id = peer.to_bytes();
     let n = id.len().min(u16::MAX as usize);
@@ -767,7 +812,13 @@ mod tests {
         let mut ids = HashSet::new();
         ids.insert(a);
         ids.insert(b);
-        let hops = select_hops(std::iter::once(a), &ids, &keys, &HashMap::new(), &HopPolicy::default());
+        let hops = select_hops(
+            std::iter::once(a),
+            &ids,
+            &keys,
+            &HashMap::new(),
+            &HopPolicy::default(),
+        );
         assert_eq!(hops.len(), 2);
         assert_eq!(hops[0].0, a);
         assert_eq!(hops[1].0, b);
@@ -785,7 +836,13 @@ mod tests {
             keys.insert(p, [i; 32]);
             ids.insert(p);
         }
-        let hops = select_hops(std::iter::once(connected), &ids, &keys, &HashMap::new(), &HopPolicy::default());
+        let hops = select_hops(
+            std::iter::once(connected),
+            &ids,
+            &keys,
+            &HashMap::new(),
+            &HopPolicy::default(),
+        );
         assert_eq!(hops.len(), 3);
         assert_eq!(hops[0].0, connected);
     }
@@ -797,7 +854,13 @@ mod tests {
         keys.insert(a, [1u8; 32]);
         let mut ids = HashSet::new();
         ids.insert(a);
-        let hops = select_hops(std::iter::empty(), &ids, &keys, &HashMap::new(), &HopPolicy::default());
+        let hops = select_hops(
+            std::iter::empty(),
+            &ids,
+            &keys,
+            &HashMap::new(),
+            &HopPolicy::default(),
+        );
         assert!(hops.is_empty());
     }
 
@@ -872,13 +935,7 @@ mod tests {
                 (c, "south".into()),
             ]),
         };
-        let hops = select_hops(
-            std::iter::once(a),
-            &ids,
-            &keys,
-            &HashMap::new(),
-            &policy,
-        );
+        let hops = select_hops(std::iter::once(a), &ids, &keys, &HashMap::new(), &policy);
         assert_eq!(hops[0].0, a);
         assert_eq!(hops[1].0, c);
     }
@@ -902,7 +959,9 @@ mod tests {
         let cell = wrap_v2(&hops, dest, &sealed).unwrap();
         assert!(V2_BUCKETS.contains(&cell.len()));
         let sender_bytes = sender.to_bytes();
-        assert!(!cell.windows(sender_bytes.len()).any(|w| w == sender_bytes.as_slice()));
+        assert!(!cell
+            .windows(sender_bytes.len())
+            .any(|w| w == sender_bytes.as_slice()));
         let mut cur = cell;
         for sk in secrets.iter().take(2) {
             match peel_v2(sk, &cur).unwrap() {

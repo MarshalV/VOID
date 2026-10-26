@@ -1,0 +1,23 @@
+{
+  "alice_ratchet_seed": "feff000102030405060708090a0b0c0d0e0f101112131415161718191a1b1c1d",
+  "bob_ratchet_seed": "0f101112131415161718191a1b1c1d1e1f202122232425262728292a2b2c2d2e",
+  "following": {
+    "ct": "e9ade5f9259ffabf9bdb929f2a6e296b6db852f6",
+    "dh_pub": "8cc4f65e93799c3f8d736431c6a3e7bd096dcd550012e9cbea6582a31758100d",
+    "from": "bob",
+    "n": 0,
+    "plaintext": "next",
+    "pn": 0
+  },
+  "frame": {
+    "ct": "5dcde15a2f8c22fa3a286fe4d0486c968fcf58e3",
+    "dh_pub": "11a7be4663ea5e4fc728c9292b9dbdff215696d285c920bd262627f9a3c8811c",
+    "from": "alice",
+    "n": 0,
+    "plaintext": "keep",
+    "pn": 0
+  },
+  "original_decrypt": "keep",
+  "tampered_decrypt": false,
+  "tampered_pn": 1
+}

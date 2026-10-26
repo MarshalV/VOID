@@ -1,0 +1,30 @@
+{
+  "rule": "На одного PeerId хранятся последние 256 эфемерных ключей. Повтор — отказ, сессия не сбрасывается. Чужой PeerId тот же ключ принимает. Потолок числа PeerId — локальный кэш клиента, в вектор не входит.",
+  "steps": [
+    {
+      "accept": true,
+      "ephemeral": "0100e1e1e1e1e1e1e1e1e1e1e1e1e1e1e1e1e1e1e1e1e1e1e1e1e1e1e1e1e1e1",
+      "peer": "A"
+    },
+    {
+      "accept": false,
+      "ephemeral": "0100e1e1e1e1e1e1e1e1e1e1e1e1e1e1e1e1e1e1e1e1e1e1e1e1e1e1e1e1e1e1",
+      "peer": "A"
+    },
+    {
+      "accept": true,
+      "ephemeral": "0200e1e1e1e1e1e1e1e1e1e1e1e1e1e1e1e1e1e1e1e1e1e1e1e1e1e1e1e1e1e1",
+      "peer": "A"
+    },
+    {
+      "accept": true,
+      "ephemeral": "0100e1e1e1e1e1e1e1e1e1e1e1e1e1e1e1e1e1e1e1e1e1e1e1e1e1e1e1e1e1e1",
+      "peer": "B"
+    }
+  ],
+  "window": {
+    "after_one_new_key_oldest_again": true,
+    "fill_distinct": 256,
+    "repeat_oldest_while_full": false
+  }
+}

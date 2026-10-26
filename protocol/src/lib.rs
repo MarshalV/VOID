@@ -8,3 +8,6 @@ pub mod kad_store;
 pub mod offline_mail;
 pub mod onion;
 pub mod protocol;
+
+#[cfg(test)]
+mod vectors;

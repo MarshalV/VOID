@@ -5,8 +5,10 @@ use chacha20poly1305::{
 };
 use hkdf::Hkdf;
 use rand::rngs::OsRng;
-use sha2::Sha256;
+#[cfg(test)]
+use rand::{rngs::StdRng, SeedableRng};
 use serde::{Deserialize, Serialize};
+use sha2::Sha256;
 use std::collections::HashMap;
 use std::time::{Duration, Instant};
 #[allow(dead_code)]
@@ -18,7 +20,8 @@ use zeroize::{Zeroize, ZeroizeOnDrop};
 fn hkdf_sha256_derive(salt: &[u8], ikm: &[u8], info: &[u8], output_len: usize) -> Vec<u8> {
     let hk = Hkdf::<Sha256>::new(Some(salt), ikm);
     let mut okm = vec![0u8; output_len];
-    hk.expand(info, &mut okm).expect("HKDF output_len within SHA256 limit");
+    hk.expand(info, &mut okm)
+        .expect("HKDF output_len within SHA256 limit");
     okm
 }
 
@@ -108,6 +111,9 @@ pub struct SecureSession {
     send_header_aad: bool,
     require_header_aad: bool,
     peer_aad: Vec<u8>,
+    /// Только для векторов: очередные DH-секреты ratchet берутся отсюда, не из ОС.
+    #[cfg(test)]
+    ratchet_rng: Option<StdRng>,
 }
 
 impl Zeroize for SecureSession {
@@ -138,7 +144,7 @@ impl Drop for SecureSession {
 
 #[allow(dead_code)]
 impl SecureSession {
-    pub fn new_initiator(
+    fn initiator_before_kickoff(
         local_static: &StaticSecret,
         remote_static: &PublicKey,
         local_ephemeral: StaticSecret,
@@ -167,6 +173,8 @@ impl SecureSession {
             send_header_aad: false,
             require_header_aad: false,
             peer_aad: Vec::new(),
+            #[cfg(test)]
+            ratchet_rng: None,
         };
 
         // 1. Ratchet send: DH(e_alice, s_bob)
@@ -188,24 +196,43 @@ impl SecureSession {
             index: 0,
         });
 
-        // 3. Первый шаг DH ratchet. Без него обе стороны так и шлют с e_alice / e_bob:
-        // ключ меняется только при приёме чужого нового dh_pub, а его никто не создаёт.
-        // Ответчик (в том числе старый клиент) проходит шаг штатным dh_ratchet.
-        sess.dhs = StaticSecret::random_from_rng(OsRng);
-        let shared_kickoff = sess.dhs.diffie_hellman(&sess.dhr);
-        let (rk3, ck_send_key) = sess.kdf_rk(&shared_kickoff);
-        sess.rk = rk3;
-        sess.ck_send = Some(ChainKey {
-            key: ck_send_key,
-            index: 0,
-        });
-
+        // Шаги 1–2 держат e_alice. Kickoff (новый dhs) делает вызывающий.
         sess
     }
 
-    /// Пир поддерживает заголовок в AAD (`HELLO_CAP_HEADER_AAD`).
+    pub fn new_initiator(
+        local_static: &StaticSecret,
+        remote_static: &PublicKey,
+        local_ephemeral: StaticSecret,
+        remote_ephemeral: &PublicKey,
+    ) -> Self {
+        let mut sess = Self::initiator_before_kickoff(
+            local_static,
+            remote_static,
+            local_ephemeral,
+            remote_ephemeral,
+        );
+        sess.kickoff_send();
+        sess
+    }
+
+    fn kickoff_send(&mut self) {
+        self.dhs = self.draw_ratchet_secret();
+        let shared_kickoff = self.dhs.diffie_hellman(&self.dhr);
+        let (rk3, ck_send_key) = self.kdf_rk(&shared_kickoff);
+        self.rk = rk3;
+        self.ck_send = Some(ChainKey {
+            key: ck_send_key,
+            index: 0,
+        });
+    }
+
+    /// Пир объявил заголовок в AAD (`HELLO_CAP_HEADER_AAD`).
+    /// С этого момента и исходящие, и входящие кадры только с AAD:
+    /// кадр без заголовка в теге не принимается, в том числе первый.
     pub fn enable_header_aad(&mut self) {
         self.send_header_aad = true;
+        self.require_header_aad = true;
     }
 
     /// Привязать кадры к PeerId обеих сторон (канонический порядок, одинаковый у обоих).
@@ -242,6 +269,8 @@ impl SecureSession {
             send_header_aad: false,
             require_header_aad: false,
             peer_aad: Vec::new(),
+            #[cfg(test)]
+            ratchet_rng: None,
         };
 
         // 1. Ratchet recv: DH(s_bob, e_alice)
@@ -284,7 +313,13 @@ impl SecureSession {
         let nonce = Nonce::from_slice(&nonce_bytes);
         let aad = header.aad(&self.peer_aad);
         let ciphertext = if self.send_header_aad {
-            cipher.encrypt(nonce, Payload { msg: plaintext, aad: &aad })
+            cipher.encrypt(
+                nonce,
+                Payload {
+                    msg: plaintext,
+                    aad: &aad,
+                },
+            )
         } else {
             cipher.encrypt(nonce, plaintext)
         }
@@ -357,7 +392,13 @@ impl SecureSession {
         let nonce_bytes = header_nonce(header.n);
         let nonce = Nonce::from_slice(&nonce_bytes);
         let aad = header.aad(&self.peer_aad);
-        if let Ok(pt) = cipher.decrypt(nonce, Payload { msg: ciphertext, aad: &aad }) {
+        if let Ok(pt) = cipher.decrypt(
+            nonce,
+            Payload {
+                msg: ciphertext,
+                aad: &aad,
+            },
+        ) {
             return Ok((pt, true));
         }
         if self.require_header_aad {
@@ -383,8 +424,7 @@ impl SecureSession {
             index: 0,
         });
 
-        let mut rng = OsRng;
-        self.dhs = StaticSecret::random_from_rng(&mut rng);
+        self.dhs = self.draw_ratchet_secret();
         let shared_send = self.dhs.diffie_hellman(&self.dhr);
         let (rk, ck_send_key) = self.kdf_rk(&shared_send);
         self.rk = rk;
@@ -394,6 +434,51 @@ impl SecureSession {
         });
 
         Ok(())
+    }
+
+    fn draw_ratchet_secret(&mut self) -> StaticSecret {
+        #[cfg(test)]
+        if let Some(rng) = self.ratchet_rng.as_mut() {
+            return StaticSecret::random_from_rng(&mut *rng);
+        }
+        StaticSecret::random_from_rng(OsRng)
+    }
+
+    #[cfg(test)]
+    pub(crate) fn new_initiator_seeded(
+        local_static: &StaticSecret,
+        remote_static: &PublicKey,
+        local_ephemeral: StaticSecret,
+        remote_ephemeral: &PublicKey,
+        seed: [u8; 32],
+    ) -> Self {
+        let mut sess = Self::initiator_before_kickoff(
+            local_static,
+            remote_static,
+            local_ephemeral,
+            remote_ephemeral,
+        );
+        sess.ratchet_rng = Some(StdRng::from_seed(seed));
+        sess.kickoff_send();
+        sess
+    }
+
+    #[cfg(test)]
+    pub(crate) fn new_responder_seeded(
+        local_static: &StaticSecret,
+        remote_static: &PublicKey,
+        remote_ephemeral: &PublicKey,
+        local_ephemeral: StaticSecret,
+        seed: [u8; 32],
+    ) -> Self {
+        let mut sess = Self::new_responder(
+            local_static,
+            remote_static,
+            remote_ephemeral,
+            local_ephemeral,
+        );
+        sess.ratchet_rng = Some(StdRng::from_seed(seed));
+        sess
     }
 
     fn kdf_rk(&self, shared: &SharedSecret) -> ([u8; 32], [u8; 32]) {
@@ -604,6 +689,17 @@ mod tests {
     }
 
     #[test]
+    fn aad_required_rejects_plain_frame_before_any_good_frame() {
+        let (mut alice, mut bob) = pair();
+        let (h_plain, c_plain) = alice.encrypt_payload(b"plain").unwrap();
+        bob.enable_header_aad();
+        assert!(bob.decrypt_payload(&h_plain, &c_plain).is_err());
+        alice.enable_header_aad();
+        let (h, c) = alice.encrypt_payload(b"aad").unwrap();
+        assert_eq!(bob.decrypt_payload(&h, &c).unwrap(), b"aad");
+    }
+
+    #[test]
     fn legacy_peer_without_aad_still_works() {
         let (mut alice, mut bob) = pair();
         for i in 0..3u8 {
@@ -621,7 +717,9 @@ mod tests {
         let (h, c) = alice.encrypt_payload(b"ok").unwrap();
         let mut huge = h.clone();
         huge.n = 1001;
-        assert!(bob.decrypt_payload(&huge, b"garbage-garbage-garbage").is_err());
+        assert!(bob
+            .decrypt_payload(&huge, b"garbage-garbage-garbage")
+            .is_err());
         assert!(bob.skipped_keys.is_empty());
         assert_eq!(bob.decrypt_payload(&h, &c).unwrap(), b"ok");
     }

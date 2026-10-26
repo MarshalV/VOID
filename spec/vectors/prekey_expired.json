@@ -1,0 +1,10 @@
+{
+  "dht_value": "95d2b57c9f49b01106f95b1dd593d4ac11c9a7623bedd06f32d5e00bda17e90e02fff05365000000004000783cd17d88799bd8495a6fba9f086e9c79202ca7fb8544aa6f2694af8852f9e98cf356008fc28bc420ce6b00e9fc21068e1eef4a1b5aae70a3780e5ffc0217030000",
+  "not_after": 1699999999,
+  "now": 1700000000,
+  "owner_peer_id": "12D3KooWRnAWyoELc5PXFkLjb72WZHp117YTg7c9CEuhPMmEQUVa",
+  "owner_seed": "52535455565758595a5b5c5d5e5f606162636465666768696a6b6c6d6e6f7071",
+  "pk": "95d2b57c9f49b01106f95b1dd593d4ac11c9a7623bedd06f32d5e00bda17e90e",
+  "sealable": false,
+  "verify_ok": true
+}

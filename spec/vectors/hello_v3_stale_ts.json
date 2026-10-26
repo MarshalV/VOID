@@ -1,0 +1,16 @@
+{
+  "accepted": false,
+  "caps": 1,
+  "freshness_window_secs": 600,
+  "nonce": "11111111111111111111111111111111",
+  "now": 1700000000,
+  "recipient_peer_id": "12D3KooWMccDS8PJAt4LCBka4SHi2MGsr7DwvKLUSjx2nsUt8j32",
+  "recipient_seed": "22232425262728292a2b2c2d2e2f303132333435363738393a3b3c3d3e3f4041",
+  "signature": "b8721a62ee5fd705feefe8c2aa9a1b9016268484e182b1e871ec7f99f480174375a72ec24c3fb2d2222b70721077b930f4079675faa94230c26c7570ba5b9b01",
+  "signer_peer_id": "12D3KooWRnoexybWxkJksh978r2Tc16PouxnDmSqLr6fCvjvwHeQ",
+  "signer_seed": "1112131415161718191a1b1c1d1e1f202122232425262728292a2b2c2d2e2f30",
+  "transport_pubkey_pb": "",
+  "ts": 1699999399,
+  "x25519_ephemeral": "030515f32e593cfe5d7c939f9b0d35d8ae58f20d9abe890affb80da0395f611d",
+  "x25519_static": "c15d2265459455c9ff156e6c1da6bfb7910bb8af50f2b2f9f853ea9325259d4d"
+}

@@ -1,0 +1,16 @@
+{
+  "accepted": true,
+  "bind": "V3",
+  "caps": 1,
+  "nonce": "11111111111111111111111111111111",
+  "now": 1700000000,
+  "recipient_peer_id": "12D3KooWMccDS8PJAt4LCBka4SHi2MGsr7DwvKLUSjx2nsUt8j32",
+  "recipient_seed": "22232425262728292a2b2c2d2e2f303132333435363738393a3b3c3d3e3f4041",
+  "signature": "a028564fe9661a3d50bc1d397e556fa1e3b4fd4620c0ccb0679f07e7a0896b46fbb44685480262f5baff454ea645945345d7b633e70a64800f1c2c513ffaf807",
+  "signer_peer_id": "12D3KooWRnoexybWxkJksh978r2Tc16PouxnDmSqLr6fCvjvwHeQ",
+  "signer_seed": "1112131415161718191a1b1c1d1e1f202122232425262728292a2b2c2d2e2f30",
+  "transport_pubkey_pb": "",
+  "ts": 1700000000,
+  "x25519_ephemeral": "030515f32e593cfe5d7c939f9b0d35d8ae58f20d9abe890affb80da0395f611d",
+  "x25519_static": "c15d2265459455c9ff156e6c1da6bfb7910bb8af50f2b2f9f853ea9325259d4d"
+}

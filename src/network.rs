@@ -45,7 +45,7 @@ use crate::protocol::{
     validate_bootstrap_gossip_addrs,
     build_group_sync_json, build_group_leave_json, build_group_delete_json,
     transfer_id_to_hex, transfer_id_from_hex, per_peer_voice_transfer_id, ChatMessage,
-    wrap_onion_packet, OnionHopHint, HELLO_CAP_HEADER_AAD,
+    wrap_onion_packet, OnionHopHint,
     decode_v2_mail, onion_desc_fresh, verify_onion_desc, V2Mail,
     DecryptedChatFrame, FileMeta, OutgoingDeliveryStatus, VoiceMeta, V1Packet,
 };
@@ -6272,7 +6272,7 @@ pub async fn run_chat_network(
                                                     )
                                                 }) {
                                                     debug!(
-                                                        "[{}] ❌ E2EE: Hello от {} без привязки к libp2p identity — игнор.",
+                                                        "[{}] ❌ E2EE: Hello от {} без bind v3 и AAD — игнор.",
                                                         now,
                                                         &peer.to_string()[..8]
                                                     );
@@ -6336,9 +6336,7 @@ pub async fn run_chat_network(
                                                         &local_peer_id.to_bytes(),
                                                         &peer.to_bytes(),
                                                     );
-                                                    if caps & HELLO_CAP_HEADER_AAD != 0 {
-                                                        session.enable_header_aad();
-                                                    }
+                                                    session.enable_header_aad();
                                                     put_e2ee_session(
                                                         &mut sessions,
                                                         &mut session_established_at,
@@ -6408,9 +6406,7 @@ pub async fn run_chat_network(
                                                     &local_peer_id.to_bytes(),
                                                     &peer.to_bytes(),
                                                 );
-                                                if caps & HELLO_CAP_HEADER_AAD != 0 {
-                                                    session.enable_header_aad();
-                                                }
+                                                session.enable_header_aad();
                                                 put_e2ee_session(
                                                     &mut sessions,
                                                     &mut session_established_at,
@@ -7330,9 +7326,11 @@ pub async fn run_chat_network(
                                                     &nonce,
                                                     caps,
                                                 );
-                                                if hello_bind.is_none() {
+                                                if hello_bind.is_none_or(|b| {
+                                                    !crate::protocol::hello_bind_ok(b, caps, false)
+                                                }) {
                                                     debug!(
-                                                        "[{}] ❌ E2EE: Hello (ответ) от {} без привязки к libp2p identity — игнор.",
+                                                        "[{}] ❌ E2EE: Hello (ответ) от {} без bind v3 и AAD — игнор.",
                                                         now,
                                                         &peer.to_string()[..8]
                                                     );
@@ -7378,9 +7376,7 @@ pub async fn run_chat_network(
                                                         &local_peer_id.to_bytes(),
                                                         &peer.to_bytes(),
                                                     );
-                                                    if caps & HELLO_CAP_HEADER_AAD != 0 {
-                                                        session.enable_header_aad();
-                                                    }
+                                                    session.enable_header_aad();
                                                     put_e2ee_session(
                                                         &mut sessions,
                                                         &mut session_established_at,

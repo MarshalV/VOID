@@ -184,10 +184,16 @@ struct GroupDeleteCommand {
 
 pub enum DecryptedChatFrame {
     Message(ChatMessage),
-    Delete { message_ids: Vec<String> },
+    Delete {
+        message_ids: Vec<String>,
+    },
     DeleteAck,
-    Read { message_ids: Vec<String> },
-    Delivered { message_ids: Vec<String> },
+    Read {
+        message_ids: Vec<String>,
+    },
+    Delivered {
+        message_ids: Vec<String>,
+    },
     GroupSync {
         group_id: String,
         group_name: String,
@@ -335,6 +341,34 @@ pub fn verify_hello_transport_binding(
     nonce: &[u8; 16],
     caps: u32,
 ) -> Option<HelloBind> {
+    verify_hello_transport_binding_at(
+        signer_peer_id,
+        recipient_peer_id,
+        x25519_static,
+        x25519_ephemeral,
+        transport_sig,
+        transport_pubkey_pb,
+        ts,
+        nonce,
+        caps,
+        hello_now_secs(),
+    )
+}
+
+/// То же, что [`verify_hello_transport_binding`], но `now` задан снаружи.
+/// Векторы фиксируют окно свежести, не зависят от часов машины.
+pub(crate) fn verify_hello_transport_binding_at(
+    signer_peer_id: PeerId,
+    recipient_peer_id: PeerId,
+    x25519_static: &[u8; 32],
+    x25519_ephemeral: &[u8; 32],
+    transport_sig: &[u8],
+    transport_pubkey_pb: &[u8],
+    ts: u64,
+    nonce: &[u8; 16],
+    caps: u32,
+    now: u64,
+) -> Option<HelloBind> {
     const MAX_SIG: usize = 256;
     if transport_sig.is_empty() || transport_sig.len() > MAX_SIG {
         return None;
@@ -342,7 +376,6 @@ pub fn verify_hello_transport_binding(
     let pubkey = void_hello_signing_public_key(signer_peer_id, transport_pubkey_pb)?;
     let fresh = ts != 0 || nonce.iter().any(|b| *b != 0);
     if fresh {
-        let now = hello_now_secs();
         if now.abs_diff(ts) > HELLO_FRESHNESS_SECS || nonce.iter().all(|b| *b == 0) {
             return None;
         }
@@ -380,17 +413,14 @@ pub fn verify_hello_transport_binding(
     pubkey.verify(&v1, transport_sig).then_some(HelloBind::V1)
 }
 
-/// Onion-Hello принимаем только с `caps` внутри подписи v3 и флагом AAD.
-/// Иначе exit вырезает флаг, и кадры идут без AAD.
-pub fn hello_bind_ok(bind: HelloBind, caps: u32, via_onion: bool) -> bool {
-    if via_onion {
-        bind == HelloBind::V3 && caps & HELLO_CAP_HEADER_AAD != 0
-    } else {
-        true
-    }
+/// Сессия открывается только с bind v3 и битом AAD внутри подписи.
+/// Прямой Hello v1/v2 и onion-Hello без флага сессию не создают:
+/// иначе собеседник или hop оставляет кадры без AAD.
+pub fn hello_bind_ok(bind: HelloBind, caps: u32, _via_onion: bool) -> bool {
+    bind == HelloBind::V3 && caps & HELLO_CAP_HEADER_AAD != 0
 }
 
-fn sign_hello_transport_binding(
+pub(crate) fn sign_hello_transport_binding(
     transport: &libp2p::identity::Keypair,
     signer_peer: PeerId,
     recipient_peer: PeerId,
@@ -417,9 +447,7 @@ fn validate_message_id(id: &str) -> bool {
 }
 
 fn validate_delete_ids(ids: &[String]) -> bool {
-    !ids.is_empty()
-        && ids.len() <= MAX_DELETE_IDS
-        && ids.iter().all(|id| validate_message_id(id))
+    !ids.is_empty() && ids.len() <= MAX_DELETE_IDS && ids.iter().all(|id| validate_message_id(id))
 }
 
 pub fn is_delete_command_json(plaintext: &[u8]) -> bool {
@@ -690,14 +718,15 @@ pub fn verify_group_sync_signature(
     pubkey.verify(&msg, sig)
 }
 
-pub fn build_delete_ack_json(
-    deleted: &[String],
-    missing: &[String],
-) -> Option<Vec<u8>> {
+pub fn build_delete_ack_json(deleted: &[String], missing: &[String]) -> Option<Vec<u8>> {
     if deleted.len() + missing.len() > MAX_DELETE_IDS {
         return None;
     }
-    if !deleted.iter().chain(missing.iter()).all(|id| validate_message_id(id)) {
+    if !deleted
+        .iter()
+        .chain(missing.iter())
+        .all(|id| validate_message_id(id))
+    {
         return None;
     }
     let ack = ChatDeleteAck {
@@ -904,7 +933,10 @@ pub enum V1Packet {
 
 /// Письмо внутри печати v2. Hello/Ack несут PeerId отправителя; Encrypted — только заголовок сессии.
 pub enum V2Mail {
-    Directed { from: PeerId, packet: V1Packet },
+    Directed {
+        from: PeerId,
+        packet: V1Packet,
+    },
     Encrypted {
         header: crypto::MessageHeader,
         ciphertext: Vec<u8>,
@@ -1165,7 +1197,8 @@ mod hello_freshness_tests {
         let kp = Keypair::generate_ed25519();
         let signer = kp.public().to_peer_id();
         let recipient = Keypair::generate_ed25519().public().to_peer_id();
-        let static_b = PublicKey::from(&StaticSecret::random_from_rng(rand::rngs::OsRng)).to_bytes();
+        let static_b =
+            PublicKey::from(&StaticSecret::random_from_rng(rand::rngs::OsRng)).to_bytes();
         let ephem_b = PublicKey::from(&StaticSecret::random_from_rng(rand::rngs::OsRng)).to_bytes();
         let hello = build_v1_hello(
             &kp,
@@ -1228,8 +1261,11 @@ mod hello_freshness_tests {
         )
         .is_none());
         assert!(hello_bind_ok(HelloBind::V3, caps, true));
+        assert!(hello_bind_ok(HelloBind::V3, caps, false));
         assert!(!hello_bind_ok(HelloBind::V2, caps, true));
+        assert!(!hello_bind_ok(HelloBind::V2, caps, false));
         assert!(!hello_bind_ok(HelloBind::V3, 0, true));
+        assert!(!hello_bind_ok(HelloBind::V3, 0, false));
     }
 
     #[test]
@@ -1237,7 +1273,8 @@ mod hello_freshness_tests {
         let kp = Keypair::generate_ed25519();
         let signer = kp.public().to_peer_id();
         let recipient = Keypair::generate_ed25519().public().to_peer_id();
-        let static_b = PublicKey::from(&StaticSecret::random_from_rng(rand::rngs::OsRng)).to_bytes();
+        let static_b =
+            PublicKey::from(&StaticSecret::random_from_rng(rand::rngs::OsRng)).to_bytes();
         let ephem_b = PublicKey::from(&StaticSecret::random_from_rng(rand::rngs::OsRng)).to_bytes();
         let msg = hello_bind_message_v1(signer, recipient, &static_b, &ephem_b);
         let sig = kp.sign(&msg).unwrap();
@@ -1255,7 +1292,7 @@ mod hello_freshness_tests {
             ),
             Some(HelloBind::V1)
         );
-        assert!(hello_bind_ok(HelloBind::V1, 0, false));
+        assert!(!hello_bind_ok(HelloBind::V1, 0, false));
         assert!(!hello_bind_ok(HelloBind::V1, 0, true));
     }
 }

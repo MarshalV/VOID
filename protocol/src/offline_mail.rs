@@ -75,18 +75,12 @@ pub fn decode_voice_chunk_payload(bytes: &[u8]) -> Option<VoiceChunk> {
 
 /// Режет байты WAV на чанки для offline-доставки. Возвращает `None`, если файл
 /// больше `OFFLINE_VOICE_MAX_BYTES` — в этом случае аудио дождётся живой передачи.
-pub fn split_voice_for_offline(
-    transfer_id: &[u8; 16],
-    bytes: &[u8],
-) -> Option<Vec<Vec<u8>>> {
+pub fn split_voice_for_offline(transfer_id: &[u8; 16], bytes: &[u8]) -> Option<Vec<Vec<u8>>> {
     if bytes.is_empty() || bytes.len() as u64 > OFFLINE_VOICE_MAX_BYTES {
         return None;
     }
     let total_size = bytes.len() as u32;
-    let total = bytes
-        .len()
-        .div_ceil(OFFLINE_VOICE_CHUNK_SIZE)
-        .max(1) as u32;
+    let total = bytes.len().div_ceil(OFFLINE_VOICE_CHUNK_SIZE).max(1) as u32;
     let mut out = Vec::with_capacity(total as usize);
     for (i, chunk) in bytes.chunks(OFFLINE_VOICE_CHUNK_SIZE).enumerate() {
         out.push(encode_voice_chunk_payload(
@@ -244,7 +238,10 @@ fn outer_message_id(recipient: &PeerId, message_id: &str) -> String {
     h.update(OFFLINE_ID_PREFIX_V3);
     h.update(recipient.to_bytes());
     h.update(message_id.as_bytes());
-    h.finalize()[..16].iter().map(|b| format!("{b:02x}")).collect()
+    h.finalize()[..16]
+        .iter()
+        .map(|b| format!("{b:02x}"))
+        .collect()
 }
 
 fn padded_len(n: usize) -> usize {
@@ -427,12 +424,7 @@ pub fn verify_signed_prekey(owner: &PeerId, value: &[u8]) -> Option<SignedPrekey
 }
 
 /// Подпись `PrekeyPut` / `PrekeyOffer` (сырой sig, не DHT-блоб).
-pub fn verify_prekey_offer(
-    owner: &PeerId,
-    pk: &[u8; 32],
-    not_after: u64,
-    sig: &[u8],
-) -> bool {
+pub fn verify_prekey_offer(owner: &PeerId, pk: &[u8; 32], not_after: u64, sig: &[u8]) -> bool {
     if *pk == [0u8; 32] || sig.is_empty() || not_after == 0 {
         return false;
     }
@@ -485,7 +477,10 @@ pub fn identity_offline_secret(key: &libp2p::identity::Keypair) -> Option<Static
 
 /// Ключ запечатывания. Проверенный непросроченный prekey — первым (PFS).
 /// Identity из PeerId — запасной путь для старых писем и пиров без prekey.
-pub fn offline_seal_key(recipient: &PeerId, verified_prekey: Option<[u8; 32]>) -> Option<PublicKey> {
+pub fn offline_seal_key(
+    recipient: &PeerId,
+    verified_prekey: Option<[u8; 32]>,
+) -> Option<PublicKey> {
     if let Some(pk) = verified_prekey {
         if pk != [0u8; 32] {
             return Some(PublicKey::from(pk));
@@ -631,6 +626,64 @@ pub fn seal_for_recipient(
         return Err(anyhow!("offline seal: transport key ≠ sender"));
     }
     let eph_secret = StaticSecret::random_from_rng(&mut rand::rngs::OsRng);
+    let mut nonce = [0u8; 12];
+    rand::thread_rng().fill_bytes(&mut nonce);
+    seal_for_recipient_parts(
+        transport,
+        recipient,
+        recipient_pk,
+        sender,
+        sender_pk,
+        message_id,
+        kind,
+        plaintext,
+        eph_secret,
+        nonce,
+    )
+}
+
+#[cfg(test)]
+pub(crate) fn seal_for_recipient_fixed(
+    transport: &libp2p::identity::Keypair,
+    recipient: &PeerId,
+    recipient_pk: &PublicKey,
+    sender: &PeerId,
+    sender_pk: &[u8; 32],
+    message_id: &str,
+    kind: &str,
+    plaintext: &[u8],
+    eph_secret: StaticSecret,
+    nonce: [u8; 12],
+) -> Result<OfflineEnvelope> {
+    seal_for_recipient_parts(
+        transport,
+        recipient,
+        recipient_pk,
+        sender,
+        sender_pk,
+        message_id,
+        kind,
+        plaintext,
+        eph_secret,
+        nonce,
+    )
+}
+
+fn seal_for_recipient_parts(
+    transport: &libp2p::identity::Keypair,
+    recipient: &PeerId,
+    recipient_pk: &PublicKey,
+    sender: &PeerId,
+    sender_pk: &[u8; 32],
+    message_id: &str,
+    kind: &str,
+    plaintext: &[u8],
+    eph_secret: StaticSecret,
+    nonce: [u8; 12],
+) -> Result<OfflineEnvelope> {
+    if PeerId::from_public_key(&transport.public()) != *sender {
+        return Err(anyhow!("offline seal: transport key ≠ sender"));
+    }
     let eph = PublicKey::from(&eph_secret).to_bytes();
     let shared = eph_secret.diffie_hellman(recipient_pk);
     let key = hkdf_offline(shared.as_bytes(), &eph, recipient_pk.as_bytes());
@@ -660,8 +713,6 @@ pub fn seal_for_recipient(
 
     let outer_id = outer_message_id(recipient, message_id);
     let aad = v3_aad(recipient, &outer_id, &eph);
-    let mut nonce = [0u8; 12];
-    rand::thread_rng().fill_bytes(&mut nonce);
     let ct = ChaCha20Poly1305::new(key.as_slice().into())
         .encrypt(
             Nonce::from_slice(&nonce),
@@ -704,10 +755,18 @@ fn open_v3(
     env: &OfflineEnvelope,
 ) -> Result<OpenedEnvelope> {
     let bad = || anyhow!("offline envelope: bad inner");
-    let inner = decrypt_envelope(recipient_secrets, env, &v3_aad(recipient, &env.message_id, &env.eph))?;
+    let inner = decrypt_envelope(
+        recipient_secrets,
+        env,
+        &v3_aad(recipient, &env.message_id, &env.eph),
+    )?;
     let (sig, pubkey_pb, mut rest) = decode_signed_inner(&inner).ok_or_else(bad)?;
     let sender = PeerId::from_bytes(read_lp(&mut rest, 128).ok_or_else(bad)?).map_err(|_| bad())?;
-    let sender_pk: [u8; 32] = rest.get(..32).ok_or_else(bad)?.try_into().map_err(|_| bad())?;
+    let sender_pk: [u8; 32] = rest
+        .get(..32)
+        .ok_or_else(bad)?
+        .try_into()
+        .map_err(|_| bad())?;
     rest = &rest[32..];
     let message_id = std::str::from_utf8(read_lp(&mut rest, 1024).ok_or_else(bad)?)
         .map_err(|_| bad())?
@@ -762,7 +821,13 @@ fn open_v2(
     let inner = decrypt_envelope(recipient_secrets, env, &header_for(OFFLINE_AAD_PREFIX))?;
     let (sig, pubkey_pb, body) =
         decode_signed_inner(&inner).ok_or_else(|| anyhow!("offline envelope: bad inner"))?;
-    verify_sender(sender, pubkey_pb, &header_for(OFFLINE_SIG_PREFIX), body, sig)?;
+    verify_sender(
+        sender,
+        pubkey_pb,
+        &header_for(OFFLINE_SIG_PREFIX),
+        body,
+        sig,
+    )?;
     Ok(OpenedEnvelope {
         sender,
         message_id: env.message_id.clone(),
@@ -780,8 +845,7 @@ fn hkdf_offline(shared: &[u8], eph: &[u8; 32], recipient_pk: &[u8; 32]) -> [u8; 
     info.extend_from_slice(eph);
     info.extend_from_slice(recipient_pk);
     let mut okm = [0u8; 32];
-    hk.expand(&info, &mut okm)
-        .expect("hkdf offline key len");
+    hk.expand(&info, &mut okm).expect("hkdf offline key len");
     okm
 }
 
@@ -840,7 +904,10 @@ mod tests {
         for _ in 0..16 {
             let p = party();
             let derived = identity_offline_public(&p.pid).expect("derive");
-            assert_eq!(derived.as_bytes(), PublicKey::from(&p.offline_sk).as_bytes());
+            assert_eq!(
+                derived.as_bytes(),
+                PublicKey::from(&p.offline_sk).as_bytes()
+            );
         }
     }
 
@@ -851,7 +918,10 @@ mod tests {
         let key = offline_seal_key(&bob.pid, Some(pre)).unwrap();
         assert_eq!(key.as_bytes(), &pre);
         let fallback = offline_seal_key(&bob.pid, None).unwrap();
-        assert_eq!(fallback.as_bytes(), PublicKey::from(&bob.offline_sk).as_bytes());
+        assert_eq!(
+            fallback.as_bytes(),
+            PublicKey::from(&bob.offline_sk).as_bytes()
+        );
     }
 
     #[test]
@@ -901,7 +971,10 @@ mod tests {
             b"old",
         )
         .unwrap();
-        assert_eq!(open_envelope(&bob.secrets(), &bob.pid, &env).unwrap().body, b"old");
+        assert_eq!(
+            open_envelope(&bob.secrets(), &bob.pid, &env).unwrap().body,
+            b"old"
+        );
     }
 
     fn seal_from(from: &Party, to: &Party, body: &[u8]) -> OfflineEnvelope {
@@ -1002,13 +1075,19 @@ mod tests {
         let alice = party();
         let pk = PublicKey::from(&alice.static_sk).to_bytes();
         let not_after = prekey_now().saturating_add(3600);
-        let published = encode_signed_prekey(&alice.key, &alice.pid, &pk, not_after).expect("encode");
+        let published =
+            encode_signed_prekey(&alice.key, &alice.pid, &pk, not_after).expect("encode");
         assert_eq!(&published.dht_value[..32], &pk);
         let got = verify_signed_prekey(&alice.pid, &published.dht_value).unwrap();
         assert_eq!(got.pk, pk);
         assert_eq!(got.not_after, not_after);
         assert!(prekey_is_sealable(got, prekey_now()));
-        assert!(verify_prekey_offer(&alice.pid, &pk, not_after, &published.sig));
+        assert!(verify_prekey_offer(
+            &alice.pid,
+            &pk,
+            not_after,
+            &published.sig
+        ));
     }
 
     #[test]
