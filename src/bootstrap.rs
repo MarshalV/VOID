@@ -285,54 +285,12 @@ pub(crate) fn addr_is_tcp(ma: &Multiaddr) -> bool {
 /// `/ip4|ip6/…/tcp/port` из любого bootstrap-адреса, в том числе circuit.
 /// Dial идёт без `/p2p/`: в vault часто лежит PeerId контакта, не ноды.
 pub(crate) fn bootstrap_tcp_dial_addr(ma: &Multiaddr) -> Option<Multiaddr> {
-    if addr_is_quic_v1(ma) {
-        return None;
-    }
-    let mut out = Multiaddr::empty();
-    let mut have_ip = false;
-    let mut have_tcp = false;
-    for p in ma.iter() {
-        match p {
-            Protocol::Ip4(_) | Protocol::Ip6(_) if !have_ip => {
-                out.push(p);
-                have_ip = true;
-            }
-            Protocol::Tcp(_) if !have_tcp => {
-                out.push(p);
-                have_tcp = true;
-            }
-            _ => {}
-        }
-    }
-    if have_ip && have_tcp {
-        Some(out)
-    } else {
-        None
-    }
+    crate::protocol::bootstrap_tcp_dial_addr(ma)
 }
 
 /// Для vault: только прямой TCP с `/p2p/` (id реле до `p2p-circuit`, не контакт после него).
 pub(crate) fn canonicalize_bootstrap_ma(ma: &Multiaddr) -> Option<Multiaddr> {
-    let tcp = bootstrap_tcp_dial_addr(ma)?;
-    let mut peer_before_circuit = None;
-    let mut seen_circuit = false;
-    let mut last_p2p = None;
-    for p in ma.iter() {
-        match p {
-            Protocol::P2pCircuit => seen_circuit = true,
-            Protocol::P2p(id) => {
-                if !seen_circuit {
-                    peer_before_circuit = Some(id);
-                }
-                last_p2p = Some(id);
-            }
-            _ => {}
-        }
-    }
-    let pid = peer_before_circuit.or(last_p2p)?;
-    let mut out = tcp;
-    out.push(Protocol::P2p(pid));
-    Some(out)
+    crate::protocol::canonicalize_bootstrap_ma(ma)
 }
 
 /// Параллельный TCP+QUIC к одному пиру часто убивает уже установленный TCP

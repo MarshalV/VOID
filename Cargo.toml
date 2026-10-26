@@ -1,3 +1,8 @@
+[workspace]
+members = [".", "protocol"]
+exclude = ["src-tauri"]
+resolver = "2"
+
 [package]
 name = "p2p-messenger"
 version = "0.1.0"
@@ -17,6 +22,7 @@ default = ["egui-ui"]
 egui-ui = ["dep:eframe"]
 
 [dependencies]
+void-protocol = { path = "protocol" }
 libp2p = { version = "0.56", features = ["tcp", "quic", "noise", "yamux", "ping", "macros", "tokio", "mdns", "request-response", "identify", "kad", "relay", "dcutr", "autonat", "upnp", "dns", "rsa", "ed25519", "secp256k1", "json"] }
 tokio = { version = "1.0", features = ["full"] }
 anyhow = "1.0"
@@ -31,6 +37,7 @@ image = "0.25"
 aes-gcm = "0.10"
 rand = "0.8"
 x25519-dalek = { version = "2.0", features = ["static_secrets"] }
+curve25519-dalek = "4.1"
 chacha20poly1305 = "0.10"
 hkdf = "0.12"
 sha2 = "0.10"

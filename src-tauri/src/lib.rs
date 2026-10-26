@@ -203,6 +203,18 @@ fn snapshot_dht(state: State<'_, Mutex<AppState>>) -> Result<SnapshotDto, String
 }
 
 #[tauri::command]
+fn set_onion_trace(
+    state: State<'_, Mutex<AppState>>,
+    enabled: bool,
+) -> Result<SnapshotDto, String> {
+    state
+        .lock()
+        .map_err(|e| e.to_string())?
+        .runtime
+        .set_onion_trace(enabled)
+}
+
+#[tauri::command]
 fn set_nickname(state: State<'_, Mutex<AppState>>, nickname: String) -> Result<SnapshotDto, String> {
     state
         .lock()
@@ -636,6 +648,7 @@ pub fn run() {
             reload_bootstraps,
             snapshot_dht,
             set_nickname,
+            set_onion_trace,
             send_file,
             save_file_to_downloads,
             delete_message,

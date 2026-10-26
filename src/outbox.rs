@@ -46,6 +46,9 @@ pub(crate) enum OutboxEntry {
         creator_id: String,
         members: Vec<GroupMember>,
         recipient: String,
+        /// Версия подписанного состава на момент постановки в очередь.
+        #[serde(default)]
+        version: u64,
     },
 }
 

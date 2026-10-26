@@ -3,19 +3,17 @@
 
 pub mod bridge;
 
+pub(crate) use void_protocol::{crypto, group, kad_store, offline_mail, onion, protocol};
+
 pub(crate) mod bootstrap;
 pub(crate) mod chat_store;
-pub(crate) mod crypto;
 pub(crate) mod file_transfer;
-pub(crate) mod group;
+pub(crate) mod hello_replay;
 pub(crate) mod metadata_strip;
 pub(crate) mod network;
-pub(crate) mod onion;
-pub(crate) mod offline_mail;
 pub(crate) mod offline_publish;
 pub(crate) mod outbox;
 pub(crate) mod paths;
-pub(crate) mod protocol;
 pub(crate) mod relay_mailbox;
 pub(crate) mod shared_chat;
 pub(crate) mod vault;
@@ -35,7 +33,21 @@ pub(crate) use bootstrap::parse_seed_input;
 #[cfg(feature = "egui-ui")]
 pub(crate) use network::{NetworkEvent, UICommand};
 #[cfg(feature = "egui-ui")]
-pub(crate) use protocol::{new_message_id, FileTransferProgress, OutgoingDeliveryStatus};
+pub(crate) use protocol::{new_message_id, OutgoingDeliveryStatus};
+
+/// Прогресс активной передачи файла (для UI).
+#[cfg(feature = "egui-ui")]
+pub(crate) struct FileTransferProgress {
+    pub filename: String,
+    pub total_size: u64,
+    pub sent_chunks: u32,
+    pub total_chunks: u32,
+    pub is_outgoing: bool,
+    pub completed: bool,
+    pub saved_to: String,
+    pub peer: libp2p::PeerId,
+    pub kind: file_transfer::FileKind,
+}
 
 /// Initialize data directory (vault, journal, outbox).
 pub fn init_paths() -> Result<(), String> {

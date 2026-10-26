@@ -405,6 +405,11 @@
     return n === 1 ? t("onion.hops1", { n }) : t("onion.hopsN", { n });
   }
 
+  const ONION_TRACE_KEY = "void.onion.trace";
+  function onionTraceWanted() {
+    return localStorage.getItem(ONION_TRACE_KEY) === "1";
+  }
+
   function onionRouteHtml(s) {
     const hops = s?.onion_hops || [];
     let path;
@@ -414,15 +419,25 @@
         ...hops.map((h) => onionChip(peerRouteLabel(h, s))),
         onionChip(t("onion.peer")),
       ];
+      const weak =
+        hops.length < 3
+          ? `<p class="muted">${t("onion.weak")}</p>`
+          : "";
       path = `<div class="onion-path">${chips.join('<span class="onion-arrow">→</span>')}</div>
-        <p class="muted">${t("onion.now", { n: hopCountLabel(hops.length) })}</p>`;
+        <p class="muted">${t("onion.now", { n: hopCountLabel(hops.length) })}</p>${weak}`;
     } else if ((s?.bootstrap_connected || 0) > 0) {
       path = `<p class="muted">${t("onion.hasNode")}</p>`;
     } else {
       path = `<p class="muted">${t("onion.noNode")}</p>`;
     }
-    const traces = (s?.onion_traces || []).slice().reverse();
-    const list = traces.length
+    const tracesOn = !!s?.onion_trace_enabled;
+    const toggle = `<label class="field onion-trace-toggle"><input type="checkbox" id="onion-trace"${
+      tracesOn ? " checked" : ""
+    }/> ${t("onion.traceToggle")}</label>`;
+    const traces = tracesOn ? (s?.onion_traces || []).slice().reverse() : [];
+    const list = !tracesOn
+      ? `<p class="muted">${t("onion.traceOff")}</p>`
+      : traces.length
       ? traces
           .map((tr) => {
             const dir =
@@ -433,7 +448,7 @@
           })
           .join("")
       : `<p class="muted">${t("onion.noPkts")}</p>`;
-    return `${path}<div class="onion-traces">${list}</div>`;
+    return `${path}${toggle}<div class="onion-traces">${list}</div>`;
   }
 
   function applySnapshotNow(s) {
@@ -1145,6 +1160,17 @@
         applySnapshot(await invoke("reload_bootstraps"));
         showToast(t("toast.bootReloaded"));
       };
+      const traceBox = document.getElementById("onion-trace");
+      if (traceBox) {
+        traceBox.onchange = async () => {
+          localStorage.setItem(ONION_TRACE_KEY, traceBox.checked ? "1" : "0");
+          try {
+            applySnapshot(await invoke("set_onion_trace", { enabled: traceBox.checked }));
+          } catch (e) {
+            showToast(String(e));
+          }
+        };
+      }
     } else if (sec === "settings") {
       document.getElementById("s-save").onclick = async () => {
         try {
@@ -1354,10 +1380,18 @@
 
     if (status.unlocked) {
       applySnapshot(await invoke("get_snapshot"));
+      try {
+        applySnapshot(await invoke("set_onion_trace", { enabled: onionTraceWanted() }));
+      } catch (_) {}
     } else {
       try {
         const auto = await invoke("try_auto_unlock");
-        if (auto) applySnapshot(auto);
+        if (auto) {
+          applySnapshot(auto);
+          try {
+            applySnapshot(await invoke("set_onion_trace", { enabled: onionTraceWanted() }));
+          } catch (_) {}
+        }
       } catch (_) {}
     }
 
@@ -1390,6 +1424,9 @@
           remember: els.remember.checked,
         });
         applySnapshot(snap);
+        try {
+          applySnapshot(await invoke("set_onion_trace", { enabled: onionTraceWanted() }));
+        } catch (_) {}
       } catch (e) {
         els.unlockError.hidden = false;
         els.unlockError.textContent = String(e);
