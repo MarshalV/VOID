@@ -26,7 +26,7 @@ Discovery and NAT traversal go through public bootstrap/relay nodes — not a ch
 
 ## What this is
 
-**VOID** (Verified Open Independent Dispatcher) is an open delivery protocol and a Rust P2P app on top of it. Both layers live in this repository. The wire rules are the `protocol/` crate and the catalog in [`spec/`](spec/README.md). Known-answer vectors are in [`spec/vectors/`](spec/vectors/README.md). The app is the desktop that runs those rules for a person. Live chat goes **peer to peer** over `libp2p`: directly on LAN, or through a **Circuit Relay Hop** on a bootstrap node when both sides are behind NAT. Text, voice, and files are encrypted with **Double Ratchet**. Identity is a `PeerId` from the local vault — no phone number, no email.
+**VOID** (Verified Open Independent Dispatcher) is an open delivery protocol and a Rust P2P app on top of it. Both layers live in this repository. The wire rules are the `protocol/` crate and the catalog in [`spec/`](spec/README.md). Known-answer vectors are in [`spec/vectors/`](spec/vectors/README.md). The harness in [`protocol-conformance/`](protocol-conformance) runs two sessions and a dispatcher mailbox without a window. The app is the desktop that runs those rules for a person. Live chat goes **peer to peer** over `libp2p`: directly on LAN, or through a **Circuit Relay Hop** on a bootstrap node when both sides are behind NAT. Text, voice, and files are encrypted with **Double Ratchet**. Identity is a `PeerId` from the local vault — no phone number, no email.
 
 A bootstrap node is needed to **find** a peer, **reserve a Hop**, and **store offline envelopes**. It does not decrypt messages, but it **sees metadata**: IP, PeerId, who builds a circuit with whom, and for whom offline mail sits, when, and how large it is. Details: [Privacy and threat model](#privacy-and-threat-model).
 
@@ -91,12 +91,15 @@ The main desktop is **Tauri 2** (`frontend/` + `src-tauri/`). Optionally a nativ
 | `protocol/src/onion.rs` | Onion v2 when every hop has a descriptor, otherwise v1 |
 | `protocol/src/offline_mail.rs` | Seal envelope to the recipient’s rotating prekey, or to the key derived from their PeerId if none is published |
 | `protocol/src/kad_store.rs` | Kademlia `put`: signed unexpired prekey, or a v3 mailbox. Other keys are refused |
-| `src/relay_mailbox.rs` | Local mailbox for LAN without bootstrap: the client stores neighbours’ mail and serves it to the owner on Query |
+| `src/relay_mailbox.rs` | Local mailbox for LAN without bootstrap: the client stores neighbours’ mail and serves it to the owner on Query. This copy keeps 256 mailboxes; the node and the harness keep 4096 |
 | `src/hello_replay.rs` | Cache of accepted `Hello` ephemeral keys (256 per peer). A `Hello` with `ts == 0` does not reset a live session |
 | `src/vault.rs` / `paths.rs` | Vault, data directory, instance lock |
 | `src/bootstrap.rs` | Seed merge: vault, env, HTTP, built-in list |
 | `src/file_transfer.rs` / `src/voice.rs` | Files and voice |
 | `protocol/src/group.rs` | Group roster, invite, creator-signed version |
+| [`spec/`](spec/README.md) | Wire catalog for a second implementation (Russian). Not linked into the desktop |
+| [`spec/vectors/`](spec/vectors/README.md) | Known-answer JSON. `cargo test -p void-protocol` checks the files in git |
+| [`protocol-conformance/`](protocol-conformance) | Two `SecureSession`s and an in-memory dispatcher mailbox. No Tauri, no egui, no vault |
 
 The UI does **not** poll `get_snapshot` on a timer in normal mode. State goes out as `void://snapshot` (flusher ~120 ms, monotonic `revision`). While status is `Hop…`, the UI also polls the snapshot so it does not stick on “waiting for Ack”.
 
@@ -519,19 +522,29 @@ The client does not use the node’s QUIC address in seed for dial (it breaks li
 
 ---
 
-## Specification and vectors
+## Specification, vectors, and harness
 
 Wire rules for a second implementation are in [`spec/`](spec/README.md) (Russian): identity, Hello, session, attachments, envelope, discovery, rendezvous, seed, onion, groups. The catalog is bytes on the wire and what a node must do with them. It does not include the vault, the window, this client's listen port, or reconnect timers.
 
-Known answers are JSON in [`spec/vectors/`](spec/vectors/README.md). Check:
+Three checks, none of them opens a window:
 
-```bash
+| Check | Command | What is green |
+|-------|---------|----------------|
+| Library and vectors | `cargo test -p void-protocol --lib` | Frames, session, envelope, onion, and the JSON in [`spec/vectors/`](spec/vectors/README.md) |
+| Harness | `cargo test -p protocol-conformance` | Two `SecureSession`s exchange Hello and ratchet frames. `MailboxNode` applies the node rules for `Store` / `Query` |
+| CI | [`.github/workflows/protocol.yml`](.github/workflows/protocol.yml) | Both commands on push and pull request |
+
+The vector files are part of the repository. CI checks them out and compares; it does not regenerate them. `UPDATE_VECTORS=1` rewrites the JSON from `protocol/src/vectors.rs`. Set it only when the wire bytes are supposed to change. The secrets in those files are test seeds.
+
+```powershell
+$env:UPDATE_VECTORS='1'
 cargo test -p void-protocol --lib vectors
+Remove-Item Env:UPDATE_VECTORS
 ```
 
-`UPDATE_VECTORS=1` rewrites those files from `protocol/src/vectors.rs`. Set it only when the wire bytes are supposed to change. The secrets in the JSON are test seeds.
+What the JSON pins is listed in [`spec/vectors/README.md`](spec/vectors/README.md): Hello v3 accepted and Hello with `ts` outside the 600-second window, ephemeral replay (a per-peer cache of the last 256 keys, not a signature check), four ratchet round-trips where `dh_pub` changes each turn, a tampered ratchet header that fails decrypt without moving state, envelope v3 seal/open, rejection of unsigned `v = 1` and of a v3 ciphertext relabeled as v2, a prekey whose `not_after` is already past, onion v2 on 1, 2, and 3 hops, and a hop secret that does not open the cell.
 
-The files cover Hello v3 accepted and Hello with `ts` outside the 600-second window, ephemeral replay (a per-peer cache of 256 keys, not a signature check), four ratchet round-trips where `dh_pub` changes each turn, a tampered ratchet header that must fail decrypt without moving state, envelope v3 seal/open, rejection of unsigned `v = 1` and of a v3 ciphertext relabeled as v2, a prekey whose `not_after` is already past, onion v2 on 1, 2, and 3 hops, and a hop secret that does not open the cell.
+`protocol-conformance` depends only on `void-protocol`. The mailbox is in memory: `Query` answers the owner only, a batch is deleted before the reply, mail lives 7 days from accept time, one uploader is capped at 256 envelopes and 8 MiB in one box, the store window is 60 seconds / 600 requests / 600 envelopes / 48 MiB of `|ct|`, and a new box past 4096 is refused. An outer envelope that is not v3 is refused. The LAN client in `src/relay_mailbox.rs` uses the same quotas except the box ceiling, which is 256 there.
 
 ---
 
@@ -555,13 +568,14 @@ The files cover Hello v3 accepted and Hello with `ts` outside the 600-second win
 - [x] `OnionDrop` only from advertised onion hops, inside only `Hello` / `Encrypted` / `Ack`
 - [x] Offline envelope v3: sender signature, metadata inside ciphertext. Seal goes to a rotating prekey; the PeerId-derived key remains the fallback
 - [x] Offline-mail Query only for the mailbox owner; on the node at most 4096 mailboxes, TTL 7 days, quotas and `Store` rate limit; with bootstrap, the client does not accept `Store` from ordinary peers
-- [x] Double Ratchet with a DH step on every speaker change; frame header and both PeerIds in AAD if both clients advertised it in `Hello.caps`. New clients sign `caps` in Hello bind v3; an onion Hello without that flag is refused
+- [x] Double Ratchet with a DH step on every speaker change. A session opens only after Hello bind v3 with the AAD bit, on a direct path and over onion. Header and both PeerIds are in AAD before the first frame
 - [x] `Hello` freshness: `ts` (±10 min) and `nonce` in the signature. A `Hello` with `ts == 0` does not reset a live session
 - [x] Vault: Argon2id 64 MiB, AES-GCM with AAD (`VOIDKEY3`; old `VOIDKEY2` still opens)
 - [x] Group roster has a creator-signed `version`. A replay of an older `group_sync` does not roll membership back. A message is stored only if the sender is in the roster
 - [x] Kademlia `put` on the client and the node keeps only a signed unexpired prekey or a v3 mailbox
 - [x] A hop forwards an onion cell only after Identify, with a forward rate limit, and does not log `next` or `src`
 - [x] Wire catalog in [`spec/`](spec/README.md) and known-answer vectors in [`spec/vectors/`](spec/vectors/README.md) (`cargo test -p void-protocol --lib vectors`)
+- [x] Conformance harness `protocol-conformance`: two `SecureSession`s and an in-memory mailbox with the node Query / TTL / quota rules. No Tauri or egui
 
 ### Optional / not default
 
@@ -569,7 +583,7 @@ The files cover Hello v3 accepted and Hello with `ts` outside the 600-second win
 
 ### Protocol plan
 
-The wire catalog and the vectors are in the tree. See [Specification and vectors](#specification-and-vectors). `protocol/` (crate `void-protocol`) holds frames, the session, offline envelopes, onion cells, groups, and the Kademlia record check. The desktop stays in `src/`, `frontend/`, and `src-tauri/`, and depends on that crate.
+The wire catalog, the vectors, and the harness are in the tree. See [Specification, vectors, and harness](#specification-vectors-and-harness). `protocol/` (crate `void-protocol`) holds frames, the session, offline envelopes, onion cells, groups, and the Kademlia record check. The desktop stays in `src/`, `frontend/`, and `src-tauri/`, and depends on that crate. `protocol-conformance` does not.
 
 The code stays [MIT](./LICENSE). Specification text — CC BY 4.0.
 
@@ -580,8 +594,9 @@ Out of spec, as this client’s local choices: vault layout, Tauri and egui, lis
 | Identity through groups | [`spec/00-overview.md`](spec/00-overview.md) … [`spec/10-groups.md`](spec/10-groups.md) |
 | Hello, ratchet, envelope, prekey, onion | [`spec/vectors/`](spec/vectors/README.md) |
 | Envelope v3, no stable cleartext sender | client and [`spec/05-envelope.md`](spec/05-envelope.md); vectors `envelope_v3_roundtrip`, `envelope_v2_reject` |
+| Two sessions and the dispatcher mailbox | [`protocol-conformance`](protocol-conformance) |
 
-Still ahead: splitting `protocol/` into separate frame, session, envelope, and onion crates; a vector for the skipped-key cap of 4096; a two-process harness with no GUI window. A test that is green only against the desktop program is a specification failure.
+Still ahead: splitting `protocol/` into separate frame, session, envelope, and onion crates, and a vector for the skipped-key cap of 4096. A test that is green only against the desktop program is a specification failure.
 
 Reference dispatcher — [`MarshalV/bootstrap_node`](https://github.com/MarshalV/bootstrap_node). One dispatcher still sees the meeting. Onion does not cancel that until several independent nodes are on the path. A v2 cell has three size buckets. A path that still contains a v1 hop also shows the sender.
 

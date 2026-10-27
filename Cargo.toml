@@ -1,5 +1,5 @@
 [workspace]
-members = [".", "protocol"]
+members = [".", "protocol", "protocol-conformance"]
 exclude = ["src-tauri"]
 resolver = "2"
 

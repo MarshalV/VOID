@@ -1,0 +1,13 @@
+[package]
+name = "protocol-conformance"
+version = "0.1.0"
+edition = "2021"
+description = "VOID conformance harness: two sessions and an in-memory mailbox, no UI"
+license = "MIT"
+publish = false
+
+[dependencies]
+void-protocol = { path = "../protocol" }
+libp2p = { version = "0.56", features = ["ed25519"] }
+rand = "0.8"
+x25519-dalek = { version = "2.0", features = ["static_secrets"] }

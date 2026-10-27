@@ -5383,6 +5383,16 @@ dependencies = [
 ]
 
 [[package]]
+name = "protocol-conformance"
+version = "0.1.0"
+dependencies = [
+ "libp2p",
+ "rand 0.8.5",
+ "void-protocol",
+ "x25519-dalek",
+]
+
+[[package]]
 name = "pxfm"
 version = "0.1.27"
 source = "registry+https://github.com/rust-lang/crates.io-index"

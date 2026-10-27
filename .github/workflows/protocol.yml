@@ -1,0 +1,16 @@
+name: protocol
+
+on:
+  push:
+  pull_request:
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - name: Protocol library and vectors
+        run: cargo test -p void-protocol --lib
+      - name: Conformance harness
+        run: cargo test -p protocol-conformance
