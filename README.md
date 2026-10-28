@@ -26,7 +26,7 @@ Discovery and NAT traversal go through public bootstrap/relay nodes — not a ch
 
 ## What this is
 
-**VOID** (Verified Open Independent Dispatcher) is an open delivery protocol and a Rust P2P app on top of it. Both layers live in this repository. The wire rules are the `protocol/` crate and the catalog in [`spec/`](spec/README.md). Known-answer vectors are in [`spec/vectors/`](spec/vectors/README.md). The harness in [`protocol-conformance/`](protocol-conformance) runs two sessions and a dispatcher mailbox without a window. The app is the desktop that runs those rules for a person. Live chat goes **peer to peer** over `libp2p`: directly on LAN, or through a **Circuit Relay Hop** on a bootstrap node when both sides are behind NAT. Text, voice, and files are encrypted with **Double Ratchet**. Identity is a `PeerId` from the local vault — no phone number, no email.
+**VOID** (Verified Open Independent Dispatcher) is an open delivery protocol and a Rust P2P app on top of it. Both layers live in this repository. The wire rules are the crates under `protocol/` and the catalog in [`spec/`](spec/README.md). `void-protocol` re-exports them for this release. Known-answer vectors are in [`spec/vectors/`](spec/vectors/README.md). The harness in [`protocol-conformance/`](protocol-conformance) runs two sessions and a dispatcher mailbox without a window. The app is the desktop that runs those rules for a person. Live chat goes **peer to peer** over `libp2p`: directly on LAN, or through a **Circuit Relay Hop** on a bootstrap node when both sides are behind NAT. Text, voice, and files are encrypted with **Double Ratchet**. Identity is a `PeerId` from the local vault — no phone number, no email.
 
 A bootstrap node is needed to **find** a peer, **reserve a Hop**, and **store offline envelopes**. It does not decrypt messages, but it **sees metadata**: IP, PeerId, who builds a circuit with whom, and for whom offline mail sits, when, and how large it is. Details: [Privacy and threat model](#privacy-and-threat-model).
 
@@ -76,29 +76,32 @@ The main desktop is **Tauri 2** (`frontend/` + `src-tauri/`). Optionally a nativ
 ┌────────────────────────────▼────────────────────────────────┐
 │  src/network.rs     libp2p Swarm (ChatBehaviour)            │
 └────────────────────────────┬────────────────────────────────┘
-                             │ crate void-protocol
+                             │ void-protocol (re-export)
 ┌────────────────────────────▼────────────────────────────────┐
-│  protocol/          frames, session, onion, offline mail    │
+│  protocol/void-frames · void-session · void-envelope        │
+│  protocol/void-onion  · void-kad-rules                      │
 └─────────────────────────────────────────────────────────────┘
 ```
+
+`p2p-messenger` depends on all five crates and on the facade. Call sites still use `void_protocol::…`. A node links `void-frames`, `void-envelope`, and `void-onion`, plus its own swarm. `void-onion` has no libp2p dependency and does not enable `kad`. Its `PeerId` is the multihash bytes; the facade turns that into `libp2p::PeerId`. Session, envelope, and frames use `libp2p-identity` for the Ed25519 bind, which is the same `PeerId` type the client already passes. `void-kad-rules` checks a DHT value and does not open a swarm. The Kademlia `RecordStore` stays on the facade because it needs the `kad` feature.
 
 | Module | Role |
 |--------|------|
 | `src/network.rs` | Swarm, dial bootstrap, Hop, RR chat, mailbox, gossip |
 | `src/bridge.rs` | Headless runtime for Tauri: snapshot push, not poll |
-| `protocol/src/protocol.rs` | `V1Packet` (`Hello`, `Encrypted`, mailbox, onion, …) |
-| `protocol/src/crypto.rs` | Handshake + Double Ratchet (DH step, header and PeerId in AAD) |
-| `protocol/src/onion.rs` | Onion v2 when every hop has a descriptor, otherwise v1 |
-| `protocol/src/offline_mail.rs` | Seal envelope to the recipient’s rotating prekey, or to the key derived from their PeerId if none is published |
-| `protocol/src/kad_store.rs` | Kademlia `put`: signed unexpired prekey, or a v3 mailbox. Other keys are refused |
+| `protocol/void-frames` | `V1Packet` (`Hello`, `Encrypted`, mailbox, onion, …), length limits, JSON encode/decode |
+| `protocol/void-session` | Hello bind, `SecureSession` (DH step, header and PeerId in AAD), group roster |
+| `protocol/void-onion` | Onion v2 when every hop has a descriptor, otherwise v1. Builds without `kad` |
+| `protocol/void-envelope` | Seal envelope to the recipient’s rotating prekey, or to the key derived from their PeerId if none is published |
+| `protocol/void-kad-rules` | `dht_record_allowed`: signed unexpired prekey, or a v3 mailbox. Other values are refused |
+| `protocol/` (`void-protocol`) | Thin re-export of the crates above for this release, plus `VoidKadStore` (`protocol/src/kad_store.rs`) |
 | `src/relay_mailbox.rs` | Local mailbox for LAN without bootstrap: the client stores neighbours’ mail and serves it to the owner on Query. This copy keeps 256 mailboxes; the node and the harness keep 4096 |
 | `src/hello_replay.rs` | Cache of accepted `Hello` ephemeral keys (256 per peer). A `Hello` with `ts == 0` does not reset a live session |
 | `src/vault.rs` / `paths.rs` | Vault, data directory, instance lock |
 | `src/bootstrap.rs` | Seed merge: vault, env, HTTP, built-in list |
 | `src/file_transfer.rs` / `src/voice.rs` | Files and voice |
-| `protocol/src/group.rs` | Group roster, invite, creator-signed version |
 | [`spec/`](spec/README.md) | Wire catalog for a second implementation (Russian). Not linked into the desktop |
-| [`spec/vectors/`](spec/vectors/README.md) | Known-answer JSON. `cargo test -p void-protocol` checks the files in git |
+| [`spec/vectors/`](spec/vectors/README.md) | Known-answer JSON. `cargo test -p void-protocol --lib vectors` checks the files in git |
 | [`protocol-conformance/`](protocol-conformance) | Two `SecureSession`s and an in-memory dispatcher mailbox. No Tauri, no egui, no vault |
 
 The UI does **not** poll `get_snapshot` on a timer in normal mode. State goes out as `void://snapshot` (flusher ~120 ms, monotonic `revision`). While status is `Hop…`, the UI also polls the snapshot so it does not stick on “waiting for Ack”.
@@ -220,7 +223,7 @@ In the connect field: `multiaddr`, `IP`, or `IP:PORT`. A bootstrap in the seed l
 
 JSON RR: request up to 4 MiB, response up to 16 MiB (offline voice chunks).
 
-### End-to-end encryption (`protocol/src/crypto.rs`)
+### End-to-end encryption (`protocol/void-session`)
 
 | Stage | Algorithm |
 |-------|-----------|
@@ -236,7 +239,7 @@ JSON RR: request up to 4 MiB, response up to 16 MiB (offline voice chunks).
 
 A session is not opened for a peer that signs only v1 or v2, or that sends frames without the header in AAD. A Hello with `ts == 0` does not reset a live session. **Update the node together with the client:** an old node on the onion path drops `ts`/`nonce`/`caps`, and a new `Hello` over onion will fail. Seed between an old and a new node will not complete either.
 
-Offline envelope v3 (`protocol/src/offline_mail.rs`):
+Offline envelope v3 (`protocol/void-envelope`):
 
 - `ct` — ChaCha20-Poly1305 to a key from X25519(ephemeral, recipient prekey — see [Prekey](#prekey)), HKDF with `eph` and that key;
 - inside `ct` — sender, `sender_pk`, `message_id`, `kind`, body, and a signature of the sender’s libp2p key over those, the recipient, and `eph`; body is padded (power of two from 512 B to 4 KiB, then multiples of 4 KiB);
@@ -326,7 +329,7 @@ The filename in the offer is seen by whoever terminates the connection (the peer
 
 WAV mono 48 kHz 16-bit PCM, up to 5 min. Recording is a child process `--voice-record` (`cpal`). Into chat — `VoiceMeta`; WAV as a file with auto-accept. Offline: `voice_chunk` pieces through the same mailbox. Metadata is stripped when possible (`metadata_strip`).
 
-### Groups (`protocol/src/group.rs`)
+### Groups (`protocol/void-session`)
 
 Member list in the vault + thread `group:<id>`. Message/file/voice is fan-out to each member (file and voice get a per-peer `transfer_id`). Group voice is queued and retried until the WAV is gone. Invite: `void://group/…`. The creator signs the roster: `version` plus a signature over `group_id ‖ version ‖ name ‖ members`. A snapshot is applied only when `version` is greater than the local one and the signature checks out. An unsigned sync from the creator is refused. Anyone else may only add or remove themselves, and that does not move `version`. `group_leave` — from the member or the creator, `group_delete` — creator only. A live or offline message is stored only when both we and the sender are in the roster. **Not MLS**: compromising a member reveals what they received.
 
@@ -530,9 +533,10 @@ Three checks, none of them opens a window:
 
 | Check | Command | What is green |
 |-------|---------|----------------|
-| Library and vectors | `cargo test -p void-protocol --lib` | Frames, session, envelope, onion, and the JSON in [`spec/vectors/`](spec/vectors/README.md) |
+| Wire crates | `cargo test -p void-frames -p void-session -p void-envelope -p void-onion -p void-kad-rules` | Frames, Hello and ratchet, envelope, onion (no `kad`), DHT value check |
+| Facade and vectors | `cargo test -p void-protocol --lib` | The re-export still type-checks, and the JSON in [`spec/vectors/`](spec/vectors/README.md) matches |
 | Harness | `cargo test -p protocol-conformance` | Two `SecureSession`s exchange Hello and ratchet frames. `MailboxNode` applies the node rules for `Store` / `Query` |
-| CI | [`.github/workflows/protocol.yml`](.github/workflows/protocol.yml) | Both commands on push and pull request |
+| CI | [`.github/workflows/protocol.yml`](.github/workflows/protocol.yml) | Facade vectors and the harness on push and pull request |
 
 The vector files are part of the repository. CI checks them out and compares; it does not regenerate them. `UPDATE_VECTORS=1` rewrites the JSON from `protocol/src/vectors.rs`. Set it only when the wire bytes are supposed to change. The secrets in those files are test seeds.
 
@@ -576,6 +580,7 @@ What the JSON pins is listed in [`spec/vectors/README.md`](spec/vectors/README.m
 - [x] A hop forwards an onion cell only after Identify, with a forward rate limit, and does not log `next` or `src`
 - [x] Wire catalog in [`spec/`](spec/README.md) and known-answer vectors in [`spec/vectors/`](spec/vectors/README.md) (`cargo test -p void-protocol --lib vectors`)
 - [x] Conformance harness `protocol-conformance`: two `SecureSession`s and an in-memory mailbox with the node Query / TTL / quota rules. No Tauri or egui
+- [x] `protocol/` split into `void-frames`, `void-session`, `void-envelope`, `void-onion`, and `void-kad-rules`. `void-onion` builds without libp2p and without `kad`. `void-protocol` re-exports the old paths for this release
 
 ### Optional / not default
 
@@ -583,7 +588,7 @@ What the JSON pins is listed in [`spec/vectors/README.md`](spec/vectors/README.m
 
 ### Protocol plan
 
-The wire catalog, the vectors, and the harness are in the tree. See [Specification, vectors, and harness](#specification-vectors-and-harness). `protocol/` (crate `void-protocol`) holds frames, the session, offline envelopes, onion cells, groups, and the Kademlia record check. The desktop stays in `src/`, `frontend/`, and `src-tauri/`, and depends on that crate. `protocol-conformance` does not.
+The wire catalog, the vectors, and the harness are in the tree. See [Specification, vectors, and harness](#specification-vectors-and-harness). Frames, the session (including groups until a later `void-groups`), offline envelopes, onion cells, and the Kademlia value check are separate crates under `protocol/`. `void-protocol` re-exports them so `void_protocol::…` keeps working for this release, then that facade goes away. The desktop stays in `src/`, `frontend/`, and `src-tauri/`, and depends on the facade and on each wire crate. `protocol-conformance` depends only on the facade.
 
 The code stays [MIT](./LICENSE). Specification text — CC BY 4.0.
 
@@ -596,7 +601,7 @@ Out of spec, as this client’s local choices: vault layout, Tauri and egui, lis
 | Envelope v3, no stable cleartext sender | client and [`spec/05-envelope.md`](spec/05-envelope.md); vectors `envelope_v3_roundtrip`, `envelope_v2_reject` |
 | Two sessions and the dispatcher mailbox | [`protocol-conformance`](protocol-conformance) |
 
-Still ahead: splitting `protocol/` into separate frame, session, envelope, and onion crates, and a vector for the skipped-key cap of 4096. A test that is green only against the desktop program is a specification failure.
+Still ahead: drop the `void-protocol` facade after this release, and a vector for the skipped-key cap of 4096. A test that is green only against the desktop program is a specification failure.
 
 Reference dispatcher — [`MarshalV/bootstrap_node`](https://github.com/MarshalV/bootstrap_node). One dispatcher still sees the meeting. Onion does not cancel that until several independent nodes are on the path. A v2 cell has three size buckets. A path that still contains a v1 hop also shows the sender.
 
