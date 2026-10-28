@@ -21,6 +21,7 @@ check.out
 check_results.txt
 build.error
 src/_network_extract.txt
+.DS_Store
 
 # Draft funding applications — do not commit
 documents/
