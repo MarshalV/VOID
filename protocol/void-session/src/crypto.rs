@@ -5,7 +5,7 @@ use chacha20poly1305::{
 };
 use hkdf::Hkdf;
 use rand::rngs::OsRng;
-#[cfg(test)]
+#[cfg(any(test, feature = "test-vectors"))]
 use rand::{rngs::StdRng, SeedableRng};
 use serde::{Deserialize, Serialize};
 use sha2::Sha256;
@@ -112,7 +112,7 @@ pub struct SecureSession {
     require_header_aad: bool,
     peer_aad: Vec<u8>,
     /// Только для векторов: очередные DH-секреты ratchet берутся отсюда, не из ОС.
-    #[cfg(test)]
+    #[cfg(any(test, feature = "test-vectors"))]
     ratchet_rng: Option<StdRng>,
 }
 
@@ -173,7 +173,7 @@ impl SecureSession {
             send_header_aad: false,
             require_header_aad: false,
             peer_aad: Vec::new(),
-            #[cfg(test)]
+            #[cfg(any(test, feature = "test-vectors"))]
             ratchet_rng: None,
         };
 
@@ -269,7 +269,7 @@ impl SecureSession {
             send_header_aad: false,
             require_header_aad: false,
             peer_aad: Vec::new(),
-            #[cfg(test)]
+            #[cfg(any(test, feature = "test-vectors"))]
             ratchet_rng: None,
         };
 
@@ -437,15 +437,15 @@ impl SecureSession {
     }
 
     fn draw_ratchet_secret(&mut self) -> StaticSecret {
-        #[cfg(test)]
+        #[cfg(any(test, feature = "test-vectors"))]
         if let Some(rng) = self.ratchet_rng.as_mut() {
             return StaticSecret::random_from_rng(&mut *rng);
         }
         StaticSecret::random_from_rng(OsRng)
     }
 
-    #[cfg(test)]
-    pub(crate) fn new_initiator_seeded(
+    #[cfg(any(test, feature = "test-vectors"))]
+    pub fn new_initiator_seeded(
         local_static: &StaticSecret,
         remote_static: &PublicKey,
         local_ephemeral: StaticSecret,
@@ -463,8 +463,8 @@ impl SecureSession {
         sess
     }
 
-    #[cfg(test)]
-    pub(crate) fn new_responder_seeded(
+    #[cfg(any(test, feature = "test-vectors"))]
+    pub fn new_responder_seeded(
         local_static: &StaticSecret,
         remote_static: &PublicKey,
         remote_ephemeral: &PublicKey,

@@ -27,14 +27,14 @@ pub struct GroupChat {
 }
 
 impl GroupChat {
-    pub fn member_peer_ids(&self) -> Vec<libp2p::PeerId> {
+    pub fn member_peer_ids(&self) -> Vec<libp2p_identity::PeerId> {
         self.members
             .iter()
             .filter_map(|m| m.peer_id.parse().ok())
             .collect()
     }
 
-    pub fn includes_peer(&self, peer_id: &libp2p::PeerId) -> bool {
+    pub fn includes_peer(&self, peer_id: &libp2p_identity::PeerId) -> bool {
         let s = peer_id.to_string();
         self.members.iter().any(|m| m.peer_id == s)
     }

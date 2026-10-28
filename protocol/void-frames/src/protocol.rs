@@ -1,11 +1,19 @@
 //! Протокол чата `/void/chat/1.0.0`: Hello, E2EE-пакеты, лимиты JSON.
 
-use libp2p::PeerId;
+use libp2p_identity::PeerId;
+use multiaddr::Multiaddr;
 use rand::RngCore;
 use serde::{Deserialize, Serialize};
 
-use crate::crypto;
-use crate::group::{self, GroupMember};
+use void_session::crypto;
+use void_session::group::{self, GroupMember};
+use void_session::hello::sign_hello_transport_binding;
+
+pub use void_session::hello::{
+    hello_bind_ok, verify_hello_transport_binding, void_hello_signing_public_key,
+    void_peer_transport_public_key, HelloBind, HELLO_CAP_HEADER_AAD, HELLO_CAPS,
+    HELLO_FRESHNESS_SECS,
+};
 
 const MAX_CHAT_FILE_BYTES: u64 = 512 * 1024 * 1024;
 
@@ -225,221 +233,19 @@ const MAX_CHAT_SENDER_NAME_BYTES: usize = 256;
 const MAX_CHAT_TEXT_BYTES: usize = 16 * 1024;
 const MAX_CHAT_TIMESTAMP_BYTES: usize = 64;
 
-const VOID_HELLO_BIND_PREFIX: &[u8] = b"VOID_E2EE_HELLO_BIND_V1\0";
-const VOID_HELLO_BIND_PREFIX_V2: &[u8] = b"VOID_E2EE_HELLO_BIND_V2\0";
-const VOID_HELLO_BIND_PREFIX_V3: &[u8] = b"VOID_E2EE_HELLO_BIND_V3\0";
-const HELLO_FRESHNESS_SECS: u64 = 10 * 60;
 
-/// Какая подпись Hello сошлась. `V3` вяжет `caps` — hop не может вырезать флаг.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum HelloBind {
-    V1,
-    V2,
-    V3,
+fn wire_peer(peer: PeerId) -> void_onion::PeerId {
+    void_onion::PeerId::from_bytes(&peer.to_bytes()).expect("peer id bytes")
 }
 
-const MAX_HELLO_TRANSPORT_PUBKEY_PB: usize = 4096;
-
-/// Inline multihash PeerId (Ed25519): извлечь транспортный `PublicKey` для проверки подписи Hello.
-pub fn void_peer_transport_public_key(peer: PeerId) -> Option<libp2p::identity::PublicKey> {
-    const CODE_IDENTITY: u64 = 0;
-    let mh = peer.as_ref();
-    if mh.code() != CODE_IDENTITY {
-        return None;
-    }
-    libp2p::identity::PublicKey::try_decode_protobuf(mh.digest()).ok()
+fn wire_hops(hops: &[(PeerId, [u8; 32])]) -> Vec<(void_onion::PeerId, [u8; 32])> {
+    hops.iter().map(|(p, k)| (wire_peer(*p), *k)).collect()
 }
 
-/// Ключ для проверки `transport_sig`: из identity-multihash или из protobuf в Hello (hashed PeerId).
-pub fn void_hello_signing_public_key(
-    signer_peer_id: PeerId,
-    transport_pubkey_pb: &[u8],
-) -> Option<libp2p::identity::PublicKey> {
-    if !transport_pubkey_pb.is_empty() {
-        if transport_pubkey_pb.len() > MAX_HELLO_TRANSPORT_PUBKEY_PB {
-            return None;
-        }
-        let pk = libp2p::identity::PublicKey::try_decode_protobuf(transport_pubkey_pb).ok()?;
-        if PeerId::from_public_key(&pk) != signer_peer_id {
-            return None;
-        }
-        return Some(pk);
-    }
-    void_peer_transport_public_key(signer_peer_id)
-}
-
-fn hello_bind_message_v1(
-    signer_peer: PeerId,
-    recipient_peer: PeerId,
-    x25519_static: &[u8; 32],
-    x25519_ephemeral: &[u8; 32],
-) -> Vec<u8> {
-    let mut v = Vec::with_capacity(96 + VOID_HELLO_BIND_PREFIX.len());
-    v.extend_from_slice(VOID_HELLO_BIND_PREFIX);
-    v.extend_from_slice(&signer_peer.to_bytes());
-    v.extend_from_slice(&recipient_peer.to_bytes());
-    v.extend_from_slice(x25519_static.as_slice());
-    v.extend_from_slice(x25519_ephemeral.as_slice());
-    v
-}
-
-fn hello_bind_message_v2(
-    signer_peer: PeerId,
-    recipient_peer: PeerId,
-    x25519_static: &[u8; 32],
-    x25519_ephemeral: &[u8; 32],
-    ts: u64,
-    nonce: &[u8; 16],
-) -> Vec<u8> {
-    let mut v = Vec::with_capacity(96 + VOID_HELLO_BIND_PREFIX_V2.len() + 24);
-    v.extend_from_slice(VOID_HELLO_BIND_PREFIX_V2);
-    v.extend_from_slice(&signer_peer.to_bytes());
-    v.extend_from_slice(&recipient_peer.to_bytes());
-    v.extend_from_slice(x25519_static.as_slice());
-    v.extend_from_slice(x25519_ephemeral.as_slice());
-    v.extend_from_slice(&ts.to_le_bytes());
-    v.extend_from_slice(nonce);
-    v
-}
-
-fn hello_bind_message_v3(
-    signer_peer: PeerId,
-    recipient_peer: PeerId,
-    x25519_static: &[u8; 32],
-    x25519_ephemeral: &[u8; 32],
-    ts: u64,
-    nonce: &[u8; 16],
-    caps: u32,
-) -> Vec<u8> {
-    let mut v = Vec::with_capacity(96 + VOID_HELLO_BIND_PREFIX_V3.len() + 28);
-    v.extend_from_slice(VOID_HELLO_BIND_PREFIX_V3);
-    v.extend_from_slice(&signer_peer.to_bytes());
-    v.extend_from_slice(&recipient_peer.to_bytes());
-    v.extend_from_slice(x25519_static.as_slice());
-    v.extend_from_slice(x25519_ephemeral.as_slice());
-    v.extend_from_slice(&ts.to_le_bytes());
-    v.extend_from_slice(nonce);
-    v.extend_from_slice(&caps.to_le_bytes());
-    v
-}
-
-fn hello_now_secs() -> u64 {
-    std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map(|d| d.as_secs())
-        .unwrap_or(0)
-}
-
-pub fn verify_hello_transport_binding(
-    signer_peer_id: PeerId,
-    recipient_peer_id: PeerId,
-    x25519_static: &[u8; 32],
-    x25519_ephemeral: &[u8; 32],
-    transport_sig: &[u8],
-    transport_pubkey_pb: &[u8],
-    ts: u64,
-    nonce: &[u8; 16],
-    caps: u32,
-) -> Option<HelloBind> {
-    verify_hello_transport_binding_at(
-        signer_peer_id,
-        recipient_peer_id,
-        x25519_static,
-        x25519_ephemeral,
-        transport_sig,
-        transport_pubkey_pb,
-        ts,
-        nonce,
-        caps,
-        hello_now_secs(),
-    )
-}
-
-/// То же, что [`verify_hello_transport_binding`], но `now` задан снаружи.
-/// Векторы фиксируют окно свежести, не зависят от часов машины.
-pub(crate) fn verify_hello_transport_binding_at(
-    signer_peer_id: PeerId,
-    recipient_peer_id: PeerId,
-    x25519_static: &[u8; 32],
-    x25519_ephemeral: &[u8; 32],
-    transport_sig: &[u8],
-    transport_pubkey_pb: &[u8],
-    ts: u64,
-    nonce: &[u8; 16],
-    caps: u32,
-    now: u64,
-) -> Option<HelloBind> {
-    const MAX_SIG: usize = 256;
-    if transport_sig.is_empty() || transport_sig.len() > MAX_SIG {
-        return None;
-    }
-    let pubkey = void_hello_signing_public_key(signer_peer_id, transport_pubkey_pb)?;
-    let fresh = ts != 0 || nonce.iter().any(|b| *b != 0);
-    if fresh {
-        if now.abs_diff(ts) > HELLO_FRESHNESS_SECS || nonce.iter().all(|b| *b == 0) {
-            return None;
-        }
-        let v3 = hello_bind_message_v3(
-            signer_peer_id,
-            recipient_peer_id,
-            x25519_static,
-            x25519_ephemeral,
-            ts,
-            nonce,
-            caps,
-        );
-        if pubkey.verify(&v3, transport_sig) {
-            return Some(HelloBind::V3);
-        }
-        let v2 = hello_bind_message_v2(
-            signer_peer_id,
-            recipient_peer_id,
-            x25519_static,
-            x25519_ephemeral,
-            ts,
-            nonce,
-        );
-        if pubkey.verify(&v2, transport_sig) {
-            return Some(HelloBind::V2);
-        }
-        return None;
-    }
-    let v1 = hello_bind_message_v1(
-        signer_peer_id,
-        recipient_peer_id,
-        x25519_static,
-        x25519_ephemeral,
-    );
-    pubkey.verify(&v1, transport_sig).then_some(HelloBind::V1)
-}
-
-/// Сессия открывается только с bind v3 и битом AAD внутри подписи.
-/// Прямой Hello v1/v2 и onion-Hello без флага сессию не создают:
-/// иначе собеседник или hop оставляет кадры без AAD.
-pub fn hello_bind_ok(bind: HelloBind, caps: u32, _via_onion: bool) -> bool {
-    bind == HelloBind::V3 && caps & HELLO_CAP_HEADER_AAD != 0
-}
-
-pub(crate) fn sign_hello_transport_binding(
-    transport: &libp2p::identity::Keypair,
-    signer_peer: PeerId,
-    recipient_peer: PeerId,
-    x25519_static: &[u8; 32],
-    x25519_ephemeral: &[u8; 32],
-    ts: u64,
-    nonce: &[u8; 16],
-    caps: u32,
-) -> Option<Vec<u8>> {
-    let msg = hello_bind_message_v3(
-        signer_peer,
-        recipient_peer,
-        x25519_static,
-        x25519_ephemeral,
-        ts,
-        nonce,
-        caps,
-    );
-    transport.sign(&msg).ok()
+fn seal_onion_deliver(dest: PeerId, mail: &[u8]) -> anyhow::Result<Vec<u8>> {
+    let pk = void_envelope::offline_mail::identity_offline_public(&dest)
+        .ok_or_else(|| anyhow::anyhow!("onion seal: no identity key"))?;
+    void_onion::seal_deliver(pk.as_bytes(), mail)
 }
 
 fn validate_message_id(id: &str) -> bool {
@@ -654,7 +460,7 @@ pub fn build_group_delete_json(group_id: &str) -> Option<Vec<u8>> {
 }
 
 pub fn build_group_sync_json(
-    transport: Option<&libp2p::identity::Keypair>,
+    transport: Option<&libp2p_identity::Keypair>,
     group_id: &str,
     group_name: &str,
     creator_id: &str,
@@ -798,7 +604,7 @@ pub fn validate_bootstrap_gossip_addrs(addrs: &[String]) -> Option<Vec<String>> 
         if t.is_empty() || t.len() > MAX_BOOTSTRAP_ADDR_LEN {
             continue;
         }
-        if let Ok(ma) = t.parse::<libp2p::Multiaddr>() {
+        if let Ok(ma) = t.parse::<Multiaddr>() {
             if let Some(c) = canonicalize_bootstrap_ma(&ma) {
                 let normalized = c.to_string();
                 if !out.contains(&normalized) {
@@ -871,7 +677,7 @@ pub enum V1Packet {
     /// Store-and-forward: сохранить офлайн-почту для получателя (E2EE-конверты).
     OfflineMailboxStore {
         recipient: String,
-        envelopes: Vec<crate::offline_mail::OfflineEnvelope>,
+        envelopes: Vec<void_envelope::offline_mail::OfflineEnvelope>,
     },
     /// Запросить офлайн-почту для peer_id.
     OfflineMailboxQuery {
@@ -879,7 +685,7 @@ pub enum V1Packet {
     },
     /// Ответ на OfflineMailboxQuery.
     OfflineMailboxDeliver {
-        envelopes: Vec<crate::offline_mail::OfflineEnvelope>,
+        envelopes: Vec<void_envelope::offline_mail::OfflineEnvelope>,
     },
     /// Опубликовать X25519 prekey на bootstrap (для офлайн-seal без DHT/Hello).
     PrekeyPut {
@@ -1037,10 +843,10 @@ pub fn wrap_onion_packet(
     }
     if v2 {
         if let Some(mail) = encode_v2_mail(src, &inner) {
-            if let Ok(sealed) = crate::onion::seal_deliver(&dest, &mail) {
-                if let Ok(cell) = crate::onion::wrap_v2(hops, dest, &sealed) {
+            if let Ok(sealed) = seal_onion_deliver(dest, &mail) {
+                if let Ok(cell) = void_onion::wrap_v2(&wire_hops(hops), wire_peer(dest), &sealed) {
                     return Some(V1Packet::Onion2 {
-                        cell_b64: crate::onion::b64_encode(&cell),
+                        cell_b64: void_onion::b64_encode(&cell),
                     });
                 }
             }
@@ -1051,12 +857,12 @@ pub fn wrap_onion_packet(
         packet: Box::new(inner),
     };
     let drop_val = serde_json::to_value(&drop).ok()?;
-    let (eph, nonce, ct) = crate::onion::wrap_layers(hops, dest, drop_val).ok()?;
+    let (eph, nonce, ct) = void_onion::wrap_layers(&wire_hops(hops), wire_peer(dest), drop_val).ok()?;
     Some(V1Packet::Onion { eph, nonce, ct })
 }
 
 pub fn build_v1_hello(
-    transport: &libp2p::identity::Keypair,
+    transport: &libp2p_identity::Keypair,
     signer_peer: PeerId,
     recipient_peer: PeerId,
     x25519_static_pubkey: crypto::PublicKey,
@@ -1064,7 +870,7 @@ pub fn build_v1_hello(
 ) -> Option<V1Packet> {
     let static_b = x25519_static_pubkey.to_bytes();
     let ephem_b = x25519_ephem_pubkey.to_bytes();
-    let ts = hello_now_secs();
+    let ts = void_session::hello::hello_now_secs();
     let mut nonce = [0u8; 16];
     rand::thread_rng().fill_bytes(&mut nonce);
     let transport_sig = sign_hello_transport_binding(
@@ -1093,15 +899,12 @@ pub fn build_v1_hello(
     })
 }
 
-/// Заголовок Double Ratchet (`dh_pub`, `pn`, `n`) входит в AAD.
-pub const HELLO_CAP_HEADER_AAD: u32 = 1;
-pub const HELLO_CAPS: u32 = HELLO_CAP_HEADER_AAD;
 
 pub fn verify_onion_pk_sig(peer: PeerId, pk: &[u8; 32], sig: &[u8]) -> bool {
     let Some(pubk) = void_peer_transport_public_key(peer) else {
         return false;
     };
-    pubk.verify(&crate::onion::onion_pk_bind_message(peer, pk), sig)
+    pubk.verify(&void_onion::onion_pk_bind_message(wire_peer(peer), pk), sig)
 }
 
 pub fn onion_desc_fresh(epoch: u64, not_after: u64, now: u64) -> bool {
@@ -1123,19 +926,18 @@ pub fn verify_onion_desc(
         return false;
     };
     pubk.verify(
-        &crate::onion::desc_message(peer, pk, epoch, not_after, operator),
+        &void_onion::desc_message(wire_peer(peer), pk, epoch, not_after, operator),
         sig,
     )
 }
 
-fn addr_is_quic_v1(ma: &libp2p::Multiaddr) -> bool {
-    use libp2p::multiaddr::Protocol;
+fn addr_is_quic_v1(ma: &Multiaddr) -> bool {
+    use multiaddr::Protocol;
     ma.iter().any(|p| matches!(p, Protocol::Udp(_))) && ma.to_string().contains("quic-v1")
 }
 
-pub fn bootstrap_tcp_dial_addr(ma: &libp2p::Multiaddr) -> Option<libp2p::Multiaddr> {
-    use libp2p::multiaddr::Protocol;
-    use libp2p::Multiaddr;
+pub fn bootstrap_tcp_dial_addr(ma: &Multiaddr) -> Option<Multiaddr> {
+    use multiaddr::Protocol;
     if addr_is_quic_v1(ma) {
         return None;
     }
@@ -1162,8 +964,8 @@ pub fn bootstrap_tcp_dial_addr(ma: &libp2p::Multiaddr) -> Option<libp2p::Multiad
     }
 }
 
-pub fn canonicalize_bootstrap_ma(ma: &libp2p::Multiaddr) -> Option<libp2p::Multiaddr> {
-    use libp2p::multiaddr::Protocol;
+pub fn canonicalize_bootstrap_ma(ma: &Multiaddr) -> Option<Multiaddr> {
+    use multiaddr::Protocol;
     let tcp = bootstrap_tcp_dial_addr(ma)?;
     let mut peer_before_circuit = None;
     let mut seen_circuit = false;
@@ -1189,8 +991,8 @@ pub fn canonicalize_bootstrap_ma(ma: &libp2p::Multiaddr) -> Option<libp2p::Multi
 #[cfg(test)]
 mod hello_freshness_tests {
     use super::*;
-    use crate::crypto::{PublicKey, StaticSecret};
-    use libp2p::identity::Keypair;
+    use void_session::crypto::{PublicKey, StaticSecret};
+    use libp2p_identity::Keypair;
 
     #[test]
     fn v2_signature_roundtrip() {
@@ -1266,33 +1068,5 @@ mod hello_freshness_tests {
         assert!(!hello_bind_ok(HelloBind::V2, caps, false));
         assert!(!hello_bind_ok(HelloBind::V3, 0, true));
         assert!(!hello_bind_ok(HelloBind::V3, 0, false));
-    }
-
-    #[test]
-    fn legacy_hello_without_ts_still_verifies() {
-        let kp = Keypair::generate_ed25519();
-        let signer = kp.public().to_peer_id();
-        let recipient = Keypair::generate_ed25519().public().to_peer_id();
-        let static_b =
-            PublicKey::from(&StaticSecret::random_from_rng(rand::rngs::OsRng)).to_bytes();
-        let ephem_b = PublicKey::from(&StaticSecret::random_from_rng(rand::rngs::OsRng)).to_bytes();
-        let msg = hello_bind_message_v1(signer, recipient, &static_b, &ephem_b);
-        let sig = kp.sign(&msg).unwrap();
-        assert_eq!(
-            verify_hello_transport_binding(
-                signer,
-                recipient,
-                &static_b,
-                &ephem_b,
-                &sig,
-                &[],
-                0,
-                &[0u8; 16],
-                0,
-            ),
-            Some(HelloBind::V1)
-        );
-        assert!(!hello_bind_ok(HelloBind::V1, 0, false));
-        assert!(!hello_bind_ok(HelloBind::V1, 0, true));
     }
 }

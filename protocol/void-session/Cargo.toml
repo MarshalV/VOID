@@ -1,0 +1,21 @@
+[package]
+name = "void-session"
+version = "0.1.0"
+edition = "2021"
+description = "VOID session: Hello bind, Double Ratchet, caps, groups"
+license = "MIT"
+
+[features]
+test-vectors = []
+
+[dependencies]
+libp2p-identity = { version = "0.2.13", features = ["ed25519", "peerid"] }
+anyhow = "1.0"
+serde = { version = "1.0", features = ["derive"] }
+rand = "0.8"
+x25519-dalek = { version = "2.0", features = ["static_secrets"] }
+chacha20poly1305 = "0.10"
+hkdf = "0.12"
+sha2 = "0.10"
+zeroize = { version = "1.7", features = ["derive"] }
+chrono = "0.4"

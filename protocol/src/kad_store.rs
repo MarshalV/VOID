@@ -9,7 +9,7 @@ use libp2p::kad::store::{MemoryStore, RecordStore, Result};
 use libp2p::kad::{ProviderRecord, Record, RecordKey};
 use libp2p::PeerId;
 
-use crate::offline_mail::dht_record_allowed;
+use void_kad_rules::dht_record_allowed;
 
 pub struct VoidKadStore {
     inner: MemoryStore,

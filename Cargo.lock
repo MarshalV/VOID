@@ -4993,7 +4993,12 @@ dependencies = [
  "tracing",
  "tracing-subscriber",
  "tray-icon",
+ "void-envelope",
+ "void-frames",
+ "void-kad-rules",
+ "void-onion",
  "void-protocol",
+ "void-session",
  "webpki-roots",
  "windows-dpapi",
  "x25519-dalek",
@@ -7039,20 +7044,91 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "0b928f33d975fc6ad9f86c8f283853ad26bdd5b10b7f1542aa2fa15e2289105a"
 
 [[package]]
-name = "void-protocol"
+name = "void-envelope"
 version = "0.1.0"
 dependencies = [
  "anyhow",
  "bincode",
- "blake2",
  "chacha20poly1305",
- "chrono",
  "curve25519-dalek",
  "hkdf",
- "libp2p",
+ "libp2p-identity",
  "rand 0.8.5",
  "serde",
  "serde_json",
+ "sha2",
+ "void-session",
+ "x25519-dalek",
+ "zeroize",
+]
+
+[[package]]
+name = "void-frames"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "blake2",
+ "libp2p-identity",
+ "multiaddr",
+ "rand 0.8.5",
+ "serde",
+ "serde_json",
+ "void-envelope",
+ "void-onion",
+ "void-session",
+]
+
+[[package]]
+name = "void-kad-rules"
+version = "0.1.0"
+dependencies = [
+ "void-envelope",
+]
+
+[[package]]
+name = "void-onion"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "bs58",
+ "chacha20poly1305",
+ "hkdf",
+ "multiaddr",
+ "multihash",
+ "rand 0.8.5",
+ "serde",
+ "serde_json",
+ "sha2",
+ "x25519-dalek",
+]
+
+[[package]]
+name = "void-protocol"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "libp2p",
+ "rand 0.8.5",
+ "serde_json",
+ "void-envelope",
+ "void-frames",
+ "void-kad-rules",
+ "void-onion",
+ "void-session",
+ "x25519-dalek",
+]
+
+[[package]]
+name = "void-session"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "chacha20poly1305",
+ "chrono",
+ "hkdf",
+ "libp2p-identity",
+ "rand 0.8.5",
+ "serde",
  "sha2",
  "x25519-dalek",
  "zeroize",

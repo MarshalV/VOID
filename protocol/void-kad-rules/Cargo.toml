@@ -1,0 +1,9 @@
+[package]
+name = "void-kad-rules"
+version = "0.1.0"
+edition = "2021"
+description = "VOID DHT record check without a swarm"
+license = "MIT"
+
+[dependencies]
+void-envelope = { path = "../void-envelope" }

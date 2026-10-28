@@ -2,21 +2,20 @@
 name = "void-protocol"
 version = "0.1.0"
 edition = "2021"
-description = "VOID wire protocol: frames, session, offline envelope, onion"
+description = "VOID wire protocol facade: re-exports frames, session, envelope, onion, and DHT rules"
 license = "MIT"
 
 [dependencies]
-libp2p = { version = "0.56", features = ["kad", "macros", "ed25519"] }
+void-frames = { path = "void-frames" }
+void-session = { path = "void-session" }
+void-envelope = { path = "void-envelope" }
+void-onion = { path = "void-onion" }
+void-kad-rules = { path = "void-kad-rules" }
+libp2p = { version = "0.56", features = ["kad", "ed25519"] }
 anyhow = "1.0"
-serde = { version = "1.0", features = ["derive"] }
 serde_json = "1.0"
 rand = "0.8"
 x25519-dalek = { version = "2.0", features = ["static_secrets"] }
-curve25519-dalek = "4.1"
-chacha20poly1305 = "0.10"
-hkdf = "0.12"
-sha2 = "0.10"
-blake2 = "0.10"
-bincode = "1.3"
-chrono = "0.4"
-zeroize = { version = "1.7", features = ["derive"] }
+
+[dev-dependencies]
+void-session = { path = "void-session", features = ["test-vectors"] }

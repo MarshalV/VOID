@@ -5,16 +5,19 @@ use chacha20poly1305::{
     aead::{Aead, KeyInit, Payload},
     ChaCha20Poly1305, Nonce,
 };
-use libp2p::kad;
-use libp2p::PeerId;
+use libp2p_identity::PeerId;
 use rand::RngCore;
 use serde::{Deserialize, Serialize};
 use std::path::Path;
 
-use crate::crypto::{PublicKey, StaticSecret};
+use void_session::crypto::{PublicKey, StaticSecret};
 
-const PREKEY_PREFIX: &[u8] = b"/void/prekey/";
-const MAILBOX_PREFIX: &[u8] = b"/void/mailbox/";
+pub fn peer_id_from_bytes(bytes: &[u8]) -> Option<PeerId> {
+    PeerId::from_bytes(bytes).ok()
+}
+
+pub const PREKEY_PREFIX: &[u8] = b"/void/prekey/";
+pub const MAILBOX_PREFIX: &[u8] = b"/void/mailbox/";
 pub const MAILBOX_TTL_SECS: u64 = 60 * 60 * 24 * 7;
 
 /// Offline-доставка голосовых: аудио режется на кусочки и уходит через тот же
@@ -135,38 +138,7 @@ impl OfflineEnvelope {
     }
 }
 
-pub fn prekey_record_key(peer: PeerId) -> kad::RecordKey {
-    let mut key = PREKEY_PREFIX.to_vec();
-    key.extend_from_slice(&peer.to_bytes());
-    kad::RecordKey::new(&key)
-}
-
-pub fn mailbox_record_key(peer: PeerId) -> kad::RecordKey {
-    let mut key = MAILBOX_PREFIX.to_vec();
-    key.extend_from_slice(&peer.to_bytes());
-    kad::RecordKey::new(&key)
-}
-
-/// Запись, которую Kademlia имеет право положить в локальный store.
-/// prekey — подпись владельца и срок; mailbox — слот PeerId и конверты v3.
-pub fn dht_record_allowed(key: &[u8], value: &[u8]) -> bool {
-    if let Some(rest) = key.strip_prefix(PREKEY_PREFIX) {
-        let Ok(owner) = PeerId::from_bytes(rest) else {
-            return false;
-        };
-        return verify_signed_prekey(&owner, value)
-            .is_some_and(|pk| prekey_is_sealable(pk, prekey_now()));
-    }
-    if let Some(rest) = key.strip_prefix(MAILBOX_PREFIX) {
-        if PeerId::from_bytes(rest).is_err() {
-            return false;
-        }
-        return mailbox_value_is_v3(value);
-    }
-    false
-}
-
-fn mailbox_value_is_v3(value: &[u8]) -> bool {
+pub fn mailbox_value_is_v3(value: &[u8]) -> bool {
     if value.is_empty() || value.len() > 64 * 1024 {
         return false;
     }
@@ -367,7 +339,7 @@ pub struct PublishedPrekey {
 /// DHT `/void/prekey/<owner>` v2: `pk[32] || 0x02 || not_after[8] || sig_inner`.
 /// v1 (без срока) ещё проверяется, но [`prekey_is_sealable`] его отвергает.
 pub fn encode_signed_prekey(
-    transport: &libp2p::identity::Keypair,
+    transport: &libp2p_identity::Keypair,
     owner: &PeerId,
     pk: &[u8; 32],
     not_after: u64,
@@ -378,7 +350,7 @@ pub fn encode_signed_prekey(
     let sig = transport
         .sign(&prekey_signed_message_v2(owner, pk, not_after))
         .ok()?;
-    let pubkey_pb = if crate::protocol::void_peer_transport_public_key(*owner).is_some() {
+    let pubkey_pb = if void_session::hello::void_peer_transport_public_key(*owner).is_some() {
         Vec::new()
     } else {
         transport.public().encode_protobuf()
@@ -407,7 +379,7 @@ pub fn verify_signed_prekey(owner: &PeerId, value: &[u8]) -> Option<SignedPrekey
         if sig.is_empty() || !rest.is_empty() {
             return None;
         }
-        let signer = crate::protocol::void_hello_signing_public_key(*owner, pubkey_pb)?;
+        let signer = void_session::hello::void_hello_signing_public_key(*owner, pubkey_pb)?;
         if !signer.verify(&prekey_signed_message_v2(owner, &pk, not_after), sig) {
             return None;
         }
@@ -417,7 +389,7 @@ pub fn verify_signed_prekey(owner: &PeerId, value: &[u8]) -> Option<SignedPrekey
     if sig.is_empty() || !rest.is_empty() {
         return None;
     }
-    let signer = crate::protocol::void_hello_signing_public_key(*owner, pubkey_pb)?;
+    let signer = void_session::hello::void_hello_signing_public_key(*owner, pubkey_pb)?;
     signer
         .verify(&prekey_signed_message(owner, &pk), sig)
         .then_some(SignedPrekey { pk, not_after: 0 })
@@ -428,7 +400,7 @@ pub fn verify_prekey_offer(owner: &PeerId, pk: &[u8; 32], not_after: u64, sig: &
     if *pk == [0u8; 32] || sig.is_empty() || not_after == 0 {
         return false;
     }
-    let Some(signer) = crate::protocol::void_peer_transport_public_key(*owner) else {
+    let Some(signer) = void_session::hello::void_peer_transport_public_key(*owner) else {
         return false;
     };
     signer.verify(&prekey_signed_message_v2(owner, pk, not_after), sig)
@@ -453,7 +425,7 @@ fn prekey_now() -> u64 {
 /// (как `crypto_sign_ed25519_pk_to_curve25519`). Его не раздаёт ни нода, ни DHT —
 /// подменить нечего.
 pub fn identity_offline_public(peer: &PeerId) -> Option<PublicKey> {
-    let ed = crate::protocol::void_peer_transport_public_key(*peer)?
+    let ed = void_session::hello::void_peer_transport_public_key(*peer)?
         .try_into_ed25519()
         .ok()?;
     let point = curve25519_dalek::edwards::CompressedEdwardsY(ed.to_bytes()).decompress()?;
@@ -464,7 +436,7 @@ pub fn identity_offline_public(peer: &PeerId) -> Option<PublicKey> {
 }
 
 /// Секрет к [`identity_offline_public`]: скаляр Ed25519 (первая половина SHA-512 от seed).
-pub fn identity_offline_secret(key: &libp2p::identity::Keypair) -> Option<StaticSecret> {
+pub fn identity_offline_secret(key: &libp2p_identity::Keypair) -> Option<StaticSecret> {
     use sha2::{Digest, Sha512};
     let ed = key.clone().try_into_ed25519().ok()?;
     let pair = zeroize::Zeroizing::new(ed.to_bytes());
@@ -510,7 +482,7 @@ pub struct LocalPrekeys {
 
 /// Загружает или ротирует одноразовый prekey и подписывает его identity-ключом.
 pub fn load_local_prekeys(
-    transport: &libp2p::identity::Keypair,
+    transport: &libp2p_identity::Keypair,
     path: &Path,
 ) -> Option<LocalPrekeys> {
     let owner = PeerId::from_public_key(&transport.public());
@@ -552,8 +524,8 @@ pub fn load_local_prekeys(
     Some(LocalPrekeys { published, secrets })
 }
 
-fn transport_pubkey_pb(transport: &libp2p::identity::Keypair, sender: &PeerId) -> Vec<u8> {
-    if crate::protocol::void_peer_transport_public_key(*sender).is_some() {
+fn transport_pubkey_pb(transport: &libp2p_identity::Keypair, sender: &PeerId) -> Vec<u8> {
+    if void_session::hello::void_peer_transport_public_key(*sender).is_some() {
         Vec::new()
     } else {
         transport.public().encode_protobuf()
@@ -601,7 +573,7 @@ fn verify_sender(
     body: &[u8],
     sig: &[u8],
 ) -> Result<()> {
-    let signer = crate::protocol::void_hello_signing_public_key(sender, pubkey_pb)
+    let signer = void_session::hello::void_hello_signing_public_key(sender, pubkey_pb)
         .ok_or_else(|| anyhow!("offline envelope: no signer key"))?;
     if sig.is_empty() || !signer.verify(&signed_message(header, body), sig) {
         return Err(anyhow!("offline envelope: bad sender signature"));
@@ -613,7 +585,7 @@ fn verify_sender(
 /// Нода видит только получателя (в `OfflineMailboxStore`), непрозрачный id и размер бакета.
 #[allow(clippy::too_many_arguments)]
 pub fn seal_for_recipient(
-    transport: &libp2p::identity::Keypair,
+    transport: &libp2p_identity::Keypair,
     recipient: &PeerId,
     recipient_pk: &PublicKey,
     sender: &PeerId,
@@ -642,9 +614,9 @@ pub fn seal_for_recipient(
     )
 }
 
-#[cfg(test)]
-pub(crate) fn seal_for_recipient_fixed(
-    transport: &libp2p::identity::Keypair,
+#[doc(hidden)]
+pub fn seal_for_recipient_fixed(
+    transport: &libp2p_identity::Keypair,
     recipient: &PeerId,
     recipient_pk: &PublicKey,
     sender: &PeerId,
@@ -670,7 +642,7 @@ pub(crate) fn seal_for_recipient_fixed(
 }
 
 fn seal_for_recipient_parts(
-    transport: &libp2p::identity::Keypair,
+    transport: &libp2p_identity::Keypair,
     recipient: &PeerId,
     recipient_pk: &PublicKey,
     sender: &PeerId,
@@ -875,7 +847,7 @@ mod tests {
     }
 
     struct Party {
-        key: libp2p::identity::Keypair,
+        key: libp2p_identity::Keypair,
         pid: PeerId,
         static_sk: StaticSecret,
         offline_sk: StaticSecret,
@@ -888,7 +860,7 @@ mod tests {
     }
 
     fn party() -> Party {
-        let key = libp2p::identity::Keypair::generate_ed25519();
+        let key = libp2p_identity::Keypair::generate_ed25519();
         let pid = PeerId::from(key.public());
         let offline_sk = identity_offline_secret(&key).expect("ed25519");
         Party {

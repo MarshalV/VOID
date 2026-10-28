@@ -1,0 +1,18 @@
+[package]
+name = "void-frames"
+version = "0.1.0"
+edition = "2021"
+description = "VOID frames: V1Packet, length limits, JSON encode/decode"
+license = "MIT"
+
+[dependencies]
+void-session = { path = "../void-session" }
+void-envelope = { path = "../void-envelope" }
+void-onion = { path = "../void-onion" }
+libp2p-identity = { version = "0.2.13", features = ["ed25519", "peerid"] }
+multiaddr = "0.18"
+anyhow = "1.0"
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+rand = "0.8"
+blake2 = "0.10"

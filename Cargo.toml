@@ -1,5 +1,14 @@
 [workspace]
-members = [".", "protocol", "protocol-conformance"]
+members = [
+    ".",
+    "protocol",
+    "protocol/void-frames",
+    "protocol/void-session",
+    "protocol/void-envelope",
+    "protocol/void-onion",
+    "protocol/void-kad-rules",
+    "protocol-conformance",
+]
 exclude = ["src-tauri"]
 resolver = "2"
 
@@ -23,6 +32,12 @@ egui-ui = ["dep:eframe"]
 
 [dependencies]
 void-protocol = { path = "protocol" }
+# Wire crates. Call sites still use the void-protocol facade this release.
+void-frames = { path = "protocol/void-frames" }
+void-session = { path = "protocol/void-session" }
+void-envelope = { path = "protocol/void-envelope" }
+void-onion = { path = "protocol/void-onion" }
+void-kad-rules = { path = "protocol/void-kad-rules" }
 libp2p = { version = "0.56", features = ["tcp", "quic", "noise", "yamux", "ping", "macros", "tokio", "mdns", "request-response", "identify", "kad", "relay", "dcutr", "autonat", "upnp", "dns", "rsa", "ed25519", "secp256k1", "json"] }
 tokio = { version = "1.0", features = ["full"] }
 anyhow = "1.0"
