@@ -15,6 +15,7 @@ pub(crate) mod offline_publish;
 pub(crate) mod outbox;
 pub(crate) mod paths;
 pub(crate) mod relay_mailbox;
+pub(crate) mod rr_codec;
 pub(crate) mod shared_chat;
 pub(crate) mod vault;
 pub(crate) mod voice;

@@ -42,6 +42,7 @@ libp2p = { version = "0.56", features = ["tcp", "quic", "noise", "yamux", "ping"
 tokio = { version = "1.0", features = ["full"] }
 anyhow = "1.0"
 futures = "0.3"
+async-trait = "0.1"
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 chrono = "0.4"

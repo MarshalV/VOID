@@ -1,7 +1,7 @@
 //! libp2p swarm, сетевой цикл и события UI ↔ сеть.
 
 use std::collections::{HashMap, HashSet};
-use std::sync::{mpsc as std_mpsc, Arc, Mutex};
+use std::sync::{mpsc as std_mpsc, Arc, Mutex, OnceLock};
 use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 use std::time::{Duration, Instant};
 
@@ -555,7 +555,8 @@ fn send_dial_back_hint(
     if circuit_addrs.is_empty() {
         return;
     }
-    let _ = swarm.behaviour_mut().request_response.send_request(
+    let _ = rr_send(
+        swarm,
         &peer,
         V1Packet::DialBack { circuit_addrs },
     );
@@ -765,7 +766,8 @@ fn fanout_bootstrap_gossip(
         })
         .collect();
     for peer in targets {
-        let _ = swarm.behaviour_mut().request_response.send_request(
+        let _ = rr_send(
+            swarm,
             &peer,
             V1Packet::BootstrapGossip {
                 addrs: addrs.clone(),
@@ -2123,7 +2125,7 @@ fn publish_self_prekey_to_bootstraps(
         let _ = swarm
             .behaviour_mut()
             .request_response
-            .send_request(&peer, packet.clone());
+            .send_request(&peer, wire_out(&peer, packet.clone()));
     }
 }
 
@@ -2153,7 +2155,7 @@ fn request_prekey_from_bootstraps(
         let rid = swarm
             .behaviour_mut()
             .request_response
-            .send_request(&peer, packet.clone());
+            .send_request(&peer, wire_out(&peer, packet.clone()));
         track.insert(rid, (recipient, items.clone(), done.clone()));
         sent = true;
     }
@@ -2360,7 +2362,7 @@ fn fanout_relay_mail(
             let rid = swarm
                 .behaviour_mut()
                 .request_response
-                .send_request(peer, packet.clone());
+                .send_request(peer, wire_out(peer, packet.clone()));
             if track_handoff {
                 if let Some(h) = handoff {
                     store_track.insert(rid, (h.clone(), recipient, env.message_id.clone()));
@@ -2401,7 +2403,7 @@ fn fanout_relay_to_bootstraps(
                 let rid = swarm
                     .behaviour_mut()
                     .request_response
-                    .send_request(pid, packet);
+                    .send_request(pid, wire_out(pid, packet));
                 if let Some(h) = handoff {
                     store_track.insert(rid, (h.clone(), recipient, env.message_id.clone()));
                 }
@@ -2551,7 +2553,7 @@ fn flush_pending_relay_for_peer(
             let rid = swarm
                 .behaviour_mut()
                 .request_response
-                .send_request(&peer, packet);
+                .send_request(&peer, wire_out(&peer, packet));
             if let Some(ref h) = handoff {
                 store_track.insert(rid, (h.clone(), recipient, mid));
             }
@@ -2594,7 +2596,7 @@ fn query_relay_mailbox(
         let _ = swarm
             .behaviour_mut()
             .request_response
-            .send_request(&peer, packet.clone());
+            .send_request(&peer, wire_out(&peer, packet.clone()));
     }
     true
 }
@@ -2627,7 +2629,7 @@ async fn remember_peer_prekey(
 
 #[derive(NetworkBehaviour)]
 struct ChatBehaviour {
-    request_response: libp2p::request_response::json::Behaviour<V1Packet, V1Packet>,
+    request_response: libp2p::request_response::Behaviour<crate::rr_codec::ChatCodec>,
     /// Отдельный sub-протокол для передачи файлов (/void/file/1.0.0).
     file_rr: libp2p::request_response::json::Behaviour<
         file_transfer::FilePacket,
@@ -2689,16 +2691,11 @@ fn build_void_swarm(
                 .with_request_timeout(Duration::from_secs(60))
                 .with_max_concurrent_streams(256);
             let rr_protocol = libp2p::StreamProtocol::new("/void/chat/1.0.0");
-            // Offline voice_chunk: один конверт ≈ десятки КБ plaintext, в JSON
-            // раздувается; дефолт codec 1 МиБ / 10 МиБ режет длинные голоса.
-            let rr_codec =
-                libp2p::request_response::json::codec::Codec::<V1Packet, V1Packet>::default()
-                    .set_request_size_maximum(4 * 1024 * 1024)
-                    .set_response_size_maximum(16 * 1024 * 1024);
+            // Полевые лимиты (ct / ciphertext / Store) режут логический размер.
+            // Поток по-прежнему: запрос 4 МиБ, ответ 16 МиБ. JSON или CBOR.
+            let rr_codec = crate::rr_codec::ChatCodec::new();
             let rr_behaviour =
-                libp2p::request_response::Behaviour::<
-                    libp2p::request_response::json::codec::Codec<V1Packet, V1Packet>,
-                >::with_codec(
+                libp2p::request_response::Behaviour::with_codec(
                     rr_codec,
                     [(rr_protocol, libp2p::request_response::ProtocolSupport::Full)],
                     rr_config.clone(),
@@ -2763,6 +2760,65 @@ fn build_void_swarm(
         .build())
 }
 
+fn cbor_peers() -> &'static Mutex<HashSet<PeerId>> {
+    static PEERS: OnceLock<Mutex<HashSet<PeerId>>> = OnceLock::new();
+    PEERS.get_or_init(|| Mutex::new(HashSet::new()))
+}
+
+fn note_peer_wire(peer: PeerId, caps: u32) {
+    let mut set = cbor_peers().lock().expect("cbor peers");
+    if crate::protocol::both_announce_cbor(crate::protocol::HELLO_CAPS, caps) {
+        set.insert(peer);
+    } else {
+        set.remove(&peer);
+    }
+}
+
+fn forget_peer_wire(peer: PeerId) {
+    cbor_peers().lock().expect("cbor peers").remove(&peer);
+}
+
+fn wire_out(peer: &PeerId, packet: V1Packet) -> crate::rr_codec::WireMsg {
+    let cbor = cbor_peers().lock().expect("cbor peers").contains(peer);
+    crate::rr_codec::WireMsg { packet, cbor }
+}
+
+fn rr_send(
+    swarm: &mut libp2p::Swarm<ChatBehaviour>,
+    peer: &PeerId,
+    packet: V1Packet,
+) -> libp2p::request_response::OutboundRequestId {
+    swarm
+        .behaviour_mut()
+        .request_response
+        .send_request(peer, wire_out(peer, packet))
+}
+
+struct ReplySlot {
+    channel: Option<libp2p::request_response::ResponseChannel<crate::rr_codec::WireMsg>>,
+    cbor: bool,
+}
+
+impl ReplySlot {
+    fn take(
+        &mut self,
+    ) -> Option<libp2p::request_response::ResponseChannel<crate::rr_codec::WireMsg>> {
+        self.channel.take()
+    }
+}
+
+fn send_rr_response(
+    swarm: &mut libp2p::Swarm<ChatBehaviour>,
+    ch: libp2p::request_response::ResponseChannel<crate::rr_codec::WireMsg>,
+    cbor: bool,
+    packet: V1Packet,
+) {
+    let _ = swarm.behaviour_mut().request_response.send_response(
+        ch,
+        crate::rr_codec::WireMsg { packet, cbor },
+    );
+}
+
 fn send_v1_to_peer(
     swarm: &mut libp2p::Swarm<ChatBehaviour>,
     dest: PeerId,
@@ -2789,10 +2845,7 @@ fn send_v1_to_peer(
                 let hop_ids: Vec<PeerId> = hops.iter().map(|(p, _)| *p).collect();
                 onion_rt_note("out", dest, &hop_ids);
             }
-            let req_id = swarm
-                .behaviour_mut()
-                .request_response
-                .send_request(&first, onion);
+            let req_id = rr_send(swarm, &first, onion);
             onion_mark_outbound(req_id);
             return Some(req_id);
         }
@@ -2811,17 +2864,12 @@ fn send_v1_to_peer(
     if matches!(packet, V1Packet::Encrypted { .. }) {
         onion_rt_note("direct", dest, &[]);
     }
-    Some(
-        swarm
-            .behaviour_mut()
-            .request_response
-            .send_request(&dest, packet),
-    )
+    Some(rr_send(swarm, &dest, packet))
 }
 
 fn rr_reply(
     swarm: &mut libp2p::Swarm<ChatBehaviour>,
-    channel: &mut Option<libp2p::request_response::ResponseChannel<V1Packet>>,
+    channel: &mut ReplySlot,
     onion_reply: Option<PeerId>,
     packet: V1Packet,
 ) {
@@ -2835,10 +2883,7 @@ fn rr_reply(
         return;
     }
     if let Some(ch) = channel.take() {
-        let _ = swarm
-            .behaviour_mut()
-            .request_response
-            .send_response(ch, packet);
+        send_rr_response(swarm, ch, channel.cbor, packet);
     }
 }
 
@@ -3534,19 +3579,22 @@ async fn ensure_e2ee_handshake_started(
 
 fn send_delete_ack_response(
     session: &mut crypto::SecureSession,
-    channel: libp2p::request_response::ResponseChannel<V1Packet>,
+    channel: libp2p::request_response::ResponseChannel<crate::rr_codec::WireMsg>,
+    cbor: bool,
     swarm: &mut libp2p::Swarm<ChatBehaviour>,
     deleted: &[String],
     missing: &[String],
-) -> Option<libp2p::request_response::ResponseChannel<V1Packet>> {
+) -> Option<libp2p::request_response::ResponseChannel<crate::rr_codec::WireMsg>> {
     let Some(json) = build_delete_ack_json(deleted, missing) else {
         return Some(channel);
     };
     let Ok((header, ciphertext)) = session.encrypt_payload(json.as_slice()) else {
         return Some(channel);
     };
-    let _ = swarm.behaviour_mut().request_response.send_response(
+    send_rr_response(
+        swarm,
         channel,
+        cbor,
         V1Packet::Encrypted { header, ciphertext },
     );
     None
@@ -5850,9 +5898,13 @@ pub async fn run_chat_network(
                             match message {
                                 libp2p::request_response::Message::Request { request, channel, .. } => {
                                     let mut peer = peer;
-                                    let mut request = request;
+                                    let inbound_cbor = request.cbor;
+                                    let mut request = request.packet;
                                     let mut onion_reply: Option<PeerId> = None;
-                                    let mut channel = Some(channel);
+                                    let mut channel = ReplySlot {
+                                        channel: Some(channel),
+                                        cbor: inbound_cbor,
+                                    };
                                     if matches!(request, V1Packet::Onion { .. } | V1Packet::Onion2 { .. }) {
                                         rr_reply(
                                             &mut swarm,
@@ -6063,16 +6115,14 @@ pub async fn run_chat_network(
                                             let our_hints =
                                                 collect_onion_hints(&onion_keys, &onion_key_sigs, &void_bootstraps, &onion_descs);
                                             if !our_extra.is_empty() || !our_hints.is_empty() {
-                                                let _ = swarm
-                                                    .behaviour_mut()
-                                                    .request_response
-                                                    .send_request(
-                                                        &peer,
-                                                        V1Packet::BootstrapGossip {
-                                                            addrs: our_extra,
-                                                            onion_keys: our_hints,
-                                                        },
-                                                    );
+                                                let _ = rr_send(
+                                                    &mut swarm,
+                                                    &peer,
+                                                    V1Packet::BootstrapGossip {
+                                                        addrs: our_extra,
+                                                        onion_keys: our_hints,
+                                                    },
+                                                );
                                             }
                                             rr_reply(
                                                 &mut swarm,
@@ -6264,6 +6314,15 @@ pub async fn run_chat_network(
                                                     &nonce,
                                                     caps,
                                                 );
+                                                if hello_bind.is_some_and(|b| {
+                                                    crate::protocol::hello_bind_ok(
+                                                        b,
+                                                        caps,
+                                                        onion_reply.is_some(),
+                                                    )
+                                                }) {
+                                                    note_peer_wire(peer, caps);
+                                                }
                                                 if hello_bind.is_none_or(|b| {
                                                     !crate::protocol::hello_bind_ok(
                                                         b,
@@ -6706,10 +6765,11 @@ pub async fn run_chat_network(
                                                                             &message_ids,
                                                                         );
                                                                     if let Some(ch) = response_channel.take() {
-                                                                        response_channel =
+                                                                        response_channel.channel =
                                                                             send_delete_ack_response(
                                                                                 session,
                                                                                 ch,
+                                                                                response_channel.cbor,
                                                                                 &mut swarm,
                                                                                 &deleted,
                                                                                 &missing,
@@ -6827,10 +6887,12 @@ pub async fn run_chat_network(
                                                         ) {
                                                             if let Some(ch) = response_channel.take()
                                                             {
-                                                                let _ = swarm
-                                                                    .behaviour_mut()
-                                                                    .request_response
-                                                                    .send_response(ch, hello);
+                                                                send_rr_response(
+                                                                    &mut swarm,
+                                                                    ch,
+                                                                    response_channel.cbor,
+                                                                    hello,
+                                                                );
                                                             }
                                                         }
                                                         if swarm.is_connected(&peer) {
@@ -6880,10 +6942,12 @@ pub async fn run_chat_network(
                                                     ephem_pub,
                                                 ) {
                                                     if let Some(ch) = response_channel.take() {
-                                                        let _ = swarm
-                                                            .behaviour_mut()
-                                                            .request_response
-                                                            .send_response(ch, hello);
+                                                        send_rr_response(
+                                                            &mut swarm,
+                                                            ch,
+                                                            response_channel.cbor,
+                                                            hello,
+                                                        );
                                                     }
                                                 }
                                                 // Also start a real outbound Hello — response
@@ -6903,11 +6967,13 @@ pub async fn run_chat_network(
                                                 .await;
                                             }
                                             if send_ack {
-                                                if let Some(ch) = response_channel {
-                                                    let _ = swarm
-                                                        .behaviour_mut()
-                                                        .request_response
-                                                        .send_response(ch, V1Packet::Ack);
+                                                if let Some(ch) = response_channel.take() {
+                                                    send_rr_response(
+                                                        &mut swarm,
+                                                        ch,
+                                                        response_channel.cbor,
+                                                        V1Packet::Ack,
+                                                    );
                                                 }
                                                 // Пир точно умеет расшифровывать — можно
                                                 // слить буфер, который ждал конца Hello.
@@ -6958,6 +7024,33 @@ pub async fn run_chat_network(
                                     } // onion / onion-drop unwrap
                                 }
                                 libp2p::request_response::Message::Response { request_id, response } => {
+                                    if let V1Packet::Hello {
+                                        public_key,
+                                        ephemeral_key,
+                                        transport_sig,
+                                        transport_pubkey_pb,
+                                        caps,
+                                        ts,
+                                        nonce,
+                                    } = &response.packet
+                                    {
+                                        if let Some(bind) = verify_hello_transport_binding(
+                                            peer,
+                                            local_peer_id,
+                                            public_key,
+                                            ephemeral_key,
+                                            transport_sig,
+                                            transport_pubkey_pb,
+                                            *ts,
+                                            nonce,
+                                            *caps,
+                                        ) {
+                                            if crate::protocol::hello_bind_ok(bind, *caps, false) {
+                                                note_peer_wire(peer, *caps);
+                                            }
+                                        }
+                                    }
+                                    let response = response.packet;
                                     let hop_only = onion_take_outbound(&request_id);
                                     if !matches!(response, V1Packet::Ack) {
                                         // Нода отказала (квота / частота): не Ack — не сдано.
@@ -8120,7 +8213,8 @@ pub async fn run_chat_network(
                                      let hints =
                                          collect_onion_hints(&onion_keys, &onion_key_sigs, &void_bootstraps, &onion_descs);
                                      if !gossip.is_empty() || !hints.is_empty() {
-                                         let _ = swarm.behaviour_mut().request_response.send_request(
+                                         let _ = rr_send(
+                                             &mut swarm,
                                              &peer_id,
                                              V1Packet::BootstrapGossip {
                                                  addrs: gossip,
@@ -8227,6 +8321,9 @@ pub async fn run_chat_network(
                             }
                         },
                         SwarmEvent::ConnectionClosed { peer_id, cause, num_established, connection_id, ref endpoint, .. } => {
+                            if num_established == 0 {
+                                forget_peer_wire(peer_id);
+                            }
                             let connected_count = swarm.connected_peers().count();
                             warn!(
                                 "connection closed {} conn={:?} cause={:?} remaining_with_peer={} peers={}",
@@ -8512,6 +8609,13 @@ pub async fn run_chat_network(
                             );
                             if is_bootstrap {
                                 bootstrap_peer_ids.insert(peer_id);
+                                if info
+                                    .agent_version
+                                    .split(';')
+                                    .any(|part| part.trim() == "cbor=1")
+                                {
+                                    note_peer_wire(peer_id, crate::protocol::HELLO_CAPS);
+                                }
                                 if swarm.is_connected(&peer_id) {
                                     let _ = event_tx
                                         .send(NetworkEvent::BootstrapSession {

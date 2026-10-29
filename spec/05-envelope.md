@@ -27,7 +27,7 @@ v1 ещё проверяется и для запечатывания не го�
 
 ### `PrekeyPut` / `PrekeyGet` / `PrekeyOffer`
 
-JSON на `/void/chat/1.0.0`:
+JSON или CBOR на `/void/chat/1.0.0` (когда писать CBOR — [02-hello.md](02-hello.md)):
 
 ```
 PrekeyPut   { peer_id, public_key[32], not_after, sig }
@@ -167,7 +167,7 @@ transfer_id[16] || index_le_u32 || total_le_u32 || total_size_le_u32 || data
 
 Объём конверта для квот: `|ct| + 96`.
 
-Один `Store` может нести список. Участник часто шлёт по одному конверту: JSON раздувает байты, лимит запроса 4 МиБ.
+Один `Store` несёт не больше 64 конвертов. `ct` каждого конверта и `Onion.ct` — не длиннее 256 КиБ, `Encrypted.ciphertext` — не длиннее 1 МиБ. Это потолок поля, не всего JSON. `Deliver` — не больше 1024 конвертов с тем же потолком `ct`. Участник часто шлёт по одному конверту.
 
 ### `OfflineMailboxStore { recipient, envelopes }`
 

@@ -126,6 +126,8 @@ pub struct OfflineEnvelope {
     pub kind: String,
     pub eph: [u8; 32],
     pub nonce: [u8; 12],
+    /// CBOR: байтовая строка. JSON и bincode ящика — как у `Vec<u8>`.
+    #[serde(with = "serde_bytes")]
     pub ct: Vec<u8>,
     /// Настоящий `kind` у отправителя (в v3 снаружи пусто); в сеть не уходит.
     #[serde(skip)]
@@ -825,6 +827,26 @@ fn hkdf_offline(shared: &[u8], eph: &[u8; 32], recipient_pk: &[u8; 32]) -> [u8; 
 mod tests {
     use super::*;
     use std::collections::HashMap;
+
+    /// `serde_bytes` на `ct` не должен сдвинуть bincode ящика: у `Vec<u8>` тот же префикс длины.
+    #[test]
+    fn envelope_ct_bincode_matches_plain_vec() {
+        #[derive(serde::Serialize, serde::Deserialize)]
+        struct Plain {
+            ct: Vec<u8>,
+        }
+        #[derive(serde::Serialize, serde::Deserialize)]
+        struct Bytes {
+            #[serde(with = "serde_bytes")]
+            ct: Vec<u8>,
+        }
+        let ct = vec![1u8, 2, 3, 255, 0, 9];
+        let plain = bincode::serialize(&Plain { ct: ct.clone() }).unwrap();
+        let bytes = bincode::serialize(&Bytes { ct: ct.clone() }).unwrap();
+        assert_eq!(plain, bytes);
+        let back: Bytes = bincode::deserialize(&plain).unwrap();
+        assert_eq!(back.ct, ct);
+    }
 
     #[test]
     fn voice_chunk_roundtrip() {

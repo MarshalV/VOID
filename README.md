@@ -89,7 +89,7 @@ The main desktop is **Tauri 2** (`frontend/` + `src-tauri/`). Optionally a nativ
 |--------|------|
 | `src/network.rs` | Swarm, dial bootstrap, Hop, RR chat, mailbox, gossip |
 | `src/bridge.rs` | Headless runtime for Tauri: snapshot push, not poll |
-| `protocol/void-frames` | `V1Packet` (`Hello`, `Encrypted`, mailbox, onion, …), length limits, JSON encode/decode |
+| `protocol/void-frames` | `V1Packet` (`Hello`, `Encrypted`, mailbox, onion, …), field limits, JSON and CBOR encode/decode |
 | `protocol/void-session` | Hello bind, `SecureSession` (DH step, header and PeerId in AAD), group roster |
 | `protocol/void-onion` | Onion v2 when every hop has a descriptor, otherwise v1. Builds without `kad` |
 | `protocol/void-envelope` | Seal envelope to the recipient’s rotating prekey, or to the key derived from their PeerId if none is published |
@@ -160,8 +160,8 @@ Two VOID copies on one vault open two TCPs to the same node — both go `yamux C
 | Dial bootstrap | one TCP to `host/tcp/port`; QUIC to the node is filtered out |
 | Multiplexer | Yamux (up to 512 streams on the client; Hop on the node is sensitive to RR spam) |
 | Channel | Noise |
-| Identify | `/void/v1`; bootstrap is recognized by `agent_version` `void-bootstrap-node…` |
-| Chat | `/void/chat/1.0.0` |
+| Identify | `/void/v1`; bootstrap is recognized by `agent_version` `void-bootstrap-node…`. `;cbor=1` on that string means the node reads and writes CBOR |
+| Chat | `/void/chat/1.0.0`, JSON or CBOR `V1Packet` |
 | Files (offer, fallback) | `/void/file/1.0.0` |
 | File/voice offer and chunks | E2EE frames `VfP1` / `VfC1` inside `/void/chat` |
 | DHT | `/void/kad/1.0.0`, `Mode::Server`, k-bucket **Manual** (addresses after live TCP) |
@@ -211,7 +211,7 @@ In the connect field: `multiaddr`, `IP`, or `IP:PORT`. A bootstrap in the seed l
 
 | Packet | Purpose |
 |--------|---------|
-| `Hello` | X25519 + identity signature. Current clients sign bind v3: `ts`, `nonce`, and `caps` (±10 min). A session opens only when that signature is v3 and `caps` bit `1` is set (ratchet header in AAD), on a direct path and over onion. v1 and v2 may verify and do not create a session. A repeated ephemeral is rejected (last 256 per PeerId) and does not reset a live session. A Hello with `ts == 0` does not replace one either |
+| `Hello` | X25519 + identity signature. Current clients sign bind v3: `ts`, `nonce`, and `caps` (±10 min). A session opens only when that signature is v3 and `caps` bit `1` (`HELLO_CAP_HEADER_AAD`) is set, on a direct path and over onion. Bit `2` (`HELLO_CAP_CBOR`) is the CBOR announcement; it does not open a session by itself. v1 and v2 may verify and do not create a session. A repeated ephemeral is rejected (last 256 per PeerId) and does not reset a live session. A Hello with `ts == 0` does not replace one either |
 | `Encrypted` | Double Ratchet |
 | `Ack` | RR reply / empty mailbox / node accepted the letter |
 | `OfflineMailboxStore` / `Query` / `Deliver` | offline mail on bootstrap; `Query` runs only for own PeerId; empty `Deliver` in reply to `Store` is a refusal |
@@ -221,7 +221,7 @@ In the connect field: `multiaddr`, `IP`, or `IP:PORT`. A bootstrap in the seed l
 | `Onion` / `OnionDrop` | `VOID_ONION_v1`. `OnionDrop` is accepted only from a bootstrap that advertised `;onion=` in its own Identify; inside — only `Hello` / `Encrypted` / `Ack`. The last layer still carries `src` |
 | `Onion2` / `OnionDeliver` | `VOID_ONION_v2`. Fixed-size cell. The exit forwards an opaque body sealed to the recipient’s identity key. No `src`. Used only when every hop on the path has a fresh descriptor |
 
-JSON RR: request up to 4 MiB, response up to 16 MiB (offline voice chunks).
+Chat RR: request up to 4 MiB, response up to 16 MiB. One serde schema for `V1Packet`. The body stays JSON until both sides have announced CBOR: bit `2` in Hello between clients, or `;cbor=1` in the node’s Identify agent (the dispatcher does not send Hello). After that, requests are CBOR. The first Hello, sent before the peer’s announcement, stays JSON. A reply uses the same encoding as the request. Receivers always accept both: content-type `VC\x01\x01` (JSON) or `VC\x01\x02` (CBOR), else CBOR magic `d9 d9 f7`, else the first byte (`{`, `[`, `"`, or whitespace is JSON). In CBOR, `Vec<u8>` is a byte string; `[u8; N]` stays an array of numbers, so JSON and the mailbox bincode layout are unchanged. Field caps, independent of JSON expansion: `ct` 256 KiB, `ciphertext` 1 MiB, at most 64 envelopes in one `Store`, at most 1024 in one `Deliver`. `/void/file/1.0.0` stays JSON.
 
 ### End-to-end encryption (`protocol/void-session`)
 
@@ -471,7 +471,7 @@ Your own bootstrap/relay nodes speed up discovery and NAT.
 | **Circuit Relay v2** | Hop for clients behind NAT; opaque circuit bytes |
 | **Offline mail / prekey** | Store/query on `/void/chat`; delivery **only to the mailbox owner**, in batches with deletion (`take_batch`). `relay_mailbox.bin` is encrypted. At most 4096 mailboxes, TTL 7 days, per-uploader quotas, refusal via empty `Deliver`. `PrekeyPut` is stored only with the owner’s signature and an expiry within 30 days. Kademlia `put` keeps a signed unexpired prekey or a v3 mailbox and drops anything else |
 | **VOID-SEED** | `/void-seed/v1` on a separate TCP — list exchange **between nodes** |
-| **Onion hop** | Identify `void-bootstrap-node/…;onion=<pk>;osig=…;epoch=…;until=…;op=…;osig2=…`. Unwrap v2 (fixed cell) or v1 (JSON) and forward only after the next hop’s Identify. The hop key rotates weekly; the previous secret lasts one more day. `next` is a PeerId. Forward is limited to 600/min per previous hop and 6000/min overall. Logs do not record `next` or `src` |
+| **Onion hop** | Identify `void-bootstrap-node/…;onion=<pk>;osig=…;epoch=…;until=…;op=…;osig2=…;cbor=1`. Unwrap v2 (fixed cell) or v1 (JSON inside the cell) and forward only after the next hop’s Identify. The outer `/void/chat` frame is CBOR only when that next hop announced it. The hop key rotates weekly; the previous secret lasts one more day. `next` is a PeerId. Forward is limited to 600/min per previous hop and 6000/min overall. Logs do not record `next` or `src` |
 
 Live `V1Packet::Encrypted` is **not** forwarded as a chat server. Circuit and mailbox are separate paths. Onion is another: the node sees the next hop, not plaintext.
 
@@ -480,7 +480,7 @@ Live `V1Packet::Encrypted` is **not** forwarded as a chat server. Circuit and ma
 | Component | Setup |
 |-----------|-------|
 | Transports | TCP + QUIC, `LISTEN_PORT` (4001) |
-| Identify | `/void/v1`, `void-bootstrap-node/…` (+ `;onion=` if built with onion) |
+| Identify | `/void/v1`, `void-bootstrap-node/…;onion=…;cbor=1`. `;cbor=1` is `HELLO_CAP_CBOR` for the dispatcher |
 | Kademlia | `/void/kad/1.0.0`, **Mode::Server**. `put` accepts `/void/prekey/*` (owner signature, expiry ≤ 30 days) and `/void/mailbox/*` (v3 envelopes). Any other key is refused |
 | Relay | Default + NAT-oriented limits |
 | Logs | `RUST_LOG` default **info** (IP in `endpoint`) |
@@ -574,6 +574,7 @@ What the JSON pins is listed in [`spec/vectors/README.md`](spec/vectors/README.m
 - [x] Offline-mail Query only for the mailbox owner; on the node at most 4096 mailboxes, TTL 7 days, quotas and `Store` rate limit; with bootstrap, the client does not accept `Store` from ordinary peers
 - [x] Double Ratchet with a DH step on every speaker change. A session opens only after Hello bind v3 with the AAD bit, on a direct path and over onion. Header and both PeerIds are in AAD before the first frame
 - [x] `Hello` freshness: `ts` (±10 min) and `nonce` in the signature. A `Hello` with `ts == 0` does not reset a live session
+- [x] CBOR `V1Packet` after both sides announce `HELLO_CAP_CBOR` (Hello bit `2`, or `;cbor=1` on the node). Mixed peers stay on JSON. Field caps on `ct`, `ciphertext`, and Store size
 - [x] Vault: Argon2id 64 MiB, AES-GCM with AAD (`VOIDKEY3`; old `VOIDKEY2` still opens)
 - [x] Group roster has a creator-signed `version`. A replay of an older `group_sync` does not roll membership back. A message is stored only if the sender is in the roster
 - [x] Kademlia `put` on the client and the node keeps only a signed unexpired prekey or a v3 mailbox

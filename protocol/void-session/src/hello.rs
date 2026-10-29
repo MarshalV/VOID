@@ -224,7 +224,9 @@ pub fn sign_hello_transport_binding(
 
 /// Заголовок Double Ratchet (`dh_pub`, `pn`, `n`) входит в AAD.
 pub const HELLO_CAP_HEADER_AAD: u32 = 1;
-pub const HELLO_CAPS: u32 = HELLO_CAP_HEADER_AAD;
+/// Кадр `/void/chat/1.0.0` можно писать CBOR. Пока бит не стоит у обеих сторон — JSON.
+pub const HELLO_CAP_CBOR: u32 = 2;
+pub const HELLO_CAPS: u32 = HELLO_CAP_HEADER_AAD | HELLO_CAP_CBOR;
 
 #[cfg(test)]
 mod tests {
@@ -308,6 +310,8 @@ mod tests {
         )
         .is_none());
         assert!(hello_bind_ok(HelloBind::V3, HELLO_CAPS, false));
+        assert!(hello_bind_ok(HelloBind::V3, HELLO_CAP_HEADER_AAD, false));
+        assert!(!hello_bind_ok(HelloBind::V3, HELLO_CAP_CBOR, false));
         assert!(!hello_bind_ok(HelloBind::V3, 0, false));
     }
 }

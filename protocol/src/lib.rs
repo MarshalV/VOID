@@ -27,6 +27,11 @@ pub mod onion;
 
 pub mod protocol {
     pub use void_frames::protocol::*;
+    pub use void_frames::wire::{
+        both_announce_cbor, decode_v1_packet, encode_v1_packet, WireEncoding, MAX_CIPHERTEXT_BYTES,
+        MAX_CT_BYTES, MAX_DELIVER_ENVELOPES, MAX_STORE_ENVELOPES, REQUEST_MAX_BYTES,
+        RESPONSE_MAX_BYTES,
+    };
     #[cfg(test)]
     pub(crate) use void_session::hello::{
         sign_hello_transport_binding, verify_hello_transport_binding_at,

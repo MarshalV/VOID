@@ -7,7 +7,7 @@ use rand::rngs::OsRng;
 use void_protocol::crypto::{PublicKey, SecureSession, StaticSecret};
 use void_protocol::protocol::{
     build_v1_hello, hello_bind_ok, verify_hello_transport_binding, HelloBind, V1Packet,
-    HELLO_CAP_HEADER_AAD,
+    HELLO_CAP_CBOR, HELLO_CAP_HEADER_AAD,
 };
 fn peer() -> (Keypair, PeerId) {
     let kp = Keypair::generate_ed25519();
@@ -45,7 +45,8 @@ fn accept_hello(packet: &V1Packet, signer: PeerId, recipient: PeerId) {
     );
     assert_eq!(bind, Some(HelloBind::V3));
     assert!(hello_bind_ok(bind.unwrap(), *caps, false));
-    assert_eq!(*caps, HELLO_CAP_HEADER_AAD);
+    assert_eq!(*caps & HELLO_CAP_HEADER_AAD, HELLO_CAP_HEADER_AAD);
+    assert_eq!(*caps & HELLO_CAP_CBOR, HELLO_CAP_CBOR);
 }
 
 #[test]

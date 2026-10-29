@@ -1,4 +1,4 @@
-//! Протокол чата `/void/chat/1.0.0`: Hello, E2EE-пакеты, лимиты JSON.
+//! Протокол чата `/void/chat/1.0.0`: Hello, E2EE-пакеты. Кодирование — `wire`.
 
 use libp2p_identity::PeerId;
 use multiaddr::Multiaddr;
@@ -11,7 +11,7 @@ use void_session::hello::sign_hello_transport_binding;
 
 pub use void_session::hello::{
     hello_bind_ok, verify_hello_transport_binding, void_hello_signing_public_key,
-    void_peer_transport_public_key, HelloBind, HELLO_CAP_HEADER_AAD, HELLO_CAPS,
+    void_peer_transport_public_key, HelloBind, HELLO_CAP_CBOR, HELLO_CAP_HEADER_AAD, HELLO_CAPS,
     HELLO_FRESHNESS_SECS,
 };
 
@@ -647,10 +647,10 @@ pub enum V1Packet {
         public_key: [u8; 32],
         ephemeral_key: [u8; 32],
         /// Подпись Ed25519 (libp2p identity): v2 — bind + `ts` + `nonce`; v1 — без них (старые клиенты).
-        #[serde(default)]
+        #[serde(default, with = "serde_bytes")]
         transport_sig: Vec<u8>,
         /// Если PeerId не identity-multihash: protobuf `PublicKey` для проверки подписи.
-        #[serde(default)]
+        #[serde(default, with = "serde_bytes")]
         transport_pubkey_pb: Vec<u8>,
         /// Возможности клиента (`HELLO_CAP_*`). С v3 входят в подпись.
         #[serde(default)]
@@ -695,7 +695,7 @@ pub enum V1Packet {
         #[serde(default)]
         not_after: u64,
         /// Подпись identity над `VOID_PREKEY_SIG_V2`.
-        #[serde(default)]
+        #[serde(default, with = "serde_bytes")]
         sig: Vec<u8>,
     },
     /// Запросить prekey контакта у bootstrap.
@@ -708,17 +708,19 @@ pub enum V1Packet {
         public_key: [u8; 32],
         #[serde(default)]
         not_after: u64,
-        #[serde(default)]
+        #[serde(default, with = "serde_bytes")]
         sig: Vec<u8>,
     },
     Encrypted {
         header: crypto::MessageHeader,
+        #[serde(with = "serde_bytes")]
         ciphertext: Vec<u8>,
     },
     /// One onion cell: sealed to the next hop's onion X25519 key.
     Onion {
         eph: [u8; 32],
         nonce: [u8; 12],
+        #[serde(with = "serde_bytes")]
         ct: Vec<u8>,
     },
     /// Exit hop → recipient. `src` is the logical sender (v1 only).
