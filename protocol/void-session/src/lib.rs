@@ -7,3 +7,4 @@
 pub mod crypto;
 pub mod group;
 pub mod hello;
+pub mod mailbox_query;

@@ -8,6 +8,7 @@ use std::collections::HashMap;
 
 use libp2p::PeerId;
 use void_protocol::offline_mail::{OfflineEnvelope, ENVELOPE_VERSION, MAILBOX_TTL_SECS};
+use void_protocol::protocol::ChallengeBook;
 
 const MAX_MAILBOXES: usize = 4096;
 const MAX_PER_MAILBOX: usize = 1024;
@@ -29,11 +30,20 @@ pub enum StoreOutcome {
     Refused,
 }
 
-/// Пустой ящик и чужой `Query` — `Ack`. Иначе пачка, уже стёртая из ящика.
+/// Пустой ящик и `Query` без свежей подписи получателя — `Ack`. Иначе пачка, уже стёртая из ящика.
 #[derive(Debug, Clone)]
 pub enum QueryOutcome {
     Ack,
     Deliver(Vec<OfflineEnvelope>),
+}
+
+/// Echo of `MailboxChallenge` plus the recipient's signature.
+#[derive(Debug, Clone)]
+pub struct SignedMailboxQuery {
+    pub recipient: String,
+    pub ts: u64,
+    pub nonce: [u8; 32],
+    pub sig: Vec<u8>,
 }
 
 #[derive(Clone)]
@@ -56,6 +66,7 @@ pub struct MailboxNode {
     now: u64,
     boxes: HashMap<String, Vec<Stored>>,
     rate: HashMap<String, Window>,
+    challenges: ChallengeBook,
 }
 
 impl Default for MailboxNode {
@@ -70,7 +81,14 @@ impl MailboxNode {
             now: 0,
             boxes: HashMap::new(),
             rate: HashMap::new(),
+            challenges: ChallengeBook::new(),
         }
+    }
+
+    /// Nonce for `recipient`. Anyone may ask. The signature still has to be theirs.
+    pub fn challenge(&mut self, recipient: &str) -> Option<([u8; 32], u64)> {
+        let id = recipient.parse().ok()?;
+        Some(self.challenges.issue(id, self.now))
     }
 
     pub fn set_now(&mut self, now: u64) {
@@ -132,11 +150,14 @@ impl MailboxNode {
         StoreOutcome::Ack
     }
 
-    pub fn query(&mut self, noise: PeerId, recipient: &str) -> QueryOutcome {
-        let Ok(who) = recipient.parse::<PeerId>() else {
+    pub fn query(&mut self, q: &SignedMailboxQuery) -> QueryOutcome {
+        let Ok(who) = q.recipient.parse::<PeerId>() else {
             return QueryOutcome::Ack;
         };
-        if who != noise {
+        if !self
+            .challenges
+            .authorize(&who, q.ts, &q.nonce, &q.sig, self.now)
+        {
             return QueryOutcome::Ack;
         }
         self.purge_expired();

@@ -8,6 +8,9 @@ use serde::{Deserialize, Serialize};
 use void_session::crypto;
 use void_session::group::{self, GroupMember};
 use void_session::hello::sign_hello_transport_binding;
+pub use void_session::mailbox_query::{
+    mailbox_query_message, mailbox_query_now, sign_mailbox_query, ChallengeBook,
+};
 
 pub use void_session::hello::{
     hello_bind_ok, verify_hello_transport_binding, void_hello_signing_public_key,
@@ -679,9 +682,26 @@ pub enum V1Packet {
         recipient: String,
         envelopes: Vec<void_envelope::offline_mail::OfflineEnvelope>,
     },
-    /// Запросить офлайн-почту для peer_id.
+    /// Запросить одноразовый nonce на выдачу ящика `recipient`.
+    MailboxChallengeRequest {
+        recipient: String,
+    },
+    /// Ответ ноды: этот nonce и `ts` надо вернуть в `OfflineMailboxQuery`.
+    MailboxChallenge {
+        nonce: [u8; 32],
+        ts: u64,
+    },
+    /// Запросить офлайн-почту. Выдача только после подписи получателя.
     OfflineMailboxQuery {
         recipient: String,
+        /// Echo `MailboxChallenge.ts`. 0 — старый клиент без подписи, ящик не открывают.
+        #[serde(default)]
+        ts: u64,
+        #[serde(default)]
+        nonce: [u8; 32],
+        /// Ed25519 получателя над `VOID_MAILBOX_QUERY_v1`.
+        #[serde(default, with = "serde_bytes")]
+        sig: Vec<u8>,
     },
     /// Ответ на OfflineMailboxQuery.
     OfflineMailboxDeliver {
@@ -740,6 +760,7 @@ pub enum V1Packet {
 }
 
 /// Письмо внутри печати v2. Hello/Ack несут PeerId отправителя; Encrypted — только заголовок сессии.
+/// `Mailbox` — Store / Query / challenge: снаружи PeerId отправителя нет, ящик кладут по `recipient`.
 pub enum V2Mail {
     Directed {
         from: PeerId,
@@ -749,6 +770,131 @@ pub enum V2Mail {
         header: crypto::MessageHeader,
         ciphertext: Vec<u8>,
     },
+    Mailbox {
+        packet: V1Packet,
+    },
+}
+
+/// Обратный путь внутри печати. На hop его нет: exit нужен, чтобы вернуть Ack / Challenge / Deliver.
+#[derive(Clone)]
+pub struct MailboxOnionRoute {
+    pub token: [u8; 16],
+    pub reply_to: Option<PeerId>,
+    pub reply_hops: Vec<(PeerId, [u8; 32])>,
+}
+
+pub fn is_mailbox_onion_packet(packet: &V1Packet) -> bool {
+    match packet {
+        V1Packet::OfflineMailboxStore { envelopes, .. } => envelopes.len() <= 1,
+        V1Packet::OfflineMailboxQuery { .. }
+        | V1Packet::MailboxChallengeRequest { .. }
+        | V1Packet::MailboxChallenge { .. }
+        | V1Packet::OfflineMailboxDeliver { .. } => true,
+        _ => false,
+    }
+}
+
+fn mailbox_mail_packet(packet: &V1Packet) -> bool {
+    is_mailbox_onion_packet(packet) || matches!(packet, V1Packet::Ack)
+}
+
+fn push_peer(out: &mut Vec<u8>, peer: PeerId) -> bool {
+    let id = peer.to_bytes();
+    if id.is_empty() || id.len() > 255 {
+        return false;
+    }
+    out.push(id.len() as u8);
+    out.extend_from_slice(&id);
+    true
+}
+
+/// `Ok(None)` — нулевая длина (нет адреса). `Err` — кадр обрезан или PeerId битый.
+fn read_peer_at(buf: &[u8], i: &mut usize) -> Result<Option<PeerId>, ()> {
+    let n = *buf.get(*i).ok_or(())? as usize;
+    *i += 1;
+    if n == 0 {
+        return Ok(None);
+    }
+    let end = i.checked_add(n).ok_or(())?;
+    let id = PeerId::from_bytes(buf.get(*i..end).ok_or(())?).map_err(|_| ())?;
+    *i = end;
+    Ok(Some(id))
+}
+
+/// Tag 4: `u32le` JSON кадра, token, адрес ответа и hop'ы обратно. Отправителя в кадре нет.
+pub fn encode_v2_mailbox(
+    packet: &V1Packet,
+    token: &[u8; 16],
+    reply_to: Option<PeerId>,
+    reply_hops: &[(PeerId, [u8; 32])],
+) -> Option<Vec<u8>> {
+    if !mailbox_mail_packet(packet) || reply_hops.len() > 3 {
+        return None;
+    }
+    let json = serde_json::to_vec(packet).ok()?;
+    if json.len() > u32::MAX as usize {
+        return None;
+    }
+    let mut v = Vec::with_capacity(1 + 4 + json.len() + 16 + 64);
+    v.push(4);
+    v.extend_from_slice(&(json.len() as u32).to_le_bytes());
+    v.extend_from_slice(&json);
+    v.extend_from_slice(token);
+    match reply_to {
+        Some(peer) => {
+            if !push_peer(&mut v, peer) {
+                return None;
+            }
+        }
+        None => v.push(0),
+    }
+    v.push(reply_hops.len() as u8);
+    for (peer, pk) in reply_hops {
+        if !push_peer(&mut v, *peer) {
+            return None;
+        }
+        v.extend_from_slice(pk);
+    }
+    Some(v)
+}
+
+pub fn decode_v2_mailbox(buf: &[u8]) -> Option<(V1Packet, MailboxOnionRoute)> {
+    if *buf.first()? != 4 {
+        return None;
+    }
+    let n = u32::from_le_bytes(buf.get(1..5)?.try_into().ok()?) as usize;
+    let json_end = 5usize.checked_add(n)?;
+    let packet: V1Packet = serde_json::from_slice(buf.get(5..json_end)?).ok()?;
+    if !mailbox_mail_packet(&packet) {
+        return None;
+    }
+    let mut i = json_end;
+    let token = buf.get(i..i + 16)?.try_into().ok()?;
+    i += 16;
+    let reply_to = read_peer_at(buf, &mut i).ok()?;
+    let nh = *buf.get(i)? as usize;
+    i += 1;
+    if nh > 3 {
+        return None;
+    }
+    let mut reply_hops = Vec::with_capacity(nh);
+    for _ in 0..nh {
+        let peer = read_peer_at(buf, &mut i).ok()?.filter(|id| id.to_bytes().len() > 0)?;
+        let pk = buf.get(i..i + 32)?.try_into().ok()?;
+        i += 32;
+        reply_hops.push((peer, pk));
+    }
+    if i != buf.len() {
+        return None;
+    }
+    Some((
+        packet,
+        MailboxOnionRoute {
+            token,
+            reply_to,
+            reply_hops,
+        },
+    ))
 }
 
 fn encode_v2_mail(src: PeerId, packet: &V1Packet) -> Option<Vec<u8>> {
@@ -827,6 +973,10 @@ pub fn decode_v2_mail(buf: &[u8]) -> Option<V2Mail> {
                 ciphertext: buf[41..].to_vec(),
             })
         }
+        4 => {
+            let (packet, _) = decode_v2_mailbox(buf)?;
+            Some(V2Mail::Mailbox { packet })
+        }
         _ => None,
     }
 }
@@ -840,7 +990,7 @@ pub fn wrap_onion_packet(
     inner: V1Packet,
     v2: bool,
 ) -> Option<V1Packet> {
-    if hops.is_empty() {
+    if hops.is_empty() || is_mailbox_onion_packet(&inner) {
         return None;
     }
     if v2 {
@@ -861,6 +1011,57 @@ pub fn wrap_onion_packet(
     let drop_val = serde_json::to_value(&drop).ok()?;
     let (eph, nonce, ct) = void_onion::wrap_layers(&wire_hops(hops), wire_peer(dest), drop_val).ok()?;
     Some(V1Packet::Onion { eph, nonce, ct })
+}
+
+fn seal_mailbox_cell(
+    hops: &[(PeerId, [u8; 32])],
+    dest: PeerId,
+    mail: &[u8],
+) -> Option<V1Packet> {
+    if hops.is_empty() || hops[0].0 == dest {
+        return None;
+    }
+    let sealed = seal_onion_deliver(dest, mail).ok()?;
+    let cell = void_onion::wrap_v2(&wire_hops(hops), wire_peer(dest), &sealed).ok()?;
+    Some(V1Packet::Onion2 {
+        cell_b64: void_onion::b64_encode(&cell),
+    })
+}
+
+/// Store / Query / challenge к bootstrap. Последний hop — сам ящик, entry — другой.
+/// В v1 не падаем: `OnionDrop` положил бы PeerId отправителя в ячейку.
+pub fn wrap_mailbox_onion(
+    hops: &[(PeerId, [u8; 32])],
+    dest: PeerId,
+    inner: &V1Packet,
+    token: [u8; 16],
+    reply_to: PeerId,
+) -> Option<V1Packet> {
+    if !is_mailbox_onion_packet(inner) || hops.len() < 2 {
+        return None;
+    }
+    let forward: &[(PeerId, [u8; 32])] = if hops.last().is_some_and(|(peer, _)| *peer == dest) {
+        &hops[..hops.len() - 1]
+    } else {
+        hops
+    };
+    if forward.is_empty() || forward[0].0 == dest {
+        return None;
+    }
+    let reply_hops: Vec<(PeerId, [u8; 32])> = forward.iter().rev().cloned().collect();
+    let mail = encode_v2_mailbox(inner, &token, Some(reply_to), &reply_hops)?;
+    seal_mailbox_cell(hops, dest, &mail)
+}
+
+/// Ответ ящика (Ack / Challenge / Deliver) по reply-path. Снова без отправителя.
+pub fn wrap_mailbox_reply(
+    hops: &[(PeerId, [u8; 32])],
+    dest: PeerId,
+    inner: &V1Packet,
+    token: [u8; 16],
+) -> Option<V1Packet> {
+    let mail = encode_v2_mailbox(inner, &token, None, &[])?;
+    seal_mailbox_cell(hops, dest, &mail)
 }
 
 pub fn build_v1_hello(
@@ -1070,5 +1271,57 @@ mod hello_freshness_tests {
         assert!(!hello_bind_ok(HelloBind::V2, caps, false));
         assert!(!hello_bind_ok(HelloBind::V3, 0, true));
         assert!(!hello_bind_ok(HelloBind::V3, 0, false));
+    }
+}
+
+#[cfg(test)]
+mod mailbox_onion_mail_tests {
+    use super::*;
+    use libp2p_identity::Keypair;
+    use void_envelope::offline_mail::OfflineEnvelope;
+
+    fn envelope() -> OfflineEnvelope {
+        OfflineEnvelope {
+            v: 3,
+            sender: String::new(),
+            sender_pk: [0u8; 32],
+            message_id: "m1".into(),
+            kind: String::new(),
+            eph: [1u8; 32],
+            nonce: [2u8; 12],
+            ct: b"hi".to_vec(),
+            local_kind: String::new(),
+        }
+    }
+
+    #[test]
+    fn mailbox_mail_has_no_sender_field() {
+        let alice = Keypair::generate_ed25519().public().to_peer_id();
+        let bob = Keypair::generate_ed25519().public().to_peer_id();
+        let entry = Keypair::generate_ed25519().public().to_peer_id();
+        let packet = V1Packet::OfflineMailboxStore {
+            recipient: bob.to_string(),
+            envelopes: vec![envelope()],
+        };
+        let token = [7u8; 16];
+        let mail = encode_v2_mailbox(&packet, &token, Some(alice), &[(entry, [9u8; 32])])
+            .expect("mail");
+        let (decoded, route) = decode_v2_mailbox(&mail).expect("decode");
+        match decode_v2_mail(&mail) {
+            Some(V2Mail::Mailbox { packet }) => {
+                assert!(matches!(packet, V1Packet::OfflineMailboxStore { .. }));
+            }
+            _ => panic!("expected mailbox mail"),
+        }
+        let json = serde_json::to_vec(&decoded).expect("json");
+        let alice_s = alice.to_string();
+        assert!(
+            !json.windows(alice_s.len()).any(|w| w == alice_s.as_bytes()),
+            "sender peer id leaked into the mailbox packet"
+        );
+        assert_eq!(route.reply_to, Some(alice));
+        assert_eq!(route.token, token);
+        assert_eq!(route.reply_hops.len(), 1);
+        assert!(wrap_onion_packet(&[(entry, [9u8; 32])], alice, bob, packet, true).is_none());
     }
 }

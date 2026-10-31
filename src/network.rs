@@ -16,6 +16,7 @@ use libp2p::{
     core::transport::ListenerId,
     tcp, upnp, yamux, Multiaddr, PeerId, StreamProtocol,
 };
+use rand::RngCore;
 use tokio::sync::mpsc;
 use tracing::{debug, info, warn};
 
@@ -45,9 +46,11 @@ use crate::protocol::{
     validate_bootstrap_gossip_addrs,
     build_group_sync_json, build_group_leave_json, build_group_delete_json,
     transfer_id_to_hex, transfer_id_from_hex, per_peer_voice_transfer_id, ChatMessage,
-    wrap_onion_packet, OnionHopHint,
-    decode_v2_mail, onion_desc_fresh, verify_onion_desc, V2Mail,
+    wrap_onion_packet, wrap_mailbox_onion, OnionHopHint,
+    decode_v2_mail, decode_v2_mailbox, is_mailbox_onion_packet, onion_desc_fresh,
+    verify_onion_desc, V2Mail,
     DecryptedChatFrame, FileMeta, OutgoingDeliveryStatus, VoiceMeta, V1Packet,
+    ChallengeBook, mailbox_query_now, sign_mailbox_query,
 };
 
 struct OnionRuntime {
@@ -98,6 +101,73 @@ fn onion_take_outbound(id: &libp2p::request_response::OutboundRequestId) -> bool
         Ok(mut g) => g.as_mut().is_some_and(|s| s.remove(id)),
         Err(_) => false,
     }
+}
+
+enum MailboxOnionWait {
+    Store {
+        handoff: Arc<ActiveHandoff>,
+        message_id: String,
+    },
+    Challenge {
+        dest: PeerId,
+    },
+    Query,
+}
+
+struct MailboxOnionMaps {
+    by_token: HashMap<[u8; 16], MailboxOnionWait>,
+    by_rr: HashMap<libp2p::request_response::OutboundRequestId, [u8; 16]>,
+}
+
+fn mailbox_onion_maps() -> std::sync::MutexGuard<'static, MailboxOnionMaps> {
+    static MAPS: OnceLock<Mutex<MailboxOnionMaps>> = OnceLock::new();
+    if MAPS.get().is_none() {
+        let _ = MAPS.set(Mutex::new(MailboxOnionMaps {
+            by_token: HashMap::with_capacity(8),
+            by_rr: HashMap::with_capacity(8),
+        }));
+    }
+    MAPS.get()
+        .expect("mailbox onion maps")
+        .lock()
+        .unwrap_or_else(|poison| poison.into_inner())
+}
+
+fn mailbox_onion_bind_rr(id: libp2p::request_response::OutboundRequestId, token: [u8; 16]) {
+    mailbox_onion_maps().by_rr.insert(id, token);
+}
+
+fn mailbox_onion_rr_token(id: &libp2p::request_response::OutboundRequestId) -> Option<[u8; 16]> {
+    mailbox_onion_maps().by_rr.get(id).copied()
+}
+
+fn mailbox_onion_forget_rr(id: &libp2p::request_response::OutboundRequestId) {
+    mailbox_onion_maps().by_rr.remove(id);
+}
+
+fn mailbox_onion_insert(token: [u8; 16], wait: MailboxOnionWait) {
+    mailbox_onion_maps().by_token.insert(token, wait);
+}
+
+fn mailbox_onion_take_token(token: &[u8; 16]) -> Option<MailboxOnionWait> {
+    let mut g = mailbox_onion_maps();
+    let wait = g.by_token.remove(token)?;
+    g.by_rr.retain(|_, saved| saved != token);
+    Some(wait)
+}
+
+fn mailbox_onion_take_rr(
+    id: &libp2p::request_response::OutboundRequestId,
+) -> Option<MailboxOnionWait> {
+    let mut g = mailbox_onion_maps();
+    let token = g.by_rr.remove(id)?;
+    g.by_token.remove(&token)
+}
+
+fn mailbox_onion_has_handoff(handoff: &Arc<ActiveHandoff>) -> bool {
+    mailbox_onion_maps().by_token.values().any(|wait| {
+        matches!(wait, MailboxOnionWait::Store { handoff: saved, .. } if Arc::ptr_eq(saved, handoff))
+    })
 }
 
 fn onion_rt_set_keys(keys: HashMap<PeerId, [u8; 32]>, bootstraps: HashSet<PeerId>, local: PeerId) {
@@ -199,6 +269,7 @@ fn onion_rt_hops_for(
     let connected: HashSet<PeerId> = connected.collect();
     let mut g = ONION_RT.lock().ok()?;
     let rt = g.as_mut()?;
+    // Живой чат на bootstrap не прячем. Store/Query идут через onion_rt_mailbox_hops.
     if rt.bootstraps.contains(&dest) {
         return None;
     }
@@ -249,8 +320,56 @@ fn packet_may_use_onion(packet: &V1Packet) -> bool {
     match packet {
         V1Packet::Hello { .. } | V1Packet::Ack => true,
         V1Packet::Encrypted { ciphertext, .. } => ciphertext.len() <= 4096,
-        _ => false,
+        _ => is_mailbox_onion_packet(packet),
     }
+}
+
+/// Путь к ящику-bootstrap: entry — другой живой hop с ключом, exit — сам ящик.
+/// Если живой entry только он сам, onion нет (иначе клиент наберёт ящик напрямую).
+fn onion_rt_mailbox_hops(
+    dest: PeerId,
+    connected: impl Iterator<Item = PeerId>,
+) -> Option<(Vec<(PeerId, [u8; 32])>, PeerId)> {
+    let connected: HashSet<PeerId> = connected.collect();
+    let mut g = ONION_RT.lock().ok()?;
+    let rt = g.as_mut()?;
+    if !rt.bootstraps.contains(&dest) {
+        return None;
+    }
+    let dest_pk = *rt.keys.get(&dest)?;
+    let mut keys = rt.keys.clone();
+    keys.remove(&dest);
+    let entry_live = keys
+        .keys()
+        .any(|peer| rt.bootstraps.contains(peer) && connected.contains(peer));
+    if !entry_live {
+        return None;
+    }
+    let mut policy = hop_policy(rt);
+    if policy.guard == Some(dest) {
+        policy.guard = None;
+    }
+    let mut hops = crate::onion::select_hops(
+        connected.iter().copied().filter(|peer| *peer != dest),
+        &rt.bootstraps,
+        &keys,
+        &rt.hop_addrs,
+        &policy,
+    );
+    if hops.is_empty() || hops[0].0 == dest {
+        return None;
+    }
+    if hops.len() >= 3 {
+        hops.pop();
+    }
+    if hops.last().is_some_and(|(peer, _)| *peer == dest) {
+        return None;
+    }
+    hops.push((dest, dest_pk));
+    if hops[0].0 == dest || !path_is_v2(rt, &hops) {
+        return None;
+    }
+    Some((hops, rt.local))
 }
 
 fn bootstrap_addrs_by_peer(void_bootstraps: &[Multiaddr]) -> HashMap<PeerId, Vec<Multiaddr>> {
@@ -2374,6 +2493,88 @@ fn fanout_relay_mail(
 
 /// Разослать офлайн-почту bootstrap-нодам. Если нода ещё не connected —
 /// dial + очередь (раньше был dial-and-forget → mail терялся при выходе).
+fn track_mailbox_rr(
+    rid: libp2p::request_response::OutboundRequestId,
+    store_track: &mut MailboxStoreTrack,
+    handoff: &Option<Arc<ActiveHandoff>>,
+    recipient: PeerId,
+    message_id: String,
+) {
+    if let Some(token) = mailbox_onion_rr_token(&rid) {
+        if let Some(h) = handoff {
+            mailbox_onion_insert(
+                token,
+                MailboxOnionWait::Store {
+                    handoff: h.clone(),
+                    message_id,
+                },
+            );
+        }
+        return;
+    }
+    if let Some(h) = handoff {
+        store_track.insert(rid, (h.clone(), recipient, message_id));
+    }
+}
+
+/// Один конверт — один RR. Если до ящика есть onion entry, кадр уходит туда, не на сам ящик.
+fn dispatch_mailbox_stores(
+    swarm: &mut libp2p::Swarm<ChatBehaviour>,
+    dest: PeerId,
+    recipient: PeerId,
+    envelopes: &[OfflineEnvelope],
+    pending_relay: &mut PendingRelayQueue,
+    pending_relay_gates: &mut HashMap<(PeerId, PeerId), Arc<ActiveHandoff>>,
+    store_track: &mut MailboxStoreTrack,
+    handoff: &Option<Arc<ActiveHandoff>>,
+) -> bool {
+    if envelopes.is_empty() {
+        return false;
+    }
+    let recip = recipient.to_string();
+    let ready = onion_rt_mailbox_hops(dest, swarm.connected_peers().copied()).is_some();
+    let connected = swarm.is_connected(&dest);
+    let mut queued = Vec::new();
+    for env in envelopes {
+        let packet = V1Packet::OfflineMailboxStore {
+            recipient: recip.clone(),
+            envelopes: vec![env.clone()],
+        };
+        if ready || connected {
+            if let Some(rid) = send_v1_to_peer(swarm, dest, packet.clone()) {
+                track_mailbox_rr(
+                    rid,
+                    store_track,
+                    handoff,
+                    recipient,
+                    env.message_id.clone(),
+                );
+                continue;
+            }
+            if connected {
+                let rid = rr_send(swarm, &dest, packet);
+                track_mailbox_rr(
+                    rid,
+                    store_track,
+                    handoff,
+                    recipient,
+                    env.message_id.clone(),
+                );
+                continue;
+            }
+        }
+        queued.push(env.clone());
+    }
+    if queued.is_empty() {
+        return false;
+    }
+    pending_relay.enqueue(dest, recipient, queued);
+    if let Some(h) = handoff {
+        pending_relay_gates.insert((dest, recipient), h.clone());
+    }
+    true
+}
+
 fn fanout_relay_to_bootstraps(
     swarm: &mut libp2p::Swarm<ChatBehaviour>,
     bootstrap_peer_ids: &HashSet<PeerId>,
@@ -2389,38 +2590,30 @@ fn fanout_relay_to_bootstraps(
     if envelopes.is_empty() {
         return;
     }
-    let recip = recipient.to_string();
     for pid in bootstrap_peer_ids {
         if *pid == local_peer_id || *pid == recipient {
             continue;
         }
-        if swarm.is_connected(pid) {
-            for env in envelopes {
-                let packet = V1Packet::OfflineMailboxStore {
-                    recipient: recip.clone(),
-                    envelopes: vec![env.clone()],
-                };
-                let rid = swarm
-                    .behaviour_mut()
-                    .request_response
-                    .send_request(pid, wire_out(pid, packet));
-                if let Some(h) = handoff {
-                    store_track.insert(rid, (h.clone(), recipient, env.message_id.clone()));
-                }
-            }
-        } else {
-            let addrs: Vec<Multiaddr> = void_bootstraps
-                .iter()
-                .filter(|ma| peer_id_from_multiaddr(ma) == Some(*pid))
-                .cloned()
-                .collect();
-            if !addrs.is_empty() {
-                pending_relay.enqueue(*pid, recipient, envelopes.to_vec());
-                if let Some(h) = handoff {
-                    pending_relay_gates.insert((*pid, recipient), h.clone());
-                }
-                dial_bootstrap_direct(swarm, *pid, addrs);
-            }
+        let queued = dispatch_mailbox_stores(
+            swarm,
+            *pid,
+            recipient,
+            envelopes,
+            pending_relay,
+            pending_relay_gates,
+            store_track,
+            handoff,
+        );
+        if !queued {
+            continue;
+        }
+        let addrs: Vec<Multiaddr> = void_bootstraps
+            .iter()
+            .filter(|ma| peer_id_from_multiaddr(ma) == Some(*pid))
+            .cloned()
+            .collect();
+        if !addrs.is_empty() {
+            dial_bootstrap_direct(swarm, *pid, addrs);
         }
     }
 }
@@ -2543,21 +2736,16 @@ fn flush_pending_relay_for_peer(
 ) {
     for (recipient, envelopes) in pending_relay.take_for(&peer) {
         let handoff = pending_relay_gates.remove(&(peer, recipient));
-        let recip = recipient.to_string();
-        for env in envelopes {
-            let mid = env.message_id.clone();
-            let packet = V1Packet::OfflineMailboxStore {
-                recipient: recip.clone(),
-                envelopes: vec![env],
-            };
-            let rid = swarm
-                .behaviour_mut()
-                .request_response
-                .send_request(&peer, wire_out(&peer, packet));
-            if let Some(ref h) = handoff {
-                store_track.insert(rid, (h.clone(), recipient, mid));
-            }
-        }
+        let _ = dispatch_mailbox_stores(
+            swarm,
+            peer,
+            recipient,
+            &envelopes,
+            pending_relay,
+            pending_relay_gates,
+            store_track,
+            &handoff,
+        );
     }
 }
 
@@ -2566,14 +2754,14 @@ fn query_relay_mailbox(
     local_peer_id: PeerId,
     bootstrap_peer_ids: &HashSet<PeerId>,
     last_query_at: &mut Option<Instant>,
+    pending_challenges: &mut HashSet<libp2p::request_response::OutboundRequestId>,
 ) -> bool {
     const MIN_GAP: Duration = Duration::from_millis(750);
     if last_query_at.is_some_and(|t| t.elapsed() < MIN_GAP) {
         return false;
     }
-    let packet = V1Packet::OfflineMailboxQuery {
-        recipient: local_peer_id.to_string(),
-    };
+    // Шаг 1. Подписанный Query уходит, когда нода вернёт nonce.
+    // Если до bootstrap есть entry, challenge идёт onion-ячейкой, не прямым dial.
     let boot: Vec<PeerId> = swarm
         .connected_peers()
         .copied()
@@ -2592,11 +2780,23 @@ fn query_relay_mailbox(
         return false;
     }
     *last_query_at = Some(Instant::now());
+    let packet = V1Packet::MailboxChallengeRequest {
+        recipient: local_peer_id.to_string(),
+    };
     for peer in peers {
-        let _ = swarm
-            .behaviour_mut()
-            .request_response
-            .send_request(&peer, wire_out(&peer, packet.clone()));
+        let ready = onion_rt_mailbox_hops(peer, swarm.connected_peers().copied()).is_some();
+        if ready {
+            if let Some(rid) = send_v1_to_peer(swarm, peer, packet.clone()) {
+                if let Some(token) = mailbox_onion_rr_token(&rid) {
+                    mailbox_onion_insert(token, MailboxOnionWait::Challenge { dest: peer });
+                } else {
+                    pending_challenges.insert(rid);
+                }
+                continue;
+            }
+        }
+        let rid = rr_send(swarm, &peer, packet.clone());
+        pending_challenges.insert(rid);
     }
     true
 }
@@ -2607,9 +2807,16 @@ fn query_relay_mailbox_with_bootstraps(
     bootstrap_peer_ids: &HashSet<PeerId>,
     void_bootstraps: &[Multiaddr],
     last_query_at: &mut Option<Instant>,
+    pending_challenges: &mut HashSet<libp2p::request_response::OutboundRequestId>,
 ) -> bool {
     dial_missing_bootstraps(swarm, bootstrap_peer_ids, void_bootstraps);
-    query_relay_mailbox(swarm, local_peer_id, bootstrap_peer_ids, last_query_at)
+    query_relay_mailbox(
+        swarm,
+        local_peer_id,
+        bootstrap_peer_ids,
+        last_query_at,
+        pending_challenges,
+    )
 }
 
 async fn remember_peer_prekey(
@@ -2824,6 +3031,34 @@ fn send_v1_to_peer(
     dest: PeerId,
     packet: V1Packet,
 ) -> Option<libp2p::request_response::OutboundRequestId> {
+    if is_mailbox_onion_packet(&packet) {
+        if let Some((hops, local)) = onion_rt_mailbox_hops(dest, swarm.connected_peers().copied())
+        {
+            let mut token = [0u8; 16];
+            rand::thread_rng().fill_bytes(&mut token);
+            if let Some(onion) = wrap_mailbox_onion(&hops, dest, &packet, token, local) {
+                let first = hops[0].0;
+                debug!(
+                    "🧅 mailbox onion {} hop(s) → {} via {}",
+                    hops.len(),
+                    &dest.to_string()[..8.min(dest.to_string().len())],
+                    &first.to_string()[..8.min(first.to_string().len())]
+                );
+                let hop_ids: Vec<PeerId> = hops.iter().map(|(peer, _)| *peer).collect();
+                onion_rt_note("out", dest, &hop_ids);
+                let req_id = rr_send(swarm, &first, onion);
+                onion_mark_outbound(req_id);
+                mailbox_onion_bind_rr(req_id, token);
+                return Some(req_id);
+            }
+            warn!(
+                "VOID: mailbox onion к {} не влез в бакет",
+                &dest.to_string()[..8.min(dest.to_string().len())]
+            );
+            onion_rt_note("blocked", dest, &[]);
+            return None;
+        }
+    }
     let dest_connected = swarm.is_connected(&dest);
     let may_onion = packet_may_use_onion(&packet);
     // Крупные Encrypted (file/voice чанки) по живому каналу — без onion (раздувание JSON).
@@ -2865,6 +3100,60 @@ fn send_v1_to_peer(
         onion_rt_note("direct", dest, &[]);
     }
     Some(rr_send(swarm, &dest, packet))
+}
+
+enum MailboxOnionIn {
+    NotMailbox,
+    Handled,
+    Deliver(Vec<OfflineEnvelope>),
+}
+
+fn settle_mailbox_onion_plain(
+    swarm: &mut libp2p::Swarm<ChatBehaviour>,
+    local_key: &libp2p::identity::Keypair,
+    local_peer_id: PeerId,
+    plain: &[u8],
+) -> MailboxOnionIn {
+    let Some((packet, route)) = decode_v2_mailbox(plain) else {
+        return MailboxOnionIn::NotMailbox;
+    };
+    let Some(wait) = mailbox_onion_take_token(&route.token) else {
+        return MailboxOnionIn::Handled;
+    };
+    match (wait, packet) {
+        (MailboxOnionWait::Store { handoff, message_id }, V1Packet::Ack) => {
+            handoff.note_store_ack(&message_id);
+            MailboxOnionIn::Handled
+        }
+        (MailboxOnionWait::Store { handoff, .. }, _) => {
+            handoff.note_fail();
+            MailboxOnionIn::Handled
+        }
+        (
+            MailboxOnionWait::Challenge { dest },
+            V1Packet::MailboxChallenge { nonce, ts },
+        ) => {
+            if let Some(sig) = sign_mailbox_query(local_key, &local_peer_id, ts, &nonce) {
+                let query = V1Packet::OfflineMailboxQuery {
+                    recipient: local_peer_id.to_string(),
+                    ts,
+                    nonce,
+                    sig,
+                };
+                if let Some(rid) = send_v1_to_peer(swarm, dest, query) {
+                    if let Some(token) = mailbox_onion_rr_token(&rid) {
+                        mailbox_onion_insert(token, MailboxOnionWait::Query);
+                    }
+                }
+            }
+            MailboxOnionIn::Handled
+        }
+        (
+            MailboxOnionWait::Query,
+            V1Packet::OfflineMailboxDeliver { envelopes },
+        ) if !envelopes.is_empty() => MailboxOnionIn::Deliver(envelopes),
+        _ => MailboxOnionIn::Handled,
+    }
 }
 
 fn rr_reply(
@@ -3798,6 +4087,10 @@ pub async fn run_chat_network(
         > = HashMap::new();
         let mut outbound_mailbox_stores: MailboxStoreTrack = HashMap::new();
         let mut outbound_prekey_gets: OutboundPrekeyGets = HashMap::new();
+        let mut pending_mailbox_challenges: HashSet<
+            libp2p::request_response::OutboundRequestId,
+        > = HashSet::new();
+        let mut lan_mailbox_challenges = ChallengeBook::new();
         let mut pending_relay = PendingRelayQueue::default();
         let mut pending_relay_gates: HashMap<(PeerId, PeerId), Arc<ActiveHandoff>> = HashMap::new();
         let mut dial_backoff: HashMap<PeerId, Instant> = HashMap::new();
@@ -3874,6 +4167,7 @@ pub async fn run_chat_network(
                                 &bootstrap_peer_ids,
                                 &void_bootstraps,
                                 &mut last_mailbox_query_at,
+                                &mut pending_mailbox_challenges,
                             );
                             if sent {
                                 mailbox_fetch_attempts =
@@ -5499,6 +5793,7 @@ pub async fn run_chat_network(
                                     local_peer_id,
                                     &bootstrap_peer_ids,
                                     &mut last_mailbox_query_at,
+                                    &mut pending_mailbox_challenges,
                                 );
                             }
                             UICommand::PublishOfflineOutbox { items, ack } => {
@@ -5926,7 +6221,7 @@ pub async fn run_chat_network(
                                             let from_hop = identified_onion_hops.contains(&peer)
                                                 && bootstrap_peer_ids.contains(&peer)
                                                 && onion_keys.contains_key(&peer);
-                                            let opened = from_hop
+                                            let opened_plain = from_hop
                                                 .then(|| crate::onion::b64_decode(&body_b64))
                                                 .flatten()
                                                 .and_then(|body| {
@@ -5935,8 +6230,8 @@ pub async fn run_chat_network(
                                                     )?;
                                                     let seal = crate::onion::deliver_bytes(&body)?;
                                                     crate::onion::open_deliver(&sk, seal).ok()
-                                                })
-                                                .and_then(|plain| decode_v2_mail(&plain));
+                                                });
+                                            let opened = opened_plain.as_deref().and_then(decode_v2_mail);
                                             match opened {
                                                 Some(V2Mail::Directed { from, packet })
                                                     if from != local_peer_id
@@ -5975,6 +6270,31 @@ pub async fn run_chat_network(
                                                             };
                                                         }
                                                     }
+                                                }
+                                                Some(V2Mail::Mailbox { .. }) => {
+                                                    if let Some(plain) = opened_plain.as_deref() {
+                                                        match settle_mailbox_onion_plain(
+                                                            &mut swarm,
+                                                            &local_key,
+                                                            local_peer_id,
+                                                            plain,
+                                                        ) {
+                                                            MailboxOnionIn::Deliver(envelopes) => {
+                                                                let _ = event_tx
+                                                                    .send(NetworkEvent::OfflineMailbox(
+                                                                        envelopes,
+                                                                    ))
+                                                                    .await;
+                                                                fetch_mailbox_after = Some(
+                                                                    Instant::now()
+                                                                        + Duration::from_millis(500),
+                                                                );
+                                                            }
+                                                            MailboxOnionIn::NotMailbox
+                                                            | MailboxOnionIn::Handled => {}
+                                                        }
+                                                    }
+                                                    request = V1Packet::Ack;
                                                 }
                                                 _ => {
                                                     warn!(
@@ -6178,13 +6498,49 @@ pub async fn run_chat_network(
                                                 );
                                             }
                                         }
-                                        V1Packet::OfflineMailboxQuery { recipient } => {
-                                            // Выдача удаляет почту: только сам получатель
-                                            // (PeerId соединения подтверждён Noise).
+                                        V1Packet::MailboxChallengeRequest { recipient } => {
+                                            let response = match recipient.parse::<PeerId>() {
+                                                Ok(id) => {
+                                                    let (nonce, ts) = lan_mailbox_challenges
+                                                        .issue(id, mailbox_query_now());
+                                                    V1Packet::MailboxChallenge { nonce, ts }
+                                                }
+                                                Err(_) => V1Packet::Ack,
+                                            };
+                                            rr_reply(
+                                                &mut swarm,
+                                                &mut channel,
+                                                onion_reply,
+                                                response,
+                                            );
+                                        }
+                                        V1Packet::MailboxChallenge { .. } => {
+                                            rr_reply(
+                                                &mut swarm,
+                                                &mut channel,
+                                                onion_reply,
+                                                V1Packet::Ack,
+                                            );
+                                        }
+                                        V1Packet::OfflineMailboxQuery {
+                                            recipient,
+                                            ts,
+                                            nonce,
+                                            sig,
+                                        } => {
+                                            // Выдача удаляет почту. Подпись получателя,
+                                            // не PeerId TCP: через onion exit — чужой.
                                             // Порциями: иначе один Deliver со всеми
                                             // voice_chunk не влезает в лимит JSON response.
-                                            let own = onion_reply.is_none()
-                                                && recipient.parse::<PeerId>().ok() == Some(peer);
+                                            let own = recipient.parse::<PeerId>().ok().is_some_and(|id| {
+                                                lan_mailbox_challenges.authorize(
+                                                    &id,
+                                                    ts,
+                                                    &nonce,
+                                                    &sig,
+                                                    mailbox_query_now(),
+                                                )
+                                            });
                                             let envs = if own {
                                                 RelayMailbox::take_batch(
                                                     &mut relay_mail_store,
@@ -7051,6 +7407,8 @@ pub async fn run_chat_network(
                                         }
                                     }
                                     let response = response.packet;
+                                    let mailbox_challenge =
+                                        pending_mailbox_challenges.remove(&request_id);
                                     let hop_only = onion_take_outbound(&request_id);
                                     if !matches!(response, V1Packet::Ack) {
                                         // Нода отказала (квота / частота): не Ack — не сдано.
@@ -7096,8 +7454,15 @@ pub async fn run_chat_network(
                                                     );
                                                 }
                                                 let _ = outbound_delete_requests.remove(&request_id);
-                                            }
-                                            if let Some((handoff, _recip, message_id)) =
+                                                mailbox_onion_forget_rr(&request_id);
+                                                if outbound_mailbox_stores.remove(&request_id).is_some()
+                                                {
+                                                    debug!(
+                                                        "[{}] onion hop Ack — не сдача офлайн-конверта",
+                                                        now
+                                                    );
+                                                }
+                                            } else if let Some((handoff, _recip, message_id)) =
                                                 outbound_mailbox_stores.remove(&request_id)
                                             {
                                                 debug!(
@@ -7731,9 +8096,28 @@ pub async fn run_chat_network(
                                                 }
                                             }
                                         }
+                                        V1Packet::MailboxChallenge { nonce, ts } => {
+                                            if mailbox_challenge {
+                                                if let Some(sig) = sign_mailbox_query(
+                                                    &local_key,
+                                                    &local_peer_id,
+                                                    ts,
+                                                    &nonce,
+                                                ) {
+                                                    let packet = V1Packet::OfflineMailboxQuery {
+                                                        recipient: local_peer_id.to_string(),
+                                                        ts,
+                                                        nonce,
+                                                        sig,
+                                                    };
+                                                    rr_send(&mut swarm, &peer, packet);
+                                                }
+                                            }
+                                        }
                                         V1Packet::BootstrapGossip { .. } => {}
                                         V1Packet::DialBack { .. } => {}
-                                        V1Packet::OfflineMailboxStore { .. }
+                                        V1Packet::MailboxChallengeRequest { .. }
+                                        | V1Packet::OfflineMailboxStore { .. }
                                         | V1Packet::OfflineMailboxQuery { .. }
                                         | V1Packet::PrekeyPut { .. }
                                         | V1Packet::PrekeyGet { .. } => {}
@@ -7750,8 +8134,22 @@ pub async fn run_chat_network(
                             // без этого он считался «отправленным» навсегда, и получатель
                             // никогда не собирал файл целиком. Перематываем next_chunk назад,
                             // чтобы chunk_tick повторил отправку именно этого чанка.
-                            let mail_store = outbound_mailbox_stores.remove(&request_id);
+                            let onion_hit = mailbox_onion_take_rr(&request_id);
+                            let mut onion_control = false;
+                            let mail_store = outbound_mailbox_stores.remove(&request_id).or_else(|| {
+                                match onion_hit {
+                                    Some(MailboxOnionWait::Store { handoff, message_id }) => {
+                                        Some((handoff, local_peer_id, message_id))
+                                    }
+                                    Some(_) => {
+                                        onion_control = true;
+                                        None
+                                    }
+                                    None => None,
+                                }
+                            });
                             let _ = outbound_prekey_gets.remove(&request_id);
+                            let _ = pending_mailbox_challenges.remove(&request_id);
                             let _ = onion_take_outbound(&request_id);
                             let was_chunk = outbound_chunk_requests.remove(&request_id);
                             if let Some((_, tid, chunk_idx)) = was_chunk {
@@ -7884,13 +8282,14 @@ pub async fn run_chat_network(
                                             .any(|(g, _, _)| Arc::ptr_eq(g, &handoff))
                                             || pending_relay_gates
                                                 .values()
-                                                .any(|g| Arc::ptr_eq(g, &handoff));
+                                                .any(|g| Arc::ptr_eq(g, &handoff))
+                                            || mailbox_onion_has_handoff(&handoff);
                                         if !still {
                                             handoff.note_fail();
                                         }
                                     }
                                 }
-                            } else {
+                            } else if !onion_control {
                                 match error {
                                     libp2p::request_response::OutboundFailure::DialFailure => {
                                         if !is_dup {
@@ -9842,5 +10241,44 @@ mod hop_listen_tests {
         let a: Multiaddr = "/ip4/147.78.64.22/tcp/4001/p2p-circuit".parse().unwrap();
         assert!(is_circuit_addr(&a));
         assert!(relay_peer_id_from_circuit_addr(&a).is_none());
+    }
+}
+
+#[cfg(test)]
+mod mailbox_onion_path_tests {
+    use super::*;
+    use libp2p::identity::Keypair;
+
+    fn desc(pk: [u8; 32]) -> crate::onion::HopDesc {
+        crate::onion::HopDesc {
+            pk,
+            epoch: 1,
+            not_after: unix_now() + 3600,
+            operator: String::new(),
+            sig2: Vec::new(),
+        }
+    }
+
+    #[test]
+    fn mailbox_path_dials_entry_not_the_mailbox() {
+        let local = Keypair::generate_ed25519().public().to_peer_id();
+        let entry = Keypair::generate_ed25519().public().to_peer_id();
+        let mailbox = Keypair::generate_ed25519().public().to_peer_id();
+        let entry_pk = [3u8; 32];
+        let mail_pk = [4u8; 32];
+        let mut keys = HashMap::new();
+        keys.insert(entry, entry_pk);
+        keys.insert(mailbox, mail_pk);
+        let mut boots = HashSet::new();
+        boots.insert(entry);
+        boots.insert(mailbox);
+        onion_rt_set_keys(keys, boots, local);
+        onion_rt_put_desc(entry, desc(entry_pk));
+        onion_rt_put_desc(mailbox, desc(mail_pk));
+        let (hops, _) = onion_rt_mailbox_hops(mailbox, std::iter::once(entry)).expect("path");
+        assert_eq!(hops[0].0, entry);
+        assert_ne!(hops[0].0, mailbox);
+        assert_eq!(hops.last().map(|(peer, _)| *peer), Some(mailbox));
+        assert!(onion_rt_mailbox_hops(mailbox, std::iter::once(mailbox)).is_none());
     }
 }

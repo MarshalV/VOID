@@ -50,7 +50,7 @@ The main desktop is **Tauri 2** (`frontend/` + `src-tauri/`). Optionally a nativ
 - **Vault** — nickname, keys, contacts, groups in `vault.bin`; master key in `void.key`. Journal — `chat_journal.bin`, undelivered — `outbox.bin`.
 - **Delivery** — ○ / ✓ / ✓✓; read receipt when the chat is open.
 - **Beacon** — closing the window hides to tray; the process stays up. UI header uses `Image_programm.png`.
-- **Onion** — `VOID_ONION_v2` when every hop has a fresh descriptor, otherwise `VOID_ONION_v1`. 1 live node → 1 hop, 2 → both, 3+ → up to three. The live path is shown in settings. A v2 exit does not see the sender; one node or two hops still link the path — see [onion](#onion-void_onion_v2).
+- **Onion** — `VOID_ONION_v2` when every hop has a fresh descriptor, otherwise `VOID_ONION_v1`. 1 live node → 1 hop, 2 → both, 3+ → up to three. The live path is shown in settings. A v2 exit does not see the sender of Hello or Encrypted. A mailbox cell has no sender field; the reply address is inside the seal so the exit can return the handoff Ack. One node or two hops still link the path — see [onion](#onion-void_onion_v2).
 
 ---
 
@@ -184,7 +184,7 @@ Kademlia `start_providing` — after Identify with a chat peer (not bootstrap). 
 | E2EE Hello | on `ConnectionEstablished` with a contact (not bootstrap) |
 | Outbound retry | `RESEND_GRACE` 1 s, exponential up to 300 s |
 | Group voice | fan-out + retry `SendGroupMessage` (~8 s) until the WAV is gone |
-| Undelivered | `outbox.bin` → `OfflineMailboxStore` on bootstrap (node Ack = handoff; node refusal — the letter stays in `outbox.bin`) |
+| Undelivered | `outbox.bin` → `OfflineMailboxStore` on bootstrap. A direct node Ack is handoff. Over onion the entry hop Ack is not: handoff is the Ack that comes back inside the return cell. A refusal leaves the letter in `outbox.bin` |
 | Offline mailbox | Query bootstrap after Hop; at most ~750 ms; remainder of a batch ~500 ms later |
 
 ### Finding a peer
@@ -214,7 +214,8 @@ In the connect field: `multiaddr`, `IP`, or `IP:PORT`. A bootstrap in the seed l
 | `Hello` | X25519 + identity signature. Current clients sign bind v3: `ts`, `nonce`, and `caps` (±10 min). A session opens only when that signature is v3 and `caps` bit `1` (`HELLO_CAP_HEADER_AAD`) is set, on a direct path and over onion. Bit `2` (`HELLO_CAP_CBOR`) is the CBOR announcement; it does not open a session by itself. v1 and v2 may verify and do not create a session. A repeated ephemeral is rejected (last 256 per PeerId) and does not reset a live session. A Hello with `ts == 0` does not replace one either |
 | `Encrypted` | Double Ratchet |
 | `Ack` | RR reply / empty mailbox / node accepted the letter |
-| `OfflineMailboxStore` / `Query` / `Deliver` | offline mail on bootstrap; `Query` runs only for own PeerId; empty `Deliver` in reply to `Store` is a refusal |
+| `MailboxChallengeRequest` / `MailboxChallenge` | one-time nonce and `ts` before a mailbox fetch |
+| `OfflineMailboxStore` / `Query` / `Deliver` | offline mail on bootstrap. `Query` echoes the nonce and carries the recipient's Ed25519 signature (`VOID_MAILBOX_QUERY_v1`); the TCP PeerId is not enough. Empty `Deliver` in reply to `Store` is a refusal. When the bootstrap has an onion key and another live hop can be the entry, Store, Query, and the challenge frames go inside a v2 cell. The client dials that entry. One envelope per cell |
 | `PrekeyPut` / `Get` / `Offer` | Rotating X25519 prekey: `{public_key, not_after, sig}`. The node stores a put only from the Noise peer who owns the PeerId, with a valid signature and `not_after` within 30 days. An offer is used for seal only when that signature and expiry check out. An unsolicited `Offer` is ignored |
 | `BootstrapGossip` | seed exchange |
 | `DialBack` | “dial me over circuit” |
@@ -262,10 +263,10 @@ Leaking the libp2p identity still opens letters that were sealed to it. Letters 
 
 ### Offline mail
 
-The live path is **not DHT**, it is RR to bootstrap:
+The live path is **not DHT**. It is RR to bootstrap, or a v2 cell when that bootstrap has an onion key and some other connected hop can be the entry. The client then dials the entry only. The entry hop Ack is not handoff.
 
-1. Recipient offline → their prekey, or the PeerId key if none is published → `OfflineMailboxStore`. The node replies `Ack` if it stored; empty `Deliver` is a quota, rate, or mailbox-ceiling refusal — the letter stays queued and will retry later.
-2. Recipient online → `OfflineMailboxQuery`; the node returns a batch (`take_batch` ≤ 512 KiB plaintext) and **deletes** it from `relay_mailbox.bin`. Mail is given only to the recipient: the connection PeerId must match `recipient`.
+1. Recipient offline → their prekey, or the PeerId key if none is published → `OfflineMailboxStore` (one envelope per cell). The node replies `Ack` if it stored; over onion that Ack comes back on the reply path inside the seal. Empty `Deliver` is a quota, rate, or mailbox-ceiling refusal — the letter stays queued and will retry later.
+2. Recipient online → `MailboxChallengeRequest`, then `OfflineMailboxQuery` echoing `nonce` and `ts` with an Ed25519 signature of the recipient PeerId (`VOID_MAILBOX_QUERY_v1`). The node returns a batch (`take_batch` ≤ 512 KiB plaintext) and **deletes** it from `relay_mailbox.bin`. A return cell carries as many envelopes as fit in the 64 KiB bucket; the rest stays for the next Query. The TCP PeerId is not the check: an onion exit is a different peer. A bad signature, a replayed nonce, or a `ts` outside ±2 minutes leaves the mail in place.
 3. The client fetches the rest with the next Query, with a pause (no immediate re-query: otherwise the same batch spins hundreds of times per second and chokes Hop).
 
 Node limits: at most 4096 mailboxes (a new slot past that is refused), envelope lifetime 7 days, up to 256 envelopes / 8 MiB from one sender in one mailbox, `Store` at most 600 requests, 600 envelopes, and 48 MiB per minute per peer.
@@ -471,7 +472,7 @@ Your own bootstrap/relay nodes speed up discovery and NAT.
 | **Circuit Relay v2** | Hop for clients behind NAT; opaque circuit bytes |
 | **Offline mail / prekey** | Store/query on `/void/chat`; delivery **only to the mailbox owner**, in batches with deletion (`take_batch`). `relay_mailbox.bin` is encrypted. At most 4096 mailboxes, TTL 7 days, per-uploader quotas, refusal via empty `Deliver`. `PrekeyPut` is stored only with the owner’s signature and an expiry within 30 days. Kademlia `put` keeps a signed unexpired prekey or a v3 mailbox and drops anything else |
 | **VOID-SEED** | `/void-seed/v1` on a separate TCP — list exchange **between nodes** |
-| **Onion hop** | Identify `void-bootstrap-node/…;onion=<pk>;osig=…;epoch=…;until=…;op=…;osig2=…;cbor=1`. Unwrap v2 (fixed cell) or v1 (JSON inside the cell) and forward only after the next hop’s Identify. The outer `/void/chat` frame is CBOR only when that next hop announced it. The hop key rotates weekly; the previous secret lasts one more day. `next` is a PeerId. Forward is limited to 600/min per previous hop and 6000/min overall. Logs do not record `next` or `src` |
+| **Onion hop** | Identify `void-bootstrap-node/…;onion=<pk>;osig=…;epoch=…;until=…;op=…;osig2=…;cbor=1`. Unwrap v2 (fixed cell) or v1 (JSON inside the cell) and forward. When the peeled `next` is this node and the seal is a mailbox frame, file `Store` by `recipient` and answer `Query` by the same signature as a direct request. The hop Ack is not handoff; the handoff Ack is a new cell on the reply path. The outer `/void/chat` frame is CBOR only when that next hop announced it. The hop key rotates weekly; the previous secret lasts one more day. `next` is a PeerId. Forward is limited to 600/min per previous hop and 6000/min overall. Logs do not record `next` or `src` |
 
 Live `V1Packet::Encrypted` is **not** forwarded as a chat server. Circuit and mailbox are separate paths. Onion is another: the node sees the next hop, not plaintext.
 
