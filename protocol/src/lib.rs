@@ -20,10 +20,12 @@ pub mod offline_mail {
     pub use void_envelope::offline_mail::*;
     pub use void_kad_rules::dht_record_allowed;
 
-    pub use crate::record_keys::{mailbox_record_key, prekey_record_key};
+    pub use crate::record_keys::{mailbox_record_key, opk_record_key, prekey_record_key};
 }
 
 pub mod onion;
+
+pub mod queue_mail;
 
 pub mod protocol {
     pub use void_frames::protocol::*;

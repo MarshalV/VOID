@@ -14,7 +14,8 @@ pub use void_session::mailbox_query::{
 
 pub use void_session::hello::{
     hello_bind_ok, verify_hello_transport_binding, void_hello_signing_public_key,
-    void_peer_transport_public_key, HelloBind, HELLO_CAP_CBOR, HELLO_CAP_HEADER_AAD, HELLO_CAPS,
+    void_peer_transport_public_key, HelloBind, HELLO_CAP_CBOR, HELLO_CAP_HEADER_AAD, HELLO_CAP_QUEUES,
+    HELLO_CAPS,
     HELLO_FRESHNESS_SECS,
 };
 
@@ -193,6 +194,14 @@ struct GroupDeleteCommand {
     group_id: String,
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct QueueGrantCommand {
+    kind: String,
+    queue_id: [u8; 32],
+    write_token: [u8; 32],
+    expiry: u64,
+}
+
 pub enum DecryptedChatFrame {
     Message(ChatMessage),
     Delete {
@@ -226,6 +235,12 @@ pub enum DecryptedChatFrame {
     VoiceAck {
         transfer_id: String,
         ok: bool,
+    },
+    /// Секрет записи в очередь контакта. В ленту чата не попадает.
+    QueueGrant {
+        queue_id: [u8; 32],
+        write_token: [u8; 32],
+        expiry: u64,
     },
 }
 
@@ -436,7 +451,37 @@ pub fn parse_decrypted_chat_frame(plaintext: &[u8]) -> Option<DecryptedChatFrame
             });
         }
     }
+    if let Ok(cmd) = serde_json::from_slice::<QueueGrantCommand>(plaintext) {
+        if cmd.kind == "queue_grant"
+            && cmd.queue_id != [0u8; 32]
+            && cmd.write_token != [0u8; 32]
+            && cmd.expiry > 0
+        {
+            return Some(DecryptedChatFrame::QueueGrant {
+                queue_id: cmd.queue_id,
+                write_token: cmd.write_token,
+                expiry: cmd.expiry,
+            });
+        }
+    }
     parse_decrypted_chat_json(plaintext).map(DecryptedChatFrame::Message)
+}
+
+pub fn build_queue_grant_json(
+    queue_id: [u8; 32],
+    write_token: [u8; 32],
+    expiry: u64,
+) -> Option<Vec<u8>> {
+    if queue_id == [0u8; 32] || write_token == [0u8; 32] || expiry == 0 {
+        return None;
+    }
+    serde_json::to_vec(&QueueGrantCommand {
+        kind: "queue_grant".into(),
+        queue_id,
+        write_token,
+        expiry,
+    })
+    .ok()
 }
 
 pub fn build_group_leave_json(group_id: &str, peer_id: &str) -> Option<Vec<u8>> {
@@ -717,6 +762,9 @@ pub enum V1Packet {
         /// Подпись identity над `VOID_PREKEY_SIG_V2`.
         #[serde(default, with = "serde_bytes")]
         sig: Vec<u8>,
+        /// Пачка одноразовых ключей. Пустой список — старый клиент, печатать нечем.
+        #[serde(default)]
+        opks: Vec<void_envelope::offline_mail::OneTimePrekey>,
     },
     /// Запросить prekey контакта у bootstrap.
     PrekeyGet {
@@ -730,6 +778,9 @@ pub enum V1Packet {
         not_after: u64,
         #[serde(default, with = "serde_bytes")]
         sig: Vec<u8>,
+        /// Один одноразовый ключ. Нода уже вычеркнула его из своего набора.
+        #[serde(default)]
+        opk: Option<void_envelope::offline_mail::OneTimePrekey>,
     },
     Encrypted {
         header: crypto::MessageHeader,
@@ -755,6 +806,40 @@ pub enum V1Packet {
     /// Тело после exit. Отправителя нет: печать на identity получателя.
     OnionDeliver {
         body_b64: String,
+    },
+    /// Зарегистрировать очередь. PeerId получателя в кадре нет.
+    CreateQueue {
+        queue_id: [u8; 32],
+        #[serde(with = "serde_bytes")]
+        owner_pk: Vec<u8>,
+        write_token: [u8; 32],
+        expiry: u64,
+        #[serde(with = "serde_bytes")]
+        sig: Vec<u8>,
+    },
+    /// Положить один конверт в очередь. Снаружи только `queue_id` и бакет.
+    QueueStore {
+        queue_id: [u8; 32],
+        proof: [u8; 32],
+        #[serde(with = "serde_bytes")]
+        blob: Vec<u8>,
+    },
+    QueueChallengeRequest {
+        queue_id: [u8; 32],
+    },
+    QueueChallenge {
+        nonce: [u8; 32],
+        ts: u64,
+    },
+    QueueQuery {
+        queue_id: [u8; 32],
+        ts: u64,
+        nonce: [u8; 32],
+        #[serde(with = "serde_bytes")]
+        sig: Vec<u8>,
+    },
+    QueueDeliver {
+        blobs: Vec<Vec<u8>>,
     },
     Ack,
 }

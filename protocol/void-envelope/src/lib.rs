@@ -5,3 +5,4 @@
 //! not on libp2p Kademlia.
 
 pub mod offline_mail;
+pub mod queue_mail;

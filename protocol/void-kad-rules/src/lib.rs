@@ -6,7 +6,7 @@
 
 use void_envelope::offline_mail::{
     mailbox_value_is_v3, peer_id_from_bytes, prekey_is_sealable, prekey_unix_now,
-    verify_signed_prekey, MAILBOX_PREFIX, PREKEY_PREFIX,
+    decode_opk_bundle, verify_signed_prekey, MAILBOX_PREFIX, OPK_PREFIX, PREKEY_PREFIX,
 };
 
 /// Запись, которую Kademlia имеет право положить в локальный store.
@@ -18,6 +18,12 @@ pub fn dht_record_allowed(key: &[u8], value: &[u8]) -> bool {
         };
         return verify_signed_prekey(&owner, value)
             .is_some_and(|pk| prekey_is_sealable(pk, prekey_unix_now()));
+    }
+    if let Some(rest) = key.strip_prefix(OPK_PREFIX) {
+        let Some(owner) = peer_id_from_bytes(rest) else {
+            return false;
+        };
+        return decode_opk_bundle(&owner, value).is_some();
     }
     if let Some(rest) = key.strip_prefix(MAILBOX_PREFIX) {
         if peer_id_from_bytes(rest).is_none() {

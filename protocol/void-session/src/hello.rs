@@ -226,7 +226,9 @@ pub fn sign_hello_transport_binding(
 pub const HELLO_CAP_HEADER_AAD: u32 = 1;
 /// Кадр `/void/chat/1.0.0` можно писать CBOR. Пока бит не стоит у обеих сторон — JSON.
 pub const HELLO_CAP_CBOR: u32 = 2;
-pub const HELLO_CAPS: u32 = HELLO_CAP_HEADER_AAD | HELLO_CAP_CBOR;
+/// Офлайн-почта идёт в очередь `queue_id`, не в слот PeerId. Нет бита — старый ящик.
+pub const HELLO_CAP_QUEUES: u32 = 4;
+pub const HELLO_CAPS: u32 = HELLO_CAP_HEADER_AAD | HELLO_CAP_CBOR | HELLO_CAP_QUEUES;
 
 #[cfg(test)]
 mod tests {

@@ -29,9 +29,9 @@ use crate::shared_chat::SharedChatMessages;
 use crate::crypto;
 use crate::file_transfer;
 use crate::offline_mail::{
-    decode_mailbox, encode_mailbox, mailbox_record_key, offline_seal_key,
-    prekey_record_key, seal_for_recipient, verify_prekey_offer, verify_signed_prekey,
-    OfflineEnvelope,
+    decode_mailbox, decode_opk_bundle, encode_mailbox, encode_opk_bundle, mailbox_record_key,
+    opk_record_key, prekey_record_key, seal_material, seal_with_opk, verify_opk,
+    verify_prekey_offer, verify_signed_prekey, OfflineEnvelope, OneTimePrekey, SignedPrekey,
     MAILBOX_TTL_SECS,
 };
 use crate::relay_mailbox::RelayMailbox;
@@ -1705,6 +1705,11 @@ pub(crate) enum NetworkEvent {
     PeerPrekey { peer: PeerId, public_key: [u8; 32] },
     /// Офлайн-почта опубликована в DHT.
     OfflineMailboxPublished,
+    /// Секреты очереди контакта изменились — записать в vault.
+    ContactQueueUpdated {
+        peer: PeerId,
+        record: crate::queue_mail::ContactQueueRecord,
+    },
     /// Отправка файла отложена — нет E2EE-сессии с пиром.
     FileSendDeferred {
         recipient: PeerId,
@@ -2059,6 +2064,8 @@ pub(crate) enum UICommand {
     },
     /// Забрать свой почтовый ящик из DHT.
     FetchOfflineMailbox,
+    /// Очереди контактов из vault: наша очередь и грант собеседника.
+    CacheContactQueues(Vec<(PeerId, crate::queue_mail::ContactQueueRecord)>),
 }
 
 /// Элемент очереди для публикации в DHT-почту.
@@ -2070,6 +2077,17 @@ pub(crate) struct OfflineOutboxItem {
     pub payload: Vec<u8>,
 }
 
+struct OpkFetch {
+    recipient: PeerId,
+    items: Vec<OfflineOutboxItem>,
+    done: Option<PublishDone>,
+    spk: Option<SignedPrekey>,
+    opk: Option<OneTimePrekey>,
+    spk_done: bool,
+    opk_done: bool,
+    taken: bool,
+}
+
 enum MailboxKadOp {
     MergePut {
         recipient: PeerId,
@@ -2077,11 +2095,9 @@ enum MailboxKadOp {
         done: Option<PublishDone>,
         record_bytes: Option<Vec<u8>>,
     },
-    PrekeyForPublish {
-        recipient: PeerId,
-        items: Vec<OfflineOutboxItem>,
-        done: Option<PublishDone>,
-        prekey_bytes: Option<Vec<u8>>,
+    BundleHalf {
+        shared: Arc<Mutex<OpkFetch>>,
+        is_opk: bool,
     },
     /// Prefetch contact X25519 into peer_prekeys (for offline seal).
     CachePrekey {
@@ -2204,6 +2220,7 @@ fn publish_self_prekey(
     swarm: &mut libp2p::Swarm<ChatBehaviour>,
     local_peer_id: PeerId,
     published: &crate::offline_mail::PublishedPrekey,
+    opks: &[OneTimePrekey],
 ) {
     let ttl = published
         .not_after
@@ -2219,6 +2236,19 @@ fn publish_self_prekey(
         .behaviour_mut()
         .kad
         .put_record(record, kad::Quorum::One);
+    if !opks.is_empty() {
+        let opk_ttl = ttl;
+        let opk_record = kad::Record {
+            key: opk_record_key(local_peer_id),
+            value: encode_opk_bundle(opks),
+            publisher: Some(local_peer_id),
+            expires: Some(Instant::now() + Duration::from_secs(opk_ttl)),
+        };
+        let _ = swarm
+            .behaviour_mut()
+            .kad
+            .put_record(opk_record, kad::Quorum::One);
+    }
 }
 
 /// Put X25519 prekey on connected bootstrap nodes (offline seal without DHT/Hello).
@@ -2226,6 +2256,7 @@ fn publish_self_prekey_to_bootstraps(
     swarm: &mut libp2p::Swarm<ChatBehaviour>,
     local_peer_id: PeerId,
     published: &crate::offline_mail::PublishedPrekey,
+    opks: &[OneTimePrekey],
     bootstrap_peer_ids: &HashSet<PeerId>,
 ) {
     if bootstrap_peer_ids.is_empty() {
@@ -2236,6 +2267,7 @@ fn publish_self_prekey_to_bootstraps(
         public_key: published.pk,
         not_after: published.not_after,
         sig: published.sig.clone(),
+        opks: opks.to_vec(),
     };
     for peer in swarm.connected_peers().copied().collect::<Vec<_>>() {
         if !bootstrap_peer_ids.contains(&peer) {
@@ -2281,6 +2313,133 @@ fn request_prekey_from_bootstraps(
     sent
 }
 
+fn republish_local_prekeys(
+    swarm: &mut libp2p::Swarm<ChatBehaviour>,
+    local_key: &libp2p::identity::Keypair,
+    local_peer_id: PeerId,
+    bootstrap_peer_ids: &HashSet<PeerId>,
+) {
+    let Some(bundle) = crate::offline_mail::load_local_prekeys(
+        local_key,
+        &crate::paths::data_file(crate::offline_mail::PREKEY_FILE),
+    ) else {
+        return;
+    };
+    publish_self_prekey(swarm, local_peer_id, &bundle.published, &bundle.opks);
+    publish_self_prekey_to_bootstraps(
+        swarm,
+        local_peer_id,
+        &bundle.published,
+        &bundle.opks,
+        bootstrap_peer_ids,
+    );
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn finish_opk_half(
+    shared: Arc<Mutex<OpkFetch>>,
+    is_opk: bool,
+    swarm: &mut libp2p::Swarm<ChatBehaviour>,
+    local_key: &libp2p::identity::Keypair,
+    peer_prekeys: &mut HashMap<PeerId, [u8; 32]>,
+    seal_prekeys: &mut HashMap<PeerId, [u8; 32]>,
+    opk_sealed: &mut HashSet<PeerId>,
+    relay_mail_store: &mut HashMap<String, Vec<OfflineEnvelope>>,
+    bootstrap_peer_ids: &HashSet<PeerId>,
+    void_bootstraps: &[Multiaddr],
+    local_peer_id: PeerId,
+    my_public_key_bytes: &[u8; 32],
+    pending_relay: &mut PendingRelayQueue,
+    pending_relay_gates: &mut HashMap<(PeerId, PeerId), Arc<ActiveHandoff>>,
+    outbound_mailbox_stores: &mut MailboxStoreTrack,
+    pending_kad_mail: &mut HashMap<kad::QueryId, MailboxKadOp>,
+    write_grants: &HashMap<PeerId, crate::queue_mail::QueueGrant>,
+    outbound_prekey_gets: &OutboundPrekeyGets,
+    event_tx: &mpsc::Sender<NetworkEvent>,
+) {
+    let ready = {
+        let mut g = shared.lock().unwrap_or_else(|e| e.into_inner());
+        if is_opk {
+            g.opk_done = true;
+        } else {
+            g.spk_done = true;
+        }
+        if g.taken || !g.spk_done || !g.opk_done {
+            None
+        } else {
+            g.taken = true;
+            Some((
+                g.recipient,
+                g.spk,
+                g.opk.clone(),
+                std::mem::take(&mut g.items),
+                g.done.clone(),
+            ))
+        }
+    };
+    let Some((recipient, spk, opk, items, done)) = ready else {
+        return;
+    };
+    let material = seal_material(spk, opk.as_ref(), crate::offline_mail::prekey_unix_now());
+    if let Some(material) = material {
+        if opk_sealed.contains(&recipient) {
+            return;
+        }
+        seal_prekeys.insert(recipient, material.spk);
+        let _ = event_tx
+            .send(NetworkEvent::PeerPrekey {
+                peer: recipient,
+                public_key: material.spk,
+            })
+            .await;
+        opk_sealed.insert(recipient);
+        seal_and_publish_offline_batch(
+            swarm,
+            local_key,
+            peer_prekeys,
+            relay_mail_store,
+            bootstrap_peer_ids,
+            void_bootstraps,
+            local_peer_id,
+            my_public_key_bytes,
+            pending_relay,
+            pending_relay_gates,
+            outbound_mailbox_stores,
+            pending_kad_mail,
+            write_grants,
+            recipient,
+            material.spk,
+            material.opk_id,
+            material.opk_pk,
+            items,
+            done,
+        );
+    } else if !opk_sealed.contains(&recipient)
+        && !outbound_prekey_gets.values().any(|(r, _, _)| *r == recipient)
+    {
+        let _ = event_tx
+            .send(NetworkEvent::Status(format!(
+                "⚠ Нет one-time prekey {} — письмо ждёт в исходящих",
+                &recipient.to_string()[..8.min(recipient.to_string().len())]
+            )))
+            .await;
+    }
+}
+
+fn note_bundle_record(shared: &Mutex<OpkFetch>, is_opk: bool, value: &[u8]) {
+    let mut g = shared.lock().unwrap_or_else(|e| e.into_inner());
+    let owner = g.recipient;
+    if is_opk {
+        if let Some(list) = decode_opk_bundle(&owner, value) {
+            g.opk = list.into_iter().next();
+        }
+    } else if let Some(sp) = verify_signed_prekey(&owner, value) {
+        if crate::offline_mail::prekey_is_sealable(sp, crate::offline_mail::prekey_unix_now()) {
+            g.spk = Some(sp);
+        }
+    }
+}
+
 fn seal_and_publish_offline_batch(
     swarm: &mut libp2p::Swarm<ChatBehaviour>,
     local_key: &libp2p::identity::Keypair,
@@ -2294,22 +2453,23 @@ fn seal_and_publish_offline_batch(
     pending_relay_gates: &mut HashMap<(PeerId, PeerId), Arc<ActiveHandoff>>,
     outbound_mailbox_stores: &mut MailboxStoreTrack,
     pending_kad_mail: &mut HashMap<kad::QueryId, MailboxKadOp>,
+    write_grants: &HashMap<PeerId, crate::queue_mail::QueueGrant>,
     recipient: PeerId,
     pk_bytes: [u8; 32],
+    opk_id: [u8; 16],
+    opk_pk: [u8; 32],
     items: Vec<OfflineOutboxItem>,
     done: Option<PublishDone>,
 ) -> bool {
     peer_prekeys.insert(recipient, pk_bytes);
-    let Some(pk) = offline_seal_key(&recipient, Some(pk_bytes)) else {
-        signal_publish_done(&done, false);
-        return false;
-    };
     let mut sealed = Vec::new();
     for item in items {
-        if let Ok(env) = seal_for_recipient(
+        if let Ok(env) = seal_with_opk(
             local_key,
             &recipient,
-            &pk,
+            &crypto::PublicKey::from(pk_bytes),
+            opk_id,
+            &crypto::PublicKey::from(opk_pk),
             &local_peer_id,
             my_public_key_bytes,
             &item.message_id,
@@ -2344,6 +2504,7 @@ fn seal_and_publish_offline_batch(
         pending_relay_gates,
         outbound_mailbox_stores,
         &handoff,
+        write_grants.get(&recipient),
     );
     if let Some(h) = &handoff {
         let tracked = outbound_mailbox_stores
@@ -2449,6 +2610,28 @@ type MailboxStoreTrack = HashMap<
     (Arc<ActiveHandoff>, PeerId, String),
 >;
 
+fn queue_or_mailbox_packet(
+    recipient: &str,
+    env: &OfflineEnvelope,
+    grant: Option<&crate::queue_mail::QueueGrant>,
+) -> V1Packet {
+    if let Some(grant) = grant {
+        if let Ok(blob) = crate::queue_mail::pad_queue_blob(env) {
+            let proof =
+                crate::queue_mail::write_proof(&grant.write_token, &grant.queue_id, &blob);
+            return V1Packet::QueueStore {
+                queue_id: grant.queue_id,
+                proof,
+                blob,
+            };
+        }
+    }
+    V1Packet::OfflineMailboxStore {
+        recipient: recipient.to_string(),
+        envelopes: vec![env.clone()],
+    }
+}
+
 fn fanout_relay_mail(
     swarm: &mut libp2p::Swarm<ChatBehaviour>,
     local_peer_id: PeerId,
@@ -2459,6 +2642,7 @@ fn fanout_relay_mail(
     // true только в LAN-режиме без bootstrap: тогда соседи — единственное хранилище
     // и их Ack закрывает handoff. С bootstrap копии обычным пирам не рассылаются.
     track_handoff: bool,
+    grant: Option<&crate::queue_mail::QueueGrant>,
 ) {
     if envelopes.is_empty() || !track_handoff {
         return;
@@ -2473,10 +2657,7 @@ fn fanout_relay_mail(
     }
     let recip = recipient.to_string();
     for env in envelopes {
-        let packet = V1Packet::OfflineMailboxStore {
-            recipient: recip.clone(),
-            envelopes: vec![env.clone()],
-        };
+        let packet = queue_or_mailbox_packet(&recip, env, grant);
         for peer in &peers {
             let rid = swarm
                 .behaviour_mut()
@@ -2527,19 +2708,18 @@ fn dispatch_mailbox_stores(
     pending_relay_gates: &mut HashMap<(PeerId, PeerId), Arc<ActiveHandoff>>,
     store_track: &mut MailboxStoreTrack,
     handoff: &Option<Arc<ActiveHandoff>>,
+    grant: Option<&crate::queue_mail::QueueGrant>,
 ) -> bool {
     if envelopes.is_empty() {
         return false;
     }
     let recip = recipient.to_string();
-    let ready = onion_rt_mailbox_hops(dest, swarm.connected_peers().copied()).is_some();
+    let ready = grant.is_none()
+        && onion_rt_mailbox_hops(dest, swarm.connected_peers().copied()).is_some();
     let connected = swarm.is_connected(&dest);
     let mut queued = Vec::new();
     for env in envelopes {
-        let packet = V1Packet::OfflineMailboxStore {
-            recipient: recip.clone(),
-            envelopes: vec![env.clone()],
-        };
+        let packet = queue_or_mailbox_packet(&recip, env, grant);
         if ready || connected {
             if let Some(rid) = send_v1_to_peer(swarm, dest, packet.clone()) {
                 track_mailbox_rr(
@@ -2586,6 +2766,7 @@ fn fanout_relay_to_bootstraps(
     pending_relay_gates: &mut HashMap<(PeerId, PeerId), Arc<ActiveHandoff>>,
     store_track: &mut MailboxStoreTrack,
     handoff: &Option<Arc<ActiveHandoff>>,
+    grant: Option<&crate::queue_mail::QueueGrant>,
 ) {
     if envelopes.is_empty() {
         return;
@@ -2603,6 +2784,7 @@ fn fanout_relay_to_bootstraps(
             pending_relay_gates,
             store_track,
             handoff,
+            grant,
         );
         if !queued {
             continue;
@@ -2629,6 +2811,7 @@ fn publish_relay_mail(
     pending_relay_gates: &mut HashMap<(PeerId, PeerId), Arc<ActiveHandoff>>,
     store_track: &mut MailboxStoreTrack,
     handoff: &Option<Arc<ActiveHandoff>>,
+    grant: Option<&crate::queue_mail::QueueGrant>,
 ) {
     // With bootstraps: mail goes only to them. Without (LAN): connected peers
     // are the store, their Ack settles the gate.
@@ -2641,6 +2824,7 @@ fn publish_relay_mail(
         store_track,
         handoff,
         track_ephemeral,
+        grant,
     );
     fanout_relay_to_bootstraps(
         swarm,
@@ -2653,6 +2837,7 @@ fn publish_relay_mail(
         pending_relay_gates,
         store_track,
         handoff,
+        grant,
     );
 }
 
@@ -2733,6 +2918,7 @@ fn flush_pending_relay_for_peer(
     pending_relay_gates: &mut HashMap<(PeerId, PeerId), Arc<ActiveHandoff>>,
     store_track: &mut MailboxStoreTrack,
     peer: PeerId,
+    write_grants: &HashMap<PeerId, crate::queue_mail::QueueGrant>,
 ) {
     for (recipient, envelopes) in pending_relay.take_for(&peer) {
         let handoff = pending_relay_gates.remove(&(peer, recipient));
@@ -2745,6 +2931,7 @@ fn flush_pending_relay_for_peer(
             pending_relay_gates,
             store_track,
             &handoff,
+            write_grants.get(&recipient),
         );
     }
 }
@@ -2972,6 +3159,23 @@ fn cbor_peers() -> &'static Mutex<HashSet<PeerId>> {
     PEERS.get_or_init(|| Mutex::new(HashSet::new()))
 }
 
+fn queue_cap_peers() -> &'static Mutex<HashSet<PeerId>> {
+    static PEERS: OnceLock<Mutex<HashSet<PeerId>>> = OnceLock::new();
+    PEERS.get_or_init(|| Mutex::new(HashSet::new()))
+}
+
+fn queue_offer_due() -> &'static Mutex<HashSet<PeerId>> {
+    static DUE: OnceLock<Mutex<HashSet<PeerId>>> = OnceLock::new();
+    DUE.get_or_init(|| Mutex::new(HashSet::new()))
+}
+
+fn peer_has_queues(peer: PeerId) -> bool {
+    queue_cap_peers()
+        .lock()
+        .expect("queue peers")
+        .contains(&peer)
+}
+
 fn note_peer_wire(peer: PeerId, caps: u32) {
     let mut set = cbor_peers().lock().expect("cbor peers");
     if crate::protocol::both_announce_cbor(crate::protocol::HELLO_CAPS, caps) {
@@ -2979,10 +3183,18 @@ fn note_peer_wire(peer: PeerId, caps: u32) {
     } else {
         set.remove(&peer);
     }
+    let mut queues = queue_cap_peers().lock().expect("queue peers");
+    if caps & crate::protocol::HELLO_CAP_QUEUES != 0 {
+        queues.insert(peer);
+        queue_offer_due().lock().expect("queue due").insert(peer);
+    } else {
+        queues.remove(&peer);
+    }
 }
 
 fn forget_peer_wire(peer: PeerId) {
     cbor_peers().lock().expect("cbor peers").remove(&peer);
+    queue_cap_peers().lock().expect("queue peers").remove(&peer);
 }
 
 fn wire_out(peer: &PeerId, packet: V1Packet) -> crate::rr_codec::WireMsg {
@@ -3377,6 +3589,7 @@ fn put_e2ee_session(
 ) {
     sessions.insert(peer, session);
     session_established_at.insert(peer, Instant::now());
+    queue_offer_due().lock().expect("queue due").insert(peer);
 }
 
 fn drop_e2ee_session(
@@ -3386,6 +3599,228 @@ fn drop_e2ee_session(
 ) {
     sessions.remove(&peer);
     session_established_at.remove(&peer);
+    session_drops().lock().expect("session drops").insert(peer);
+}
+
+fn session_drops() -> &'static Mutex<HashSet<PeerId>> {
+    static DROPS: OnceLock<Mutex<HashSet<PeerId>>> = OnceLock::new();
+    DROPS.get_or_init(|| Mutex::new(HashSet::new()))
+}
+
+fn send_create_queue(
+    swarm: &mut libp2p::Swarm<ChatBehaviour>,
+    bootstrap_peer_ids: &HashSet<PeerId>,
+    local_peer_id: PeerId,
+    queue: &crate::queue_mail::OwnedQueue,
+    pending: &mut HashMap<libp2p::request_response::OutboundRequestId, PeerId>,
+    for_peer: PeerId,
+) -> bool {
+    let Some(sig) = crate::queue_mail::sign_create(queue) else {
+        return false;
+    };
+    let packet = V1Packet::CreateQueue {
+        queue_id: queue.queue_id,
+        owner_pk: queue.owner.public().encode_protobuf(),
+        write_token: queue.write_token,
+        expiry: queue.expiry,
+        sig,
+    };
+    let Some(dest) = swarm.connected_peers().copied().find(|p| {
+        bootstrap_peer_ids.contains(p) && *p != local_peer_id
+    }) else {
+        queue_offer_due().lock().expect("queue due").insert(for_peer);
+        return false;
+    };
+    let rid = rr_send(swarm, &dest, packet);
+    pending.insert(rid, for_peer);
+    true
+}
+
+fn query_contact_queues(
+    swarm: &mut libp2p::Swarm<ChatBehaviour>,
+    local_peer_id: PeerId,
+    bootstrap_peer_ids: &HashSet<PeerId>,
+    owned: &HashMap<PeerId, crate::queue_mail::OwnedQueue>,
+    prev: &HashMap<PeerId, crate::queue_mail::OwnedQueue>,
+    pending: &mut HashMap<libp2p::request_response::OutboundRequestId, [u8; 32]>,
+) {
+    let now = crate::offline_mail::prekey_unix_now();
+    let ids: Vec<[u8; 32]> = owned
+        .values()
+        .chain(prev.values())
+        .filter(|q| now < q.expiry)
+        .map(|q| q.queue_id)
+        .collect();
+    if ids.is_empty() {
+        return;
+    }
+    let Some(dest) = swarm.connected_peers().copied().find(|p| {
+        bootstrap_peer_ids.contains(p) && *p != local_peer_id
+    }) else {
+        return;
+    };
+    for queue_id in ids {
+        let rid = rr_send(
+            swarm,
+            &dest,
+            V1Packet::QueueChallengeRequest { queue_id },
+        );
+        pending.insert(rid, queue_id);
+    }
+}
+
+fn queue_peer_of(
+    owned: &HashMap<PeerId, crate::queue_mail::OwnedQueue>,
+    prev: &HashMap<PeerId, crate::queue_mail::OwnedQueue>,
+    queue_id: &[u8; 32],
+) -> Option<PeerId> {
+    owned
+        .iter()
+        .chain(prev.iter())
+        .find(|(_, q)| q.queue_id == *queue_id)
+        .map(|(p, _)| *p)
+}
+
+fn note_queue_delivery(
+    owned: &mut HashMap<PeerId, crate::queue_mail::OwnedQueue>,
+    prev: &mut HashMap<PeerId, crate::queue_mail::OwnedQueue>,
+    queue_id: &[u8; 32],
+    n: u32,
+    now: u64,
+) {
+    let Some(peer) = queue_peer_of(owned, prev, queue_id) else {
+        return;
+    };
+    if let Some(q) = owned.get_mut(&peer) {
+        if q.queue_id == *queue_id {
+            q.stored = q.stored.saturating_add(n);
+            if q.should_rotate(now) {
+                queue_offer_due().lock().expect("queue due").insert(peer);
+            }
+            return;
+        }
+    }
+    if let Some(q) = prev.get_mut(&peer) {
+        if q.queue_id == *queue_id {
+            q.stored = q.stored.saturating_add(n);
+        }
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn maintain_contact_queues(
+    swarm: &mut libp2p::Swarm<ChatBehaviour>,
+    sessions: &mut HashMap<PeerId, crypto::SecureSession>,
+    owned_queues: &mut HashMap<PeerId, crate::queue_mail::OwnedQueue>,
+    prev_queues: &mut HashMap<PeerId, crate::queue_mail::OwnedQueue>,
+    write_grants: &HashMap<PeerId, crate::queue_mail::QueueGrant>,
+    queue_ready: &mut HashSet<PeerId>,
+    queue_grant_sent: &mut HashSet<PeerId>,
+    pending_queue_creates: &mut HashMap<libp2p::request_response::OutboundRequestId, PeerId>,
+    outbound_msg_requests: &mut HashMap<
+        libp2p::request_response::OutboundRequestId,
+        (PeerId, String, Vec<u8>),
+    >,
+    outbound_delete_requests: &mut HashMap<
+        libp2p::request_response::OutboundRequestId,
+        (PeerId, Vec<String>),
+    >,
+    event_tx: &mpsc::Sender<NetworkEvent>,
+    local_peer_id: PeerId,
+    bootstrap_peer_ids: &HashSet<PeerId>,
+) {
+    let now_unix = crate::offline_mail::prekey_unix_now();
+    for peer in session_drops().lock().expect("session drops").drain() {
+        queue_grant_sent.remove(&peer);
+    }
+    prev_queues.retain(|_, q| now_unix < q.expiry);
+    let due: Vec<PeerId> = queue_offer_due()
+        .lock()
+        .expect("queue due")
+        .drain()
+        .collect();
+    let mut peers: HashSet<PeerId> = due.into_iter().collect();
+    for (peer, q) in owned_queues.iter() {
+        if q.should_rotate(now_unix) || !queue_ready.contains(peer) {
+            peers.insert(*peer);
+        }
+    }
+    let now = chrono::Local::now().format("%H:%M:%S").to_string();
+    for peer in peers {
+        if !sessions.contains_key(&peer) || !peer_has_queues(peer) {
+            continue;
+        }
+        if pending_queue_creates.values().any(|p| *p == peer) {
+            continue;
+        }
+        let rotate = owned_queues
+            .get(&peer)
+            .map(|q| q.should_rotate(now_unix))
+            .unwrap_or(false);
+        let missing = !owned_queues.contains_key(&peer);
+        let stuck = owned_queues.contains_key(&peer) && !queue_ready.contains(&peer);
+        if missing || rotate || stuck {
+            if !missing {
+                if queue_ready.contains(&peer) {
+                    if let Some(old) = owned_queues.remove(&peer) {
+                        prev_queues.insert(peer, old);
+                    }
+                } else {
+                    owned_queues.remove(&peer);
+                }
+                queue_ready.remove(&peer);
+                queue_grant_sent.remove(&peer);
+            }
+            let queue = crate::queue_mail::OwnedQueue::create(now_unix);
+            if send_create_queue(
+                swarm,
+                bootstrap_peer_ids,
+                local_peer_id,
+                &queue,
+                pending_queue_creates,
+                peer,
+            ) {
+                owned_queues.insert(peer, queue);
+            }
+            continue;
+        }
+        if queue_ready.contains(&peer) && !queue_grant_sent.contains(&peer) {
+            let Some(queue) = owned_queues.get(&peer) else {
+                continue;
+            };
+            let grant = queue.grant();
+            let Some(json) = crate::protocol::build_queue_grant_json(
+                grant.queue_id,
+                grant.write_token,
+                grant.expiry,
+            ) else {
+                continue;
+            };
+            let sent = send_encrypted_chat_payload(
+                swarm,
+                sessions,
+                outbound_msg_requests,
+                outbound_delete_requests,
+                event_tx,
+                peer,
+                json,
+                None,
+                &now,
+            )
+            .await;
+            if sent {
+                queue_grant_sent.insert(peer);
+                let record = crate::queue_mail::ContactQueueRecord::assemble(
+                    owned_queues.get(&peer),
+                    prev_queues.get(&peer),
+                    write_grants.get(&peer),
+                );
+                let _ = event_tx
+                    .send(NetworkEvent::ContactQueueUpdated { peer, record })
+                    .await;
+            }
+        }
+    }
 }
 
 fn e2ee_session_is_fresh(
@@ -3925,11 +4360,24 @@ pub async fn run_chat_network(
         let mut peer_prekeys: HashMap<PeerId, [u8; 32]> = HashMap::new();
         // Проверенные ротируемые prekey контактов. Hello-static сюда не кладём.
         let mut seal_prekeys: HashMap<PeerId, [u8; 32]> = HashMap::new();
-        let local_published_prekey = crate::offline_mail::load_local_prekeys(
-            &local_key,
-            &crate::paths::data_file(crate::offline_mail::PREKEY_FILE),
-        )
-            .map(|p| p.published);
+        let mut opk_sealed: HashSet<PeerId> = HashSet::new();
+        let mut write_grants: HashMap<PeerId, crate::queue_mail::QueueGrant> = HashMap::new();
+        let mut owned_queues: HashMap<PeerId, crate::queue_mail::OwnedQueue> = HashMap::new();
+        let mut prev_queues: HashMap<PeerId, crate::queue_mail::OwnedQueue> = HashMap::new();
+        let mut queue_grant_sent: HashSet<PeerId> = HashSet::new();
+        let mut queue_ready: HashSet<PeerId> = HashSet::new();
+        let mut pending_queue_creates: HashMap<
+            libp2p::request_response::OutboundRequestId,
+            PeerId,
+        > = HashMap::new();
+        let mut pending_queue_challenges: HashMap<
+            libp2p::request_response::OutboundRequestId,
+            [u8; 32],
+        > = HashMap::new();
+        let mut pending_queue_queries: HashMap<
+            libp2p::request_response::OutboundRequestId,
+            [u8; 32],
+        > = HashMap::new();
         let mut lan_store_rate = crate::relay_mailbox::StoreRateLimit::default();
         let mut lan_uploader_quota = crate::relay_mailbox::UploaderQuota::default();
         let mut pending_kad_mail: HashMap<kad::QueryId, MailboxKadOp> = HashMap::new();
@@ -4148,9 +4596,31 @@ pub async fn run_chat_network(
         provider_tick.tick().await;
         chunk_tick.tick().await;
 
+        republish_local_prekeys(
+            &mut swarm,
+            &local_key,
+            local_peer_id,
+            &bootstrap_peer_ids,
+        );
         loop {
             tokio::select! {
                 _ = mailbox_tick.tick() => {
+                    maintain_contact_queues(
+                        &mut swarm,
+                        &mut sessions,
+                        &mut owned_queues,
+                        &mut prev_queues,
+                        &write_grants,
+                        &mut queue_ready,
+                        &mut queue_grant_sent,
+                        &mut pending_queue_creates,
+                        &mut outbound_msg_requests,
+                        &mut outbound_delete_requests,
+                        &event_tx,
+                        local_peer_id,
+                        &bootstrap_peer_ids,
+                    )
+                    .await;
                     if let Some(deadline) = fetch_mailbox_after {
                         if Instant::now() >= deadline {
                             // RR-ящик до Hop забивает HOP-стримы. Ждём Hop Ack.
@@ -4170,6 +4640,14 @@ pub async fn run_chat_network(
                                 &mut pending_mailbox_challenges,
                             );
                             if sent {
+                                query_contact_queues(
+                                    &mut swarm,
+                                    local_peer_id,
+                                    &bootstrap_peer_ids,
+                                    &owned_queues,
+                                    &prev_queues,
+                                    &mut pending_queue_challenges,
+                                );
                                 mailbox_fetch_attempts =
                                     mailbox_fetch_attempts.saturating_add(1);
                                 // Частый poll: без живого circuit доставка только через
@@ -4332,15 +4810,12 @@ pub async fn run_chat_network(
                 // ─── Tick: переобъявление себя в DHT (каждые 10 мин) ───────
                 _ = provider_tick.tick() => {
                     publish_self_in_dht(&mut swarm.behaviour_mut().kad, local_peer_id);
-                    if let Some(ref published) = local_published_prekey {
-                        publish_self_prekey(&mut swarm, local_peer_id, published);
-                        publish_self_prekey_to_bootstraps(
-                            &mut swarm,
-                            local_peer_id,
-                            published,
-                            &bootstrap_peer_ids,
-                        );
-                    }
+                    republish_local_prekeys(
+                        &mut swarm,
+                        &local_key,
+                        local_peer_id,
+                        &bootstrap_peer_ids,
+                    );
                 }
                 // ─── Tick: отправка очередных чанков с rate-limit ───────────
                 _ = chunk_tick.tick() => {
@@ -5785,6 +6260,20 @@ pub async fn run_chat_network(
                                     peer_prekeys.insert(peer, pk);
                                 }
                             }
+                            UICommand::CacheContactQueues(rows) => {
+                                for (peer, rec) in rows {
+                                    if let Some(g) = rec.grant() {
+                                        write_grants.insert(peer, g);
+                                    }
+                                    if let Some(q) = rec.owned() {
+                                        owned_queues.insert(peer, q);
+                                        queue_ready.insert(peer);
+                                    }
+                                    if let Some(q) = rec.previous() {
+                                        prev_queues.insert(peer, q);
+                                    }
+                                }
+                            }
                             UICommand::FetchOfflineMailbox => {
                                 // Только query, без dial: иначе Unlock шлёт это до
                                 // первого swarm.poll и дублирует стартовый TCP.
@@ -5794,6 +6283,14 @@ pub async fn run_chat_network(
                                     &bootstrap_peer_ids,
                                     &mut last_mailbox_query_at,
                                     &mut pending_mailbox_challenges,
+                                );
+                                query_contact_queues(
+                                    &mut swarm,
+                                    local_peer_id,
+                                    &bootstrap_peer_ids,
+                                    &owned_queues,
+                                    &prev_queues,
+                                    &mut pending_queue_challenges,
                                 );
                             }
                             UICommand::PublishOfflineOutbox { items, ack } => {
@@ -5817,29 +6314,9 @@ pub async fn run_chat_network(
                                         .as_ref()
                                         .map(|g| once_publish_gate(g.clone()))
                                         .unwrap_or_else(|| Arc::new(|_| {}) as PublishDone);
-                                    let mut sealed: Vec<OfflineEnvelope> = Vec::new();
-                                    let mut need_prekey: Vec<OfflineOutboxItem> = Vec::new();
-                                    if let Some(pk) = seal_prekeys.get(&recipient).copied().and_then(|b| {
-                                        offline_seal_key(&recipient, Some(b))
-                                    }) {
-                                        for item in batch {
-                                            match seal_for_recipient(
-                                                &local_key,
-                                                &recipient,
-                                                &pk,
-                                                &local_peer_id,
-                                                &my_public_key_bytes,
-                                                &item.message_id,
-                                                &item.kind,
-                                                &item.payload,
-                                            ) {
-                                                Ok(env) => sealed.push(env),
-                                                Err(e) => debug!("offline seal: {e}"),
-                                            }
-                                        }
-                                    } else {
-                                        need_prekey = batch;
-                                    }
+                                    // Одноразовый ключ нельзя взять из кэша: нода выдаёт его один раз.
+                                    let sealed: Vec<OfflineEnvelope> = Vec::new();
+                                    let need_prekey = batch;
                                     if sealed.is_empty() && need_prekey.is_empty() {
                                         recip_done(false);
                                         continue;
@@ -5871,6 +6348,7 @@ pub async fn run_chat_network(
                                             &mut pending_relay_gates,
                                             &mut outbound_mailbox_stores,
                                             &handoff,
+                                            None,
                                         );
                                         if let Some(h) = &handoff {
                                             let tracked = outbound_mailbox_stores
@@ -5944,17 +6422,36 @@ pub async fn run_chat_network(
                                                 )))
                                                 .await;
                                         }
-                                        let qid = swarm
+                                        let shared = Arc::new(Mutex::new(OpkFetch {
+                                            recipient,
+                                            items: need_prekey,
+                                            done: Some(recip_done),
+                                            spk: None,
+                                            opk: None,
+                                            spk_done: false,
+                                            opk_done: false,
+                                            taken: false,
+                                        }));
+                                        let spk_q = swarm
                                             .behaviour_mut()
                                             .kad
                                             .get_record(prekey_record_key(recipient));
+                                        let opk_q = swarm
+                                            .behaviour_mut()
+                                            .kad
+                                            .get_record(opk_record_key(recipient));
                                         pending_kad_mail.insert(
-                                            qid,
-                                            MailboxKadOp::PrekeyForPublish {
-                                                recipient,
-                                                items: need_prekey,
-                                                done: Some(recip_done),
-                                                prekey_bytes: None,
+                                            spk_q,
+                                            MailboxKadOp::BundleHalf {
+                                                shared: shared.clone(),
+                                                is_opk: false,
+                                            },
+                                        );
+                                        pending_kad_mail.insert(
+                                            opk_q,
+                                            MailboxKadOp::BundleHalf {
+                                                shared,
+                                                is_opk: true,
                                             },
                                         );
                                     }
@@ -7079,6 +7576,32 @@ pub async fn run_chat_network(
                                                                     .await;
                                                                     send_ack = true;
                                                                 }
+                                                                DecryptedChatFrame::QueueGrant {
+                                                                    queue_id,
+                                                                    write_token,
+                                                                    expiry,
+                                                                } => {
+                                                                    write_grants.insert(
+                                                                        peer,
+                                                                        crate::queue_mail::QueueGrant {
+                                                                            queue_id,
+                                                                            write_token,
+                                                                            expiry,
+                                                                        },
+                                                                    );
+                                                                    let record = crate::queue_mail::ContactQueueRecord::assemble(
+                                                                        owned_queues.get(&peer),
+                                                                        prev_queues.get(&peer),
+                                                                        write_grants.get(&peer),
+                                                                    );
+                                                                    let _ = event_tx
+                                                                        .send(NetworkEvent::ContactQueueUpdated {
+                                                                            peer,
+                                                                            record,
+                                                                        })
+                                                                        .await;
+                                                                    send_ack = true;
+                                                                }
                                                                 DecryptedChatFrame::Delivered {
                                                                     message_ids,
                                                                 } => {
@@ -7368,6 +7891,19 @@ pub async fn run_chat_network(
                                                 V1Packet::Ack,
                                             );
                                         }
+                                        V1Packet::CreateQueue { .. }
+                                        | V1Packet::QueueStore { .. }
+                                        | V1Packet::QueueChallengeRequest { .. }
+                                        | V1Packet::QueueChallenge { .. }
+                                        | V1Packet::QueueQuery { .. }
+                                        | V1Packet::QueueDeliver { .. } => {
+                                            rr_reply(
+                                                &mut swarm,
+                                                &mut channel,
+                                                onion_reply,
+                                                V1Packet::Ack,
+                                            );
+                                        }
                                         V1Packet::Ack => {
                                             rr_reply(
                                                 &mut swarm,
@@ -7411,6 +7947,17 @@ pub async fn run_chat_network(
                                         pending_mailbox_challenges.remove(&request_id);
                                     let hop_only = onion_take_outbound(&request_id);
                                     if !matches!(response, V1Packet::Ack) {
+                                        if let Some(for_peer) =
+                                            pending_queue_creates.remove(&request_id)
+                                        {
+                                            if !queue_ready.contains(&for_peer) {
+                                                owned_queues.remove(&for_peer);
+                                            }
+                                            queue_offer_due()
+                                                .lock()
+                                                .expect("queue due")
+                                                .insert(for_peer);
+                                        }
                                         // Нода отказала (квота / частота): не Ack — не сдано.
                                         if let Some((handoff, _recip, message_id)) =
                                             outbound_mailbox_stores.remove(&request_id)
@@ -7423,7 +7970,85 @@ pub async fn run_chat_network(
                                         }
                                     }
                                     match response {
+                                        V1Packet::QueueChallenge { nonce, ts } => {
+                                            if let Some(queue_id) =
+                                                pending_queue_challenges.remove(&request_id)
+                                            {
+                                                let signed = owned_queues
+                                                    .values()
+                                                    .chain(prev_queues.values())
+                                                    .find(|q| q.queue_id == queue_id)
+                                                    .and_then(|q| {
+                                                        crate::queue_mail::sign_queue_query(
+                                                            q, ts, &nonce,
+                                                        )
+                                                    });
+                                                if let Some(sig) = signed {
+                                                    let rid = rr_send(
+                                                        &mut swarm,
+                                                        &peer,
+                                                        V1Packet::QueueQuery {
+                                                            queue_id,
+                                                            ts,
+                                                            nonce,
+                                                            sig,
+                                                        },
+                                                    );
+                                                    pending_queue_queries.insert(rid, queue_id);
+                                                }
+                                            }
+                                        }
+                                        V1Packet::QueueDeliver { blobs } => {
+                                            let queue_id =
+                                                pending_queue_queries.remove(&request_id);
+                                            let mut envelopes = Vec::new();
+                                            for blob in &blobs {
+                                                if let Some(env) =
+                                                    crate::queue_mail::unpad_queue_blob(blob)
+                                                {
+                                                    envelopes.push(env);
+                                                }
+                                            }
+                                            if let Some(queue_id) = queue_id {
+                                                if !envelopes.is_empty() {
+                                                    note_queue_delivery(
+                                                        &mut owned_queues,
+                                                        &mut prev_queues,
+                                                        &queue_id,
+                                                        envelopes.len() as u32,
+                                                        crate::offline_mail::prekey_unix_now(),
+                                                    );
+                                                }
+                                            }
+                                            if !envelopes.is_empty() {
+                                                let _ = event_tx
+                                                    .send(NetworkEvent::OfflineMailbox(envelopes))
+                                                    .await;
+                                            }
+                                        }
                                         V1Packet::Ack => {
+                                            let _ = pending_queue_queries.remove(&request_id);
+                                            if let Some(for_peer) =
+                                                pending_queue_creates.remove(&request_id)
+                                            {
+                                                queue_ready.insert(for_peer);
+                                                let record =
+                                                    crate::queue_mail::ContactQueueRecord::assemble(
+                                                        owned_queues.get(&for_peer),
+                                                        prev_queues.get(&for_peer),
+                                                        write_grants.get(&for_peer),
+                                                    );
+                                                let _ = event_tx
+                                                    .send(NetworkEvent::ContactQueueUpdated {
+                                                        peer: for_peer,
+                                                        record,
+                                                    })
+                                                    .await;
+                                                queue_offer_due()
+                                                    .lock()
+                                                    .expect("queue due")
+                                                    .insert(for_peer);
+                                            }
                                             if hop_only {
                                                 // Entry-hop принял ячейку. Это не Боб:
                                                 // ✓ только по E2EE `delivered`, чанк — повтор.
@@ -7561,38 +8186,55 @@ pub async fn run_chat_network(
                                             public_key,
                                             not_after,
                                             sig,
+                                            opk,
                                         } => {
                                             if let Some((recipient, items, done)) =
                                                 outbound_prekey_gets.remove(&request_id)
                                             {
+                                                let now_pk = crate::offline_mail::prekey_unix_now();
                                                 let verified = peer_id
                                                     .parse::<PeerId>()
                                                     .ok()
                                                     .filter(|p| *p == recipient)
-                                                    .is_some_and(|id| {
-                                                        verify_prekey_offer(
+                                                    .and_then(|id| {
+                                                        let spk_ok = verify_prekey_offer(
                                                             &id,
                                                             &public_key,
                                                             not_after,
                                                             &sig,
                                                         ) && crate::offline_mail::prekey_is_sealable(
-                                                            crate::offline_mail::SignedPrekey {
+                                                            SignedPrekey {
                                                                 pk: public_key,
                                                                 not_after,
                                                             },
-                                                            crate::offline_mail::prekey_unix_now(),
+                                                            now_pk,
+                                                        );
+                                                        let opk = opk.clone().filter(|o| {
+                                                            verify_opk(&id, &o.id, &o.pk, &o.sig)
+                                                        });
+                                                        seal_material(
+                                                            spk_ok.then_some(SignedPrekey {
+                                                                pk: public_key,
+                                                                not_after,
+                                                            }),
+                                                            opk.as_ref(),
+                                                            now_pk,
                                                         )
                                                     });
-                                                if !verified {
+                                                if verified.is_none() {
                                                     debug!(
-                                                        "VOID: prekey {} с bootstrap без подписи или срока — ждём DHT",
+                                                        "VOID: prekey {} без одноразового ключа — письмо ждёт",
                                                         &recipient.to_string()
                                                             [..8.min(recipient.to_string().len())]
                                                     );
-                                                } else {
+                                                } else if let Some(material) = verified {
+                                                    if opk_sealed.contains(&recipient) {
+                                                        // Нода уже выдала ключ другому запросу этого же письма.
+                                                    } else {
                                                     seal_prekeys.insert(recipient, public_key);
                                                     outbound_prekey_gets
                                                         .retain(|_, (r, _, _)| *r != recipient);
+                                                    opk_sealed.insert(recipient);
                                                     let ok = seal_and_publish_offline_batch(
                                                         &mut swarm,
                                                         &local_key,
@@ -7606,8 +8248,11 @@ pub async fn run_chat_network(
                                                         &mut pending_relay_gates,
                                                         &mut outbound_mailbox_stores,
                                                         &mut pending_kad_mail,
+                                                        &write_grants,
                                                         recipient,
-                                                        public_key,
+                                                        material.spk,
+                                                        material.opk_id,
+                                                        material.opk_pk,
                                                         items,
                                                         done,
                                                     );
@@ -7617,6 +8262,7 @@ pub async fn run_chat_network(
                                                                 "📤 Офлайн → bootstrap".into(),
                                                             ))
                                                             .await;
+                                                    }
                                                     }
                                                 }
                                             } else {
@@ -8004,6 +8650,31 @@ pub async fn run_chat_network(
                                                                 )
                                                                 .await;
                                                             }
+                                                            DecryptedChatFrame::QueueGrant {
+                                                                queue_id,
+                                                                write_token,
+                                                                expiry,
+                                                            } => {
+                                                                write_grants.insert(
+                                                                    peer,
+                                                                    crate::queue_mail::QueueGrant {
+                                                                        queue_id,
+                                                                        write_token,
+                                                                        expiry,
+                                                                    },
+                                                                );
+                                                                let record = crate::queue_mail::ContactQueueRecord::assemble(
+                                                                    owned_queues.get(&peer),
+                                                                    prev_queues.get(&peer),
+                                                                    write_grants.get(&peer),
+                                                                );
+                                                                let _ = event_tx
+                                                                    .send(NetworkEvent::ContactQueueUpdated {
+                                                                        peer,
+                                                                        record,
+                                                                    })
+                                                                    .await;
+                                                            }
                                                             DecryptedChatFrame::Delivered {
                                                                 message_ids,
                                                             } => {
@@ -8120,7 +8791,11 @@ pub async fn run_chat_network(
                                         | V1Packet::OfflineMailboxStore { .. }
                                         | V1Packet::OfflineMailboxQuery { .. }
                                         | V1Packet::PrekeyPut { .. }
-                                        | V1Packet::PrekeyGet { .. } => {}
+                                        | V1Packet::PrekeyGet { .. }
+                                        | V1Packet::CreateQueue { .. }
+                                        | V1Packet::QueueStore { .. }
+                                        | V1Packet::QueueChallengeRequest { .. }
+                                        | V1Packet::QueueQuery { .. } => {}
                                         V1Packet::Onion { .. }
                                         | V1Packet::Onion2 { .. }
                                         | V1Packet::OnionDrop { .. }
@@ -8454,6 +9129,12 @@ pub async fn run_chat_network(
                                     bootstrap_ep_mark_live(address, true);
                                     if peer_id != local_peer_id {
                                         bootstrap_peer_ids.insert(peer_id);
+                                        republish_local_prekeys(
+                                            &mut swarm,
+                                            &local_key,
+                                            local_peer_id,
+                                            &bootstrap_peer_ids,
+                                        );
                                         let mut rewritten = Vec::new();
                                         let next = if is_void_bootstrap_host(address) {
                                             normalize_peer_addr(void_node_tcp_addr(), peer_id)
@@ -8520,6 +9201,7 @@ pub async fn run_chat_network(
                                 &mut pending_relay_gates,
                                 &mut outbound_mailbox_stores,
                                 peer_id,
+                                &write_grants,
                             );
 
                             // Определяем, идёт ли соединение через relay.
@@ -9418,12 +10100,7 @@ pub async fn run_chat_network(
                                                 *record_bytes =
                                                     Some(peer_record.record.value.clone());
                                             }
-                                            MailboxKadOp::PrekeyForPublish {
-                                                recipient: owner,
-                                                prekey_bytes,
-                                                ..
-                                            }
-                                            | MailboxKadOp::CachePrekey {
+                                            MailboxKadOp::CachePrekey {
                                                 peer: owner,
                                                 prekey_bytes,
                                             } => {
@@ -9444,6 +10121,9 @@ pub async fn run_chat_network(
                                                         &owner.to_string()[..8.min(owner.to_string().len())]
                                                     ),
                                                 }
+                                            }
+                                            MailboxKadOp::BundleHalf { shared, is_opk } => {
+                                                note_bundle_record(shared, *is_opk, &peer_record.record.value);
                                             }
                                             MailboxKadOp::AwaitPut { .. } => {}
                                         }
@@ -9475,145 +10155,29 @@ pub async fn run_chat_network(
                                                     done,
                                                 );
                                             }
-                                            MailboxKadOp::PrekeyForPublish {
-                                                recipient,
-                                                items,
-                                                done,
-                                                prekey_bytes,
-                                            } => {
-                                                let pk_bytes =
-                                                    prekey_bytes.and_then(|bytes| {
-                                                        bytes.get(..32).map(|s| {
-                                                            let mut arr = [0u8; 32];
-                                                            arr.copy_from_slice(s);
-                                                            arr
-                                                        })
-                                                    });
-                                                let pk = if let Some(pk_bytes) = pk_bytes {
-                                                    seal_prekeys.insert(recipient, pk_bytes);
-                                                    peer_prekeys.insert(recipient, pk_bytes);
-                                                    let _ = event_tx
-                                                        .send(NetworkEvent::PeerPrekey {
-                                                            peer: recipient,
-                                                            public_key: pk_bytes,
-                                                        })
-                                                        .await;
-                                                    offline_seal_key(&recipient, Some(pk_bytes))
-                                                } else {
-                                                    offline_seal_key(&recipient, None)
-                                                };
-                                                if let Some(pk) = pk {
-                                                    let mut sealed = Vec::new();
-                                                    for item in items {
-                                                        if let Ok(env) = seal_for_recipient(
-                                                            &local_key,
-                                                            &recipient,
-                                                            &pk,
-                                                            &local_peer_id,
-                                                            &my_public_key_bytes,
-                                                            &item.message_id,
-                                                            &item.kind,
-                                                            &item.payload,
-                                                        ) {
-                                                            sealed.push(env);
-                                                        }
-                                                    }
-                                                    if !sealed.is_empty() {
-                                                        if RelayMailbox::merge(
-                                                            &mut relay_mail_store,
-                                                            &recipient.to_string(),
-                                                            sealed.clone(),
-                                                        ) {
-                                                            let _ =
-                                                                RelayMailbox::save(&relay_mail_store);
-                                                        }
-                                                        let allow_dht =
-                                                            bootstrap_peer_ids.is_empty();
-                                                        let done_cb: PublishDone = done
-                                                            .unwrap_or_else(
-                                                                || Arc::new(|_| {}) as PublishDone,
-                                                            );
-                                                        let handoff = Some(ActiveHandoff::new(
-                                                            &sealed,
-                                                            done_cb,
-                                                            allow_dht,
-                                                        ));
-                                                        publish_relay_mail(
-                                                            &mut swarm,
-                                                            &bootstrap_peer_ids,
-                                                            &void_bootstraps,
-                                                            local_peer_id,
-                                                            recipient,
-                                                            &sealed,
-                                                            &mut pending_relay,
-                                                            &mut pending_relay_gates,
-                                                            &mut outbound_mailbox_stores,
-                                                            &handoff,
-                                                        );
-                                                        if let Some(h) = &handoff {
-                                                            let tracked = outbound_mailbox_stores
-                                                                .values()
-                                                                .any(|(g, _, _)| Arc::ptr_eq(g, h));
-                                                            let queued = pending_relay_gates
-                                                                .values()
-                                                                .any(|g| Arc::ptr_eq(g, h));
-                                                            if !tracked
-                                                                && !queued
-                                                                && !accept_dht_as_full_handoff(
-                                                                    &sealed,
-                                                                    allow_dht,
-                                                                )
-                                                            {
-                                                                warn!(
-                                                                    "VOID: нет bootstrap-ноды для offline (после prekey)"
-                                                                );
-                                                                let _ = event_tx
-                                                                    .send(NetworkEvent::Status(
-                                                                        "❌ Нет связи с bootstrap — офлайн-почта не сдана".into(),
-                                                                    ))
-                                                                    .await;
-                                                                h.note_fail();
-                                                            }
-                                                        }
-                                                        if allow_dht {
-                                                            let for_dht =
-                                                                dht_eligible_envelopes(&sealed);
-                                                            let dht_done: Option<PublishDone> =
-                                                                handoff.as_ref().map(|h| {
-                                                                    let h = h.clone();
-                                                                    Arc::new(move |ok: bool| {
-                                                                        if ok {
-                                                                            h.note_dht_ok();
-                                                                        }
-                                                                    })
-                                                                        as PublishDone
-                                                                });
-                                                            start_mailbox_merge_put(
-                                                                &mut swarm,
-                                                                &mut pending_kad_mail,
-                                                                recipient,
-                                                                for_dht,
-                                                                dht_done,
-                                                            );
-                                                        } else {
-                                                            let _ = event_tx
-                                                                .send(NetworkEvent::Status(
-                                                                    "📤 Офлайн → bootstrap-нода (без DHT)".into(),
-                                                                ))
-                                                                .await;
-                                                        }
-                                                    } else {
-                                                        signal_publish_done(&done, false);
-                                                    }
-                                                } else {
-                                                    signal_publish_done(&done, false);
-                                                    let _ = event_tx
-                                                        .send(NetworkEvent::Status(format!(
-                                                            "⚠ Нет prekey {} — офлайн-почта не отправлена",
-                                                            &recipient.to_string()[..8.min(recipient.to_string().len())]
-                                                        )))
-                                                        .await;
-                                                }
+                                            MailboxKadOp::BundleHalf { shared, is_opk } => {
+                                                finish_opk_half(
+                                                    shared,
+                                                    is_opk,
+                                                    &mut swarm,
+                                                    &local_key,
+                                                    &mut peer_prekeys,
+                                                    &mut seal_prekeys,
+                                                    &mut opk_sealed,
+                                                    &mut relay_mail_store,
+                                                    &bootstrap_peer_ids,
+                                                    &void_bootstraps,
+                                                    local_peer_id,
+                                                    &my_public_key_bytes,
+                                                    &mut pending_relay,
+                                                    &mut pending_relay_gates,
+                                                    &mut outbound_mailbox_stores,
+                                                    &mut pending_kad_mail,
+                                                    &write_grants,
+                                                    &outbound_prekey_gets,
+                                                    &event_tx,
+                                                )
+                                                .await;
                                             }
                                             MailboxKadOp::CachePrekey {
                                                 peer,
@@ -9660,8 +10224,29 @@ pub async fn run_chat_network(
                                                     done,
                                                 );
                                             }
-                                            MailboxKadOp::PrekeyForPublish { done, .. } => {
-                                                signal_publish_done(&done, false);
+                                            MailboxKadOp::BundleHalf { shared, is_opk } => {
+                                                finish_opk_half(
+                                                    shared,
+                                                    is_opk,
+                                                    &mut swarm,
+                                                    &local_key,
+                                                    &mut peer_prekeys,
+                                                    &mut seal_prekeys,
+                                                    &mut opk_sealed,
+                                                    &mut relay_mail_store,
+                                                    &bootstrap_peer_ids,
+                                                    &void_bootstraps,
+                                                    local_peer_id,
+                                                    &my_public_key_bytes,
+                                                    &mut pending_relay,
+                                                    &mut pending_relay_gates,
+                                                    &mut outbound_mailbox_stores,
+                                                    &mut pending_kad_mail,
+                                                    &write_grants,
+                                                    &outbound_prekey_gets,
+                                                    &event_tx,
+                                                )
+                                                .await;
                                             }
                                             MailboxKadOp::AwaitPut { .. }
                                             | MailboxKadOp::CachePrekey { .. } => {}

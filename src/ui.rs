@@ -1989,6 +1989,10 @@ impl eframe::App for App {
                 NetworkEvent::PeerPrekey { peer, public_key } => {
                     self.cache_peer_prekey(peer, public_key);
                 }
+                NetworkEvent::ContactQueueUpdated { peer, record } => {
+                    self.contact_queues.insert(peer, record);
+                    self.persist_vault();
+                }
                 NetworkEvent::OfflineMailboxPublished => {}
                 NetworkEvent::MessageDelivered { peer, message_id } => {
                     self.set_outgoing_delivery(

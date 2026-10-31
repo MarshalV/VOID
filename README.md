@@ -92,7 +92,7 @@ The main desktop is **Tauri 2** (`frontend/` + `src-tauri/`). Optionally a nativ
 | `protocol/void-frames` | `V1Packet` (`Hello`, `Encrypted`, mailbox, onion, …), field limits, JSON and CBOR encode/decode |
 | `protocol/void-session` | Hello bind, `SecureSession` (DH step, header and PeerId in AAD), group roster |
 | `protocol/void-onion` | Onion v2 when every hop has a descriptor, otherwise v1. Builds without `kad` |
-| `protocol/void-envelope` | Seal envelope to the recipient’s rotating prekey, or to the key derived from their PeerId if none is published |
+| `protocol/void-envelope` | New envelopes seal to the rotating prekey plus one one-time key. The PeerId-derived key opens old envelopes only |
 | `protocol/void-kad-rules` | `dht_record_allowed`: signed unexpired prekey, or a v3 mailbox. Other values are refused |
 | `protocol/` (`void-protocol`) | Thin re-export of the crates above for this release, plus `VoidKadStore` (`protocol/src/kad_store.rs`) |
 | `src/relay_mailbox.rs` | Local mailbox for LAN without bootstrap: the client stores neighbours’ mail and serves it to the owner on Query. This copy keeps 256 mailboxes; the node and the harness keep 4096 |
@@ -211,12 +211,12 @@ In the connect field: `multiaddr`, `IP`, or `IP:PORT`. A bootstrap in the seed l
 
 | Packet | Purpose |
 |--------|---------|
-| `Hello` | X25519 + identity signature. Current clients sign bind v3: `ts`, `nonce`, and `caps` (±10 min). A session opens only when that signature is v3 and `caps` bit `1` (`HELLO_CAP_HEADER_AAD`) is set, on a direct path and over onion. Bit `2` (`HELLO_CAP_CBOR`) is the CBOR announcement; it does not open a session by itself. v1 and v2 may verify and do not create a session. A repeated ephemeral is rejected (last 256 per PeerId) and does not reset a live session. A Hello with `ts == 0` does not replace one either |
+| `Hello` | X25519 + identity signature. Current clients sign bind v3: `ts`, `nonce`, and `caps` (±10 min). A session opens only when that signature is v3 and `caps` bit `1` (`HELLO_CAP_HEADER_AAD`) is set, on a direct path and over onion. Bit `2` (`HELLO_CAP_CBOR`) is the CBOR announcement; bit `4` (`HELLO_CAP_QUEUES`) is the contact queue. Neither bit opens a session by itself. v1 and v2 may verify and do not create a session. A repeated ephemeral is rejected (last 256 per PeerId) and does not reset a live session. A Hello with `ts == 0` does not replace one either |
 | `Encrypted` | Double Ratchet |
 | `Ack` | RR reply / empty mailbox / node accepted the letter |
 | `MailboxChallengeRequest` / `MailboxChallenge` | one-time nonce and `ts` before a mailbox fetch |
 | `OfflineMailboxStore` / `Query` / `Deliver` | offline mail on bootstrap. `Query` echoes the nonce and carries the recipient's Ed25519 signature (`VOID_MAILBOX_QUERY_v1`); the TCP PeerId is not enough. Empty `Deliver` in reply to `Store` is a refusal. When the bootstrap has an onion key and another live hop can be the entry, Store, Query, and the challenge frames go inside a v2 cell. The client dials that entry. One envelope per cell |
-| `PrekeyPut` / `Get` / `Offer` | Rotating X25519 prekey: `{public_key, not_after, sig}`. The node stores a put only from the Noise peer who owns the PeerId, with a valid signature and `not_after` within 30 days. An offer is used for seal only when that signature and expiry check out. An unsolicited `Offer` is ignored |
+| `PrekeyPut` / `Get` / `Offer` | Signed prekey plus a batch of one-time keys. `Offer` returns the signed prekey and one one-time key, then deletes that key. An empty batch does not seal: the letter stays in the outbox. An unsolicited `Offer` is ignored |
 | `BootstrapGossip` | seed exchange |
 | `DialBack` | “dial me over circuit” |
 | `Onion` / `OnionDrop` | `VOID_ONION_v1`. `OnionDrop` is accepted only from a bootstrap that advertised `;onion=` in its own Identify; inside — only `Hello` / `Encrypted` / `Ack`. The last layer still carries `src` |
@@ -242,7 +242,7 @@ A session is not opened for a peer that signs only v1 or v2, or that sends frame
 
 Offline envelope v3 (`protocol/void-envelope`):
 
-- `ct` — ChaCha20-Poly1305 to a key from X25519(ephemeral, recipient prekey — see [Prekey](#prekey)), HKDF with `eph` and that key;
+- `ct` — ChaCha20-Poly1305. A new letter uses both DH shared secrets (signed prekey and one one-time key). An old letter uses one DH. See [Prekey](#prekey);
 - inside `ct` — sender, `sender_pk`, `message_id`, `kind`, body, and a signature of the sender’s libp2p key over those, the recipient, and `eph`; body is padded (power of two from 512 B to 4 KiB, then multiples of 4 KiB);
 - outside, `sender` and `kind` are empty, `sender_pk` is zero, `message_id` is a hash of the recipient and the real id (the node can dedupe repeats but cannot link letters of different recipients);
 - external id, recipient, and `eph` are cipher AAD: the node cannot rewrite the id or redirect the envelope;
@@ -253,7 +253,7 @@ The node sees the recipient (mailbox slot), time, and size to bucket accuracy.
 
 ### Prekey
 
-A new offline letter is sealed to the recipient’s **rotating X25519 prekey**, not to the long-lived chat static key. The prekey lives 7 days and is rotated when less than 24 hours remain. The previous secret is kept until its own `not_after`, then dropped. The client publishes it on the bootstrap (`PrekeyPut`) and in DHT `/void/prekey/<peer>`.
+A new offline letter is sealed to the recipient’s **rotating X25519 prekey** and one **one-time prekey**: DH(ephemeral, signed prekey) and DH(ephemeral, one-time key). The one-time id sits inside the ciphertext. After open the recipient deletes that key; a second letter with the same id does not open. If the bundle has no one-time key, the letter stays in the outbox. The signed prekey lives 7 days and is rotated when less than 24 hours remain. The previous secret is kept until its own `not_after`, then dropped. The client publishes both on the bootstrap (`PrekeyPut`) and in DHT `/void/prekey/<peer>` and `/void/opk/<peer>`. The key derived from `PeerId` opens old letters only.
 
 DHT value v2: `pk[32] || 0x02 || not_after[8] ||` owner signature. v1 (no expiry) still verifies and is not used for seal. The node accepts `PrekeyPut` only when the Noise peer is the claimed owner, the signature matches the identity key inside the PeerId, and `not_after` is in the future and at most 30 days out. An unsigned put is refused. `PrekeyOffer` is used only if the same signature and expiry check out, and only in answer to our own `PrekeyGet`.
 

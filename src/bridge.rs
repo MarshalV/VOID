@@ -28,7 +28,6 @@ use crate::group::{
     GroupMember,
 };
 use crate::network::{run_chat_network, NetworkEvent, OfflineOutboxItem, UICommand};
-use crate::offline_mail::open_envelope;
 use crate::outbox::{Outbox, OutboxEntry};
 use crate::protocol::{
     build_group_sync_json, new_message_id, parse_decrypted_chat_frame, per_peer_voice_transfer_id,
@@ -331,6 +330,8 @@ struct Inner {
     offline_identity: Option<crypto::StaticSecret>,
     identity_key: Option<libp2p::identity::Keypair>,
     offline_prekey_secrets: Vec<crypto::StaticSecret>,
+    offline_opks: Vec<crate::offline_mail::OpkSecret>,
+    spent_opk: Vec<[u8; 16]>,
     command_tx: Option<mpsc::Sender<UICommand>>,
     messages: SharedChatMessages,
     known_peers: HashMap<PeerId, String>,
@@ -347,6 +348,7 @@ struct Inner {
     dht_lines: Vec<String>,
     dht_total: usize,
     peer_prekeys: HashMap<PeerId, [u8; 32]>,
+    contact_queues: HashMap<PeerId, crate::queue_mail::ContactQueueRecord>,
     outbox_entries: Vec<OutboxEntry>,
     incoming_file_offers: Vec<FileOfferDto>,
     voice_recorder: VoiceRecorder,
@@ -392,6 +394,8 @@ impl Inner {
             offline_identity: None,
             identity_key: None,
             offline_prekey_secrets: Vec::new(),
+            offline_opks: Vec::new(),
+            spent_opk: Vec::new(),
             command_tx: None,
             messages,
             known_peers: HashMap::new(),
@@ -408,6 +412,7 @@ impl Inner {
             dht_lines: Vec::new(),
             dht_total: 0,
             peer_prekeys: HashMap::new(),
+            contact_queues: HashMap::new(),
             outbox_entries: Vec::new(),
             incoming_file_offers: Vec::new(),
             voice_recorder: VoiceRecorder::new(),
@@ -1228,19 +1233,20 @@ impl Inner {
             Vec<u8>,
         )> = Vec::new();
         {
-            let Some(ref secret) = self.local_static else {
+            let Some(secret_owned) = self.local_static.clone() else {
                 return;
             };
+            let secret = &secret_owned;
             let Some(local_pid) = self.local_peer_id else {
                 return;
             };
-            let prekeys: Vec<&crypto::StaticSecret> =
-                self.offline_prekey_secrets.iter().collect();
-            let secrets: Vec<&crypto::StaticSecret> = self
-                .offline_identity
+            let spk_owned = self.offline_prekey_secrets.clone();
+            let spk_secrets: Vec<&crypto::StaticSecret> = spk_owned.iter().collect();
+            let identity = self.offline_identity.clone();
+            let secrets: Vec<&crypto::StaticSecret> = identity
                 .iter()
                 .chain([secret])
-                .chain(prekeys)
+                .chain(spk_secrets.iter().copied())
                 .collect();
             for env in envelopes {
                 if self.offline_mail_processed.contains(&env.message_id) {
@@ -1251,8 +1257,25 @@ impl Inner {
                     message_id: mid,
                     kind,
                     body: plaintext,
-                } = match open_envelope(&secrets, &local_pid, &env) {
-                    Ok(p) => p,
+                } = match crate::offline_mail::open_with_opks(
+                    &secrets,
+                    &spk_secrets,
+                    &self.offline_opks,
+                    &self.spent_opk,
+                    &local_pid,
+                    &env,
+                ) {
+                    Ok(out) => {
+                        if let Some(id) = out.spent_opk {
+                            self.offline_opks.retain(|o| o.id != id);
+                            self.spent_opk.push(id);
+                            let _ = crate::offline_mail::consume_opk(
+                                &crate::paths::data_file(crate::offline_mail::PREKEY_FILE),
+                                &id,
+                            );
+                        }
+                        out.mail
+                    }
                     Err(e) => {
                         warn!(
                             "VOID: offline mail {} отброшен: {e}",
@@ -1689,6 +1712,7 @@ impl Inner {
                     display_name: name.clone(),
                     addrs,
                     x25519_public: self.peer_prekeys.get(pid).copied(),
+                    queue: self.contact_queues.get(pid).cloned(),
                 }
             })
             .collect();
@@ -2634,6 +2658,10 @@ impl VoidRuntime {
                             g.peer_prekeys.insert(peer, public_key);
                             g.persist_vault();
                         }
+                        NetworkEvent::ContactQueueUpdated { peer, record } => {
+                            g.contact_queues.insert(peer, record);
+                            g.persist_vault();
+                        }
                         NetworkEvent::FileOffer { filename, .. } => {
                             // Голос и обычные файлы принимаются сетью автоматически.
                             let _ = filename;
@@ -3118,12 +3146,18 @@ impl VoidRuntime {
                 let mut book = HashMap::new();
                 let mut addrs_map: HashMap<PeerId, Vec<Multiaddr>> = HashMap::new();
                 let mut peer_prekeys = HashMap::new();
+                let mut contact_queues = HashMap::new();
                 for entry in storage.address_book {
                     if let Ok(pid) = entry.peer_id.parse::<PeerId>() {
                         if pid != my_id {
                             book.insert(pid, entry.display_name);
                             if let Some(pk) = entry.x25519_public {
                                 peer_prekeys.insert(pid, pk);
+                            }
+                            if let Some(q) = entry.queue.clone() {
+                                if !q.is_empty() {
+                                    contact_queues.insert(pid, q);
+                                }
                             }
                             let mut parsed: Vec<Multiaddr> = entry
                                 .addrs
@@ -3155,11 +3189,20 @@ impl VoidRuntime {
                 }
                 let outbox = Outbox::load(&master_arr).unwrap_or_default();
                 let identity_key = local_key.clone();
-                let offline_prekey_secrets = crate::offline_mail::load_local_prekeys(
+                let loaded_prekeys = crate::offline_mail::load_local_prekeys(
                     &local_key,
                     &crate::paths::data_file(crate::offline_mail::PREKEY_FILE),
-                )
-                    .map(|p| p.secrets)
+                );
+                let offline_prekey_secrets = loaded_prekeys
+                    .as_ref()
+                    .map(|p| p.secrets.clone())
+                    .unwrap_or_default();
+                let offline_opks = loaded_prekeys
+                    .as_ref()
+                    .map(|p| p.opk_secrets.clone())
+                    .unwrap_or_default();
+                let spent_opk = loaded_prekeys
+                    .map(|p| p.spent_opk)
                     .unwrap_or_default();
 
                 if !self.network_started.swap(true, Ordering::SeqCst) {
@@ -3184,6 +3227,8 @@ impl VoidRuntime {
                     g.offline_identity = offline_identity.clone();
                     g.identity_key = Some(identity_key.clone());
                     g.offline_prekey_secrets = offline_prekey_secrets.clone();
+                    g.offline_opks = offline_opks.clone();
+                    g.spent_opk = spent_opk.clone();
                     g.command_tx = Some(command_tx);
                     g.known_peers = book;
                     g.contact_addrs = addrs_map;
@@ -3191,12 +3236,23 @@ impl VoidRuntime {
                     g.groups = groups_map;
                     g.left_groups = left_groups;
                     g.peer_prekeys = peer_prekeys;
+                    g.contact_queues = contact_queues.clone();
                     g.outbox_entries = outbox;
                     g.add_status("Vault разблокирован — сеть запущена".into());
                     if !g.peer_prekeys.is_empty() {
                         let cache: Vec<_> = g.peer_prekeys.iter().map(|(p, k)| (*p, *k)).collect();
                         if let Some(tx) = &g.command_tx {
                             let _ = tx.try_send(UICommand::CachePeerPrekeys(cache));
+                        }
+                    }
+                    if !g.contact_queues.is_empty() {
+                        let queues: Vec<_> = g
+                            .contact_queues
+                            .iter()
+                            .map(|(p, q)| (*p, q.clone()))
+                            .collect();
+                        if let Some(tx) = &g.command_tx {
+                            let _ = tx.try_send(UICommand::CacheContactQueues(queues));
                         }
                     }
                     g.watch_all_contacts();
@@ -3282,12 +3338,15 @@ impl VoidRuntime {
                     g.offline_identity = offline_identity.clone();
                     g.identity_key = Some(identity_key);
                     g.offline_prekey_secrets = offline_prekey_secrets;
+                    g.offline_opks = offline_opks;
+                    g.spent_opk = spent_opk;
                     g.known_peers = book;
                     g.contact_addrs = addrs_map;
                     g.void_bootstrap_strings = bootstraps;
                     g.groups = groups_map;
                     g.left_groups = left_groups;
                     g.peer_prekeys = peer_prekeys;
+                    g.contact_queues = contact_queues;
                     g.outbox_entries = outbox;
                 }
             }
@@ -3314,11 +3373,20 @@ impl VoidRuntime {
                     e.to_string()
                 })?;
                 let identity_key = local_key.clone();
-                let offline_prekey_secrets = crate::offline_mail::load_local_prekeys(
+                let loaded_prekeys = crate::offline_mail::load_local_prekeys(
                     &local_key,
                     &crate::paths::data_file(crate::offline_mail::PREKEY_FILE),
-                )
-                    .map(|p| p.secrets)
+                );
+                let offline_prekey_secrets = loaded_prekeys
+                    .as_ref()
+                    .map(|p| p.secrets.clone())
+                    .unwrap_or_default();
+                let offline_opks = loaded_prekeys
+                    .as_ref()
+                    .map(|p| p.opk_secrets.clone())
+                    .unwrap_or_default();
+                let spent_opk = loaded_prekeys
+                    .map(|p| p.spent_opk)
                     .unwrap_or_default();
 
                 if !self.network_started.swap(true, Ordering::SeqCst) {
@@ -3343,6 +3411,8 @@ impl VoidRuntime {
                     g.offline_identity = offline_identity.clone();
                     g.identity_key = Some(identity_key.clone());
                     g.offline_prekey_secrets = offline_prekey_secrets.clone();
+                    g.offline_opks = offline_opks.clone();
+                    g.spent_opk = spent_opk.clone();
                     g.command_tx = Some(command_tx);
                     g.add_status("Профиль создан — войдите в сеть через IP ноды".into());
                 } else {
@@ -3356,6 +3426,8 @@ impl VoidRuntime {
                     g.offline_identity = offline_identity.clone();
                     g.identity_key = Some(identity_key);
                     g.offline_prekey_secrets = offline_prekey_secrets;
+                    g.offline_opks = offline_opks;
+                    g.spent_opk = spent_opk;
                 }
             }
         }

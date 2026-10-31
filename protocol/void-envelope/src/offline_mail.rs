@@ -8,6 +8,7 @@ use chacha20poly1305::{
 use libp2p_identity::PeerId;
 use rand::RngCore;
 use serde::{Deserialize, Serialize};
+use std::collections::HashMap;
 use std::path::Path;
 
 use void_session::crypto::{PublicKey, StaticSecret};
@@ -17,7 +18,10 @@ pub fn peer_id_from_bytes(bytes: &[u8]) -> Option<PeerId> {
 }
 
 pub const PREKEY_PREFIX: &[u8] = b"/void/prekey/";
+pub const OPK_PREFIX: &[u8] = b"/void/opk/";
 pub const MAILBOX_PREFIX: &[u8] = b"/void/mailbox/";
+/// Сколько одноразовых ключей держит получатель и сколько кладёт в DHT-список.
+pub const OPK_POOL: usize = 16;
 pub const MAILBOX_TTL_SECS: u64 = 60 * 60 * 24 * 7;
 
 /// Offline-доставка голосовых: аудио режется на кусочки и уходит через тот же
@@ -449,25 +453,250 @@ pub fn identity_offline_secret(key: &libp2p_identity::Keypair) -> Option<StaticS
     Some(StaticSecret::from(*scalar))
 }
 
-/// Ключ запечатывания. Проверенный непросроченный prekey — первым (PFS).
-/// Identity из PeerId — запасной путь для старых писем и пиров без prekey.
+/// Ключ запечатывания нового письма: только проверенный prekey.
+/// X25519 из PeerId сюда не подставляется. Им открывают старые конверты.
 pub fn offline_seal_key(
-    recipient: &PeerId,
+    _recipient: &PeerId,
     verified_prekey: Option<[u8; 32]>,
 ) -> Option<PublicKey> {
-    if let Some(pk) = verified_prekey {
-        if pk != [0u8; 32] {
-            return Some(PublicKey::from(pk));
+    let pk = verified_prekey?;
+    if pk == [0u8; 32] {
+        return None;
+    }
+    Some(PublicKey::from(pk))
+}
+
+const OPK_SIG_PREFIX: &[u8] = b"VOID_OPK_SIG_V1\0";
+
+/// Один одноразовый X25519. `id` уходит внутрь печати, не на ноду отдельным полем конверта.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct OneTimePrekey {
+    pub id: [u8; 16],
+    pub pk: [u8; 32],
+    #[serde(with = "serde_bytes")]
+    pub sig: Vec<u8>,
+}
+
+/// Секрет одноразового ключа на диске получателя.
+#[derive(Clone)]
+pub struct OpkSecret {
+    pub id: [u8; 16],
+    pub secret: StaticSecret,
+}
+
+/// Что нужно, чтобы закрыть новое письмо. Пустой набор одноразовых — `None`, письмо ждёт.
+pub struct SealMaterial {
+    pub spk: [u8; 32],
+    pub opk_id: [u8; 16],
+    pub opk_pk: [u8; 32],
+}
+
+pub fn seal_material(
+    spk: Option<SignedPrekey>,
+    opk: Option<&OneTimePrekey>,
+    now: u64,
+) -> Option<SealMaterial> {
+    let spk = spk.filter(|p| prekey_is_sealable(*p, now))?;
+    let opk = opk.filter(|o| o.id != [0u8; 16] && o.pk != [0u8; 32] && !o.sig.is_empty())?;
+    Some(SealMaterial {
+        spk: spk.pk,
+        opk_id: opk.id,
+        opk_pk: opk.pk,
+    })
+}
+
+fn opk_signed_message(owner: &PeerId, id: &[u8; 16], pk: &[u8; 32]) -> Vec<u8> {
+    let mut v = OPK_SIG_PREFIX.to_vec();
+    push_lp(&mut v, &owner.to_bytes());
+    v.extend_from_slice(id);
+    v.extend_from_slice(pk);
+    v
+}
+
+pub fn encode_one_time_prekey(
+    transport: &libp2p_identity::Keypair,
+    owner: &PeerId,
+    id: &[u8; 16],
+    pk: &[u8; 32],
+) -> Option<OneTimePrekey> {
+    if PeerId::from_public_key(&transport.public()) != *owner
+        || *id == [0u8; 16]
+        || *pk == [0u8; 32]
+    {
+        return None;
+    }
+    let sig = transport.sign(&opk_signed_message(owner, id, pk)).ok()?;
+    Some(OneTimePrekey { id: *id, pk: *pk, sig })
+}
+
+pub fn verify_opk(owner: &PeerId, id: &[u8; 16], pk: &[u8; 32], sig: &[u8]) -> bool {
+    if *id == [0u8; 16] || *pk == [0u8; 32] || sig.is_empty() {
+        return false;
+    }
+    let Some(signer) = void_session::hello::void_peer_transport_public_key(*owner) else {
+        return false;
+    };
+    signer.verify(&opk_signed_message(owner, id, pk), sig)
+}
+
+/// DHT `/void/opk/<owner>`: `0x01 || u16le count || (id[16] || pk[32] || lp(sig))*`.
+pub fn encode_opk_bundle(opks: &[OneTimePrekey]) -> Vec<u8> {
+    let n = opks.len().min(OPK_POOL);
+    let mut v = Vec::with_capacity(3 + n * 80);
+    v.push(1);
+    v.extend_from_slice(&(n as u16).to_le_bytes());
+    for o in opks.iter().take(n) {
+        v.extend_from_slice(&o.id);
+        v.extend_from_slice(&o.pk);
+        push_lp(&mut v, &o.sig);
+    }
+    v
+}
+
+pub fn decode_opk_bundle(owner: &PeerId, bytes: &[u8]) -> Option<Vec<OneTimePrekey>> {
+    if bytes.first() != Some(&1) {
+        return None;
+    }
+    let n = u16::from_le_bytes(bytes.get(1..3)?.try_into().ok()?) as usize;
+    if n == 0 || n > OPK_POOL {
+        return None;
+    }
+    let mut rest = &bytes[3..];
+    let mut out = Vec::with_capacity(n);
+    for _ in 0..n {
+        let id: [u8; 16] = rest.get(..16)?.try_into().ok()?;
+        rest = &rest[16..];
+        let pk: [u8; 32] = rest.get(..32)?.try_into().ok()?;
+        rest = &rest[32..];
+        let sig = read_lp(&mut rest, 256)?.to_vec();
+        if !verify_opk(owner, &id, &pk, &sig) {
+            return None;
+        }
+        out.push(OneTimePrekey { id, pk, sig });
+    }
+    if !rest.is_empty() {
+        return None;
+    }
+    Some(out)
+}
+
+/// Каталог ноды: `PrekeyOffer` отдаёт signed-prekey и один одноразовый, затем стирает его.
+#[derive(Default)]
+pub struct NodePrekeys {
+    records: HashMap<String, NodePrekey>,
+}
+
+struct NodePrekey {
+    pk: [u8; 32],
+    not_after: u64,
+    sig: Vec<u8>,
+    opks: Vec<OneTimePrekey>,
+    spent: Vec<[u8; 16]>,
+}
+
+pub struct PrekeyOfferParts {
+    pub public_key: [u8; 32],
+    pub not_after: u64,
+    pub sig: Vec<u8>,
+    pub opk: OneTimePrekey,
+}
+
+impl NodePrekeys {
+    pub fn new() -> Self {
+        Self {
+            records: HashMap::new(),
         }
     }
-    identity_offline_public(recipient)
+
+    /// Кладёт signed-prekey и дописывает новые одноразовые. Уже выданные id не возвращаются.
+    pub fn put(
+        &mut self,
+        peer: &str,
+        pk: [u8; 32],
+        not_after: u64,
+        sig: Vec<u8>,
+        opks: Vec<OneTimePrekey>,
+        now: u64,
+    ) -> bool {
+        let Ok(owner) = peer.parse::<PeerId>() else {
+            return false;
+        };
+        if !verify_prekey_offer(&owner, &pk, not_after, &sig)
+            || !prekey_is_sealable(SignedPrekey { pk, not_after }, now)
+        {
+            return false;
+        }
+        let entry = self.records.entry(peer.to_string()).or_insert(NodePrekey {
+            pk,
+            not_after,
+            sig: sig.clone(),
+            opks: Vec::new(),
+            spent: Vec::new(),
+        });
+        entry.pk = pk;
+        entry.not_after = not_after;
+        entry.sig = sig;
+        for opk in opks {
+            if entry.opks.len() >= OPK_POOL {
+                break;
+            }
+            if entry.spent.contains(&opk.id) || entry.opks.iter().any(|o| o.id == opk.id) {
+                continue;
+            }
+            if verify_opk(&owner, &opk.id, &opk.pk, &opk.sig) {
+                entry.opks.push(opk);
+            }
+        }
+        true
+    }
+
+    /// Один одноразовый на выдачу. Пустой набор — `None`, письмо у отправителя ждёт.
+    pub fn take_offer(&mut self, peer: &str) -> Option<PrekeyOfferParts> {
+        let entry = self.records.get_mut(peer)?;
+        if entry.opks.is_empty() {
+            return None;
+        }
+        let opk = entry.opks.remove(0);
+        entry.spent.push(opk.id);
+        if entry.spent.len() > 256 {
+            let drop_n = entry.spent.len() - 256;
+            entry.spent.drain(0..drop_n);
+        }
+        Some(PrekeyOfferParts {
+            public_key: entry.pk,
+            not_after: entry.not_after,
+            sig: entry.sig.clone(),
+            opk,
+        })
+    }
 }
 
 pub const PREKEY_FILE: &str = "offline_prekey.bin";
 const PREKEY_ROTATE_MARGIN: u64 = 24 * 3600;
 
 #[derive(Serialize, Deserialize)]
+struct OpkDisk {
+    id: [u8; 16],
+    secret: [u8; 32],
+}
+
+#[derive(Serialize, Deserialize)]
 struct OfflinePrekeyDisk {
+    secret: [u8; 32],
+    not_after: u64,
+    #[serde(default)]
+    prev_secret: Option<[u8; 32]>,
+    #[serde(default)]
+    prev_not_after: u64,
+    #[serde(default)]
+    opks: Vec<OpkDisk>,
+    #[serde(default)]
+    spent_opk: Vec<[u8; 16]>,
+}
+
+/// Старый файл без одноразовых ключей. bincode не подставляет default на обрыве.
+#[derive(Deserialize)]
+struct OfflinePrekeyDiskV0 {
     secret: [u8; 32],
     not_after: u64,
     #[serde(default)]
@@ -480,24 +709,58 @@ struct OfflinePrekeyDisk {
 pub struct LocalPrekeys {
     pub published: PublishedPrekey,
     pub secrets: Vec<StaticSecret>,
+    pub opks: Vec<OneTimePrekey>,
+    pub opk_secrets: Vec<OpkSecret>,
+    pub spent_opk: Vec<[u8; 16]>,
 }
 
-/// Загружает или ротирует одноразовый prekey и подписывает его identity-ключом.
+fn read_prekey_disk(bytes: &[u8]) -> Option<OfflinePrekeyDisk> {
+    if let Ok(disk) = bincode::deserialize::<OfflinePrekeyDisk>(bytes) {
+        return Some(disk);
+    }
+    let old: OfflinePrekeyDiskV0 = bincode::deserialize(bytes).ok()?;
+    Some(OfflinePrekeyDisk {
+        secret: old.secret,
+        not_after: old.not_after,
+        prev_secret: old.prev_secret,
+        prev_not_after: old.prev_not_after,
+        opks: Vec::new(),
+        spent_opk: Vec::new(),
+    })
+}
+
+fn write_prekey_disk(path: &Path, disk: &OfflinePrekeyDisk) {
+    let Ok(bytes) = bincode::serialize(disk) else {
+        return;
+    };
+    let tmp = path.with_extension("bin.tmp");
+    if std::fs::write(&tmp, &bytes).is_ok() {
+        let _ = std::fs::rename(&tmp, path);
+    }
+}
+
+fn empty_prekey_disk() -> OfflinePrekeyDisk {
+    OfflinePrekeyDisk {
+        secret: [0u8; 32],
+        not_after: 0,
+        prev_secret: None,
+        prev_not_after: 0,
+        opks: Vec::new(),
+        spent_opk: Vec::new(),
+    }
+}
+
+/// Загружает или ротирует signed-prekey и пачку одноразовых, подписывает identity-ключом.
 pub fn load_local_prekeys(
     transport: &libp2p_identity::Keypair,
     path: &Path,
 ) -> Option<LocalPrekeys> {
     let owner = PeerId::from_public_key(&transport.public());
     let now = prekey_now();
-    let mut disk = std::fs::read(&path)
+    let mut disk = std::fs::read(path)
         .ok()
-        .and_then(|b| bincode::deserialize::<OfflinePrekeyDisk>(&b).ok())
-        .unwrap_or(OfflinePrekeyDisk {
-            secret: [0u8; 32],
-            not_after: 0,
-            prev_secret: None,
-            prev_not_after: 0,
-        });
+        .and_then(|b| read_prekey_disk(&b))
+        .unwrap_or_else(empty_prekey_disk);
     let stale = disk.not_after == 0 || now.saturating_add(PREKEY_ROTATE_MARGIN) >= disk.not_after;
     if stale {
         if disk.not_after > now && disk.secret != [0u8; 32] {
@@ -511,19 +774,62 @@ pub fn load_local_prekeys(
         disk.prev_secret = None;
         disk.prev_not_after = 0;
     }
-    let pk = PublicKey::from(disk.secret).to_bytes();
+    let spk_secret = StaticSecret::from(disk.secret);
+    let pk = PublicKey::from(&spk_secret).to_bytes();
     let published = encode_signed_prekey(transport, &owner, &pk, disk.not_after)?;
-    if let Ok(bytes) = bincode::serialize(&disk) {
-        let tmp = path.with_extension("bin.tmp");
-        if std::fs::write(&tmp, &bytes).is_ok() {
-            let _ = std::fs::rename(&tmp, &path);
+    disk.opks.retain(|o| o.id != [0u8; 16] && o.secret != [0u8; 32]);
+    while disk.opks.len() < OPK_POOL {
+        let mut id = [0u8; 16];
+        rand::rngs::OsRng.fill_bytes(&mut id);
+        if id == [0u8; 16] || disk.spent_opk.contains(&id) || disk.opks.iter().any(|o| o.id == id)
+        {
+            continue;
         }
+        let secret = StaticSecret::random_from_rng(&mut rand::rngs::OsRng).to_bytes();
+        disk.opks.push(OpkDisk { id, secret });
     }
-    let mut secrets = vec![StaticSecret::from(disk.secret)];
+    let mut opks = Vec::with_capacity(disk.opks.len());
+    let mut opk_secrets = Vec::with_capacity(disk.opks.len());
+    for o in &disk.opks {
+        let secret = StaticSecret::from(o.secret);
+        let public = PublicKey::from(&secret).to_bytes();
+        let signed = encode_one_time_prekey(transport, &owner, &o.id, &public)?;
+        opk_secrets.push(OpkSecret { id: o.id, secret });
+        opks.push(signed);
+    }
+    write_prekey_disk(path, &disk);
+    let mut secrets = vec![spk_secret];
     if let Some(prev) = disk.prev_secret {
         secrets.push(StaticSecret::from(prev));
     }
-    Some(LocalPrekeys { published, secrets })
+    Some(LocalPrekeys {
+        published,
+        secrets,
+        opks,
+        opk_secrets,
+        spent_opk: disk.spent_opk,
+    })
+}
+
+/// После успешного open: секрет этого id больше не открывает второй конверт.
+pub fn consume_opk(path: &Path, id: &[u8; 16]) -> bool {
+    let Ok(bytes) = std::fs::read(path) else {
+        return false;
+    };
+    let Some(mut disk) = read_prekey_disk(&bytes) else {
+        return false;
+    };
+    let before = disk.opks.len();
+    disk.opks.retain(|o| o.id != *id);
+    if !disk.spent_opk.contains(id) {
+        disk.spent_opk.push(*id);
+        if disk.spent_opk.len() > 64 {
+            let drop_n = disk.spent_opk.len() - 64;
+            disk.spent_opk.drain(0..drop_n);
+        }
+    }
+    write_prekey_disk(path, &disk);
+    disk.opks.len() != before || disk.spent_opk.contains(id)
 }
 
 fn transport_pubkey_pb(transport: &libp2p_identity::Keypair, sender: &PeerId) -> Vec<u8> {
@@ -823,6 +1129,256 @@ fn hkdf_offline(shared: &[u8], eph: &[u8; 32], recipient_pk: &[u8; 32]) -> [u8; 
     okm
 }
 
+fn hkdf_x3dh(
+    dh_spk: &[u8],
+    dh_opk: &[u8],
+    eph: &[u8; 32],
+    spk: &[u8; 32],
+    opk_id: &[u8; 16],
+    opk_pk: &[u8; 32],
+) -> [u8; 32] {
+    use hkdf::Hkdf;
+    use sha2::Sha256;
+    let mut ikm = Vec::with_capacity(dh_spk.len() + dh_opk.len());
+    ikm.extend_from_slice(dh_spk);
+    ikm.extend_from_slice(dh_opk);
+    let hk = Hkdf::<Sha256>::new(Some(b"VOID_OFFLINE_X3DH"), &ikm);
+    let mut info = Vec::with_capacity(4 + 32 + 32 + 16 + 32);
+    info.extend_from_slice(b"mail");
+    info.extend_from_slice(eph);
+    info.extend_from_slice(spk);
+    info.extend_from_slice(opk_id);
+    info.extend_from_slice(opk_pk);
+    let mut okm = [0u8; 32];
+    hk.expand(&info, &mut okm).expect("hkdf x3dh key len");
+    okm
+}
+
+fn x3dh_aad(recipient: &PeerId, outer_id: &str, eph: &[u8; 32], opk_id: &[u8; 16]) -> Vec<u8> {
+    let mut v = v3_aad(recipient, outer_id, eph);
+    v.extend_from_slice(opk_id);
+    v
+}
+
+/// Новое письмо: DH(eph, signed-prekey) и DH(eph, одноразовый). `opk_id` внутри AAD и `ct`.
+#[allow(clippy::too_many_arguments)]
+pub fn seal_with_opk(
+    transport: &libp2p_identity::Keypair,
+    recipient: &PeerId,
+    spk: &PublicKey,
+    opk_id: [u8; 16],
+    opk_pk: &PublicKey,
+    sender: &PeerId,
+    sender_pk: &[u8; 32],
+    message_id: &str,
+    kind: &str,
+    plaintext: &[u8],
+) -> Result<OfflineEnvelope> {
+    if PeerId::from_public_key(&transport.public()) != *sender {
+        return Err(anyhow!("offline seal: transport key ≠ sender"));
+    }
+    if opk_id == [0u8; 16] {
+        return Err(anyhow!("offline seal: empty one-time prekey"));
+    }
+    let eph_secret = StaticSecret::random_from_rng(&mut rand::rngs::OsRng);
+    let mut nonce = [0u8; 12];
+    rand::thread_rng().fill_bytes(&mut nonce);
+    let eph = PublicKey::from(&eph_secret).to_bytes();
+    let dh_spk = eph_secret.diffie_hellman(spk);
+    let dh_opk = eph_secret.diffie_hellman(opk_pk);
+    let key = hkdf_x3dh(
+        dh_spk.as_bytes(),
+        dh_opk.as_bytes(),
+        &eph,
+        spk.as_bytes(),
+        &opk_id,
+        opk_pk.as_bytes(),
+    );
+    let mut header = envelope_header_bytes(
+        OFFLINE_SIG_PREFIX_V3,
+        ENVELOPE_VERSION,
+        sender,
+        recipient,
+        sender_pk,
+        message_id,
+        kind,
+        &eph,
+    );
+    header.extend_from_slice(&opk_id);
+    let sig = transport
+        .sign(&signed_message(&header, plaintext))
+        .map_err(|e| anyhow!("offline sign: {e}"))?;
+    let mut fields = Vec::with_capacity(plaintext.len() + 144);
+    push_lp(&mut fields, &sender.to_bytes());
+    fields.extend_from_slice(sender_pk);
+    push_lp(&mut fields, message_id.as_bytes());
+    push_lp(&mut fields, kind.as_bytes());
+    fields.extend_from_slice(&opk_id);
+    push_lp(&mut fields, plaintext);
+    fields.resize(padded_len(fields.len()), 0);
+    let inner = encode_signed_inner(&sig, &transport_pubkey_pb(transport, sender), &fields);
+    let outer_id = outer_message_id(recipient, message_id);
+    let aad = x3dh_aad(recipient, &outer_id, &eph, &opk_id);
+    let ct = ChaCha20Poly1305::new(key.as_slice().into())
+        .encrypt(
+            Nonce::from_slice(&nonce),
+            Payload {
+                msg: &inner,
+                aad: &aad,
+            },
+        )
+        .map_err(|_| anyhow!("offline seal failed"))?;
+    Ok(OfflineEnvelope {
+        v: ENVELOPE_VERSION,
+        sender: String::new(),
+        sender_pk: [0u8; 32],
+        message_id: outer_id,
+        kind: String::new(),
+        eph,
+        nonce,
+        ct,
+        local_kind: kind.to_string(),
+    })
+}
+
+/// Вскрытый конверт. `spent_opk` — id, который надо стереть и больше не принимать.
+pub struct OpenOutcome {
+    pub mail: OpenedEnvelope,
+    pub spent_opk: Option<[u8; 16]>,
+}
+
+/// Сначала одноразовый ключ вместе со signed-prekey. Иначе старый конверт (один DH, в том числе identity).
+pub fn open_with_opks(
+    legacy_secrets: &[&StaticSecret],
+    spk_secrets: &[&StaticSecret],
+    opks: &[OpkSecret],
+    spent: &[[u8; 16]],
+    recipient: &PeerId,
+    env: &OfflineEnvelope,
+) -> Result<OpenOutcome> {
+    if env.v == ENVELOPE_VERSION {
+        if let Some(mail) = open_x3dh(spk_secrets, opks, spent, recipient, env)? {
+            return Ok(mail);
+        }
+    }
+    let mail = open_envelope(legacy_secrets, recipient, env)?;
+    Ok(OpenOutcome {
+        mail,
+        spent_opk: None,
+    })
+}
+
+fn open_x3dh(
+    spk_secrets: &[&StaticSecret],
+    opks: &[OpkSecret],
+    spent: &[[u8; 16]],
+    recipient: &PeerId,
+    env: &OfflineEnvelope,
+) -> Result<Option<OpenOutcome>> {
+    let eph_pk = PublicKey::from(env.eph);
+    for spk_sk in spk_secrets {
+        let spk_pk = PublicKey::from(*spk_sk);
+        let dh_spk = spk_sk.diffie_hellman(&eph_pk);
+        for opk in opks {
+            if spent.iter().any(|id| id == &opk.id) {
+                continue;
+            }
+            let opk_pk = PublicKey::from(&opk.secret);
+            let dh_opk = opk.secret.diffie_hellman(&eph_pk);
+            let key = hkdf_x3dh(
+                dh_spk.as_bytes(),
+                dh_opk.as_bytes(),
+                &env.eph,
+                spk_pk.as_bytes(),
+                &opk.id,
+                opk_pk.as_bytes(),
+            );
+            let aad = x3dh_aad(recipient, &env.message_id, &env.eph, &opk.id);
+            let Ok(inner) = ChaCha20Poly1305::new(key.as_slice().into()).decrypt(
+                Nonce::from_slice(&env.nonce),
+                Payload {
+                    msg: env.ct.as_ref(),
+                    aad: &aad,
+                },
+            ) else {
+                continue;
+            };
+            let Some(mail) = parse_x3dh_inner(recipient, env, &inner, &opk.id)? else {
+                continue;
+            };
+            return Ok(Some(OpenOutcome {
+                mail,
+                spent_opk: Some(opk.id),
+            }));
+        }
+    }
+    Ok(None)
+}
+
+fn parse_x3dh_inner(
+    recipient: &PeerId,
+    env: &OfflineEnvelope,
+    inner: &[u8],
+    expect_opk: &[u8; 16],
+) -> Result<Option<OpenedEnvelope>> {
+    let bad = || anyhow!("offline envelope: bad inner");
+    let Some((sig, pubkey_pb, mut rest)) = decode_signed_inner(inner) else {
+        return Ok(None);
+    };
+    let Ok(sender) = PeerId::from_bytes(read_lp(&mut rest, 128).ok_or_else(bad)?) else {
+        return Ok(None);
+    };
+    let Some(sender_pk_bytes) = rest.get(..32) else {
+        return Ok(None);
+    };
+    let sender_pk: [u8; 32] = sender_pk_bytes.try_into().map_err(|_| bad())?;
+    rest = &rest[32..];
+    let Some(message_id_b) = read_lp(&mut rest, 1024) else {
+        return Ok(None);
+    };
+    let Ok(message_id) = std::str::from_utf8(message_id_b) else {
+        return Ok(None);
+    };
+    let Some(kind_b) = read_lp(&mut rest, 64) else {
+        return Ok(None);
+    };
+    let Ok(kind) = std::str::from_utf8(kind_b) else {
+        return Ok(None);
+    };
+    let Some(opk_bytes) = rest.get(..16) else {
+        return Ok(None);
+    };
+    let opk_id: [u8; 16] = opk_bytes.try_into().map_err(|_| bad())?;
+    if opk_id != *expect_opk {
+        return Ok(None);
+    }
+    rest = &rest[16..];
+    let Some(body) = read_lp(&mut rest, usize::MAX) else {
+        return Ok(None);
+    };
+    if env.message_id != outer_message_id(recipient, message_id) {
+        return Err(anyhow!("offline envelope: outer id mismatch"));
+    }
+    let mut header = envelope_header_bytes(
+        OFFLINE_SIG_PREFIX_V3,
+        ENVELOPE_VERSION,
+        &sender,
+        recipient,
+        &sender_pk,
+        message_id,
+        kind,
+        &env.eph,
+    );
+    header.extend_from_slice(&opk_id);
+    verify_sender(sender, pubkey_pb, &header, body, sig)?;
+    Ok(Some(OpenedEnvelope {
+        sender,
+        message_id: message_id.to_string(),
+        kind: kind.to_string(),
+        body: body.to_vec(),
+    }))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -906,16 +1462,13 @@ mod tests {
     }
 
     #[test]
-    fn seal_key_prefers_verified_prekey_and_falls_back_to_identity() {
+    fn seal_key_requires_verified_prekey() {
         let bob = party();
         let pre = [9u8; 32];
         let key = offline_seal_key(&bob.pid, Some(pre)).unwrap();
         assert_eq!(key.as_bytes(), &pre);
-        let fallback = offline_seal_key(&bob.pid, None).unwrap();
-        assert_eq!(
-            fallback.as_bytes(),
-            PublicKey::from(&bob.offline_sk).as_bytes()
-        );
+        assert!(offline_seal_key(&bob.pid, None).is_none());
+        assert!(offline_seal_key(&bob.pid, Some([0u8; 32])).is_none());
     }
 
     #[test]
@@ -976,7 +1529,7 @@ mod tests {
         seal_for_recipient(
             &from.key,
             &to.pid,
-            &offline_seal_key(&to.pid, None).expect("ed25519 pid"),
+            &identity_offline_public(&to.pid).expect("ed25519 pid"),
             &from.pid,
             &sender_pk,
             "m1",
@@ -1103,6 +1656,109 @@ mod tests {
             not_after: prekey_now().saturating_sub(1),
         };
         assert!(!prekey_is_sealable(expired, prekey_now()));
+    }
+
+    fn fresh_opk(owner: &Party) -> (OpkSecret, OneTimePrekey) {
+        let secret = StaticSecret::random_from_rng(rand::rngs::OsRng);
+        let mut id = [0u8; 16];
+        rand::rngs::OsRng.fill_bytes(&mut id);
+        let pk = PublicKey::from(&secret).to_bytes();
+        let signed = encode_one_time_prekey(&owner.key, &owner.pid, &id, &pk).unwrap();
+        (OpkSecret { id, secret }, signed)
+    }
+
+    fn seal_x3dh(from: &Party, to: &Party, spk: &StaticSecret, opk: &OneTimePrekey, body: &[u8], mid: &str) -> OfflineEnvelope {
+        let sender_pk = PublicKey::from(&from.static_sk).to_bytes();
+        seal_with_opk(
+            &from.key,
+            &to.pid,
+            &PublicKey::from(spk),
+            opk.id,
+            &PublicKey::from(opk.pk),
+            &from.pid,
+            &sender_pk,
+            mid,
+            "dm",
+            body,
+        )
+        .unwrap()
+    }
+
+    #[test]
+    fn empty_opk_bundle_does_not_seal() {
+        let now = prekey_now();
+        let spk = SignedPrekey {
+            pk: [9u8; 32],
+            not_after: now + 3600,
+        };
+        assert!(seal_material(Some(spk), None, now).is_none());
+        assert!(seal_material(None, None, now).is_none());
+        let (secret, opk) = fresh_opk(&party());
+        let _ = secret;
+        let ready = seal_material(Some(spk), Some(&opk), now).unwrap();
+        assert_eq!(ready.opk_id, opk.id);
+        assert_eq!(ready.spk, spk.pk);
+    }
+
+    #[test]
+    fn spent_opk_does_not_open_a_second_envelope() {
+        let (alice, bob) = (party(), party());
+        let spk = StaticSecret::random_from_rng(rand::rngs::OsRng);
+        let (opk_secret, opk) = fresh_opk(&bob);
+        let first = seal_x3dh(&alice, &bob, &spk, &opk, b"one", "m-1");
+        let second = seal_x3dh(&alice, &bob, &spk, &opk, b"two", "m-2");
+        let opened = open_with_opks(&[], &[&spk], &[opk_secret.clone()], &[], &bob.pid, &first)
+            .unwrap();
+        assert_eq!(opened.mail.body, b"one");
+        assert_eq!(opened.spent_opk, Some(opk.id));
+        let spent = [opk.id];
+        assert!(open_with_opks(&[], &[&spk], &[opk_secret], &spent, &bob.pid, &second).is_err());
+    }
+
+    #[test]
+    fn leaked_old_opk_does_not_open_a_new_one() {
+        let (alice, bob) = (party(), party());
+        let spk = StaticSecret::random_from_rng(rand::rngs::OsRng);
+        let (old_secret, _old) = fresh_opk(&bob);
+        let (new_secret, new_opk) = fresh_opk(&bob);
+        let env = seal_x3dh(&alice, &bob, &spk, &new_opk, b"fresh", "m-new");
+        assert!(open_with_opks(&[], &[&spk], &[old_secret], &[], &bob.pid, &env).is_err());
+        let opened = open_with_opks(&[], &[&spk], &[new_secret], &[], &bob.pid, &env).unwrap();
+        assert_eq!(opened.mail.body, b"fresh");
+        assert_eq!(opened.spent_opk, Some(new_opk.id));
+    }
+
+    #[test]
+    fn node_offer_drops_the_issued_opk() {
+        let bob = party();
+        let spk = StaticSecret::random_from_rng(rand::rngs::OsRng);
+        let pk = PublicKey::from(&spk).to_bytes();
+        let not_after = prekey_now() + 3600;
+        let published = encode_signed_prekey(&bob.key, &bob.pid, &pk, not_after).unwrap();
+        let (_a, opk_a) = fresh_opk(&bob);
+        let (_b, opk_b) = fresh_opk(&bob);
+        let mut dir = NodePrekeys::new();
+        assert!(dir.put(
+            &bob.pid.to_string(),
+            pk,
+            not_after,
+            published.sig.clone(),
+            vec![opk_a.clone(), opk_b.clone()],
+            prekey_now(),
+        ));
+        let first = dir.take_offer(&bob.pid.to_string()).unwrap();
+        let second = dir.take_offer(&bob.pid.to_string()).unwrap();
+        assert_ne!(first.opk.id, second.opk.id);
+        assert!(dir.take_offer(&bob.pid.to_string()).is_none());
+        assert!(dir.put(
+            &bob.pid.to_string(),
+            pk,
+            not_after,
+            published.sig.clone(),
+            vec![opk_a, opk_b],
+            prekey_now(),
+        ));
+        assert!(dir.take_offer(&bob.pid.to_string()).is_none());
     }
 
     #[test]

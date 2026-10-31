@@ -6,10 +6,16 @@
 use libp2p::kad;
 use libp2p::PeerId;
 
-use void_envelope::offline_mail::{MAILBOX_PREFIX, PREKEY_PREFIX};
+use void_envelope::offline_mail::{MAILBOX_PREFIX, OPK_PREFIX, PREKEY_PREFIX};
 
 pub fn prekey_record_key(peer: PeerId) -> kad::RecordKey {
     let mut key = PREKEY_PREFIX.to_vec();
+    key.extend_from_slice(&peer.to_bytes());
+    kad::RecordKey::new(&key)
+}
+
+pub fn opk_record_key(peer: PeerId) -> kad::RecordKey {
+    let mut key = OPK_PREFIX.to_vec();
     key.extend_from_slice(&peer.to_bytes());
     kad::RecordKey::new(&key)
 }

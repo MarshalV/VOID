@@ -28,6 +28,9 @@ pub(crate) struct AddressBookEntry {
     /// X25519 static public key для офлайн-почты через DHT.
     #[serde(default)]
     pub(crate) x25519_public: Option<[u8; 32]>,
+    /// Очередь этого контакта: наш owner-секрет и его write-грант.
+    #[serde(default)]
+    pub(crate) queue: Option<crate::queue_mail::ContactQueueRecord>,
 }
 
 #[derive(Serialize, Deserialize)]
@@ -349,6 +352,11 @@ impl Storage {
                         i, j
                     )
                     .into());
+                }
+            }
+            if let Some(q) = &e.queue {
+                if q.owner_secret.len() > 512 || q.prev_owner_secret.len() > 512 {
+                    return Err(format!("vault: address_book[{}].queue — секрет длиннее 512 байт", i).into());
                 }
             }
         }

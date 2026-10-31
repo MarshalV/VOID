@@ -23,7 +23,7 @@ use crate::group::{
 };
 use crate::network::{run_chat_network, NetworkEvent, OfflineOutboxItem, UICommand};
 use crate::offline_mail::{
-    assemble_voice_chunks, decode_voice_chunk_payload, open_envelope, split_voice_for_offline,
+    assemble_voice_chunks, decode_voice_chunk_payload, split_voice_for_offline,
     OfflineEnvelope, OFFLINE_VOICE_CHUNK_KIND,
 };
 use crate::outbox::{Outbox, OutboxEntry};
@@ -175,6 +175,8 @@ pub(crate) struct App {
     identity_key: Option<libp2p::identity::Keypair>,
     /// Текущий и предыдущий prekey, пока не истёк `not_after`.
     offline_prekey_secrets: Vec<crypto::StaticSecret>,
+    offline_opks: Vec<crate::offline_mail::OpkSecret>,
+    spent_opk: Vec<[u8; 16]>,
     pub(crate) pending_sends: Vec<PendingSend>,
     pub(crate) pending_file_sends: Vec<PendingFileSend>,
     /// Прочитанные входящие — read receipt уже отправлен (не персистится).
@@ -222,6 +224,8 @@ pub(crate) struct App {
     pub(crate) outbox_entries: Vec<OutboxEntry>,
     /// X25519 prekey контактов (для DHT офлайн-почты).
     pub(crate) peer_prekeys: HashMap<PeerId, [u8; 32]>,
+    /// Очередь контакта: owner-секрет и write-грант собеседника.
+    pub(crate) contact_queues: HashMap<PeerId, crate::queue_mail::ContactQueueRecord>,
     offline_dht_publish_after: Option<Instant>,
     offline_mail_processed: HashSet<String>,
     /// Пиры, которым уже отправили group_sync в этой сессии (до disconnect).
@@ -328,6 +332,8 @@ impl App {
             offline_identity: None,
             identity_key: None,
             offline_prekey_secrets: Vec::new(),
+            offline_opks: Vec::new(),
+            spent_opk: Vec::new(),
             pending_sends: Vec::new(),
             pending_file_sends: Vec::new(),
             read_receipts_sent: HashSet::new(),
@@ -357,6 +363,7 @@ impl App {
             add_group_member_peer: String::new(),
             outbox_entries: Vec::new(),
             peer_prekeys: HashMap::new(),
+            contact_queues: HashMap::new(),
             offline_dht_publish_after: None,
             offline_mail_processed: HashSet::new(),
             group_synced_peers: HashSet::new(),
@@ -645,12 +652,18 @@ impl App {
                 let mut book = HashMap::new();
                 let mut addrs_map: HashMap<PeerId, Vec<Multiaddr>> = HashMap::new();
                 let mut peer_prekeys = HashMap::new();
+                let mut contact_queues = HashMap::new();
                 for entry in storage.address_book {
                     if let Ok(pid) = entry.peer_id.parse::<PeerId>() {
                         if pid != my_id {
                             book.insert(pid, entry.display_name);
                             if let Some(pk) = entry.x25519_public {
                                 peer_prekeys.insert(pid, pk);
+                            }
+                            if let Some(q) = entry.queue.clone() {
+                                if !q.is_empty() {
+                                    contact_queues.insert(pid, q);
+                                }
                             }
                             let mut parsed: Vec<Multiaddr> = entry
                                 .addrs
@@ -691,6 +704,7 @@ impl App {
                     file_transfer::derive_file_cache_key(&master_arr),
                 ));
                 self.peer_prekeys = peer_prekeys;
+                self.contact_queues = contact_queues;
                 self.apply_unlock_success(
                     ctx,
                     local_key,
@@ -786,6 +800,8 @@ impl App {
             &crate::paths::data_file(crate::offline_mail::PREKEY_FILE),
         ) {
             self.offline_prekey_secrets = pre.secrets;
+            self.offline_opks = pre.opk_secrets;
+            self.spent_opk = pre.spent_opk;
         }
         self.identity_key = Some(local_key);
         self.local_nickname = nickname;
@@ -954,6 +970,16 @@ impl App {
             .collect();
         if !keys.is_empty() {
             let _ = self.command_tx.try_send(UICommand::CachePeerPrekeys(keys));
+        }
+        let queues: Vec<_> = self
+            .contact_queues
+            .iter()
+            .map(|(p, q)| (*p, q.clone()))
+            .collect();
+        if !queues.is_empty() {
+            let _ = self
+                .command_tx
+                .try_send(UICommand::CacheContactQueues(queues));
         }
         self.schedule_offline_dht_publish();
         let _ = self.command_tx.try_send(UICommand::FetchOfflineMailbox);
@@ -1254,6 +1280,8 @@ impl App {
             .cloned()
             .collect();
         let secrets: Vec<&crypto::StaticSecret> = own_secrets.iter().collect();
+        let spk_owned = self.offline_prekey_secrets.clone();
+        let spk_secrets: Vec<&crypto::StaticSecret> = spk_owned.iter().collect();
         for env in envelopes {
             if self.offline_mail_processed.contains(&env.message_id) {
                 continue;
@@ -1263,8 +1291,25 @@ impl App {
                 message_id: mid,
                 kind,
                 body: plaintext,
-            } = match open_envelope(&secrets, &self.local_peer_id, &env) {
-                Ok(p) => p,
+            } = match crate::offline_mail::open_with_opks(
+                &secrets,
+                &spk_secrets,
+                &self.offline_opks,
+                &self.spent_opk,
+                &self.local_peer_id,
+                &env,
+            ) {
+                Ok(out) => {
+                    if let Some(id) = out.spent_opk {
+                        self.offline_opks.retain(|o| o.id != id);
+                        self.spent_opk.push(id);
+                        let _ = crate::offline_mail::consume_opk(
+                            &crate::paths::data_file(crate::offline_mail::PREKEY_FILE),
+                            &id,
+                        );
+                    }
+                    out.mail
+                }
                 Err(e) => {
                     warn!("VOID: offline mail отброшен: {e}");
                     decrypt_failed += 1;
@@ -2920,6 +2965,7 @@ impl App {
                     display_name: name.clone(),
                     addrs,
                     x25519_public: self.peer_prekeys.get(pid).copied(),
+                    queue: self.contact_queues.get(pid).cloned(),
                 }
             })
             .collect();
