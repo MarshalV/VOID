@@ -7123,6 +7123,7 @@ name = "void-onion"
 version = "0.1.0"
 dependencies = [
  "anyhow",
+ "blake2",
  "bs58",
  "chacha20poly1305",
  "hkdf",

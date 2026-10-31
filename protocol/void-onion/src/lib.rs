@@ -786,6 +786,69 @@ pub fn desc_message(
     v
 }
 
+/// How long a hop remembers a peeled v2 slot. Same bound as a client guard.
+pub const ONION_REPLAY_TTL: std::time::Duration =
+    std::time::Duration::from_secs(14 * 24 * 60 * 60);
+
+/// BLAKE2b-128 of slot 0: `eph || ct`. The nonce between them is not part of the key.
+pub fn v2_replay_key(cell: &[u8]) -> Option<[u8; 16]> {
+    use blake2::digest::{Digest, FixedOutput};
+    if cell.len() < V2_SLOT_LEN {
+        return None;
+    }
+    let mut h = blake2::Blake2b::<blake2::digest::consts::U16>::new();
+    h.update(&cell[..32]);
+    h.update(&cell[44..V2_SLOT_LEN]);
+    Some(h.finalize_fixed().into())
+}
+
+/// Cells this hop has already peeled. A repeat inside [`ONION_REPLAY_TTL`] is not forwarded.
+pub struct OnionReplay {
+    seen: HashMap<[u8; 16], std::time::Instant>,
+}
+
+impl OnionReplay {
+    pub fn new() -> Self {
+        Self {
+            seen: HashMap::new(),
+        }
+    }
+
+    /// `true` when `cell` was noted within the TTL. Does not record a new key.
+    pub fn is_replay(&mut self, cell: &[u8], now: std::time::Instant) -> bool {
+        let Some(key) = v2_replay_key(cell) else {
+            return false;
+        };
+        self.sweep(now);
+        self.seen.get(&key).is_some_and(|at| match now.checked_duration_since(*at) {
+            None => true,
+            Some(age) => age <= ONION_REPLAY_TTL,
+        })
+    }
+
+    /// Remember a cell whose peel succeeded.
+    pub fn note(&mut self, cell: &[u8], now: std::time::Instant) {
+        let Some(key) = v2_replay_key(cell) else {
+            return;
+        };
+        self.sweep(now);
+        self.seen.insert(key, now);
+    }
+
+    fn sweep(&mut self, now: std::time::Instant) {
+        self.seen.retain(|_, at| match now.checked_duration_since(*at) {
+            None => true,
+            Some(age) => age <= ONION_REPLAY_TTL,
+        });
+    }
+}
+
+impl Default for OnionReplay {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1040,5 +1103,24 @@ mod tests {
             }
             V2Peel::Forward { .. } => panic!("exit should deliver"),
         }
+    }
+
+    #[test]
+    fn replay_key_drops_the_same_slot_after_ttl_accepts_it() {
+        let sk = StaticSecret::random_from_rng(rand::rngs::OsRng);
+        let hop = (PeerId::random(), PublicKey::from(&sk).to_bytes());
+        let dest = PeerId::random();
+        let cell = wrap_v2(&[hop], dest, b"x").unwrap();
+        let mut other = cell.clone();
+        other[0] ^= 1;
+        assert_ne!(v2_replay_key(&cell), v2_replay_key(&other));
+        let mut cache = OnionReplay::new();
+        let t0 = std::time::Instant::now();
+        assert!(!cache.is_replay(&cell, t0));
+        cache.note(&cell, t0);
+        assert!(cache.is_replay(&cell, t0));
+        assert!(!cache.is_replay(&other, t0));
+        let later = t0 + ONION_REPLAY_TTL + std::time::Duration::from_secs(1);
+        assert!(!cache.is_replay(&cell, later));
     }
 }
