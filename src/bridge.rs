@@ -1442,6 +1442,9 @@ impl Inner {
                     }
                 }
             }
+            if !resend_cmds.is_empty() {
+                self.publish_outbox_to_dht();
+            }
             for (peer, text, message_id) in resend_cmds {
                 let _ = tx.try_send(UICommand::EnsureChatSession(peer));
                 let _ = tx.try_send(UICommand::SendMessage {

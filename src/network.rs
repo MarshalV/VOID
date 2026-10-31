@@ -30,7 +30,7 @@ use crate::crypto;
 use crate::file_transfer;
 use crate::offline_mail::{
     decode_mailbox, decode_opk_bundle, encode_mailbox, encode_opk_bundle, mailbox_record_key,
-    opk_record_key, prekey_record_key, seal_material, seal_with_opk, verify_opk,
+    opk_record_key, prekey_record_key, seal_for_recipient, seal_material, seal_with_opk, verify_opk,
     verify_prekey_offer, verify_signed_prekey, OfflineEnvelope, OneTimePrekey, SignedPrekey,
     MAILBOX_TTL_SECS,
 };
@@ -2414,12 +2414,40 @@ async fn finish_opk_half(
             items,
             done,
         );
+    } else if let Some(spk) = spk.filter(|s| {
+        crate::offline_mail::prekey_is_sealable(*s, crate::offline_mail::prekey_unix_now())
+    }) {
+        if !opk_sealed.contains(&recipient) {
+            opk_sealed.insert(recipient);
+            let _ = seal_and_publish_offline_batch(
+                swarm,
+                local_key,
+                peer_prekeys,
+                relay_mail_store,
+                bootstrap_peer_ids,
+                void_bootstraps,
+                local_peer_id,
+                my_public_key_bytes,
+                pending_relay,
+                pending_relay_gates,
+                outbound_mailbox_stores,
+                pending_kad_mail,
+                write_grants,
+                recipient,
+                spk.pk,
+                [0u8; 16],
+                [0u8; 32],
+                items,
+                done,
+            );
+        }
     } else if !opk_sealed.contains(&recipient)
         && !outbound_prekey_gets.values().any(|(r, _, _)| *r == recipient)
     {
+        signal_publish_done(&done, false);
         let _ = event_tx
             .send(NetworkEvent::Status(format!(
-                "⚠ Нет one-time prekey {} — письмо ждёт в исходящих",
+                "⚠ Нет prekey {} — письмо ждёт в исходящих",
                 &recipient.to_string()[..8.min(recipient.to_string().len())]
             )))
             .await;
@@ -2463,19 +2491,34 @@ fn seal_and_publish_offline_batch(
 ) -> bool {
     peer_prekeys.insert(recipient, pk_bytes);
     let mut sealed = Vec::new();
+    let spk_only = opk_id == [0u8; 16];
     for item in items {
-        if let Ok(env) = seal_with_opk(
-            local_key,
-            &recipient,
-            &crypto::PublicKey::from(pk_bytes),
-            opk_id,
-            &crypto::PublicKey::from(opk_pk),
-            &local_peer_id,
-            my_public_key_bytes,
-            &item.message_id,
-            &item.kind,
-            &item.payload,
-        ) {
+        let sealed_one = if spk_only {
+            seal_for_recipient(
+                local_key,
+                &recipient,
+                &crypto::PublicKey::from(pk_bytes),
+                &local_peer_id,
+                my_public_key_bytes,
+                &item.message_id,
+                &item.kind,
+                &item.payload,
+            )
+        } else {
+            seal_with_opk(
+                local_key,
+                &recipient,
+                &crypto::PublicKey::from(pk_bytes),
+                opk_id,
+                &crypto::PublicKey::from(opk_pk),
+                &local_peer_id,
+                my_public_key_bytes,
+                &item.message_id,
+                &item.kind,
+                &item.payload,
+            )
+        };
+        if let Ok(env) = sealed_one {
             sealed.push(env);
         }
     }
@@ -2610,26 +2653,30 @@ type MailboxStoreTrack = HashMap<
     (Arc<ActiveHandoff>, PeerId, String),
 >;
 
-fn queue_or_mailbox_packet(
-    recipient: &str,
-    env: &OfflineEnvelope,
-    grant: Option<&crate::queue_mail::QueueGrant>,
-) -> V1Packet {
-    if let Some(grant) = grant {
-        if let Ok(blob) = crate::queue_mail::pad_queue_blob(env) {
-            let proof =
-                crate::queue_mail::write_proof(&grant.write_token, &grant.queue_id, &blob);
-            return V1Packet::QueueStore {
-                queue_id: grant.queue_id,
-                proof,
-                blob,
-            };
-        }
-    }
+fn peer_mailbox_packet(recipient: &str, env: &OfflineEnvelope) -> V1Packet {
     V1Packet::OfflineMailboxStore {
         recipient: recipient.to_string(),
         envelopes: vec![env.clone()],
     }
+}
+
+/// Дополнительная копия в очередь. Ящик по PeerId остаётся, пока старые клиенты
+/// читают только его: без этой копии письмо не доходит, если очередь на ноде пустая.
+fn queue_store_packet(
+    env: &OfflineEnvelope,
+    grant: Option<&crate::queue_mail::QueueGrant>,
+) -> Option<V1Packet> {
+    let grant = grant?;
+    if grant.expiry <= crate::offline_mail::prekey_unix_now() {
+        return None;
+    }
+    let blob = crate::queue_mail::pad_queue_blob(env).ok()?;
+    let proof = crate::queue_mail::write_proof(&grant.write_token, &grant.queue_id, &blob);
+    Some(V1Packet::QueueStore {
+        queue_id: grant.queue_id,
+        proof,
+        blob,
+    })
 }
 
 fn fanout_relay_mail(
@@ -2657,7 +2704,12 @@ fn fanout_relay_mail(
     }
     let recip = recipient.to_string();
     for env in envelopes {
-        let packet = queue_or_mailbox_packet(&recip, env, grant);
+        if let Some(extra) = queue_store_packet(env, grant) {
+            for peer in &peers {
+                let _ = rr_send(swarm, peer, extra.clone());
+            }
+        }
+        let packet = peer_mailbox_packet(&recip, env);
         for peer in &peers {
             let rid = swarm
                 .behaviour_mut()
@@ -2714,12 +2766,16 @@ fn dispatch_mailbox_stores(
         return false;
     }
     let recip = recipient.to_string();
-    let ready = grant.is_none()
-        && onion_rt_mailbox_hops(dest, swarm.connected_peers().copied()).is_some();
+    let ready = onion_rt_mailbox_hops(dest, swarm.connected_peers().copied()).is_some();
     let connected = swarm.is_connected(&dest);
     let mut queued = Vec::new();
     for env in envelopes {
-        let packet = queue_or_mailbox_packet(&recip, env, grant);
+        if connected {
+            if let Some(extra) = queue_store_packet(env, grant) {
+                let _ = rr_send(swarm, &dest, extra);
+            }
+        }
+        let packet = peer_mailbox_packet(&recip, env);
         if ready || connected {
             if let Some(rid) = send_v1_to_peer(swarm, dest, packet.clone()) {
                 track_mailbox_rr(
@@ -4500,7 +4556,6 @@ pub async fn run_chat_network(
         let mut hop_listen_after: HashMap<PeerId, Instant> = HashMap::new();
         let mut bootstrap_hop_addr: HashMap<PeerId, Multiaddr> = HashMap::new();
         let mut kad_bootstrap_after: Option<Instant> = None;
-        let swarm_started = Instant::now();
         // Consecutive ping failures for chat peers → drop zombie after threshold.
         let mut peer_ping_fail_streak: HashMap<PeerId, u32> = HashMap::new();
         // Throttle contact dials when chasing via bootstrap circuit.
@@ -4624,12 +4679,6 @@ pub async fn run_chat_network(
                     if let Some(deadline) = fetch_mailbox_after {
                         if Instant::now() >= deadline {
                             // RR-ящик до Hop забивает HOP-стримы. Ждём Hop Ack.
-                            if relay_circuit_reserved.is_empty()
-                                && swarm_started.elapsed() < Duration::from_secs(90)
-                            {
-                                fetch_mailbox_after = Some(Instant::now() + Duration::from_secs(2));
-                                continue;
-                            }
                             // Почта только с bootstrap-нод (RR), без DHT-ящика.
                             let sent = query_relay_mailbox_with_bootstraps(
                                 &mut swarm,
@@ -6309,6 +6358,7 @@ pub async fn run_chat_network(
                                     signal_publish_done(&shared_gate, false);
                                 }
                                 for (recipient, batch) in by_recipient {
+                                    opk_sealed.remove(&recipient);
                                     // Track Store for exit-flush / handoff, not for UI ✓.
                                     let recip_done: PublishDone = shared_gate
                                         .as_ref()
@@ -8221,13 +8271,19 @@ pub async fn run_chat_network(
                                                             now_pk,
                                                         )
                                                     });
-                                                if verified.is_none() {
-                                                    debug!(
-                                                        "VOID: prekey {} без одноразового ключа — письмо ждёт",
-                                                        &recipient.to_string()
-                                                            [..8.min(recipient.to_string().len())]
-                                                    );
-                                                } else if let Some(material) = verified {
+                                                let spk_ok = verify_prekey_offer(
+                                                    &recipient,
+                                                    &public_key,
+                                                    not_after,
+                                                    &sig,
+                                                ) && crate::offline_mail::prekey_is_sealable(
+                                                    SignedPrekey {
+                                                        pk: public_key,
+                                                        not_after,
+                                                    },
+                                                    crate::offline_mail::prekey_unix_now(),
+                                                );
+                                                if let Some(material) = verified {
                                                     if opk_sealed.contains(&recipient) {
                                                         // Нода уже выдала ключ другому запросу этого же письма.
                                                     } else {
@@ -8264,6 +8320,39 @@ pub async fn run_chat_network(
                                                             .await;
                                                     }
                                                     }
+                                                } else if spk_ok && !opk_sealed.contains(&recipient)
+                                                {
+                                                    outbound_prekey_gets
+                                                        .retain(|_, (r, _, _)| *r != recipient);
+                                                    opk_sealed.insert(recipient);
+                                                    let _ = seal_and_publish_offline_batch(
+                                                        &mut swarm,
+                                                        &local_key,
+                                                        &mut peer_prekeys,
+                                                        &mut relay_mail_store,
+                                                        &bootstrap_peer_ids,
+                                                        &void_bootstraps,
+                                                        local_peer_id,
+                                                        &my_public_key_bytes,
+                                                        &mut pending_relay,
+                                                        &mut pending_relay_gates,
+                                                        &mut outbound_mailbox_stores,
+                                                        &mut pending_kad_mail,
+                                                        &write_grants,
+                                                        recipient,
+                                                        public_key,
+                                                        [0u8; 16],
+                                                        [0u8; 32],
+                                                        items,
+                                                        done,
+                                                    );
+                                                } else {
+                                                    signal_publish_done(&done, false);
+                                                    debug!(
+                                                        "VOID: нет ключа для офлайн-письма {}",
+                                                        &recipient.to_string()
+                                                            [..8.min(recipient.to_string().len())]
+                                                    );
                                                 }
                                             } else {
                                                 // PrekeyOffer без нашего PrekeyGet — не доверяем.
@@ -9129,6 +9218,7 @@ pub async fn run_chat_network(
                                     bootstrap_ep_mark_live(address, true);
                                     if peer_id != local_peer_id {
                                         bootstrap_peer_ids.insert(peer_id);
+                                        fetch_mailbox_after = Some(Instant::now());
                                         republish_local_prekeys(
                                             &mut swarm,
                                             &local_key,

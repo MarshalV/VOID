@@ -669,6 +669,50 @@ impl NodePrekeys {
             opk,
         })
     }
+
+    pub fn export(&self) -> Vec<u8> {
+        let items: Vec<StoredNodePrekey> = self
+            .records
+            .iter()
+            .map(|(peer, entry)| StoredNodePrekey {
+                peer: peer.clone(),
+                pk: entry.pk,
+                not_after: entry.not_after,
+                sig: entry.sig.clone(),
+                opks: entry.opks.clone(),
+                spent: entry.spent.clone(),
+            })
+            .collect();
+        bincode::serialize(&items).unwrap_or_default()
+    }
+
+    pub fn import(bytes: &[u8]) -> Self {
+        let items: Vec<StoredNodePrekey> = bincode::deserialize(bytes).unwrap_or_default();
+        let mut records = HashMap::new();
+        for item in items {
+            records.insert(
+                item.peer,
+                NodePrekey {
+                    pk: item.pk,
+                    not_after: item.not_after,
+                    sig: item.sig,
+                    opks: item.opks,
+                    spent: item.spent,
+                },
+            );
+        }
+        Self { records }
+    }
+}
+
+#[derive(Serialize, Deserialize)]
+struct StoredNodePrekey {
+    peer: String,
+    pk: [u8; 32],
+    not_after: u64,
+    sig: Vec<u8>,
+    opks: Vec<OneTimePrekey>,
+    spent: Vec<[u8; 16]>,
 }
 
 pub const PREKEY_FILE: &str = "offline_prekey.bin";
