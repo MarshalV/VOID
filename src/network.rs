@@ -108,6 +108,8 @@ enum MailboxOnionWait {
         handoff: Arc<ActiveHandoff>,
         message_id: String,
     },
+    // Прямой TCP до ноды. Вариант остаётся для ответа, пришедшего onion-ом.
+    #[allow(dead_code)]
     Challenge {
         dest: PeerId,
     },
@@ -2770,25 +2772,25 @@ fn dispatch_mailbox_stores(
     let connected = swarm.is_connected(&dest);
     let mut queued = Vec::new();
     for env in envelopes {
+        let packet = peer_mailbox_packet(&recip, env);
+        // TCP до ноды уже есть — Store идёт прямым кадром. Onion-обёртка
+        // при живом соединении не доходит до старого обработчика ящика.
         if connected {
             if let Some(extra) = queue_store_packet(env, grant) {
                 let _ = rr_send(swarm, &dest, extra);
             }
+            let rid = rr_send(swarm, &dest, packet);
+            track_mailbox_rr(
+                rid,
+                store_track,
+                handoff,
+                recipient,
+                env.message_id.clone(),
+            );
+            continue;
         }
-        let packet = peer_mailbox_packet(&recip, env);
-        if ready || connected {
+        if ready {
             if let Some(rid) = send_v1_to_peer(swarm, dest, packet.clone()) {
-                track_mailbox_rr(
-                    rid,
-                    store_track,
-                    handoff,
-                    recipient,
-                    env.message_id.clone(),
-                );
-                continue;
-            }
-            if connected {
-                let rid = rr_send(swarm, &dest, packet);
                 track_mailbox_rr(
                     rid,
                     store_track,
@@ -3027,17 +3029,8 @@ fn query_relay_mailbox(
         recipient: local_peer_id.to_string(),
     };
     for peer in peers {
-        let ready = onion_rt_mailbox_hops(peer, swarm.connected_peers().copied()).is_some();
-        if ready {
-            if let Some(rid) = send_v1_to_peer(swarm, peer, packet.clone()) {
-                if let Some(token) = mailbox_onion_rr_token(&rid) {
-                    mailbox_onion_insert(token, MailboxOnionWait::Challenge { dest: peer });
-                } else {
-                    pending_challenges.insert(rid);
-                }
-                continue;
-            }
-        }
+        // Запрос ящика — на тот же TCP, куда лёг Store. Иначе challenge
+        // уходит onion-ом и ответ ноды не попадает в pending.
         let rid = rr_send(swarm, &peer, packet.clone());
         pending_challenges.insert(rid);
     }
@@ -6364,9 +6357,32 @@ pub async fn run_chat_network(
                                         .as_ref()
                                         .map(|g| once_publish_gate(g.clone()))
                                         .unwrap_or_else(|| Arc::new(|_| {}) as PublishDone);
-                                    // Одноразовый ключ нельзя взять из кэша: нода выдаёт его один раз.
-                                    let sealed: Vec<OfflineEnvelope> = Vec::new();
-                                    let need_prekey = batch;
+                                    // PeerId уже содержит X25519. Ждать PrekeyOffer нельзя:
+                                    // нет записи на ноде — письмо так и сидит в outbox, пока
+                                    // отправитель снова не откроет клиент и не отдаст его вживую.
+                                    let mut sealed = Vec::new();
+                                    let mut need_prekey = Vec::new();
+                                    if let Some(pk) =
+                                        crate::offline_mail::identity_offline_public(&recipient)
+                                    {
+                                        for item in batch {
+                                            match seal_for_recipient(
+                                                &local_key,
+                                                &recipient,
+                                                &pk,
+                                                &local_peer_id,
+                                                &my_public_key_bytes,
+                                                &item.message_id,
+                                                &item.kind,
+                                                &item.payload,
+                                            ) {
+                                                Ok(env) => sealed.push(env),
+                                                Err(_) => need_prekey.push(item),
+                                            }
+                                        }
+                                    } else {
+                                        need_prekey = batch;
+                                    }
                                     if sealed.is_empty() && need_prekey.is_empty() {
                                         recip_done(false);
                                         continue;
@@ -6398,7 +6414,7 @@ pub async fn run_chat_network(
                                             &mut pending_relay_gates,
                                             &mut outbound_mailbox_stores,
                                             &handoff,
-                                            None,
+                                            write_grants.get(&recipient),
                                         );
                                         if let Some(h) = &handoff {
                                             let tracked = outbound_mailbox_stores
