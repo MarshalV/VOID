@@ -2996,6 +2996,7 @@ fn flush_pending_relay_for_peer(
 
 fn query_relay_mailbox(
     swarm: &mut libp2p::Swarm<ChatBehaviour>,
+    local_key: &libp2p::identity::Keypair,
     local_peer_id: PeerId,
     bootstrap_peer_ids: &HashSet<PeerId>,
     last_query_at: &mut Option<Instant>,
@@ -3005,8 +3006,6 @@ fn query_relay_mailbox(
     if last_query_at.is_some_and(|t| t.elapsed() < MIN_GAP) {
         return false;
     }
-    // Шаг 1. Подписанный Query уходит, когда нода вернёт nonce.
-    // Если до bootstrap есть entry, challenge идёт onion-ячейкой, не прямым dial.
     let boot: Vec<PeerId> = swarm
         .connected_peers()
         .copied()
@@ -3025,20 +3024,49 @@ fn query_relay_mailbox(
         return false;
     }
     *last_query_at = Some(Instant::now());
-    let packet = V1Packet::MailboxChallengeRequest {
-        recipient: local_peer_id.to_string(),
-    };
+    let recipient = local_peer_id.to_string();
+    // Нода на 147.78.64.22 собрана до подписи запроса: она понимает только
+    // OfflineMailboxQuery { recipient } и не знает MailboxChallengeRequest.
+    // Challenge на неё роняет кадр. `;cbor=1` есть только у новой ноды.
+    let modern: HashSet<PeerId> = cbor_peers()
+        .lock()
+        .expect("cbor peers")
+        .iter()
+        .copied()
+        .collect();
     for peer in peers {
-        // Запрос ящика — на тот же TCP, куда лёг Store. Иначе challenge
-        // уходит onion-ом и ответ ноды не попадает в pending.
-        let rid = rr_send(swarm, &peer, packet.clone());
-        pending_challenges.insert(rid);
+        if modern.contains(&peer) {
+            let rid = rr_send(
+                swarm,
+                &peer,
+                V1Packet::MailboxChallengeRequest {
+                    recipient: recipient.clone(),
+                },
+            );
+            pending_challenges.insert(rid);
+            continue;
+        }
+        let ts = crate::offline_mail::prekey_unix_now();
+        let mut nonce = [0u8; 32];
+        rand::thread_rng().fill_bytes(&mut nonce);
+        let sig = sign_mailbox_query(local_key, &local_peer_id, ts, &nonce).unwrap_or_default();
+        rr_send(
+            swarm,
+            &peer,
+            V1Packet::OfflineMailboxQuery {
+                recipient: recipient.clone(),
+                ts,
+                nonce,
+                sig,
+            },
+        );
     }
     true
 }
 
 fn query_relay_mailbox_with_bootstraps(
     swarm: &mut libp2p::Swarm<ChatBehaviour>,
+    local_key: &libp2p::identity::Keypair,
     local_peer_id: PeerId,
     bootstrap_peer_ids: &HashSet<PeerId>,
     void_bootstraps: &[Multiaddr],
@@ -3048,6 +3076,7 @@ fn query_relay_mailbox_with_bootstraps(
     dial_missing_bootstraps(swarm, bootstrap_peer_ids, void_bootstraps);
     query_relay_mailbox(
         swarm,
+        local_key,
         local_peer_id,
         bootstrap_peer_ids,
         last_query_at,
@@ -4675,6 +4704,7 @@ pub async fn run_chat_network(
                             // Почта только с bootstrap-нод (RR), без DHT-ящика.
                             let sent = query_relay_mailbox_with_bootstraps(
                                 &mut swarm,
+                                &local_key,
                                 local_peer_id,
                                 &bootstrap_peer_ids,
                                 &void_bootstraps,
@@ -6321,6 +6351,7 @@ pub async fn run_chat_network(
                                 // первого swarm.poll и дублирует стартовый TCP.
                                 query_relay_mailbox(
                                     &mut swarm,
+                                    &local_key,
                                     local_peer_id,
                                     &bootstrap_peer_ids,
                                     &mut last_mailbox_query_at,
