@@ -2402,6 +2402,12 @@ impl VoidRuntime {
                         NetworkEvent::Connected(pid) => {
                             g.connected_peer_ids.insert(pid);
                             g.recount_connected();
+                            for p in g.pending_sends.iter_mut().filter(|p| p.peer == pid) {
+                                p.awaiting_session = false;
+                                p.dht_kicked = true;
+                                p.dht_kicked_at =
+                                    Some(Instant::now() - resend_delay_for_attempt(p.attempts));
+                            }
                             bridge_evs.push(BridgeEvent::Peer {
                                 peer_id: pid.to_string(),
                                 online: true,

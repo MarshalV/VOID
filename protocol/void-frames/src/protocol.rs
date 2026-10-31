@@ -689,6 +689,14 @@ pub struct OnionHopHint {
     pub sig2_hex: String,
 }
 
+fn is_zero_u64(v: &u64) -> bool {
+    *v == 0
+}
+
+fn is_zero_32(v: &[u8; 32]) -> bool {
+    *v == [0u8; 32]
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub enum V1Packet {
     Hello {
@@ -736,16 +744,18 @@ pub enum V1Packet {
         nonce: [u8; 32],
         ts: u64,
     },
-    /// Запросить офлайн-почту. Выдача только после подписи получателя.
+    /// Запросить офлайн-почту.
+    /// Нода `VOID_node` знает только `recipient` и сверяет его с TCP-пиром.
+    /// Нули не пишем в кадр: лишние поля та нода не разбирает.
     OfflineMailboxQuery {
         recipient: String,
-        /// Echo `MailboxChallenge.ts`. 0 — старый клиент без подписи, ящик не открывают.
-        #[serde(default)]
+        /// Echo `MailboxChallenge.ts`. 0 — запрос без подписи.
+        #[serde(default, skip_serializing_if = "is_zero_u64")]
         ts: u64,
-        #[serde(default)]
+        #[serde(default, skip_serializing_if = "is_zero_32")]
         nonce: [u8; 32],
         /// Ed25519 получателя над `VOID_MAILBOX_QUERY_v1`.
-        #[serde(default, with = "serde_bytes")]
+        #[serde(default, with = "serde_bytes", skip_serializing_if = "Vec::is_empty")]
         sig: Vec<u8>,
     },
     /// Ответ на OfflineMailboxQuery.

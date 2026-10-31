@@ -2996,11 +2996,11 @@ fn flush_pending_relay_for_peer(
 
 fn query_relay_mailbox(
     swarm: &mut libp2p::Swarm<ChatBehaviour>,
-    local_key: &libp2p::identity::Keypair,
+    _local_key: &libp2p::identity::Keypair,
     local_peer_id: PeerId,
     bootstrap_peer_ids: &HashSet<PeerId>,
     last_query_at: &mut Option<Instant>,
-    pending_challenges: &mut HashSet<libp2p::request_response::OutboundRequestId>,
+    _pending_challenges: &mut HashSet<libp2p::request_response::OutboundRequestId>,
 ) -> bool {
     const MIN_GAP: Duration = Duration::from_millis(750);
     if last_query_at.is_some_and(|t| t.elapsed() < MIN_GAP) {
@@ -3024,42 +3024,16 @@ fn query_relay_mailbox(
         return false;
     }
     *last_query_at = Some(Instant::now());
-    let recipient = local_peer_id.to_string();
-    // Нода на 147.78.64.22 собрана до подписи запроса: она понимает только
-    // OfflineMailboxQuery { recipient } и не знает MailboxChallengeRequest.
-    // Challenge на неё роняет кадр. `;cbor=1` есть только у новой ноды.
-    let modern: HashSet<PeerId> = cbor_peers()
-        .lock()
-        .expect("cbor peers")
-        .iter()
-        .copied()
-        .collect();
+    // VOID_node отдаёт ящик только на OfflineMailboxQuery { recipient },
+    // и только если TCP-пир — сам получатель. Challenge она не разбирает.
+    let packet = V1Packet::OfflineMailboxQuery {
+        recipient: local_peer_id.to_string(),
+        ts: 0,
+        nonce: [0u8; 32],
+        sig: Vec::new(),
+    };
     for peer in peers {
-        if modern.contains(&peer) {
-            let rid = rr_send(
-                swarm,
-                &peer,
-                V1Packet::MailboxChallengeRequest {
-                    recipient: recipient.clone(),
-                },
-            );
-            pending_challenges.insert(rid);
-            continue;
-        }
-        let ts = crate::offline_mail::prekey_unix_now();
-        let mut nonce = [0u8; 32];
-        rand::thread_rng().fill_bytes(&mut nonce);
-        let sig = sign_mailbox_query(local_key, &local_peer_id, ts, &nonce).unwrap_or_default();
-        rr_send(
-            swarm,
-            &peer,
-            V1Packet::OfflineMailboxQuery {
-                recipient: recipient.clone(),
-                ts,
-                nonce,
-                sig,
-            },
-        );
+        rr_send(swarm, &peer, packet.clone());
     }
     true
 }
@@ -4460,10 +4434,8 @@ pub async fn run_chat_network(
         let mut lan_uploader_quota = crate::relay_mailbox::UploaderQuota::default();
         let mut pending_kad_mail: HashMap<kad::QueryId, MailboxKadOp> = HashMap::new();
         let mut relay_mail_store = RelayMailbox::load();
-        let mut fetch_mailbox_after = Some(Instant::now() + Duration::from_secs(5));
+        let mut fetch_mailbox_after = Some(Instant::now());
         let mut last_mailbox_query_at: Option<Instant> = None;
-        let mut mailbox_fetch_attempts: u32 = 0;
-        const MAX_MAILBOX_FETCH_ATTEMPTS: u32 = 30;
 
         let _instance_lock = match crate::paths::acquire_instance_lock() {
             Ok(f) => f,
@@ -4720,17 +4692,7 @@ pub async fn run_chat_network(
                                     &prev_queues,
                                     &mut pending_queue_challenges,
                                 );
-                                mailbox_fetch_attempts =
-                                    mailbox_fetch_attempts.saturating_add(1);
-                                // Частый poll: без живого circuit доставка только через
-                                // ящик; 10–30 с выглядели как «сообщения идут очень долго».
-                                let gap = if mailbox_fetch_attempts
-                                    < MAX_MAILBOX_FETCH_ATTEMPTS
-                                {
-                                    Duration::from_secs(2)
-                                } else {
-                                    Duration::from_secs(5)
-                                };
+                                let gap = Duration::from_secs(1);
                                 fetch_mailbox_after = Some(Instant::now() + gap);
                             }
                         }
