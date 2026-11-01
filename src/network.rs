@@ -2714,8 +2714,10 @@ fn peer_mailbox_packet(recipient: &str, env: &OfflineEnvelope) -> V1Packet {
     }
 }
 
-/// Дополнительная копия в очередь. Ящик по PeerId остаётся, пока старые клиенты
-/// читают только его: без этой копии письмо не доходит, если очередь на ноде пустая.
+fn queue_grant_live(grant: Option<&crate::queue_mail::QueueGrant>, now: u64) -> bool {
+    grant.is_some_and(|g| g.expiry > now)
+}
+
 fn queue_store_packet(
     env: &OfflineEnvelope,
     grant: Option<&crate::queue_mail::QueueGrant>,
@@ -2822,14 +2824,26 @@ fn dispatch_mailbox_stores(
     let recip = recipient.to_string();
     let ready = onion_rt_mailbox_hops(dest, swarm.connected_peers().copied()).is_some();
     let connected = swarm.is_connected(&dest);
+    let now = crate::offline_mail::prekey_unix_now();
+    // Бит очереди уже обменян грантом. Копия в слот PeerId даёт пустой Deliver,
+    // и клиент считает сдачу проваленной, хотя очередь письмо приняла.
+    let queue_only = queue_grant_live(grant, now);
     let mut queued = Vec::new();
     for env in envelopes {
         let packet = peer_mailbox_packet(&recip, env);
-        // TCP до ноды уже есть — Store идёт прямым кадром. Onion-обёртка
-        // при живом соединении не доходит до старого обработчика ящика.
         if connected {
             if let Some(extra) = queue_store_packet(env, grant) {
-                let _ = rr_send(swarm, &dest, extra);
+                let rid = rr_send(swarm, &dest, extra);
+                if queue_only {
+                    track_mailbox_rr(
+                        rid,
+                        store_track,
+                        handoff,
+                        recipient,
+                        env.message_id.clone(),
+                    );
+                    continue;
+                }
             }
             let rid = rr_send(swarm, &dest, packet);
             track_mailbox_rr(
