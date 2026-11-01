@@ -20,7 +20,7 @@
 | [07-rendezvous.md](07-rendezvous.md) | Hop reservation, circuit, `DialBack` |
 | [08-seed.md](08-seed.md) | `/void-seed/v1` между диспетчерами |
 | [09-onion.md](09-onion.md) | v1 и v2, дескриптор, что видит hop |
-| [10-groups.md](10-groups.md) | Fan-out и подписанный состав (до MLS) |
+| [10-groups.md](10-groups.md) | Попарный fan-out и MLS, подписанный состав |
 | [vectors/README.md](vectors/README.md) | Известные ответы: Hello, ratchet, конверт, prekey, onion |
 
 В каждом файле одна и та же таблица: **Наблюдатель / Видит / Не видит**.

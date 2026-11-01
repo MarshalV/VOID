@@ -1,3 +1,7 @@
+> **In development.** This tree is moving, and there is no stable version. A build from one day does not promise to open a vault or finish a handshake with a build from another. Install the desktop and the node from the same tree.
+>
+> The cryptography has not been reviewed outside this project. Do not use VOID where a failure would put someone in danger.
+
 <div align="center">
 
 <img src="static/Image_programm.png" alt="VOID Logo" width="160" />
