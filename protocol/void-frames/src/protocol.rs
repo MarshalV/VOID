@@ -925,7 +925,17 @@ pub fn is_mailbox_onion_packet(packet: &V1Packet) -> bool {
 }
 
 fn mailbox_mail_packet(packet: &V1Packet) -> bool {
-    is_mailbox_onion_packet(packet) || matches!(packet, V1Packet::Ack)
+    is_mailbox_onion_packet(packet)
+        || matches!(
+            packet,
+            V1Packet::Ack
+                | V1Packet::CreateQueue { .. }
+                | V1Packet::QueueStore { .. }
+                | V1Packet::QueueChallengeRequest { .. }
+                | V1Packet::QueueChallenge { .. }
+                | V1Packet::QueueQuery { .. }
+                | V1Packet::QueueDeliver { .. }
+        )
 }
 
 fn push_peer(out: &mut Vec<u8>, peer: PeerId) -> bool {
@@ -1531,5 +1541,22 @@ mod mailbox_onion_mail_tests {
         assert_eq!(route.token, token);
         assert_eq!(route.reply_hops.len(), 1);
         assert!(wrap_onion_packet(&[(entry, [9u8; 32])], alice, bob, packet, true).is_none());
+    }
+
+    #[test]
+    fn queue_reply_roundtrips_inside_the_mailbox_seal() {
+        let dest = Keypair::generate_ed25519().public().to_peer_id();
+        let hop = Keypair::generate_ed25519().public().to_peer_id();
+        let token = [4u8; 16];
+        let packet = V1Packet::QueueDeliver {
+            blobs: vec![vec![1, 2, 3]],
+        };
+        let cell = wrap_mailbox_reply(&[(hop, [5u8; 32])], dest, &packet, token).expect("reply");
+        assert!(matches!(cell, V1Packet::Onion2 { .. }));
+        let mail = encode_v2_mailbox(&packet, &token, None, &[]).expect("mail");
+        let (decoded, route) = decode_v2_mailbox(&mail).expect("decode");
+        assert!(matches!(decoded, V1Packet::QueueDeliver { blobs } if blobs == vec![vec![1, 2, 3]]));
+        assert!(route.reply_hops.is_empty());
+        assert_eq!(route.token, token);
     }
 }
