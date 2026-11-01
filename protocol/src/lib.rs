@@ -12,6 +12,10 @@ pub mod crypto {
     pub use void_session::crypto::*;
 }
 
+pub mod kem {
+    pub use void_session::kem::*;
+}
+
 pub mod group {
     pub use void_session::group::*;
 }
@@ -26,6 +30,10 @@ pub mod offline_mail {
 pub mod onion;
 
 pub mod queue_mail;
+
+pub mod mls {
+    pub use void_mls::*;
+}
 
 pub mod protocol {
     pub use void_frames::protocol::*;

@@ -90,13 +90,30 @@ fn cbor_bytes(packet: &V1Packet) -> Result<Vec<u8>> {
 
 pub fn check_v1_limits(packet: &V1Packet) -> Result<()> {
     match packet {
-        V1Packet::Encrypted { ciphertext, .. } => {
-            if ciphertext.len() > MAX_CIPHERTEXT_BYTES {
+        V1Packet::Encrypted { header, ciphertext } => {
+            if ciphertext.len() > MAX_CIPHERTEXT_BYTES || header.sealed.len() > 256 {
                 return Err(anyhow!(
                     "ciphertext {} exceeds {}",
                     ciphertext.len(),
                     MAX_CIPHERTEXT_BYTES
                 ));
+            }
+        }
+        V1Packet::Hello {
+            kem_ek,
+            kem_ct,
+            pq_sig,
+            transport_sig,
+            ..
+        } => {
+            if !matches!(kem_ek.len(), 0 | void_session::kem::EK_LEN) {
+                return Err(anyhow!("hello kem_ek"));
+            }
+            if !matches!(kem_ct.len(), 0 | void_session::kem::CT_LEN) {
+                return Err(anyhow!("hello kem_ct"));
+            }
+            if pq_sig.len() > 256 || transport_sig.len() > 256 {
+                return Err(anyhow!("hello sig"));
             }
         }
         V1Packet::Onion { ct, .. } => {
@@ -115,6 +132,16 @@ pub fn check_v1_limits(packet: &V1Packet) -> Result<()> {
             )?;
         }
         V1Packet::OnionDrop { packet, .. } => check_v1_limits(packet)?,
+        V1Packet::GroupMls { group_id, body, .. } => {
+            if !void_session::group::validate_group_id(group_id) || body.len() > 256 * 1024 {
+                return Err(anyhow!("group mls frame"));
+            }
+        }
+        V1Packet::MlsKeyPackage { group_id, body } => {
+            if !void_session::group::validate_group_id(group_id) || body.len() > 64 * 1024 {
+                return Err(anyhow!("mls key package frame"));
+            }
+        }
         _ => {}
     }
     Ok(())
@@ -148,6 +175,7 @@ mod tests {
                 dh_pub: [9u8; 32],
                 pn: 1,
                 n: 2,
+                sealed: Vec::new(),
             },
             ciphertext: vec![0xab; n],
         }

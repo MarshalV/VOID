@@ -1,0 +1,71 @@
+(*
+  Model of three VOID messages. This is not a proof of the Rust.
+
+  1. Hello bind: the signature covers both peer ids, the keys, ts, nonce, caps.
+     A signature for one recipient is not a signature for another.
+  2. The first ratchet frame is AEAD under a key derived from the signed Hello.
+  3. A queue query is accepted only with the owner's signature
+     (VOID_QUEUE_QUERY_V1).
+*)
+
+free net: channel.
+
+type pkey.
+type skey.
+type nonce.
+
+fun pk(skey): pkey.
+
+fun sign(bitstring, skey): bitstring.
+reduc forall m: bitstring, k: skey; check(sign(m, k), pk(k)) = true.
+
+fun aead(bitstring, bitstring): bitstring.
+reduc forall m: bitstring, k: bitstring; open(aead(m, k), k) = m.
+
+fun hello(pkey, pkey, bitstring, bitstring, nonce, bitstring): bitstring.
+fun query(bitstring, bitstring, nonce): bitstring.
+
+event HelloBound(pkey, pkey).
+event QueryOk(pkey, bitstring).
+
+free secret: bitstring [private].
+
+query attacker(secret).
+query a: pkey, b: pkey, c: pkey;
+  event(HelloBound(a, b)) ==> a <> c || b = c.
+
+let initiator(skA: skey, pkB: pkey) =
+  new eph: bitstring;
+  new ts: bitstring;
+  new n: nonce;
+  new caps: bitstring;
+  let body = hello(pk(skA), pkB, eph, ts, n, caps) in
+  out(net, (body, sign(body, skA))).
+
+let responder(skB: skey, pkA: pkey) =
+  in(net, (body: bitstring, sig: bitstring));
+  if check(sig, pkA) = true then
+  event HelloBound(pkA, pk(skB));
+  out(net, aead(secret, body)).
+
+let owner(sk: skey, queue: bitstring) =
+  new ts: bitstring;
+  new n: nonce;
+  let msg = query(queue, ts, n) in
+  out(net, (msg, sign(msg, sk))).
+
+let node(pkOwner: pkey, queue: bitstring) =
+  in(net, (msg: bitstring, sig: bitstring));
+  if check(sig, pkOwner) = true then
+  event QueryOk(pkOwner, queue).
+
+process
+  new skA: skey;
+  new skB: skey;
+  new queue: bitstring;
+  (
+    initiator(skA, pk(skB)) |
+    responder(skB, pk(skA)) |
+    owner(skA, queue) |
+    node(pk(skA), queue)
+  )

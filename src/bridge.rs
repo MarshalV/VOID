@@ -331,6 +331,7 @@ struct Inner {
     identity_key: Option<libp2p::identity::Keypair>,
     offline_prekey_secrets: Vec<crypto::StaticSecret>,
     offline_opks: Vec<crate::offline_mail::OpkSecret>,
+    offline_kem_dks: Vec<Vec<u8>>,
     spent_opk: Vec<[u8; 16]>,
     command_tx: Option<mpsc::Sender<UICommand>>,
     messages: SharedChatMessages,
@@ -349,6 +350,7 @@ struct Inner {
     dht_total: usize,
     peer_prekeys: HashMap<PeerId, [u8; 32]>,
     contact_queues: HashMap<PeerId, crate::queue_mail::ContactQueueRecord>,
+    group_mls: crate::group_mls::GroupMls,
     outbox_entries: Vec<OutboxEntry>,
     incoming_file_offers: Vec<FileOfferDto>,
     voice_recorder: VoiceRecorder,
@@ -395,6 +397,7 @@ impl Inner {
             identity_key: None,
             offline_prekey_secrets: Vec::new(),
             offline_opks: Vec::new(),
+            offline_kem_dks: Vec::new(),
             spent_opk: Vec::new(),
             command_tx: None,
             messages,
@@ -413,6 +416,7 @@ impl Inner {
             dht_total: 0,
             peer_prekeys: HashMap::new(),
             contact_queues: HashMap::new(),
+            group_mls: crate::group_mls::GroupMls::empty(),
             outbox_entries: Vec::new(),
             incoming_file_offers: Vec::new(),
             voice_recorder: VoiceRecorder::new(),
@@ -634,6 +638,7 @@ impl Inner {
                         creator_id,
                         *version,
                         members,
+                        self.groups.get(group_id).is_some_and(|g| g.mls),
                     ) {
                         items.push(OfflineOutboxItem {
                             recipient: pid,
@@ -1231,6 +1236,7 @@ impl Inner {
             u64,
             Vec<u8>,
             Vec<u8>,
+            bool,
         )> = Vec::new();
         {
             let Some(secret_owned) = self.local_static.clone() else {
@@ -1264,6 +1270,11 @@ impl Inner {
                     &self.spent_opk,
                     &local_pid,
                     &env,
+                    &self
+                        .offline_kem_dks
+                        .iter()
+                        .map(|d| d.as_slice())
+                        .collect::<Vec<_>>(),
                 ) {
                     Ok(out) => {
                         if let Some(id) = out.spent_opk {
@@ -1354,6 +1365,7 @@ impl Inner {
                             version,
                             sig,
                             creator_pubkey_pb,
+                            mls,
                         }) = parse_decrypted_chat_frame(&plaintext)
                         {
                             group_syncs.push((
@@ -1365,6 +1377,7 @@ impl Inner {
                                 version,
                                 sig,
                                 creator_pubkey_pb,
+                                mls,
                             ));
                             self.offline_mail_processed.insert(env.message_id);
                         }
@@ -1373,8 +1386,17 @@ impl Inner {
                 }
             }
         }
-        for (from, group_id, group_name, creator_id, members, version, sig, creator_pubkey_pb) in
-            group_syncs
+        for (
+            from,
+            group_id,
+            group_name,
+            creator_id,
+            members,
+            version,
+            sig,
+            creator_pubkey_pb,
+            mls,
+        ) in group_syncs
         {
             self.merge_incoming_group_sync(
                 from,
@@ -1385,6 +1407,7 @@ impl Inner {
                 version,
                 sig,
                 creator_pubkey_pb,
+                mls,
             );
             any = true;
         }
@@ -1726,6 +1749,7 @@ impl Inner {
         });
         let groups: Vec<GroupChat> = self.groups.values().cloned().collect();
         let left: Vec<String> = self.left_groups.iter().cloned().collect();
+        let snap = self.group_mls.snapshot();
         if let Err(e) = Storage::save(
             key,
             &self.local_nickname,
@@ -1735,6 +1759,7 @@ impl Inner {
             Some(&self.void_bootstrap_strings),
             Some(&groups),
             Some(&left),
+            snap.as_ref(),
         ) {
             warn!("VOID bridge: persist vault: {e}");
         }
@@ -1826,14 +1851,15 @@ impl Inner {
         }
         self.accelerate_offline_publish();
         if let Some(tx) = &self.command_tx {
-            let _ = tx.try_send(UICommand::SendGroupSync {
-                group_id: group.id.clone(),
-                group_name: group.name.clone(),
-                creator_id: group.creator_id.clone(),
-                members: group.members.clone(),
-                recipients,
-                version: group.version,
-            });
+                let _ = tx.try_send(UICommand::SendGroupSync {
+                    group_id: group.id.clone(),
+                    group_name: group.name.clone(),
+                    creator_id: group.creator_id.clone(),
+                    members: group.members.clone(),
+                    recipients,
+                    version: group.version,
+                    mls: group.mls,
+                });
         }
     }
 
@@ -1886,6 +1912,7 @@ impl Inner {
                     members: group.members.clone(),
                     recipients: vec![peer],
                     version: group.version,
+                    mls: group.mls,
                 });
             }
         }
@@ -1909,6 +1936,7 @@ impl Inner {
         version: u64,
         sig: Vec<u8>,
         creator_pubkey_pb: Vec<u8>,
+        mls: bool,
     ) {
         if self.left_groups.contains(&group_id) || !group::validate_group_id(&group_id) {
             return;
@@ -1925,6 +1953,7 @@ impl Inner {
             &members,
             &sig,
             &creator_pubkey_pb,
+            mls,
         );
         let Some(group::AuthorizedGroupSync {
             name,
@@ -1947,6 +1976,31 @@ impl Inner {
         if !members.iter().any(|m| m.peer_id == me) {
             return;
         }
+        let existing_mls = self.groups.get(&group_id).is_some_and(|g| g.mls);
+        let mls = existing_mls || mls;
+        if self.groups.get(&group_id).is_some_and(|g| !g.mls) {
+            // Уже существующая попарная группа такой и остаётся.
+        } else if mls {
+            for m in &members {
+                if m.peer_id == me {
+                    continue;
+                }
+                let Ok(pid) = m.peer_id.parse::<PeerId>() else {
+                    warn!("VOID: MLS-группа отвергла участника без PeerId");
+                    return;
+                };
+                if crate::network::peer_has_mls(pid) {
+                    continue;
+                }
+                warn!("VOID: MLS-группа отвергла {} без HELLO_CAP_MLS", m.peer_id);
+                return;
+            }
+        }
+        let mls = if self.groups.get(&group_id).is_some_and(|g| !g.mls) {
+            false
+        } else {
+            mls
+        };
         for m in &mut members {
             if m.display_name.trim().is_empty() {
                 m.display_name = m
@@ -1967,17 +2021,44 @@ impl Inner {
                     .to_string()
             });
         let is_new = !self.groups.contains_key(&group_id);
+        let id = group_id.clone();
+        let creator_for_mls = creator_id.clone();
         self.groups.insert(
-            group_id.clone(),
+            id.clone(),
             GroupChat {
-                id: group_id,
+                id: id.clone(),
                 name: name.clone(),
                 creator_id,
                 members: members.clone(),
                 created_at,
                 version,
+                mls,
             },
         );
+        if mls {
+            let peer_id = local.to_string();
+            if self.group_mls.snapshot().is_none() {
+                self.group_mls = crate::group_mls::GroupMls::open(&peer_id, None);
+            }
+            if creator_for_mls == peer_id && !self.group_mls.has(&id) {
+                let _ = self.group_mls.ensure_group(&id);
+            }
+            if creator_for_mls != peer_id && !self.group_mls.has(&id) {
+                if let (Ok(body), Ok(creator)) = (
+                    self.group_mls.key_package(),
+                    creator_for_mls.parse::<PeerId>(),
+                ) {
+                    if let Some(tx) = &self.command_tx {
+                        let _ = tx.try_send(UICommand::SendMlsKeyPackage {
+                            recipient: creator,
+                            group_id: id,
+                            body,
+                        });
+                    }
+                }
+            }
+            self.persist_vault();
+        }
         for m in &members {
             if let Ok(pid) = m.peer_id.parse::<PeerId>() {
                 if pid != local && !self.known_peers.contains_key(&pid) {
@@ -2072,12 +2153,13 @@ impl Inner {
             self.ensure_peer_routed(pid);
             if let Some(tx) = &self.command_tx {
                 let _ = tx.try_send(UICommand::SendGroupSync {
-                    group_id,
+                    group_id: group_id.clone(),
                     group_name,
                     creator_id,
                     members,
                     recipients: vec![pid],
                     version,
+                    mls: self.groups.get(&group_id).is_some_and(|g| g.mls),
                 });
             }
         }
@@ -2085,6 +2167,33 @@ impl Inner {
             for (group_id, message_id, text, members) in text_jobs {
                 for pid in &members {
                     self.ensure_peer_routed(*pid);
+                }
+                let mls = self.groups.get(&group_id).is_some_and(|g| g.mls);
+                if mls {
+                    let msg = ChatMessage {
+                        id: message_id.clone(),
+                        sender_id: local.map(|p| p.to_string()).unwrap_or_default(),
+                        sender_name: nick.clone(),
+                        recipient_id: None,
+                        text: text.clone(),
+                        timestamp: chrono::Local::now().format("%H:%M:%S").to_string(),
+                        delivery: OutgoingDeliveryStatus::Pending,
+                        voice: None,
+                        file: None,
+                        group_id: Some(group_id.clone()),
+                    };
+                    if let Ok(json) = serde_json::to_vec(&msg) {
+                        if let Ok(sealed) = self.group_mls.seal(&group_id, &json) {
+                            let _ = tx.try_send(UICommand::SendGroupMls {
+                                group_id,
+                                epoch: sealed.epoch,
+                                body: sealed.body,
+                                recipients: members,
+                                message_id,
+                            });
+                            continue;
+                        }
+                    }
                 }
                 let _ = tx.try_send(UICommand::SendGroupMessage {
                     sender_name: nick.clone(),
@@ -2891,6 +3000,7 @@ impl VoidRuntime {
                             version,
                             sig,
                             creator_pubkey_pb,
+                            mls,
                         } => {
                             let had = g.groups.contains_key(&group_id);
                             g.merge_incoming_group_sync(
@@ -2902,6 +3012,7 @@ impl VoidRuntime {
                                 version,
                                 sig,
                                 creator_pubkey_pb,
+                                mls,
                             );
                             if let Some(added) = g.groups.get(&group_id).filter(|_| !had) {
                                 bridge_evs.push(BridgeEvent::Status {
@@ -2928,6 +3039,20 @@ impl VoidRuntime {
                                     gchat.clone()
                                 });
                                 if let Some(updated) = updated {
+                                    if updated.mls && updated.creator_id == me {
+                                        if let Ok(commit) = g.group_mls.evict(&updated.id, &peer_id) {
+                                            let recipients = updated.member_peer_ids();
+                                            if let Some(tx) = &g.command_tx {
+                                                let _ = tx.try_send(UICommand::SendGroupMls {
+                                                    group_id: updated.id.clone(),
+                                                    epoch: commit.epoch,
+                                                    body: commit.commit,
+                                                    recipients,
+                                                    message_id: String::new(),
+                                                });
+                                            }
+                                        }
+                                    }
                                     if updated.members.is_empty() {
                                         g.groups.remove(&group_id);
                                     }
@@ -2941,12 +3066,96 @@ impl VoidRuntime {
                         }
                         NetworkEvent::GroupDelete { from, group_id } => {
                             if group::may_apply_group_delete(g.groups.get(&group_id), &from.to_string()) {
+                                g.group_mls.forget(&group_id);
                                 g.groups.remove(&group_id);
                                 g.left_groups.insert(group_id);
                                 g.persist_vault();
                                 emit_snapshot = true;
                             } else {
                                 warn!("VOID: group_delete от {from} отклонён: не создатель");
+                            }
+                        }
+                        NetworkEvent::MlsKeyPackage {
+                            from,
+                            group_id,
+                            body,
+                        } => {
+                            let me = g.local_peer_id.map(|p| p.to_string()).unwrap_or_default();
+                            let admit = g.groups.get(&group_id).is_some_and(|gr| {
+                                gr.mls
+                                    && gr.creator_id == me
+                                    && gr.members.iter().any(|m| m.peer_id == from.to_string())
+                            });
+                            if admit {
+                                if let Ok(added) = g.group_mls.admit(&group_id, &body) {
+                                    if let Some(tx) = &g.command_tx {
+                                        let _ = tx.try_send(UICommand::SendGroupMls {
+                                            group_id: group_id.clone(),
+                                            epoch: added.epoch,
+                                            body: added.welcome,
+                                            recipients: vec![from],
+                                            message_id: String::new(),
+                                        });
+                                        let others = g
+                                            .groups
+                                            .get(&group_id)
+                                            .map(|gr| gr.member_peer_ids())
+                                            .unwrap_or_default()
+                                            .into_iter()
+                                            .filter(|p| *p != from && g.local_peer_id != Some(*p))
+                                            .collect();
+                                        let _ = tx.try_send(UICommand::SendGroupMls {
+                                            group_id,
+                                            epoch: added.epoch,
+                                            body: added.commit,
+                                            recipients: others,
+                                            message_id: String::new(),
+                                        });
+                                    }
+                                    g.persist_vault();
+                                }
+                            }
+                        }
+                        NetworkEvent::GroupMls {
+                            from: _,
+                            group_id,
+                            epoch: _,
+                            body,
+                        } => {
+                            let local = g
+                                .local_peer_id
+                                .map(|p| p.to_string())
+                                .unwrap_or_default();
+                            match g.group_mls.take(&group_id, &body) {
+                                Ok(crate::group_mls::MlsIn::Application { plaintext }) => {
+                                    if let Ok(msg) = serde_json::from_slice::<ChatMessage>(&plaintext)
+                                    {
+                                        if group::validate_group_id(&group_id)
+                                            && !g.left_groups.contains(&group_id)
+                                            && g.groups.get(&group_id).is_some_and(|gr| {
+                                                group::member_may_post(gr, &local, &msg.sender_id)
+                                            })
+                                            && !g.messages.is_deleted(&msg.id)
+                                        {
+                                            let chat_id = group_thread_key(&group_id);
+                                            let mut map = g.messages.lock();
+                                            let list = map.entry(chat_id.clone()).or_default();
+                                            if !list.iter().any(|m| m.id == msg.id) {
+                                                list.push(msg);
+                                                drop(map);
+                                                g.messages.mark_dirty();
+                                                g.persist_journal();
+                                                bridge_evs.push(BridgeEvent::Message { chat_id });
+                                                emit_snapshot = true;
+                                            }
+                                        }
+                                    }
+                                }
+                                Ok(_) => {
+                                    g.persist_vault();
+                                    emit_snapshot = true;
+                                }
+                                Err(_) => {}
                             }
                         }
                         _ => {}
@@ -3149,6 +3358,7 @@ impl VoidRuntime {
                         Some(&bootstraps),
                         None,
                         None,
+                        None,
                     );
                 }
 
@@ -3206,6 +3416,10 @@ impl VoidRuntime {
                     .as_ref()
                     .map(|p| p.secrets.clone())
                     .unwrap_or_default();
+                let offline_kem_dks = loaded_prekeys
+                    .as_ref()
+                    .map(|p| p.kem_dks.clone())
+                    .unwrap_or_default();
                 let offline_opks = loaded_prekeys
                     .as_ref()
                     .map(|p| p.opk_secrets.clone())
@@ -3236,6 +3450,7 @@ impl VoidRuntime {
                     g.offline_identity = offline_identity.clone();
                     g.identity_key = Some(identity_key.clone());
                     g.offline_prekey_secrets = offline_prekey_secrets.clone();
+                    g.offline_kem_dks = offline_kem_dks.clone();
                     g.offline_opks = offline_opks.clone();
                     g.spent_opk = spent_opk.clone();
                     g.command_tx = Some(command_tx);
@@ -3246,6 +3461,8 @@ impl VoidRuntime {
                     g.left_groups = left_groups;
                     g.peer_prekeys = peer_prekeys;
                     g.contact_queues = contact_queues.clone();
+                    g.group_mls =
+                        crate::group_mls::GroupMls::open(&my_id.to_string(), storage.mls_snapshot.as_ref());
                     g.outbox_entries = outbox;
                     g.add_status("Vault разблокирован — сеть запущена".into());
                     if !g.peer_prekeys.is_empty() {
@@ -3297,12 +3514,13 @@ impl VoidRuntime {
                                     g.ensure_peer_routed(pid);
                                     if let Some(tx) = &g.command_tx {
                                         let _ = tx.try_send(UICommand::SendGroupSync {
-                                            group_id,
+                                            group_id: group_id.clone(),
                                             group_name,
                                             creator_id,
                                             members,
                                             recipients: vec![pid],
                                             version,
+                                            mls: g.groups.get(&group_id).is_some_and(|gr| gr.mls),
                                         });
                                     }
                                 }
@@ -3347,6 +3565,7 @@ impl VoidRuntime {
                     g.offline_identity = offline_identity.clone();
                     g.identity_key = Some(identity_key);
                     g.offline_prekey_secrets = offline_prekey_secrets;
+                    g.offline_kem_dks = offline_kem_dks;
                     g.offline_opks = offline_opks;
                     g.spent_opk = spent_opk;
                     g.known_peers = book;
@@ -3356,6 +3575,8 @@ impl VoidRuntime {
                     g.left_groups = left_groups;
                     g.peer_prekeys = peer_prekeys;
                     g.contact_queues = contact_queues;
+                    g.group_mls =
+                        crate::group_mls::GroupMls::open(&my_id.to_string(), storage.mls_snapshot.as_ref());
                     g.outbox_entries = outbox;
                 }
             }
@@ -3376,6 +3597,7 @@ impl VoidRuntime {
                     None,
                     None,
                     None,
+                    None,
                 )
                 .map_err(|e| {
                     let _ = std::fs::remove_file(crate::paths::data_file(Storage::KEY_FILE));
@@ -3389,6 +3611,10 @@ impl VoidRuntime {
                 let offline_prekey_secrets = loaded_prekeys
                     .as_ref()
                     .map(|p| p.secrets.clone())
+                    .unwrap_or_default();
+                let offline_kem_dks = loaded_prekeys
+                    .as_ref()
+                    .map(|p| p.kem_dks.clone())
                     .unwrap_or_default();
                 let offline_opks = loaded_prekeys
                     .as_ref()
@@ -3420,6 +3646,7 @@ impl VoidRuntime {
                     g.offline_identity = offline_identity.clone();
                     g.identity_key = Some(identity_key.clone());
                     g.offline_prekey_secrets = offline_prekey_secrets.clone();
+                    g.offline_kem_dks = offline_kem_dks.clone();
                     g.offline_opks = offline_opks.clone();
                     g.spent_opk = spent_opk.clone();
                     g.command_tx = Some(command_tx);
@@ -3435,6 +3662,7 @@ impl VoidRuntime {
                     g.offline_identity = offline_identity.clone();
                     g.identity_key = Some(identity_key);
                     g.offline_prekey_secrets = offline_prekey_secrets;
+                    g.offline_kem_dks = offline_kem_dks;
                     g.offline_opks = offline_opks;
                     g.spent_opk = spent_opk;
                 }
@@ -3532,7 +3760,7 @@ impl VoidRuntime {
                 file: None,
                 group_id: Some(gid.clone()),
             };
-            g.messages.lock().entry(chat).or_default().push(msg);
+            g.messages.lock().entry(chat).or_default().push(msg.clone());
             g.messages.mark_dirty();
             g.persist_journal();
             for pid in &targets {
@@ -3541,7 +3769,20 @@ impl VoidRuntime {
             g.queue_outbox_group_message(gid.clone(), mid.clone(), text.clone(), &members);
             g.schedule_offline_publish();
             g.publish_outbox_to_dht();
-            if let Some(tx) = &g.command_tx {
+            if group.mls {
+                let json = serde_json::to_vec(&msg).map_err(|e| e.to_string())?;
+                let sealed = g.group_mls.seal(&gid, &json).map_err(|e| e.to_string())?;
+                g.persist_vault();
+                if let Some(tx) = &g.command_tx {
+                    let _ = tx.try_send(UICommand::SendGroupMls {
+                        group_id: gid,
+                        epoch: sealed.epoch,
+                        body: sealed.body,
+                        recipients: targets,
+                        message_id: mid,
+                    });
+                }
+            } else if let Some(tx) = &g.command_tx {
                 let _ = tx.try_send(UICommand::SendGroupMessage {
                     sender_name: nick,
                     text,
@@ -4345,6 +4586,7 @@ impl VoidRuntime {
             g.ensure_peer_routed(*pid);
         }
         members = dedupe_members(members);
+        let mls = !extra.is_empty() && extra.iter().all(|pid| crate::network::peer_has_mls(*pid));
         let id = group::new_group_id();
         let group = GroupChat {
             id: id.clone(),
@@ -4355,7 +4597,17 @@ impl VoidRuntime {
                 .format("%Y-%m-%d %H:%M:%S")
                 .to_string(),
             version: 1,
+            mls,
         };
+        if mls {
+            let peer = local.to_string();
+            if g.group_mls.snapshot().is_none() {
+                g.group_mls = crate::group_mls::GroupMls::open(&peer, None);
+            }
+            g.group_mls
+                .ensure_group(&id)
+                .map_err(|e| e.to_string())?;
+        }
         g.groups.insert(id.clone(), group.clone());
         g.selected_chat = group_thread_key(&id);
         g.persist_vault();
@@ -4379,6 +4631,20 @@ impl VoidRuntime {
         g.left_groups.remove(&group.id);
         g.selected_chat = group_thread_key(&group.id);
         g.groups.insert(group.id.clone(), group.clone());
+        if group.mls {
+            if let (Ok(body), Ok(creator)) = (
+                g.group_mls.key_package(),
+                group.creator_id.parse::<PeerId>(),
+            ) {
+                if let Some(tx) = &g.command_tx {
+                    let _ = tx.try_send(UICommand::SendMlsKeyPackage {
+                        recipient: creator,
+                        group_id: group.id.clone(),
+                        body,
+                    });
+                }
+            }
+        }
         g.persist_vault();
         g.broadcast_group_sync(&group);
         drop(g);
@@ -4414,6 +4680,11 @@ impl VoidRuntime {
             let canonical = pid.to_string();
             if pid == local || already.contains(&canonical) {
                 continue;
+            }
+            if g.groups.get(&gid).is_some_and(|gr| gr.mls)
+                && !crate::network::peer_has_mls(pid)
+            {
+                return Err("Этот контакт не объявил MLS. В такую группу его не добавить.".into());
             }
             if newcomers.iter().any(|m| m.peer_id == canonical) {
                 continue;
@@ -4509,6 +4780,7 @@ impl VoidRuntime {
             }
         }
         g.left_groups.insert(gid.clone());
+        g.group_mls.forget(&gid);
         g.groups.remove(&gid);
         g.outbox_entries.retain(|e| match e {
             OutboxEntry::GroupMessage { group_id, .. }

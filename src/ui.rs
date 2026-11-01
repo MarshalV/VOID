@@ -1930,6 +1930,7 @@ impl eframe::App for App {
                     version,
                     sig,
                     creator_pubkey_pb,
+                    mls,
                 } => {
                     self.merge_incoming_group_sync(
                         from,
@@ -1940,6 +1941,7 @@ impl eframe::App for App {
                         version,
                         sig,
                         creator_pubkey_pb,
+                        mls,
                     );
                     self.push_toast(
                         "Обновлён состав группы".into(),
@@ -2429,6 +2431,16 @@ impl eframe::App for App {
                         }
                         self.persist_vault();
                     }
+                }
+                NetworkEvent::GroupMls { group_id, body, .. } => {
+                    self.ingest_group_mls(group_id, body);
+                }
+                NetworkEvent::MlsKeyPackage {
+                    from,
+                    group_id,
+                    body,
+                } => {
+                    self.ingest_mls_key_package(from, group_id, body);
                 }
             }
         }
@@ -3539,6 +3551,37 @@ impl eframe::App for App {
                                             text_to_send.clone(),
                                             members.clone(),
                                         );
+                                        if self.group_uses_mls(&gid) {
+                                            match self.try_send_mls_group_text(
+                                                &gid,
+                                                &message_id,
+                                                &text_to_send,
+                                                targets.clone(),
+                                            ) {
+                                                Ok(true) => {
+                                                    self.chat_input.clear();
+                                                    self.pending_group_sends.push(PendingGroupSend {
+                                                        group_id: gid,
+                                                        members,
+                                                        text: text_to_send,
+                                                        message_id,
+                                                        last_send_at: Instant::now(),
+                                                        attempts: 0,
+                                                        delivered_to: std::collections::HashSet::new(),
+                                                        voice_delivered_to: std::collections::HashSet::new(),
+                                                        voice_path: None,
+                                                        voice_duration_secs: 0.0,
+                                                        voice_transfer_id: None,
+                                                        chat_message: None,
+                                                        voice_shown: false,
+                                                    });
+                                                }
+                                                _ => self.add_status(
+                                                    "⚠ MLS-группа не запечатала сообщение."
+                                                        .into(),
+                                                ),
+                                            }
+                                        } else {
                                         match self.command_tx.try_send(UICommand::SendGroupMessage {
                                             sender_name: self.local_nickname.clone(),
                                             text: text_to_send.clone(),
@@ -3573,6 +3616,7 @@ impl eframe::App for App {
                                                 "⚠ Очередь к сети переполнена, повторите отправку."
                                                     .into(),
                                             ),
+                                        }
                                         }
                                     }
                                 } else if let Some(peer_id) = self.selected_chat.parse::<PeerId>().ok() {

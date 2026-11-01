@@ -39,7 +39,7 @@ k2 = okm[32..64]
 C → S   frame( e_c )                         ровно 32 байта тела
 S → C   frame( e_s || AEAD(k1, n=0, auth_s) )
 C → S   frame( AEAD(k2, n=0, auth_c || request) )
-S → C   frame( AEAD(k2, n=1, response) )
+S → C   frame( AEAD(k2, n=1, confirm || response) )
 ```
 
 `e_c` и `e_s` — 32 байта. После рукопожатия секреты эфемеров стираются.
@@ -61,10 +61,18 @@ S → C   frame( AEAD(k2, n=1, response) )
 Подпись Ed25519 на сообщении (не на всём `AuthPayload`):
 
 ```
-"/void-seed/v1" || "|" || direction || "|" || e_c || e_s
+"/void-seed/v1" || "|" || direction || "|" || e_c || e_s || peer_id подписавшего || timestamp_le
 ```
 
-`direction` — `s` у принявшего (msg2), `c` у инициатора (msg3). Вертикальная черта — один байт `0x7c`.
+У инициатора (`direction = c`) после timestamp дописывается PeerId сервера. У принявшего (`direction = s`) в msg2 PeerId клиента ещё нет, и в подпись он не входит.
+
+msg4 — не голый `SeedResponse`. Это bincode структуры с полями `confirm_ts`, `confirm_sig`, `response`. Подпись подтверждения:
+
+```
+"/void-seed/v1" || "|both|" || e_c || e_s || PeerId сервера || PeerId клиента || timestamp_le
+```
+
+Клиент проверяет её ключом `static_ed_pub` из msg2 и не принимает список, если подпись или окно 300 секунд не сошлись. Старый msg4 без этих полей рукопожатие не заканчивает.
 
 Проверка:
 

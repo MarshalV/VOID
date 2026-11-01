@@ -24,6 +24,9 @@ pub struct GroupChat {
     /// Монотонная версия подписанного состава. 0 — группа ещё без подписи создателя.
     #[serde(default)]
     pub version: u64,
+    /// Группа шифрует письма одним MLS-эпохой. Старые vault читают это как false.
+    #[serde(default)]
+    pub mls: bool,
 }
 
 impl GroupChat {
@@ -127,8 +130,12 @@ pub fn build_invite_link(group: &GroupChat) -> String {
         .collect::<Vec<_>>()
         .join(",");
     format!(
-        "void://group/{}?name={}&m={}&creator={}",
-        group.id, name_enc, members, group.creator_id
+        "void://group/{}?name={}&m={}&creator={}{}",
+        group.id,
+        name_enc,
+        members,
+        group.creator_id,
+        if group.mls { "&mls=1" } else { "" }
     )
 }
 
@@ -146,6 +153,7 @@ pub fn parse_invite_link(input: &str) -> Option<GroupChat> {
     let mut name = format!("Группа {}", &id_part[..8.min(id_part.len())]);
     let mut creator_id = String::new();
     let mut member_ids: Vec<String> = Vec::new();
+    let mut mls = false;
 
     if let Some(q) = query {
         for pair in q.split('&') {
@@ -169,6 +177,7 @@ pub fn parse_invite_link(input: &str) -> Option<GroupChat> {
                         .map(str::to_string)
                         .collect();
                 }
+                "mls" => mls = v == "1",
                 _ => {}
             }
         }
@@ -204,6 +213,7 @@ pub fn parse_invite_link(input: &str) -> Option<GroupChat> {
         members,
         created_at: chrono::Local::now().format("%Y-%m-%d %H:%M").to_string(),
         version: 0,
+        mls,
     };
     if validate_group_chat(&group) {
         Some(group)
@@ -316,6 +326,27 @@ pub fn group_sync_message(
         push_lp16(&mut v, m.display_name.as_bytes());
     }
     v
+}
+
+/// Те же байты, что [`group_sync_message`], и ещё байт `1`, если группа MLS.
+/// Без MLS подпись не меняется.
+pub fn group_sync_signed_bytes(
+    group_id: &str,
+    version: u64,
+    name: &str,
+    members: &[GroupMember],
+    mls: bool,
+) -> Vec<u8> {
+    let mut v = group_sync_message(group_id, version, name, members);
+    if mls {
+        v.push(1);
+    }
+    v
+}
+
+/// Участник без `HELLO_CAP_MLS` в MLS-группу не входит.
+pub fn mls_peer_refused(group_is_mls: bool, peer_has_cap: bool) -> bool {
+    group_is_mls && !peer_has_cap
 }
 
 fn push_lp16(out: &mut Vec<u8>, bytes: &[u8]) {
@@ -503,6 +534,7 @@ mod tests {
             members: vec![member("alice"), member("bob"), member("me")],
             created_at: "now".into(),
             version: 1,
+            mls: false,
         }
     }
 
@@ -609,12 +641,24 @@ mod tests {
             members: members_on_group_create("creatorpeer", "Alice", &["bob".into()]),
             created_at: "now".into(),
             version: 1,
+            mls: false,
         };
         let link = build_invite_link(&g);
         let parsed = parse_invite_link(&link).expect("parse");
         assert_eq!(parsed.members.len(), 1);
         assert_eq!(parsed.members[0].peer_id, "creatorpeer");
         assert!(!parsed.members.iter().any(|m| m.peer_id == "bob"));
+        assert!(!parsed.mls);
+        let mut mls_group = g.clone();
+        mls_group.mls = true;
+        let parsed = parse_invite_link(&build_invite_link(&mls_group)).unwrap();
+        assert!(parsed.mls);
+        assert!(mls_peer_refused(true, false));
+        assert!(!mls_peer_refused(true, true));
+        assert!(!mls_peer_refused(false, false));
+        let legacy = group_sync_signed_bytes("id", 1, "N", &g.members, false);
+        assert_eq!(legacy, group_sync_message("id", 1, "N", &g.members));
+        assert_ne!(legacy, group_sync_signed_bytes("id", 1, "N", &g.members, true));
     }
 
     #[test]

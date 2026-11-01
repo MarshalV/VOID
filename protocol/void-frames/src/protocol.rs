@@ -7,15 +7,15 @@ use serde::{Deserialize, Serialize};
 
 use void_session::crypto;
 use void_session::group::{self, GroupMember};
-use void_session::hello::sign_hello_transport_binding;
+use void_session::hello::{sign_hello_pq, sign_hello_transport_binding};
 pub use void_session::mailbox_query::{
     mailbox_query_message, mailbox_query_now, sign_mailbox_query, ChallengeBook,
 };
 
 pub use void_session::hello::{
-    hello_bind_ok, verify_hello_transport_binding, void_hello_signing_public_key,
-    void_peer_transport_public_key, HelloBind, HELLO_CAP_CBOR, HELLO_CAP_HEADER_AAD, HELLO_CAP_QUEUES,
-    HELLO_CAPS,
+    hello_bind_ok, hello_pq_ok, verify_hello_transport_binding, void_hello_signing_public_key,
+    void_peer_transport_public_key, HelloBind, HELLO_CAP_CBOR, HELLO_CAP_HEADER_AAD,
+    HELLO_CAP_HEADER_ENC, HELLO_CAP_MLS, HELLO_CAP_PQ, HELLO_CAP_QUEUES, HELLO_CAPS,
     HELLO_FRESHNESS_SECS,
 };
 
@@ -179,6 +179,9 @@ struct GroupSyncCommand {
     /// Protobuf identity, если PeerId создателя не identity-multihash.
     #[serde(default)]
     creator_pubkey_pb: Vec<u8>,
+    /// Группа на MLS. Старый клиент поле не шлёт.
+    #[serde(default)]
+    mls: bool,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -222,6 +225,7 @@ pub enum DecryptedChatFrame {
         version: u64,
         sig: Vec<u8>,
         creator_pubkey_pb: Vec<u8>,
+        mls: bool,
     },
     GroupLeave {
         group_id: String,
@@ -429,6 +433,7 @@ pub fn parse_decrypted_chat_frame(plaintext: &[u8]) -> Option<DecryptedChatFrame
                 version: cmd.version,
                 sig: cmd.sig,
                 creator_pubkey_pb: cmd.creator_pubkey_pb,
+                mls: cmd.mls,
             });
         }
     }
@@ -514,6 +519,7 @@ pub fn build_group_sync_json(
     creator_id: &str,
     version: u64,
     members: &[GroupMember],
+    mls: bool,
 ) -> Option<Vec<u8>> {
     if !group::validate_group_id(group_id)
         || group_name.is_empty()
@@ -526,7 +532,7 @@ pub fn build_group_sync_json(
     }
     let (sig, creator_pubkey_pb) = match transport {
         Some(kp) if kp.public().to_peer_id().to_string() == creator_id && version > 0 => {
-            let msg = group::group_sync_message(group_id, version, group_name, members);
+            let msg = group::group_sync_signed_bytes(group_id, version, group_name, members, mls);
             let sig = kp.sign(&msg).ok()?;
             let pb = if void_peer_transport_public_key(kp.public().to_peer_id()).is_some() {
                 Vec::new()
@@ -546,6 +552,7 @@ pub fn build_group_sync_json(
         version,
         sig,
         creator_pubkey_pb,
+        mls,
     };
     serde_json::to_vec(&cmd).ok()
 }
@@ -558,6 +565,7 @@ pub fn verify_group_sync_signature(
     members: &[GroupMember],
     sig: &[u8],
     creator_pubkey_pb: &[u8],
+    mls: bool,
 ) -> bool {
     if sig.is_empty() || version == 0 || sig.len() > 256 || creator_pubkey_pb.len() > 4096 {
         return false;
@@ -568,7 +576,7 @@ pub fn verify_group_sync_signature(
     let Some(pubkey) = void_hello_signing_public_key(creator, creator_pubkey_pb) else {
         return false;
     };
-    let msg = group::group_sync_message(group_id, version, name, members);
+    let msg = group::group_sync_signed_bytes(group_id, version, name, members, mls);
     pubkey.verify(&msg, sig)
 }
 
@@ -717,6 +725,15 @@ pub enum V1Packet {
         /// Случайные 16 байт; вместе с `ts` входят в подпись v2.
         #[serde(default)]
         nonce: [u8; 16],
+        /// ML-KEM-768 encapsulation key. Пусто, если бит PQ не объявлен.
+        #[serde(default, skip_serializing_if = "Vec::is_empty", with = "serde_bytes")]
+        kem_ek: Vec<u8>,
+        /// ML-KEM ciphertext ответа. Пусто в первом Hello.
+        #[serde(default, skip_serializing_if = "Vec::is_empty", with = "serde_bytes")]
+        kem_ct: Vec<u8>,
+        /// Подпись v4 над bind и байтами KEM. `transport_sig` остаётся v3.
+        #[serde(default, skip_serializing_if = "Vec::is_empty", with = "serde_bytes")]
+        pq_sig: Vec<u8>,
     },
     /// Обмен известными VOID bootstrap-нодами между участниками (публичные multiaddr).
     BootstrapGossip {
@@ -775,6 +792,9 @@ pub enum V1Packet {
         /// Пачка одноразовых ключей. Пустой список — старый клиент, печатать нечем.
         #[serde(default)]
         opks: Vec<void_envelope::offline_mail::OneTimePrekey>,
+        /// ML-KEM-768 encapsulation key. Пусто — подпись v2.
+        #[serde(default, skip_serializing_if = "Vec::is_empty", with = "serde_bytes")]
+        kem_ek: Vec<u8>,
     },
     /// Запросить prekey контакта у bootstrap.
     PrekeyGet {
@@ -791,6 +811,8 @@ pub enum V1Packet {
         /// Один одноразовый ключ. Нода уже вычеркнула его из своего набора.
         #[serde(default)]
         opk: Option<void_envelope::offline_mail::OneTimePrekey>,
+        #[serde(default, skip_serializing_if = "Vec::is_empty", with = "serde_bytes")]
+        kem_ek: Vec<u8>,
     },
     Encrypted {
         header: crypto::MessageHeader,
@@ -850,6 +872,19 @@ pub enum V1Packet {
     },
     QueueDeliver {
         blobs: Vec<Vec<u8>>,
+    },
+    /// Письмо или Commit группы. Один ciphertext на эпоху, без PeerId внутри MLS.
+    GroupMls {
+        group_id: String,
+        epoch: u64,
+        #[serde(with = "serde_bytes")]
+        body: Vec<u8>,
+    },
+    /// Публичный key package для вступления в MLS-группу.
+    MlsKeyPackage {
+        group_id: String,
+        #[serde(with = "serde_bytes")]
+        body: Vec<u8>,
     },
     Ack,
 }
@@ -1019,6 +1054,17 @@ fn encode_v2_mail(src: PeerId, packet: &V1Packet) -> Option<Vec<u8>> {
             Some(v)
         }
         V1Packet::Encrypted { header, ciphertext } => {
+            if !header.sealed.is_empty() {
+                if header.sealed.len() > u16::MAX as usize {
+                    return None;
+                }
+                let mut v = Vec::with_capacity(3 + header.sealed.len() + ciphertext.len());
+                v.push(5);
+                v.extend_from_slice(&(header.sealed.len() as u16).to_le_bytes());
+                v.extend_from_slice(&header.sealed);
+                v.extend_from_slice(ciphertext);
+                return Some(v);
+            }
             let mut v = Vec::with_capacity(41 + ciphertext.len());
             v.push(2);
             v.extend_from_slice(&header.dh_pub);
@@ -1064,8 +1110,31 @@ pub fn decode_v2_mail(buf: &[u8]) -> Option<V2Mail> {
             let pn = u32::from_le_bytes(buf[33..37].try_into().ok()?);
             let n = u32::from_le_bytes(buf[37..41].try_into().ok()?);
             Some(V2Mail::Encrypted {
-                header: crypto::MessageHeader { dh_pub, pn, n },
+                header: crypto::MessageHeader {
+                    dh_pub,
+                    pn,
+                    n,
+                    sealed: Vec::new(),
+                },
                 ciphertext: buf[41..].to_vec(),
+            })
+        }
+        5 => {
+            if buf.len() < 3 {
+                return None;
+            }
+            let n = u16::from_le_bytes(buf[1..3].try_into().ok()?) as usize;
+            if buf.len() < 3 + n {
+                return None;
+            }
+            Some(V2Mail::Encrypted {
+                header: crypto::MessageHeader {
+                    dh_pub: [0u8; 32],
+                    pn: 0,
+                    n: 0,
+                    sealed: buf[3..3 + n].to_vec(),
+                },
+                ciphertext: buf[3 + n..].to_vec(),
             })
         }
         4 => {
@@ -1159,18 +1228,25 @@ pub fn wrap_mailbox_reply(
     seal_mailbox_cell(hops, dest, &mail)
 }
 
+pub struct BuiltHello {
+    pub packet: V1Packet,
+    pub kem_dk: void_session::kem::KemDk,
+}
+
 pub fn build_v1_hello(
     transport: &libp2p_identity::Keypair,
     signer_peer: PeerId,
     recipient_peer: PeerId,
     x25519_static_pubkey: crypto::PublicKey,
     x25519_ephem_pubkey: crypto::PublicKey,
-) -> Option<V1Packet> {
+    kem_ct: &[u8],
+) -> Option<BuiltHello> {
     let static_b = x25519_static_pubkey.to_bytes();
     let ephem_b = x25519_ephem_pubkey.to_bytes();
     let ts = void_session::hello::hello_now_secs();
     let mut nonce = [0u8; 16];
     rand::thread_rng().fill_bytes(&mut nonce);
+    let (kem_dk, kem_ek) = void_session::kem::generate();
     let transport_sig = sign_hello_transport_binding(
         transport,
         signer_peer,
@@ -1181,19 +1257,37 @@ pub fn build_v1_hello(
         &nonce,
         HELLO_CAPS,
     )?;
+    let pq_sig = sign_hello_pq(
+        transport,
+        signer_peer,
+        recipient_peer,
+        &static_b,
+        &ephem_b,
+        ts,
+        &nonce,
+        HELLO_CAPS,
+        &kem_ek,
+        kem_ct,
+    )?;
     let transport_pubkey_pb = if void_peer_transport_public_key(signer_peer).is_some() {
         Vec::new()
     } else {
         transport.public().encode_protobuf()
     };
-    Some(V1Packet::Hello {
-        public_key: static_b,
-        ephemeral_key: ephem_b,
-        transport_sig,
-        transport_pubkey_pb,
-        caps: HELLO_CAPS,
-        ts,
-        nonce,
+    Some(BuiltHello {
+        packet: V1Packet::Hello {
+            public_key: static_b,
+            ephemeral_key: ephem_b,
+            transport_sig,
+            transport_pubkey_pb,
+            caps: HELLO_CAPS,
+            ts,
+            nonce,
+            kem_ek,
+            kem_ct: kem_ct.to_vec(),
+            pq_sig,
+        },
+        kem_dk,
     })
 }
 
@@ -1306,6 +1400,7 @@ mod hello_freshness_tests {
             recipient,
             PublicKey::from(static_b),
             PublicKey::from(ephem_b),
+            &[],
         )
         .unwrap();
         let V1Packet::Hello {
@@ -1316,7 +1411,10 @@ mod hello_freshness_tests {
             caps,
             ts,
             nonce,
-        } = hello
+            kem_ek,
+            kem_ct,
+            pq_sig,
+        } = hello.packet
         else {
             panic!("not hello");
         };
@@ -1336,6 +1434,21 @@ mod hello_freshness_tests {
             ),
             Some(HelloBind::V3)
         );
+        assert!(hello_pq_ok(
+            signer,
+            recipient,
+            &public_key,
+            &ephemeral_key,
+            ts,
+            &nonce,
+            caps,
+            &kem_ek,
+            &kem_ct,
+            &pq_sig,
+            &transport_pubkey_pb,
+        ));
+        assert_eq!(kem_ek.len(), void_session::kem::EK_LEN);
+        assert!(kem_ct.is_empty());
         assert!(verify_hello_transport_binding(
             signer,
             recipient,

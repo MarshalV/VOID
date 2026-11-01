@@ -51,6 +51,9 @@ pub(crate) struct StorageData {
     /// Группы, из которых пользователь вышел (не показывать и не принимать сообщения).
     #[serde(default)]
     pub(crate) left_groups: Vec<String>,
+    /// Состояние MLS-групп. Лежит в том же vault, под тем же мастер-ключом.
+    #[serde(default)]
+    pub(crate) mls_snapshot: Option<crate::group_mls::MlsSnapshot>,
 }
 
 fn storage_format_v2() -> u32 {
@@ -60,7 +63,7 @@ fn storage_format_v2() -> u32 {
 pub(crate) struct Storage;
 impl Storage {
     /// Максимум байт JSON после расшифровки `vault.bin` (защита от чрезмерного `serde_json`).
-    const VAULT_PLAINTEXT_JSON_MAX: usize = 512 * 1024;
+    const VAULT_PLAINTEXT_JSON_MAX: usize = 2 * 1024 * 1024;
     const VAULT_NICKNAME_MAX: usize = 256;
     const VAULT_KEYPAIR_BYTES_MAX: usize = 16384;
     const VAULT_ADDRESS_BOOK_MAX_ENTRIES: usize = 4096;
@@ -191,6 +194,7 @@ impl Storage {
         void_bootstraps: Option<&[String]>,
         groups: Option<&[GroupChat]>,
         left_groups: Option<&[String]>,
+        mls_snapshot: Option<&crate::group_mls::MlsSnapshot>,
     ) -> Result<(), Box<dyn Error>> {
         let current_load = Self::load(master_key);
 
@@ -253,6 +257,13 @@ impl Storage {
                 .map(|c| c.left_groups.clone())
                 .unwrap_or_default()
         };
+        let mls_snapshot = match mls_snapshot {
+            Some(snap) => Some(snap.clone()),
+            None => current_load
+                .as_ref()
+                .ok()
+                .and_then(|c| c.mls_snapshot.clone()),
+        };
 
         let data = StorageData {
             format_version: 2,
@@ -263,6 +274,7 @@ impl Storage {
             void_bootstraps: void_bootstraps_vec,
             groups: groups_vec,
             left_groups: left_groups_vec,
+            mls_snapshot,
         };
         let plaintext = serde_json::to_vec(&data)?;
 

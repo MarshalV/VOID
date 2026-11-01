@@ -28,6 +28,7 @@ fn accept_hello(packet: &V1Packet, signer: PeerId, recipient: PeerId) {
         caps,
         ts,
         nonce,
+        ..
     } = packet
     else {
         panic!("hello");
@@ -68,12 +69,20 @@ fn two_sessions_roundtrip_and_bad_header_does_not_advance() {
         bob_peer,
         alice_static_pk,
         alice_eph_pk,
+        &[],
     )
     .expect("alice hello");
-    let bob_hello = build_v1_hello(&bob_kp, bob_peer, alice_peer, bob_static_pk, bob_eph_pk)
-        .expect("bob hello");
-    accept_hello(&alice_hello, alice_peer, bob_peer);
-    accept_hello(&bob_hello, bob_peer, alice_peer);
+    let bob_hello = build_v1_hello(
+        &bob_kp,
+        bob_peer,
+        alice_peer,
+        bob_static_pk,
+        bob_eph_pk,
+        &[],
+    )
+    .expect("bob hello");
+    accept_hello(&alice_hello.packet, alice_peer, bob_peer);
+    accept_hello(&bob_hello.packet, bob_peer, alice_peer);
 
     let mut alice =
         SecureSession::new_initiator(&alice_static, &bob_static_pk, alice_eph, &bob_eph_pk);

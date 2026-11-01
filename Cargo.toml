@@ -7,9 +7,10 @@ members = [
     "protocol/void-envelope",
     "protocol/void-onion",
     "protocol/void-kad-rules",
+    "protocol/void-mls",
     "protocol-conformance",
 ]
-exclude = ["src-tauri"]
+exclude = ["src-tauri", "fuzz"]
 resolver = "2"
 
 [package]

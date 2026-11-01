@@ -305,7 +305,9 @@ fn decode_signed_inner(bytes: &[u8]) -> Option<(&[u8], &[u8], &[u8])> {
 
 const PREKEY_SIG_PREFIX: &[u8] = b"VOID_PREKEY_SIG_V1\0";
 const PREKEY_SIG_PREFIX_V2: &[u8] = b"VOID_PREKEY_SIG_V2\0";
+const PREKEY_SIG_PREFIX_V3: &[u8] = b"VOID_PREKEY_SIG_V3\0";
 const PREKEY_V2_MARK: u8 = 2;
+const PREKEY_V3_MARK: u8 = 3;
 /// Срок ротируемого prekey. Дольше этого DHT и нода запись не держат.
 pub const PREKEY_TTL_SECS: u64 = 7 * 24 * 3600;
 pub const PREKEY_MAX_TTL_SECS: u64 = 30 * 24 * 3600;
@@ -316,6 +318,18 @@ pub const PREKEY_MAX_TTL_SECS: u64 = 30 * 24 * 3600;
 pub struct SignedPrekey {
     pub pk: [u8; 32],
     pub not_after: u64,
+    /// ML-KEM-768 encapsulation key. Нули — запись v1/v2, только X25519.
+    pub kem_ek: [u8; void_session::kem::EK_LEN],
+}
+
+impl SignedPrekey {
+    pub fn x25519(pk: [u8; 32], not_after: u64) -> Self {
+        Self {
+            pk,
+            not_after,
+            kem_ek: [0u8; void_session::kem::EK_LEN],
+        }
+    }
 }
 
 fn prekey_signed_message(owner: &PeerId, pk: &[u8; 32]) -> Vec<u8> {
@@ -333,6 +347,15 @@ fn prekey_signed_message_v2(owner: &PeerId, pk: &[u8; 32], not_after: u64) -> Ve
     v
 }
 
+fn prekey_signed_message_v3(owner: &PeerId, pk: &[u8; 32], not_after: u64, kem_ek: &[u8]) -> Vec<u8> {
+    let mut v = PREKEY_SIG_PREFIX_V3.to_vec();
+    push_lp(&mut v, &owner.to_bytes());
+    v.extend_from_slice(pk);
+    v.extend_from_slice(&not_after.to_le_bytes());
+    v.extend_from_slice(kem_ek);
+    v
+}
+
 /// Готовый к публикации prekey: DHT-значение и поля `PrekeyPut`.
 #[derive(Clone)]
 pub struct PublishedPrekey {
@@ -340,6 +363,7 @@ pub struct PublishedPrekey {
     pub not_after: u64,
     pub sig: Vec<u8>,
     pub dht_value: Vec<u8>,
+    pub kem_ek: Vec<u8>,
 }
 
 /// DHT `/void/prekey/<owner>` v2: `pk[32] || 0x02 || not_after[8] || sig_inner`.
@@ -370,6 +394,44 @@ pub fn encode_signed_prekey(
         not_after,
         sig,
         dht_value,
+        kem_ek: Vec::new(),
+    })
+}
+
+/// DHT v3: `pk[32] || 0x03 || not_after[8] || kem_ek[1184] || sig_inner`.
+/// Подпись покрывает оба ключа. v2 остаётся для старых записей.
+pub fn encode_signed_prekey_v3(
+    transport: &libp2p_identity::Keypair,
+    owner: &PeerId,
+    pk: &[u8; 32],
+    not_after: u64,
+    kem_ek: &[u8],
+) -> Option<PublishedPrekey> {
+    if PeerId::from_public_key(&transport.public()) != *owner
+        || not_after == 0
+        || kem_ek.len() != void_session::kem::EK_LEN
+    {
+        return None;
+    }
+    let sig = transport
+        .sign(&prekey_signed_message_v3(owner, pk, not_after, kem_ek))
+        .ok()?;
+    let pubkey_pb = if void_session::hello::void_peer_transport_public_key(*owner).is_some() {
+        Vec::new()
+    } else {
+        transport.public().encode_protobuf()
+    };
+    let mut dht_value = pk.to_vec();
+    dht_value.push(PREKEY_V3_MARK);
+    dht_value.extend_from_slice(&not_after.to_le_bytes());
+    dht_value.extend_from_slice(kem_ek);
+    dht_value.extend_from_slice(&encode_signed_inner(&sig, &pubkey_pb, &[]));
+    Some(PublishedPrekey {
+        pk: *pk,
+        not_after,
+        sig,
+        dht_value,
+        kem_ek: kem_ek.to_vec(),
     })
 }
 
@@ -389,7 +451,32 @@ pub fn verify_signed_prekey(owner: &PeerId, value: &[u8]) -> Option<SignedPrekey
         if !signer.verify(&prekey_signed_message_v2(owner, &pk, not_after), sig) {
             return None;
         }
-        return Some(SignedPrekey { pk, not_after });
+        return Some(SignedPrekey {
+            pk,
+            not_after,
+            kem_ek: [0u8; void_session::kem::EK_LEN],
+        });
+    }
+    if value.get(32) == Some(&PREKEY_V3_MARK) {
+        let not_after = u64::from_le_bytes(value.get(33..41)?.try_into().ok()?);
+        let ek_end = 41 + void_session::kem::EK_LEN;
+        let kem_ek: [u8; void_session::kem::EK_LEN] = value.get(41..ek_end)?.try_into().ok()?;
+        let (sig, pubkey_pb, rest) = decode_signed_inner(value.get(ek_end..)?)?;
+        if sig.is_empty() || !rest.is_empty() {
+            return None;
+        }
+        let signer = void_session::hello::void_hello_signing_public_key(*owner, pubkey_pb)?;
+        if !signer.verify(
+            &prekey_signed_message_v3(owner, &pk, not_after, &kem_ek),
+            sig,
+        ) {
+            return None;
+        }
+        return Some(SignedPrekey {
+            pk,
+            not_after,
+            kem_ek,
+        });
     }
     let (sig, pubkey_pb, rest) = decode_signed_inner(value.get(32..)?)?;
     if sig.is_empty() || !rest.is_empty() {
@@ -398,17 +485,26 @@ pub fn verify_signed_prekey(owner: &PeerId, value: &[u8]) -> Option<SignedPrekey
     let signer = void_session::hello::void_hello_signing_public_key(*owner, pubkey_pb)?;
     signer
         .verify(&prekey_signed_message(owner, &pk), sig)
-        .then_some(SignedPrekey { pk, not_after: 0 })
+        .then_some(SignedPrekey::x25519(pk, 0))
 }
 
 /// Подпись `PrekeyPut` / `PrekeyOffer` (сырой sig, не DHT-блоб).
-pub fn verify_prekey_offer(owner: &PeerId, pk: &[u8; 32], not_after: u64, sig: &[u8]) -> bool {
+pub fn verify_prekey_offer(
+    owner: &PeerId,
+    pk: &[u8; 32],
+    not_after: u64,
+    sig: &[u8],
+    kem_ek: &[u8],
+) -> bool {
     if *pk == [0u8; 32] || sig.is_empty() || not_after == 0 {
         return false;
     }
     let Some(signer) = void_session::hello::void_peer_transport_public_key(*owner) else {
         return false;
     };
+    if kem_ek.len() == void_session::kem::EK_LEN {
+        return signer.verify(&prekey_signed_message_v3(owner, pk, not_after, kem_ek), sig);
+    }
     signer.verify(&prekey_signed_message_v2(owner, pk, not_after), sig)
 }
 
@@ -489,6 +585,7 @@ pub struct SealMaterial {
     pub spk: [u8; 32],
     pub opk_id: [u8; 16],
     pub opk_pk: [u8; 32],
+    pub kem_ek: Vec<u8>,
 }
 
 pub fn seal_material(
@@ -498,10 +595,16 @@ pub fn seal_material(
 ) -> Option<SealMaterial> {
     let spk = spk.filter(|p| prekey_is_sealable(*p, now))?;
     let opk = opk.filter(|o| o.id != [0u8; 16] && o.pk != [0u8; 32] && !o.sig.is_empty())?;
+    let kem_ek = if spk.kem_ek.iter().any(|b| *b != 0) {
+        spk.kem_ek.to_vec()
+    } else {
+        Vec::new()
+    };
     Some(SealMaterial {
         spk: spk.pk,
         opk_id: opk.id,
         opk_pk: opk.pk,
+        kem_ek,
     })
 }
 
@@ -615,14 +718,15 @@ impl NodePrekeys {
         pk: [u8; 32],
         not_after: u64,
         sig: Vec<u8>,
+        kem_ek: &[u8],
         opks: Vec<OneTimePrekey>,
         now: u64,
     ) -> bool {
         let Ok(owner) = peer.parse::<PeerId>() else {
             return false;
         };
-        if !verify_prekey_offer(&owner, &pk, not_after, &sig)
-            || !prekey_is_sealable(SignedPrekey { pk, not_after }, now)
+        if !verify_prekey_offer(&owner, &pk, not_after, &sig, kem_ek)
+            || !prekey_is_sealable(SignedPrekey::x25519(pk, not_after), now)
         {
             return false;
         }
@@ -738,7 +842,22 @@ struct OfflinePrekeyDisk {
     spent_opk: Vec<[u8; 16]>,
 }
 
-/// Старый файл без одноразовых ключей. bincode не подставляет default на обрыве.
+/// Файл с seed ML-KEM. Старый `OfflinePrekeyDisk` читается, если этих полей ещё нет.
+#[derive(Serialize, Deserialize)]
+struct OfflinePrekeyDiskKem {
+    secret: [u8; 32],
+    not_after: u64,
+    #[serde(default)]
+    prev_secret: Option<[u8; 32]>,
+    #[serde(default)]
+    prev_not_after: u64,
+    #[serde(default)]
+    opks: Vec<OpkDisk>,
+    #[serde(default)]
+    spent_opk: Vec<[u8; 16]>,
+    kem_dk: Vec<u8>,
+    prev_kem_dk: Vec<u8>,
+}
 #[derive(Deserialize)]
 struct OfflinePrekeyDiskV0 {
     secret: [u8; 32],
@@ -756,24 +875,39 @@ pub struct LocalPrekeys {
     pub opks: Vec<OneTimePrekey>,
     pub opk_secrets: Vec<OpkSecret>,
     pub spent_opk: Vec<[u8; 16]>,
+    pub kem_dks: Vec<Vec<u8>>,
 }
 
-fn read_prekey_disk(bytes: &[u8]) -> Option<OfflinePrekeyDisk> {
-    if let Ok(disk) = bincode::deserialize::<OfflinePrekeyDisk>(bytes) {
+fn read_prekey_disk(bytes: &[u8]) -> Option<OfflinePrekeyDiskKem> {
+    if let Ok(disk) = bincode::deserialize::<OfflinePrekeyDiskKem>(bytes) {
         return Some(disk);
     }
+    if let Ok(old) = bincode::deserialize::<OfflinePrekeyDisk>(bytes) {
+        return Some(OfflinePrekeyDiskKem {
+            secret: old.secret,
+            not_after: old.not_after,
+            prev_secret: old.prev_secret,
+            prev_not_after: old.prev_not_after,
+            opks: old.opks,
+            spent_opk: old.spent_opk,
+            kem_dk: Vec::new(),
+            prev_kem_dk: Vec::new(),
+        });
+    }
     let old: OfflinePrekeyDiskV0 = bincode::deserialize(bytes).ok()?;
-    Some(OfflinePrekeyDisk {
+    Some(OfflinePrekeyDiskKem {
         secret: old.secret,
         not_after: old.not_after,
         prev_secret: old.prev_secret,
         prev_not_after: old.prev_not_after,
         opks: Vec::new(),
         spent_opk: Vec::new(),
+        kem_dk: Vec::new(),
+        prev_kem_dk: Vec::new(),
     })
 }
 
-fn write_prekey_disk(path: &Path, disk: &OfflinePrekeyDisk) {
+fn write_prekey_disk(path: &Path, disk: &OfflinePrekeyDiskKem) {
     let Ok(bytes) = bincode::serialize(disk) else {
         return;
     };
@@ -783,14 +917,16 @@ fn write_prekey_disk(path: &Path, disk: &OfflinePrekeyDisk) {
     }
 }
 
-fn empty_prekey_disk() -> OfflinePrekeyDisk {
-    OfflinePrekeyDisk {
+fn empty_prekey_disk() -> OfflinePrekeyDiskKem {
+    OfflinePrekeyDiskKem {
         secret: [0u8; 32],
         not_after: 0,
         prev_secret: None,
         prev_not_after: 0,
         opks: Vec::new(),
         spent_opk: Vec::new(),
+        kem_dk: Vec::new(),
+        prev_kem_dk: Vec::new(),
     }
 }
 
@@ -810,9 +946,16 @@ pub fn load_local_prekeys(
         if disk.not_after > now && disk.secret != [0u8; 32] {
             disk.prev_secret = Some(disk.secret);
             disk.prev_not_after = disk.not_after;
+            if disk.kem_dk.len() == void_session::kem::DK_LEN {
+                disk.prev_kem_dk = disk.kem_dk.clone();
+            }
         }
         disk.secret = StaticSecret::random_from_rng(&mut rand::rngs::OsRng).to_bytes();
         disk.not_after = now.saturating_add(PREKEY_TTL_SECS);
+        disk.kem_dk = void_session::kem::generate().0.as_bytes().to_vec();
+    }
+    if disk.kem_dk.len() != void_session::kem::DK_LEN {
+        disk.kem_dk = void_session::kem::generate().0.as_bytes().to_vec();
     }
     if disk.prev_not_after <= now {
         disk.prev_secret = None;
@@ -820,7 +963,9 @@ pub fn load_local_prekeys(
     }
     let spk_secret = StaticSecret::from(disk.secret);
     let pk = PublicKey::from(&spk_secret).to_bytes();
-    let published = encode_signed_prekey(transport, &owner, &pk, disk.not_after)?;
+    let kem_dk = void_session::kem::KemDk::from_bytes(&disk.kem_dk)?;
+    let kem_ek = kem_dk.encapsulation_key()?;
+    let published = encode_signed_prekey_v3(transport, &owner, &pk, disk.not_after, &kem_ek)?;
     disk.opks.retain(|o| o.id != [0u8; 16] && o.secret != [0u8; 32]);
     while disk.opks.len() < OPK_POOL {
         let mut id = [0u8; 16];
@@ -843,8 +988,12 @@ pub fn load_local_prekeys(
     }
     write_prekey_disk(path, &disk);
     let mut secrets = vec![spk_secret];
+    let mut kem_dks = vec![disk.kem_dk.clone()];
     if let Some(prev) = disk.prev_secret {
         secrets.push(StaticSecret::from(prev));
+    }
+    if disk.prev_kem_dk.len() == void_session::kem::DK_LEN {
+        kem_dks.push(disk.prev_kem_dk.clone());
     }
     Some(LocalPrekeys {
         published,
@@ -852,6 +1001,7 @@ pub fn load_local_prekeys(
         opks,
         opk_secrets,
         spent_opk: disk.spent_opk,
+        kem_dks,
     })
 }
 
@@ -898,24 +1048,43 @@ fn decrypt_envelope(
     recipient_secrets: &[&StaticSecret],
     env: &OfflineEnvelope,
     aad: &[u8],
+    kem_dks: &[&[u8]],
 ) -> Result<Vec<u8>> {
     recipient_secrets
         .iter()
         .find_map(|secret| {
             let recipient_pk = PublicKey::from(*secret);
             let shared = secret.diffie_hellman(&PublicKey::from(env.eph));
-            let key = hkdf_offline(shared.as_bytes(), &env.eph, recipient_pk.as_bytes());
-            ChaCha20Poly1305::new(key.as_slice().into())
-                .decrypt(
-                    Nonce::from_slice(&env.nonce),
-                    Payload {
-                        msg: env.ct.as_ref(),
-                        aad,
-                    },
-                )
-                .ok()
+            let classic = hkdf_offline(shared.as_bytes(), &env.eph, recipient_pk.as_bytes());
+            if let Some(pt) = aead_open(&classic, &env.nonce, aad, &env.ct) {
+                return Some(pt);
+            }
+            let (kct, aead_ct) = split_kem_ct(&env.ct)?;
+            for dk in kem_dks {
+                let dk = void_session::kem::KemDk::from_bytes(dk)?;
+                let ss = void_session::kem::decapsulate(&dk, kct)?;
+                let key = hkdf_offline_pq(shared.as_bytes(), &ss, &env.eph, recipient_pk.as_bytes());
+                if let Some(pt) = aead_open(&key, &env.nonce, aad, aead_ct) {
+                    return Some(pt);
+                }
+            }
+            None
         })
         .ok_or_else(|| anyhow!("offline open failed"))
+}
+
+fn aead_open(key: &[u8; 32], nonce: &[u8; 12], aad: &[u8], ct: &[u8]) -> Option<Vec<u8>> {
+    ChaCha20Poly1305::new(key.as_slice().into())
+        .decrypt(Nonce::from_slice(nonce), Payload { msg: ct, aad })
+        .ok()
+}
+
+fn split_kem_ct(ct: &[u8]) -> Option<(&[u8], &[u8])> {
+    let rest = ct.strip_prefix(b"VQK1")?;
+    if rest.len() < void_session::kem::CT_LEN {
+        return None;
+    }
+    Some(rest.split_at(void_session::kem::CT_LEN))
 }
 
 fn verify_sender(
@@ -963,6 +1132,41 @@ pub fn seal_for_recipient(
         plaintext,
         eph_secret,
         nonce,
+        &[],
+    )
+}
+
+/// То же, но общий секрет мешается с ML-KEM, если `kem_ek` не пуст.
+#[allow(clippy::too_many_arguments)]
+pub fn seal_for_recipient_kem(
+    transport: &libp2p_identity::Keypair,
+    recipient: &PeerId,
+    recipient_pk: &PublicKey,
+    sender: &PeerId,
+    sender_pk: &[u8; 32],
+    message_id: &str,
+    kind: &str,
+    plaintext: &[u8],
+    kem_ek: &[u8],
+) -> Result<OfflineEnvelope> {
+    if PeerId::from_public_key(&transport.public()) != *sender {
+        return Err(anyhow!("offline seal: transport key ≠ sender"));
+    }
+    let eph_secret = StaticSecret::random_from_rng(&mut rand::rngs::OsRng);
+    let mut nonce = [0u8; 12];
+    rand::thread_rng().fill_bytes(&mut nonce);
+    seal_for_recipient_parts(
+        transport,
+        recipient,
+        recipient_pk,
+        sender,
+        sender_pk,
+        message_id,
+        kind,
+        plaintext,
+        eph_secret,
+        nonce,
+        kem_ek,
     )
 }
 
@@ -990,6 +1194,7 @@ pub fn seal_for_recipient_fixed(
         plaintext,
         eph_secret,
         nonce,
+        &[],
     )
 }
 
@@ -1004,13 +1209,26 @@ fn seal_for_recipient_parts(
     plaintext: &[u8],
     eph_secret: StaticSecret,
     nonce: [u8; 12],
+    kem_ek: &[u8],
 ) -> Result<OfflineEnvelope> {
     if PeerId::from_public_key(&transport.public()) != *sender {
         return Err(anyhow!("offline seal: transport key ≠ sender"));
     }
     let eph = PublicKey::from(&eph_secret).to_bytes();
     let shared = eph_secret.diffie_hellman(recipient_pk);
-    let key = hkdf_offline(shared.as_bytes(), &eph, recipient_pk.as_bytes());
+    let (key, kem_ct) = if kem_ek.is_empty() {
+        (
+            hkdf_offline(shared.as_bytes(), &eph, recipient_pk.as_bytes()),
+            Vec::new(),
+        )
+    } else {
+        let (ct, ss) = void_session::kem::encapsulate(kem_ek)
+            .ok_or_else(|| anyhow!("offline seal: kem"))?;
+        (
+            hkdf_offline_pq(shared.as_bytes(), &ss, &eph, recipient_pk.as_bytes()),
+            ct,
+        )
+    };
 
     let header = envelope_header_bytes(
         OFFLINE_SIG_PREFIX_V3,
@@ -1046,6 +1264,7 @@ fn seal_for_recipient_parts(
             },
         )
         .map_err(|_| anyhow!("offline seal failed"))?;
+    let ct = prefix_kem_ct(&kem_ct, ct);
     Ok(OfflineEnvelope {
         v: ENVELOPE_VERSION,
         sender: String::new(),
@@ -1067,7 +1286,7 @@ pub fn open_envelope(
     env: &OfflineEnvelope,
 ) -> Result<OpenedEnvelope> {
     match env.v {
-        ENVELOPE_VERSION => open_v3(recipient_secrets, recipient, env),
+        ENVELOPE_VERSION => open_v3(recipient_secrets, recipient, env, &[]),
         ENVELOPE_V2 => open_v2(recipient_secrets, recipient, env),
         v => Err(anyhow!("offline envelope v{v} без подписи отправителя")),
     }
@@ -1077,12 +1296,14 @@ fn open_v3(
     recipient_secrets: &[&StaticSecret],
     recipient: &PeerId,
     env: &OfflineEnvelope,
+    kem_dks: &[&[u8]],
 ) -> Result<OpenedEnvelope> {
     let bad = || anyhow!("offline envelope: bad inner");
     let inner = decrypt_envelope(
         recipient_secrets,
         env,
         &v3_aad(recipient, &env.message_id, &env.eph),
+        kem_dks,
     )?;
     let (sig, pubkey_pb, mut rest) = decode_signed_inner(&inner).ok_or_else(bad)?;
     let sender = PeerId::from_bytes(read_lp(&mut rest, 128).ok_or_else(bad)?).map_err(|_| bad())?;
@@ -1142,7 +1363,7 @@ fn open_v2(
             &env.eph,
         )
     };
-    let inner = decrypt_envelope(recipient_secrets, env, &header_for(OFFLINE_AAD_PREFIX))?;
+    let inner = decrypt_envelope(recipient_secrets, env, &header_for(OFFLINE_AAD_PREFIX), &[])?;
     let (sig, pubkey_pb, body) =
         decode_signed_inner(&inner).ok_or_else(|| anyhow!("offline envelope: bad inner"))?;
     verify_sender(
@@ -1158,6 +1379,37 @@ fn open_v2(
         kind: env.kind.clone(),
         body: body.to_vec(),
     })
+}
+
+fn prefix_kem_ct(kem_ct: &[u8], aead: Vec<u8>) -> Vec<u8> {
+    if kem_ct.is_empty() {
+        return aead;
+    }
+    let mut out = b"VQK1".to_vec();
+    out.extend_from_slice(kem_ct);
+    out.extend_from_slice(&aead);
+    out
+}
+
+fn hkdf_offline_pq(
+    shared: &[u8],
+    kem_ss: &[u8],
+    eph: &[u8; 32],
+    recipient_pk: &[u8; 32],
+) -> [u8; 32] {
+    use hkdf::Hkdf;
+    use sha2::Sha256;
+    let mut ikm = Vec::with_capacity(shared.len() + kem_ss.len());
+    ikm.extend_from_slice(shared);
+    ikm.extend_from_slice(kem_ss);
+    let hk = Hkdf::<Sha256>::new(Some(b"VOID_OFFLINE_PQ"), &ikm);
+    let mut info = Vec::with_capacity(4 + 64);
+    info.extend_from_slice(b"mail");
+    info.extend_from_slice(eph);
+    info.extend_from_slice(recipient_pk);
+    let mut okm = [0u8; 32];
+    hk.expand(&info, &mut okm).expect("hkdf offline pq key len");
+    okm
 }
 
 fn hkdf_offline(shared: &[u8], eph: &[u8; 32], recipient_pk: &[u8; 32]) -> [u8; 32] {
@@ -1299,10 +1551,19 @@ pub fn open_with_opks(
     spent: &[[u8; 16]],
     recipient: &PeerId,
     env: &OfflineEnvelope,
+    kem_dks: &[&[u8]],
 ) -> Result<OpenOutcome> {
     if env.v == ENVELOPE_VERSION {
         if let Some(mail) = open_x3dh(spk_secrets, opks, spent, recipient, env)? {
             return Ok(mail);
+        }
+        if !kem_dks.is_empty() {
+            if let Ok(mail) = open_v3(legacy_secrets, recipient, env, kem_dks) {
+                return Ok(OpenOutcome {
+                    mail,
+                    spent_opk: None,
+                });
+            }
         }
     }
     let mail = open_envelope(legacy_secrets, recipient, env)?;
@@ -1677,7 +1938,8 @@ mod tests {
             &alice.pid,
             &pk,
             not_after,
-            &published.sig
+            &published.sig,
+            &[],
         ));
     }
 
@@ -1695,10 +1957,7 @@ mod tests {
             .dht_value;
         value[..32].copy_from_slice(&evil_pk);
         assert!(verify_signed_prekey(&alice.pid, &value).is_none());
-        let expired = SignedPrekey {
-            pk,
-            not_after: prekey_now().saturating_sub(1),
-        };
+        let expired = SignedPrekey::x25519(pk, prekey_now().saturating_sub(1));
         assert!(!prekey_is_sealable(expired, prekey_now()));
     }
 
@@ -1731,10 +1990,7 @@ mod tests {
     #[test]
     fn empty_opk_bundle_does_not_seal() {
         let now = prekey_now();
-        let spk = SignedPrekey {
-            pk: [9u8; 32],
-            not_after: now + 3600,
-        };
+        let spk = SignedPrekey::x25519([9u8; 32], now + 3600);
         assert!(seal_material(Some(spk), None, now).is_none());
         assert!(seal_material(None, None, now).is_none());
         let (secret, opk) = fresh_opk(&party());
@@ -1751,12 +2007,12 @@ mod tests {
         let (opk_secret, opk) = fresh_opk(&bob);
         let first = seal_x3dh(&alice, &bob, &spk, &opk, b"one", "m-1");
         let second = seal_x3dh(&alice, &bob, &spk, &opk, b"two", "m-2");
-        let opened = open_with_opks(&[], &[&spk], &[opk_secret.clone()], &[], &bob.pid, &first)
+        let opened = open_with_opks(&[], &[&spk], &[opk_secret.clone()], &[], &bob.pid, &first, &[])
             .unwrap();
         assert_eq!(opened.mail.body, b"one");
         assert_eq!(opened.spent_opk, Some(opk.id));
         let spent = [opk.id];
-        assert!(open_with_opks(&[], &[&spk], &[opk_secret], &spent, &bob.pid, &second).is_err());
+        assert!(open_with_opks(&[], &[&spk], &[opk_secret], &spent, &bob.pid, &second, &[]).is_err());
     }
 
     #[test]
@@ -1766,8 +2022,8 @@ mod tests {
         let (old_secret, _old) = fresh_opk(&bob);
         let (new_secret, new_opk) = fresh_opk(&bob);
         let env = seal_x3dh(&alice, &bob, &spk, &new_opk, b"fresh", "m-new");
-        assert!(open_with_opks(&[], &[&spk], &[old_secret], &[], &bob.pid, &env).is_err());
-        let opened = open_with_opks(&[], &[&spk], &[new_secret], &[], &bob.pid, &env).unwrap();
+        assert!(open_with_opks(&[], &[&spk], &[old_secret], &[], &bob.pid, &env, &[]).is_err());
+        let opened = open_with_opks(&[], &[&spk], &[new_secret], &[], &bob.pid, &env, &[]).unwrap();
         assert_eq!(opened.mail.body, b"fresh");
         assert_eq!(opened.spent_opk, Some(new_opk.id));
     }
@@ -1787,6 +2043,7 @@ mod tests {
             pk,
             not_after,
             published.sig.clone(),
+            &[],
             vec![opk_a.clone(), opk_b.clone()],
             prekey_now(),
         ));
@@ -1799,6 +2056,7 @@ mod tests {
             pk,
             not_after,
             published.sig.clone(),
+            &[],
             vec![opk_a, opk_b],
             prekey_now(),
         ));
@@ -1810,5 +2068,39 @@ mod tests {
         let tid = [1u8; 16];
         let big = vec![0u8; (OFFLINE_VOICE_MAX_BYTES as usize) + 1];
         assert!(split_voice_for_offline(&tid, &big).is_none());
+    }
+
+    #[test]
+    fn hybrid_letter_needs_the_kem_seed() {
+        let alice = party();
+        let bob = party();
+        let (dk, ek) = void_session::kem::generate();
+        let sender_pk = PublicKey::from(&alice.static_sk).to_bytes();
+        let env = seal_for_recipient_kem(
+            &alice.key,
+            &bob.pid,
+            &PublicKey::from(&bob.static_sk),
+            &alice.pid,
+            &sender_pk,
+            "m-pq",
+            "dm",
+            b"hybrid",
+            &ek,
+        )
+        .unwrap();
+        assert!(env.ct.starts_with(b"VQK1"));
+        assert!(open_envelope(&[&bob.static_sk], &bob.pid, &env).is_err());
+        let seed = dk.as_bytes();
+        let opened = open_with_opks(
+            &[&bob.static_sk],
+            &[],
+            &[],
+            &[],
+            &bob.pid,
+            &env,
+            &[seed],
+        )
+        .unwrap();
+        assert_eq!(opened.mail.body, b"hybrid");
     }
 }

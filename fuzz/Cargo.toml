@@ -1,0 +1,45 @@
+[package]
+name = "void-fuzz"
+version = "0.0.0"
+publish = false
+edition = "2021"
+
+[package.metadata]
+cargo-fuzz = true
+
+[dependencies]
+libfuzzer-sys = "0.4"
+void-frames = { path = "../protocol/void-frames" }
+void-envelope = { path = "../protocol/void-envelope" }
+void-onion = { path = "../protocol/void-onion" }
+x25519-dalek = { version = "2", features = ["static_secrets"] }
+
+[workspace]
+
+[[bin]]
+name = "packet"
+path = "fuzz_targets/packet.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "envelope"
+path = "fuzz_targets/envelope.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "onion_v2"
+path = "fuzz_targets/onion_v2.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "seed_frame"
+path = "fuzz_targets/seed_frame.rs"
+test = false
+doc = false
+bench = false

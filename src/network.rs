@@ -1649,6 +1649,7 @@ pub(crate) enum NetworkEvent {
         version: u64,
         sig: Vec<u8>,
         creator_pubkey_pb: Vec<u8>,
+        mls: bool,
     },
     GroupLeave {
         from: PeerId,
@@ -1658,6 +1659,21 @@ pub(crate) enum NetworkEvent {
     GroupDelete {
         from: PeerId,
         group_id: String,
+    },
+    /// Кадр MLS-группы (Welcome, Commit или письмо).
+    GroupMls {
+        #[allow(dead_code)]
+        from: PeerId,
+        group_id: String,
+        #[allow(dead_code)]
+        epoch: u64,
+        body: Vec<u8>,
+    },
+    /// Key package для вступления в MLS-группу.
+    MlsKeyPackage {
+        from: PeerId,
+        group_id: String,
+        body: Vec<u8>,
     },
     Status(String),
     PublicIpConfirmed(String),
@@ -1994,6 +2010,7 @@ pub(crate) enum UICommand {
         members: Vec<crate::group::GroupMember>,
         recipients: Vec<PeerId>,
         version: u64,
+        mls: bool,
     },
     SendGroupLeave {
         group_id: String,
@@ -2003,6 +2020,19 @@ pub(crate) enum UICommand {
     SendGroupDelete {
         group_id: String,
         recipients: Vec<PeerId>,
+    },
+    /// Один MLS-кадр всем перечисленным участникам.
+    SendGroupMls {
+        group_id: String,
+        epoch: u64,
+        body: Vec<u8>,
+        recipients: Vec<PeerId>,
+        message_id: String,
+    },
+    SendMlsKeyPackage {
+        recipient: PeerId,
+        group_id: String,
+        body: Vec<u8>,
     },
     /// Уведомить собеседника, что мы прочитали его сообщения.
     SendReadReceipt {
@@ -2270,6 +2300,7 @@ fn publish_self_prekey_to_bootstraps(
         not_after: published.not_after,
         sig: published.sig.clone(),
         opks: opks.to_vec(),
+        kem_ek: published.kem_ek.clone(),
     };
     for peer in swarm.connected_peers().copied().collect::<Vec<_>>() {
         if !bootstrap_peer_ids.contains(&peer) {
@@ -2413,6 +2444,7 @@ async fn finish_opk_half(
             material.spk,
             material.opk_id,
             material.opk_pk,
+            &material.kem_ek,
             items,
             done,
         );
@@ -2439,6 +2471,11 @@ async fn finish_opk_half(
                 spk.pk,
                 [0u8; 16],
                 [0u8; 32],
+                if spk.kem_ek.iter().any(|b| *b != 0) {
+                    &spk.kem_ek
+                } else {
+                    &[]
+                },
                 items,
                 done,
             );
@@ -2488,6 +2525,7 @@ fn seal_and_publish_offline_batch(
     pk_bytes: [u8; 32],
     opk_id: [u8; 16],
     opk_pk: [u8; 32],
+    kem_ek: &[u8],
     items: Vec<OfflineOutboxItem>,
     done: Option<PublishDone>,
 ) -> bool {
@@ -2496,16 +2534,30 @@ fn seal_and_publish_offline_batch(
     let spk_only = opk_id == [0u8; 16];
     for item in items {
         let sealed_one = if spk_only {
-            seal_for_recipient(
-                local_key,
-                &recipient,
-                &crypto::PublicKey::from(pk_bytes),
-                &local_peer_id,
-                my_public_key_bytes,
-                &item.message_id,
-                &item.kind,
-                &item.payload,
-            )
+            if kem_ek.is_empty() {
+                seal_for_recipient(
+                    local_key,
+                    &recipient,
+                    &crypto::PublicKey::from(pk_bytes),
+                    &local_peer_id,
+                    my_public_key_bytes,
+                    &item.message_id,
+                    &item.kind,
+                    &item.payload,
+                )
+            } else {
+                crate::offline_mail::seal_for_recipient_kem(
+                    local_key,
+                    &recipient,
+                    &crypto::PublicKey::from(pk_bytes),
+                    &local_peer_id,
+                    my_public_key_bytes,
+                    &item.message_id,
+                    &item.kind,
+                    &item.payload,
+                    kem_ek,
+                )
+            }
         } else {
             seal_with_opk(
                 local_key,
@@ -3221,6 +3273,15 @@ fn queue_offer_due() -> &'static Mutex<HashSet<PeerId>> {
     DUE.get_or_init(|| Mutex::new(HashSet::new()))
 }
 
+fn mls_cap_peers() -> &'static Mutex<HashSet<PeerId>> {
+    static PEERS: OnceLock<Mutex<HashSet<PeerId>>> = OnceLock::new();
+    PEERS.get_or_init(|| Mutex::new(HashSet::new()))
+}
+
+pub(crate) fn peer_has_mls(peer: PeerId) -> bool {
+    mls_cap_peers().lock().expect("mls peers").contains(&peer)
+}
+
 fn peer_has_queues(peer: PeerId) -> bool {
     queue_cap_peers()
         .lock()
@@ -3242,11 +3303,18 @@ fn note_peer_wire(peer: PeerId, caps: u32) {
     } else {
         queues.remove(&peer);
     }
+    let mut mls = mls_cap_peers().lock().expect("mls peers");
+    if caps & crate::protocol::HELLO_CAP_MLS != 0 {
+        mls.insert(peer);
+    } else {
+        mls.remove(&peer);
+    }
 }
 
 fn forget_peer_wire(peer: PeerId) {
     cbor_peers().lock().expect("cbor peers").remove(&peer);
     queue_cap_peers().lock().expect("queue peers").remove(&peer);
+    mls_cap_peers().lock().expect("mls peers").remove(&peer);
 }
 
 fn wire_out(peer: &PeerId, packet: V1Packet) -> crate::rr_codec::WireMsg {
@@ -4243,6 +4311,65 @@ async fn flush_pending_read_receipts(
     }
 }
 
+type PendingHandshake = (crypto::StaticSecret, void_session::kem::KemDk);
+
+fn enable_peer_header_enc(session: &mut crypto::SecureSession, caps: u32) {
+    if caps & crate::protocol::HELLO_CAP_HEADER_ENC != 0 {
+        session.enable_header_enc();
+    }
+}
+
+fn initiator_session(
+    local_static: &crypto::StaticSecret,
+    remote_static: &crypto::PublicKey,
+    local_eph: crypto::StaticSecret,
+    remote_eph: &crypto::PublicKey,
+    kem_dk: &void_session::kem::KemDk,
+    caps: u32,
+    kem_ek: &[u8],
+    kem_ct: &[u8],
+    pq_sig: &[u8],
+    signer: PeerId,
+    recipient: PeerId,
+    static_b: &[u8; 32],
+    eph_b: &[u8; 32],
+    ts: u64,
+    nonce: &[u8; 16],
+    transport_pubkey_pb: &[u8],
+) -> Option<crypto::SecureSession> {
+    let mut session = if caps & crate::protocol::HELLO_CAP_PQ != 0 {
+        if kem_ct.len() != void_session::kem::CT_LEN
+            || !crate::protocol::hello_pq_ok(
+                signer,
+                recipient,
+                static_b,
+                eph_b,
+                ts,
+                nonce,
+                caps,
+                kem_ek,
+                kem_ct,
+                pq_sig,
+                transport_pubkey_pb,
+            )
+        {
+            return None;
+        }
+        let ss = void_session::kem::decapsulate(kem_dk, kem_ct)?;
+        crypto::SecureSession::new_initiator_kem(
+            local_static,
+            remote_static,
+            local_eph,
+            remote_eph,
+            &ss,
+        )
+    } else {
+        crypto::SecureSession::new_initiator(local_static, remote_static, local_eph, remote_eph)
+    };
+    enable_peer_header_enc(&mut session, caps);
+    Some(session)
+}
+
 /// Нет живой E2EE к участнику группы: Hello если уже connected, иначе
 /// circuit-dial как у `SendGroupSync` / `EnsureChatSession`. Без dial
 /// `pending_messages` висит навсегда — групповые текст/файл не уходят.
@@ -4253,7 +4380,7 @@ async fn kick_group_peer_path(
     my_public_key: crypto::PublicKey,
     peer_id: PeerId,
     sessions: &HashMap<PeerId, crypto::SecureSession>,
-    pending_handshakes: &mut HashMap<PeerId, crypto::StaticSecret>,
+    pending_handshakes: &mut HashMap<PeerId, PendingHandshake>,
     handshake_started: &mut HashMap<PeerId, Instant>,
     reconnect_targets: &mut HashMap<PeerId, Vec<Multiaddr>>,
     bootstrap_peer_ids: &HashSet<PeerId>,
@@ -4301,7 +4428,7 @@ async fn ensure_e2ee_handshake_started(
     my_public_key: crypto::PublicKey,
     peer_id: PeerId,
     sessions: &HashMap<PeerId, crypto::SecureSession>,
-    pending_handshakes: &mut HashMap<PeerId, crypto::StaticSecret>,
+    pending_handshakes: &mut HashMap<PeerId, PendingHandshake>,
     handshake_started: &mut HashMap<PeerId, Instant>,
     now: &str,
     force: bool,
@@ -4333,6 +4460,7 @@ async fn ensure_e2ee_handshake_started(
         peer_id,
         my_public_key,
         ephem_pub,
+        &[],
     ) else {
         debug!(
             "[{}] ❌ E2EE: не удалось подписать Hello для {}",
@@ -4341,9 +4469,9 @@ async fn ensure_e2ee_handshake_started(
         );
         return false;
     };
-    pending_handshakes.insert(peer_id, ephem_secret);
+    pending_handshakes.insert(peer_id, (ephem_secret, hello.kem_dk));
     handshake_started.insert(peer_id, Instant::now());
-    let _ = send_v1_to_peer(swarm, peer_id, hello);
+    let _ = send_v1_to_peer(swarm, peer_id, hello.packet);
     debug!(
         "[{}] 🤝 E2EE: Hello (+Ephem) → {}{}",
         now,
@@ -4390,7 +4518,7 @@ pub async fn run_chat_network(
         let mut void_bootstraps = void_bootstraps;
         let mut sessions: HashMap<PeerId, crypto::SecureSession> = HashMap::new();
         let mut session_established_at: HashMap<PeerId, Instant> = HashMap::new();
-        let mut pending_handshakes: HashMap<PeerId, crypto::StaticSecret> = HashMap::new();
+        let mut pending_handshakes: HashMap<PeerId, PendingHandshake> = HashMap::new();
         let mut handshake_started: HashMap<PeerId, Instant> = HashMap::new();
         let mut hello_replay = crate::hello_replay::HelloReplayCache::load();
         let mut pending_messages: HashMap<PeerId, Vec<Vec<u8>>> = HashMap::new();
@@ -4413,7 +4541,11 @@ pub async fn run_chat_network(
         // Проверенные ротируемые prekey контактов. Hello-static сюда не кладём.
         let mut seal_prekeys: HashMap<PeerId, [u8; 32]> = HashMap::new();
         let mut opk_sealed: HashSet<PeerId> = HashSet::new();
-        let mut write_grants: HashMap<PeerId, crate::queue_mail::QueueGrant> = HashMap::new();
+                                let mut write_grants: HashMap<PeerId, crate::queue_mail::QueueGrant> = HashMap::new();
+        let mut outbound_group_mls: HashMap<
+            libp2p::request_response::OutboundRequestId,
+            (PeerId, String),
+        > = HashMap::new();
         let mut owned_queues: HashMap<PeerId, crate::queue_mail::OwnedQueue> = HashMap::new();
         let mut prev_queues: HashMap<PeerId, crate::queue_mail::OwnedQueue> = HashMap::new();
         let mut queue_grant_sent: HashSet<PeerId> = HashSet::new();
@@ -5715,6 +5847,52 @@ pub async fn run_chat_network(
                                     let _ = msg;
                                 }
                             }
+                            UICommand::SendGroupMls {
+                                group_id,
+                                epoch,
+                                body,
+                                recipients,
+                                message_id,
+                            } => {
+                                if !crate::group::validate_group_id(&group_id)
+                                    || body.is_empty()
+                                    || body.len() > 256 * 1024
+                                {
+                                    continue;
+                                }
+                                for peer_id in recipients {
+                                    if peer_id == local_peer_id {
+                                        continue;
+                                    }
+                                    let packet = V1Packet::GroupMls {
+                                        group_id: group_id.clone(),
+                                        epoch,
+                                        body: body.clone(),
+                                    };
+                                    let rid = rr_send(&mut swarm, &peer_id, packet);
+                                    if !message_id.is_empty() {
+                                        outbound_group_mls.insert(rid, (peer_id, message_id.clone()));
+                                    }
+                                }
+                            }
+                            UICommand::SendMlsKeyPackage {
+                                recipient,
+                                group_id,
+                                body,
+                            } => {
+                                if recipient == local_peer_id
+                                    || !crate::group::validate_group_id(&group_id)
+                                    || body.is_empty()
+                                    || body.len() > 64 * 1024
+                                {
+                                    continue;
+                                }
+                                rr_send(
+                                    &mut swarm,
+                                    &recipient,
+                                    V1Packet::MlsKeyPackage { group_id, body },
+                                );
+                            }
                             UICommand::SendGroupSync {
                                 group_id,
                                 group_name,
@@ -5722,6 +5900,7 @@ pub async fn run_chat_network(
                                 members,
                                 recipients,
                                 version,
+                                mls,
                             } => {
                                 let now = chrono::Local::now().format("%H:%M:%S").to_string();
                                 let Some(json_data) = build_group_sync_json(
@@ -5731,6 +5910,7 @@ pub async fn run_chat_network(
                                     &creator_id,
                                     version,
                                     &members,
+                                    mls,
                                 ) else {
                                     continue;
                                 };
@@ -7213,6 +7393,9 @@ pub async fn run_chat_network(
                                             caps,
                                             ts,
                                             nonce,
+                                            kem_ek,
+                                            kem_ct,
+                                            pq_sig,
                                         } => {
                                             if peer != local_peer_id {
                                                 let hello_bind = verify_hello_transport_binding(
@@ -7277,7 +7460,7 @@ pub async fn run_chat_network(
                                                         onion_reply,
                                                         V1Packet::Ack,
                                                     );
-                                                } else if let Some(local_ephem_secret) =
+                                                } else if let Some((local_ephem_secret, kem_dk)) =
                                                     pending_handshakes.remove(&peer)
                                                 {
                                                     handshake_started.remove(&peer);
@@ -7297,12 +7480,32 @@ pub async fn run_chat_network(
                                                     .await;
                                                     let remote_ephem_pub =
                                                         crypto::PublicKey::from(ephemeral_key);
-                                                    let mut session = crypto::SecureSession::new_initiator(
+                                                    let Some(mut session) = initiator_session(
                                                         &local_static,
                                                         &remote_static_pub,
                                                         local_ephem_secret,
                                                         &remote_ephem_pub,
-                                                    );
+                                                        &kem_dk,
+                                                        caps,
+                                                        &kem_ek,
+                                                        &kem_ct,
+                                                        &pq_sig,
+                                                        peer,
+                                                        local_peer_id,
+                                                        &public_key,
+                                                        &ephemeral_key,
+                                                        ts,
+                                                        &nonce,
+                                                        &transport_pubkey_pb,
+                                                    ) else {
+                                                        rr_reply(
+                                                            &mut swarm,
+                                                            &mut channel,
+                                                            onion_reply,
+                                                            V1Packet::Ack,
+                                                        );
+                                                        continue;
+                                                    };
                                                     session.bind_peers(
                                                         &local_peer_id.to_bytes(),
                                                         &peer.to_bytes(),
@@ -7367,12 +7570,55 @@ pub async fn run_chat_network(
                                                 let remote_ephem_pub = crypto::PublicKey::from(ephemeral_key);
                                                 let local_ephem_secret = crypto::StaticSecret::random_from_rng(&mut rand::rngs::OsRng);
                                                 let local_ephem_pub = crypto::PublicKey::from(&local_ephem_secret);
-                                                let mut session = crypto::SecureSession::new_responder(
-                                                    &local_static,
-                                                    &remote_static_pub,
-                                                    &remote_ephem_pub,
-                                                    local_ephem_secret,
-                                                );
+                                                let opened = if caps & crate::protocol::HELLO_CAP_PQ != 0 {
+                                                    if kem_ek.len() != void_session::kem::EK_LEN
+                                                        || !crate::protocol::hello_pq_ok(
+                                                            peer,
+                                                            local_peer_id,
+                                                            &public_key,
+                                                            &ephemeral_key,
+                                                            ts,
+                                                            &nonce,
+                                                            caps,
+                                                            &kem_ek,
+                                                            &kem_ct,
+                                                            &pq_sig,
+                                                            &transport_pubkey_pb,
+                                                        )
+                                                    {
+                                                        None
+                                                    } else {
+                                                        void_session::kem::encapsulate(&kem_ek).map(|(ct, ss)| {
+                                                            let mut session = crypto::SecureSession::new_responder_kem(
+                                                                &local_static,
+                                                                &remote_static_pub,
+                                                                &remote_ephem_pub,
+                                                                local_ephem_secret,
+                                                                Some(&ss),
+                                                            );
+                                                            enable_peer_header_enc(&mut session, caps);
+                                                            (session, ct)
+                                                        })
+                                                    }
+                                                } else {
+                                                    let mut session = crypto::SecureSession::new_responder(
+                                                        &local_static,
+                                                        &remote_static_pub,
+                                                        &remote_ephem_pub,
+                                                        local_ephem_secret,
+                                                    );
+                                                    enable_peer_header_enc(&mut session, caps);
+                                                    Some((session, Vec::new()))
+                                                };
+                                                let Some((mut session, kem_ct_reply)) = opened else {
+                                                    rr_reply(
+                                                        &mut swarm,
+                                                        &mut channel,
+                                                        onion_reply,
+                                                        V1Packet::Ack,
+                                                    );
+                                                    continue;
+                                                };
                                                 session.bind_peers(
                                                     &local_peer_id.to_bytes(),
                                                     &peer.to_bytes(),
@@ -7395,12 +7641,13 @@ pub async fn run_chat_network(
                                                     peer,
                                                     my_public_key,
                                                     local_ephem_pub,
+                                                    &kem_ct_reply,
                                                 ) {
                                                     rr_reply(
                                                         &mut swarm,
                                                         &mut channel,
                                                         onion_reply,
-                                                        my_hello,
+                                                        my_hello.packet,
                                                     );
                                                 }
                                                 }
@@ -7736,6 +7983,7 @@ pub async fn run_chat_network(
                                                                     version,
                                                                     sig,
                                                                     creator_pubkey_pb,
+                                                                    mls,
                                                                 } => {
                                                                     let _ = event_tx
                                                                         .send(NetworkEvent::GroupSync {
@@ -7747,6 +7995,7 @@ pub async fn run_chat_network(
                                                                             version,
                                                                             sig,
                                                                             creator_pubkey_pb,
+                                                                            mls,
                                                                         })
                                                                         .await;
                                                                     send_ack = true;
@@ -7822,6 +8071,7 @@ pub async fn run_chat_network(
                                                             peer,
                                                             my_public_key,
                                                             ephem_pub,
+                                                            &[],
                                                         ) {
                                                             if let Some(ch) = response_channel.take()
                                                             {
@@ -7829,7 +8079,7 @@ pub async fn run_chat_network(
                                                                     &mut swarm,
                                                                     ch,
                                                                     response_channel.cbor,
-                                                                    hello,
+                                                                    hello.packet,
                                                                 );
                                                             }
                                                         }
@@ -7878,13 +8128,14 @@ pub async fn run_chat_network(
                                                     peer,
                                                     my_public_key,
                                                     ephem_pub,
+                                                    &[],
                                                 ) {
                                                     if let Some(ch) = response_channel.take() {
                                                         send_rr_response(
                                                             &mut swarm,
                                                             ch,
                                                             response_channel.cbor,
-                                                            hello,
+                                                            hello.packet,
                                                         );
                                                     }
                                                 }
@@ -7950,6 +8201,51 @@ pub async fn run_chat_network(
                                                 V1Packet::Ack,
                                             );
                                         }
+                                        V1Packet::GroupMls {
+                                            group_id,
+                                            epoch,
+                                            body,
+                                        } => {
+                                            if crate::group::validate_group_id(&group_id)
+                                                && !body.is_empty()
+                                                && body.len() <= 256 * 1024
+                                            {
+                                                let _ = event_tx
+                                                    .send(NetworkEvent::GroupMls {
+                                                        from: peer,
+                                                        group_id,
+                                                        epoch,
+                                                        body,
+                                                    })
+                                                    .await;
+                                            }
+                                            rr_reply(
+                                                &mut swarm,
+                                                &mut channel,
+                                                onion_reply,
+                                                V1Packet::Ack,
+                                            );
+                                        }
+                                        V1Packet::MlsKeyPackage { group_id, body } => {
+                                            if crate::group::validate_group_id(&group_id)
+                                                && !body.is_empty()
+                                                && body.len() <= 64 * 1024
+                                            {
+                                                let _ = event_tx
+                                                    .send(NetworkEvent::MlsKeyPackage {
+                                                        from: peer,
+                                                        group_id,
+                                                        body,
+                                                    })
+                                                    .await;
+                                            }
+                                            rr_reply(
+                                                &mut swarm,
+                                                &mut channel,
+                                                onion_reply,
+                                                V1Packet::Ack,
+                                            );
+                                        }
                                         V1Packet::CreateQueue { .. }
                                         | V1Packet::QueueStore { .. }
                                         | V1Packet::QueueChallengeRequest { .. }
@@ -7983,6 +8279,7 @@ pub async fn run_chat_network(
                                         caps,
                                         ts,
                                         nonce,
+                                        ..
                                     } = &response.packet
                                     {
                                         if let Some(bind) = verify_hello_transport_binding(
@@ -8086,6 +8383,16 @@ pub async fn run_chat_network(
                                             }
                                         }
                                         V1Packet::Ack => {
+                                            if let Some((peer_id, message_id)) =
+                                                outbound_group_mls.remove(&request_id)
+                                            {
+                                                let _ = event_tx
+                                                    .send(NetworkEvent::MessageDelivered {
+                                                        peer: peer_id,
+                                                        message_id,
+                                                    })
+                                                    .await;
+                                            }
                                             let _ = pending_queue_queries.remove(&request_id);
                                             if let Some(for_peer) =
                                                 pending_queue_creates.remove(&request_id)
@@ -8246,6 +8553,7 @@ pub async fn run_chat_network(
                                             not_after,
                                             sig,
                                             opk,
+                                            kem_ek,
                                         } => {
                                             if let Some((recipient, items, done)) =
                                                 outbound_prekey_gets.remove(&request_id)
@@ -8256,39 +8564,49 @@ pub async fn run_chat_network(
                                                     .ok()
                                                     .filter(|p| *p == recipient)
                                                     .and_then(|id| {
+                                                        let spk = if kem_ek.len() == void_session::kem::EK_LEN {
+                                                            let mut ek = [0u8; void_session::kem::EK_LEN];
+                                                            ek.copy_from_slice(&kem_ek);
+                                                            SignedPrekey {
+                                                                pk: public_key,
+                                                                not_after,
+                                                                kem_ek: ek,
+                                                            }
+                                                        } else {
+                                                            SignedPrekey::x25519(public_key, not_after)
+                                                        };
                                                         let spk_ok = verify_prekey_offer(
                                                             &id,
                                                             &public_key,
                                                             not_after,
                                                             &sig,
+                                                            &kem_ek,
                                                         ) && crate::offline_mail::prekey_is_sealable(
-                                                            SignedPrekey {
-                                                                pk: public_key,
-                                                                not_after,
-                                                            },
+                                                            spk,
                                                             now_pk,
                                                         );
                                                         let opk = opk.clone().filter(|o| {
                                                             verify_opk(&id, &o.id, &o.pk, &o.sig)
                                                         });
-                                                        seal_material(
-                                                            spk_ok.then_some(SignedPrekey {
-                                                                pk: public_key,
-                                                                not_after,
-                                                            }),
-                                                            opk.as_ref(),
-                                                            now_pk,
-                                                        )
+                                                        seal_material(spk_ok.then_some(spk), opk.as_ref(), now_pk)
                                                     });
                                                 let spk_ok = verify_prekey_offer(
                                                     &recipient,
                                                     &public_key,
                                                     not_after,
                                                     &sig,
+                                                    &kem_ek,
                                                 ) && crate::offline_mail::prekey_is_sealable(
-                                                    SignedPrekey {
-                                                        pk: public_key,
-                                                        not_after,
+                                                    if kem_ek.len() == void_session::kem::EK_LEN {
+                                                        let mut ek = [0u8; void_session::kem::EK_LEN];
+                                                        ek.copy_from_slice(&kem_ek);
+                                                        SignedPrekey {
+                                                            pk: public_key,
+                                                            not_after,
+                                                            kem_ek: ek,
+                                                        }
+                                                    } else {
+                                                        SignedPrekey::x25519(public_key, not_after)
                                                     },
                                                     crate::offline_mail::prekey_unix_now(),
                                                 );
@@ -8318,6 +8636,7 @@ pub async fn run_chat_network(
                                                         material.spk,
                                                         material.opk_id,
                                                         material.opk_pk,
+                                                        &material.kem_ek,
                                                         items,
                                                         done,
                                                     );
@@ -8352,6 +8671,7 @@ pub async fn run_chat_network(
                                                         public_key,
                                                         [0u8; 16],
                                                         [0u8; 32],
+                                                        &kem_ek,
                                                         items,
                                                         done,
                                                     );
@@ -8392,6 +8712,9 @@ pub async fn run_chat_network(
                                             caps,
                                             ts,
                                             nonce,
+                                            kem_ek,
+                                            kem_ct,
+                                            pq_sig,
                                         } => {
                                             // Encrypted got Hello instead of Ack: peer has no
                                             // matching session. That Hello's ephem is disposable —
@@ -8548,7 +8871,7 @@ pub async fn run_chat_network(
                                                 // наш исходящий Hello ещё жив. Иначе это
                                                 // disposable Hello (нет сессии у пира) —
                                                 // сброс уже рабочей сессии убивает чат.
-                                                if let Some(local_ephem_secret) =
+                                                if let Some((local_ephem_secret, kem_dk)) =
                                                     pending_handshakes.remove(&peer)
                                                 {
                                                     handshake_started.remove(&peer);
@@ -8568,12 +8891,31 @@ pub async fn run_chat_network(
                                                     .await;
                                                     let remote_ephem_pub =
                                                         crypto::PublicKey::from(ephemeral_key);
-                                                    let mut session = crypto::SecureSession::new_initiator(
+                                                    let Some(mut session) = initiator_session(
                                                         &local_static,
                                                         &remote_static_pub,
                                                         local_ephem_secret,
                                                         &remote_ephem_pub,
-                                                    );
+                                                        &kem_dk,
+                                                        caps,
+                                                        &kem_ek,
+                                                        &kem_ct,
+                                                        &pq_sig,
+                                                        peer,
+                                                        local_peer_id,
+                                                        &public_key,
+                                                        &ephemeral_key,
+                                                        ts,
+                                                        &nonce,
+                                                        &transport_pubkey_pb,
+                                                    ) else {
+                                                        debug!(
+                                                            "[{}] ❌ E2EE: Hello (ответ) от {} без PQ — сессию не открываю",
+                                                            now,
+                                                            &peer.to_string()[..8]
+                                                        );
+                                                        continue;
+                                                    };
                                                     session.bind_peers(
                                                         &local_peer_id.to_bytes(),
                                                         &peer.to_bytes(),
@@ -8824,6 +9166,7 @@ pub async fn run_chat_network(
                                                                 version,
                                                                 sig,
                                                                 creator_pubkey_pb,
+                                                                mls,
                                                             } => {
                                                                 let _ = event_tx
                                                                     .send(NetworkEvent::GroupSync {
@@ -8835,6 +9178,7 @@ pub async fn run_chat_network(
                                                                         version,
                                                                         sig,
                                                                         creator_pubkey_pb,
+                                                                        mls,
                                                                     })
                                                                     .await;
                                                             }
@@ -8894,6 +9238,7 @@ pub async fn run_chat_network(
                                         | V1Packet::QueueStore { .. }
                                         | V1Packet::QueueChallengeRequest { .. }
                                         | V1Packet::QueueQuery { .. } => {}
+                                        V1Packet::GroupMls { .. } | V1Packet::MlsKeyPackage { .. } => {}
                                         V1Packet::Onion { .. }
                                         | V1Packet::Onion2 { .. }
                                         | V1Packet::OnionDrop { .. }

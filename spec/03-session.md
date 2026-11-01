@@ -8,6 +8,8 @@ Encrypted { header: { dh_pub[32], pn: u32, n: u32 }, ciphertext: bytes }
 
 `ciphertext` — ChaCha20-Poly1305. Открытый текст — один кадр: JSON чата, команда или кадр вложения ([04-attachments.md](04-attachments.md)). Промежуточный узел эти байты не читает: они лежат внутри Noise, а на onion ещё и внутри ячейки.
 
+Если обе стороны объявили `HELLO_CAP_HEADER_ENC`, открытые `dh_pub`, `pn` и `n` — нули. Настоящие 40 байт лежат в `header.sealed`: 12 байт случайного nonce и ChaCha20-Poly1305 от ключа заголовка, AAD `VOID_HDR_CT_V1`. Ключи заголовка ставятся из `RK2` до kickoff Алисы (`HKDF` с солью `RK2`, ikm `VOID_HDR_V1`, info `init`, 128 байт). Получатель пробует текущий ключ приёма, затем следующий. Почта v2 с таким заголовком — тег `5`, затем `u16le` длины `sealed`. Без бита заголовок остаётся открытым, почта — тег `2`.
+
 Это Double Ratchet VOID, не копия Signal байт в байт. Ниже — точные KDF, иначе вторая реализация не откроет кадр.
 
 ## Корни
@@ -19,6 +21,14 @@ Encrypted { header: { dh_pub[32], pn: u32, n: u32 }, ciphertext: bytes }
 ```
 RK0 = HKDF-SHA256("VOID_SALT", DH(static_a, static_b), "VOID_INIT_RK", 32)
 ```
+
+Если Hello обеих сторон принёс один и тот же секрет ML-KEM-768, корень другой:
+
+```
+RK0 = HKDF-SHA256("VOID_SALT_PQ", DH(static_a, static_b) || kem_ss, "VOID_INIT_RK_PQ", 32)
+```
+
+Без общего секрета KEM остаётся первая формула.
 
 Шаг корня:
 

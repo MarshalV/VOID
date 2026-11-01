@@ -59,8 +59,12 @@ impl ChainKey {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct MessageHeader {
     pub dh_pub: [u8; 32],
-    pub pn: u32, // Previous number of messages in sending chain
-    pub n: u32,  // Message index in current chain
+    pub pn: u32,
+    pub n: u32,
+    /// AEAD заголовка, когда обе стороны объявили `HELLO_CAP_HEADER_ENC`.
+    /// Пусто — заголовок в открытых полях, как раньше.
+    #[serde(default, skip_serializing_if = "Vec::is_empty", with = "serde_bytes")]
+    pub sealed: Vec<u8>,
 }
 
 impl MessageHeader {
@@ -88,6 +92,25 @@ fn canonical_peer_aad(a: &[u8], b: &[u8]) -> Vec<u8> {
     v
 }
 
+fn root_from_static(shared: &SharedSecret, kem: Option<&[u8; 32]>) -> [u8; 32] {
+    if let Some(kem) = kem {
+        let mut ikm = Vec::with_capacity(64);
+        ikm.extend_from_slice(shared.as_bytes());
+        ikm.extend_from_slice(kem);
+        return hkdf_sha256_derive(b"VOID_SALT_PQ", &ikm, b"VOID_INIT_RK_PQ", 32)
+            .try_into()
+            .unwrap();
+    }
+    hkdf_sha256_derive(
+        b"VOID_SALT".as_slice(),
+        shared.as_bytes(),
+        b"VOID_INIT_RK".as_slice(),
+        32,
+    )
+    .try_into()
+    .unwrap()
+}
+
 fn header_nonce(n: u32) -> [u8; 12] {
     let mut nonce = [0u8; 12];
     nonce[..4].copy_from_slice(&n.to_le_bytes());
@@ -111,6 +134,12 @@ pub struct SecureSession {
     send_header_aad: bool,
     require_header_aad: bool,
     peer_aad: Vec<u8>,
+    /// Шифровать заголовок отдельным ключом (`HELLO_CAP_HEADER_ENC`).
+    header_enc: bool,
+    hk_send: [u8; 32],
+    hk_recv: [u8; 32],
+    nhk_send: [u8; 32],
+    nhk_recv: [u8; 32],
     /// Только для векторов: очередные DH-секреты ratchet берутся отсюда, не из ОС.
     #[cfg(any(test, feature = "test-vectors"))]
     ratchet_rng: Option<StdRng>,
@@ -131,6 +160,10 @@ impl Zeroize for SecureSession {
         }
         self.skipped_keys.clear();
         self.peer_aad.zeroize();
+        self.hk_send.zeroize();
+        self.hk_recv.zeroize();
+        self.nhk_send.zeroize();
+        self.nhk_recv.zeroize();
         // dhs (StaticSecret) is ZeroizeOnDrop — zeroed when it is dropped.
         // dhr (PublicKey) is non-secret public material.
     }
@@ -149,16 +182,10 @@ impl SecureSession {
         remote_static: &PublicKey,
         local_ephemeral: StaticSecret,
         remote_ephemeral: &PublicKey,
+        kem: Option<&[u8; 32]>,
     ) -> Self {
         let shared_static = local_static.diffie_hellman(remote_static);
-        let rk: [u8; 32] = hkdf_sha256_derive(
-            b"VOID_SALT".as_slice(),
-            shared_static.as_bytes(),
-            b"VOID_INIT_RK".as_slice(),
-            32,
-        )
-        .try_into()
-        .unwrap();
+        let rk = root_from_static(&shared_static, kem);
 
         let mut sess = Self {
             dhs: local_ephemeral,
@@ -173,13 +200,18 @@ impl SecureSession {
             send_header_aad: false,
             require_header_aad: false,
             peer_aad: Vec::new(),
+            header_enc: false,
+            hk_send: [0u8; 32],
+            hk_recv: [0u8; 32],
+            nhk_send: [0u8; 32],
+            nhk_recv: [0u8; 32],
             #[cfg(any(test, feature = "test-vectors"))]
             ratchet_rng: None,
         };
 
         // 1. Ratchet send: DH(e_alice, s_bob)
         let shared_send_static = sess.dhs.diffie_hellman(remote_static);
-        let (rk1, ck_send_key) = sess.kdf_rk(&shared_send_static);
+        let (rk1, ck_send_key, _) = sess.kdf_rk(&shared_send_static);
         sess.rk = rk1;
         sess.ck_send = Some(ChainKey {
             key: ck_send_key,
@@ -189,7 +221,7 @@ impl SecureSession {
         // 2. Ratchet recv: DH(e_alice, e_bob)
         sess.dhr = *remote_ephemeral;
         let shared_recv_ephem = sess.dhs.diffie_hellman(&sess.dhr);
-        let (rk2, ck_recv_key) = sess.kdf_rk(&shared_recv_ephem);
+        let (rk2, ck_recv_key, _) = sess.kdf_rk(&shared_recv_ephem);
         sess.rk = rk2;
         sess.ck_recv = Some(ChainKey {
             key: ck_recv_key,
@@ -197,6 +229,7 @@ impl SecureSession {
         });
 
         // Шаги 1–2 держат e_alice. Kickoff (новый dhs) делает вызывающий.
+        sess.install_header_keys(true);
         sess
     }
 
@@ -211,6 +244,25 @@ impl SecureSession {
             remote_static,
             local_ephemeral,
             remote_ephemeral,
+            None,
+        );
+        sess.kickoff_send();
+        sess
+    }
+
+    pub fn new_initiator_kem(
+        local_static: &StaticSecret,
+        remote_static: &PublicKey,
+        local_ephemeral: StaticSecret,
+        remote_ephemeral: &PublicKey,
+        kem: &[u8; 32],
+    ) -> Self {
+        let mut sess = Self::initiator_before_kickoff(
+            local_static,
+            remote_static,
+            local_ephemeral,
+            remote_ephemeral,
+            Some(kem),
         );
         sess.kickoff_send();
         sess
@@ -219,7 +271,7 @@ impl SecureSession {
     fn kickoff_send(&mut self) {
         self.dhs = self.draw_ratchet_secret();
         let shared_kickoff = self.dhs.diffie_hellman(&self.dhr);
-        let (rk3, ck_send_key) = self.kdf_rk(&shared_kickoff);
+        let (rk3, ck_send_key, _) = self.kdf_rk(&shared_kickoff);
         self.rk = rk3;
         self.ck_send = Some(ChainKey {
             key: ck_send_key,
@@ -240,21 +292,123 @@ impl SecureSession {
         self.peer_aad = canonical_peer_aad(local, remote);
     }
 
+    /// Заголовок кадра шифруется отдельным ключом. Включать, когда пир объявил бит.
+    pub fn enable_header_enc(&mut self) {
+        self.header_enc = true;
+    }
+
+    fn install_header_keys(&mut self, alice: bool) {
+        let material = hkdf_sha256_derive(self.rk.as_slice(), b"VOID_HDR_V1", b"init", 128);
+        let k0: [u8; 32] = material[0..32].try_into().unwrap();
+        let k2: [u8; 32] = material[32..64].try_into().unwrap();
+        let k3: [u8; 32] = material[64..96].try_into().unwrap();
+        let k1: [u8; 32] = material[96..128].try_into().unwrap();
+        if alice {
+            self.hk_send = k0;
+            self.hk_recv = k2;
+            self.nhk_send = k3;
+            self.nhk_recv = k1;
+        } else {
+            self.hk_send = k2;
+            self.hk_recv = k0;
+            self.nhk_send = k1;
+            self.nhk_recv = k3;
+        }
+    }
+
+    fn seal_header(&self, header: &MessageHeader) -> Result<Vec<u8>> {
+        let mut plain = [0u8; 40];
+        plain[..32].copy_from_slice(&header.dh_pub);
+        plain[32..36].copy_from_slice(&header.pn.to_le_bytes());
+        plain[36..40].copy_from_slice(&header.n.to_le_bytes());
+        let mut nonce = [0u8; 12];
+        rand::RngCore::fill_bytes(&mut OsRng, &mut nonce);
+        let cipher = ChaCha20Poly1305::new(self.hk_send.as_slice().into());
+        let ct = cipher
+            .encrypt(
+                Nonce::from_slice(&nonce),
+                Payload {
+                    msg: &plain,
+                    aad: b"VOID_HDR_CT_V1",
+                },
+            )
+            .map_err(|_| anyhow!("header seal failed"))?;
+        let mut out = nonce.to_vec();
+        out.extend_from_slice(&ct);
+        Ok(out)
+    }
+
+    fn open_header(key: &[u8; 32], sealed: &[u8]) -> Option<MessageHeader> {
+        if sealed.len() < 12 + 16 {
+            return None;
+        }
+        let (nonce, ct) = sealed.split_at(12);
+        let cipher = ChaCha20Poly1305::new(key.as_slice().into());
+        let plain = cipher
+            .decrypt(
+                Nonce::from_slice(nonce),
+                Payload {
+                    msg: ct,
+                    aad: b"VOID_HDR_CT_V1",
+                },
+            )
+            .ok()?;
+        if plain.len() != 40 {
+            return None;
+        }
+        let mut dh_pub = [0u8; 32];
+        dh_pub.copy_from_slice(&plain[..32]);
+        let pn = u32::from_le_bytes(plain[32..36].try_into().ok()?);
+        let n = u32::from_le_bytes(plain[36..40].try_into().ok()?);
+        Some(MessageHeader {
+            dh_pub,
+            pn,
+            n,
+            sealed: sealed.to_vec(),
+        })
+    }
+
+    /// `(заголовок с настоящими dh/pn/n, открыт следующим ключом)`.
+    fn unseal_header(&self, header: &MessageHeader) -> Result<(MessageHeader, bool)> {
+        if header.sealed.is_empty() {
+            if self.header_enc {
+                return Err(anyhow!("header must be sealed"));
+            }
+            return Ok((header.clone(), false));
+        }
+        if let Some(opened) = Self::open_header(&self.hk_recv, &header.sealed) {
+            return Ok((opened, false));
+        }
+        if let Some(opened) = Self::open_header(&self.nhk_recv, &header.sealed) {
+            return Ok((opened, true));
+        }
+        Err(anyhow!("header seal"))
+    }
+
     pub fn new_responder(
         local_static: &StaticSecret,
         remote_static: &PublicKey,
         remote_ephemeral: &PublicKey,
         local_ephemeral: StaticSecret,
     ) -> Self {
-        let shared_static = local_static.diffie_hellman(remote_static);
-        let rk: [u8; 32] = hkdf_sha256_derive(
-            b"VOID_SALT".as_slice(),
-            shared_static.as_bytes(),
-            b"VOID_INIT_RK".as_slice(),
-            32,
+        Self::new_responder_kem(
+            local_static,
+            remote_static,
+            remote_ephemeral,
+            local_ephemeral,
+            None,
         )
-        .try_into()
-        .unwrap();
+    }
+
+    pub fn new_responder_kem(
+        local_static: &StaticSecret,
+        remote_static: &PublicKey,
+        remote_ephemeral: &PublicKey,
+        local_ephemeral: StaticSecret,
+        kem: Option<&[u8; 32]>,
+    ) -> Self {
+        let shared_static = local_static.diffie_hellman(remote_static);
+        let rk = root_from_static(&shared_static, kem);
 
         let mut sess = Self {
             dhs: local_ephemeral,
@@ -269,13 +423,18 @@ impl SecureSession {
             send_header_aad: false,
             require_header_aad: false,
             peer_aad: Vec::new(),
+            header_enc: false,
+            hk_send: [0u8; 32],
+            hk_recv: [0u8; 32],
+            nhk_send: [0u8; 32],
+            nhk_recv: [0u8; 32],
             #[cfg(any(test, feature = "test-vectors"))]
             ratchet_rng: None,
         };
 
         // 1. Ratchet recv: DH(s_bob, e_alice)
         let shared_recv_static = local_static.diffie_hellman(remote_ephemeral);
-        let (rk1, ck_recv_key) = sess.kdf_rk(&shared_recv_static);
+        let (rk1, ck_recv_key, _) = sess.kdf_rk(&shared_recv_static);
         sess.rk = rk1;
         sess.ck_recv = Some(ChainKey {
             key: ck_recv_key,
@@ -284,13 +443,14 @@ impl SecureSession {
 
         // 2. Ratchet send: DH(e_bob, e_alice)
         let shared_send_ephem = sess.dhs.diffie_hellman(remote_ephemeral);
-        let (rk2, ck_send_key) = sess.kdf_rk(&shared_send_ephem);
+        let (rk2, ck_send_key, _) = sess.kdf_rk(&shared_send_ephem);
         sess.rk = rk2;
         sess.ck_send = Some(ChainKey {
             key: ck_send_key,
             index: 0,
         });
 
+        sess.install_header_keys(false);
         sess
     }
 
@@ -305,13 +465,25 @@ impl SecureSession {
             dh_pub: PublicKey::from(&self.dhs).to_bytes(),
             pn: self.pn,
             n: ns,
+            sealed: Vec::new(),
         };
         self.ns += 1;
+        let mut aad_header = header.clone();
+        let mut wire = header.clone();
+        if self.header_enc {
+            aad_header.sealed = self.seal_header(&header)?;
+            wire = MessageHeader {
+                dh_pub: [0u8; 32],
+                pn: 0,
+                n: 0,
+                sealed: aad_header.sealed.clone(),
+            };
+        }
 
         let cipher = ChaCha20Poly1305::new(mk.as_slice().into());
         let nonce_bytes = header_nonce(ns);
         let nonce = Nonce::from_slice(&nonce_bytes);
-        let aad = header.aad(&self.peer_aad);
+        let aad = self.message_aad(&aad_header);
         let ciphertext = if self.send_header_aad {
             cipher.encrypt(
                 nonce,
@@ -325,7 +497,7 @@ impl SecureSession {
         }
         .map_err(|_| anyhow!("Encryption failed"))?;
 
-        Ok((header, ciphertext))
+        Ok((wire, ciphertext))
     }
 
     /// Состояние меняется только при успешной проверке AEAD: поддельный или
@@ -336,8 +508,9 @@ impl SecureSession {
         ciphertext: &[u8],
     ) -> Result<Vec<u8>> {
         self.purge_stale_skipped();
+        let (header, opened_with_next) = self.unseal_header(header)?;
         if let Some(&(mk, _)) = self.skipped_keys.get(&(header.dh_pub, header.n)) {
-            let (plaintext, with_aad) = self.decrypt_with_key(&mk, header, ciphertext)?;
+            let (plaintext, with_aad) = self.decrypt_with_key(&mk, &header, ciphertext)?;
             if let Some((mut used, _)) = self.skipped_keys.remove(&(header.dh_pub, header.n)) {
                 used.zeroize();
             }
@@ -346,7 +519,7 @@ impl SecureSession {
         }
 
         let mut trial = self.clone();
-        let (plaintext, with_aad) = trial.decrypt_advancing(header, ciphertext)?;
+        let (plaintext, with_aad) = trial.decrypt_advancing(&header, ciphertext, opened_with_next)?;
         *self = trial;
         self.note_header_aad(with_aad);
         Ok(plaintext)
@@ -359,14 +532,27 @@ impl SecureSession {
         }
     }
 
+    fn message_aad(&self, header: &MessageHeader) -> Vec<u8> {
+        if header.sealed.is_empty() {
+            return header.aad(&self.peer_aad);
+        }
+        let mut v = header.aad(&self.peer_aad);
+        v.splice(0..0, b"VOID_RATCHET_HDR_V2".iter().copied());
+        // aad() already starts with V1 domain. Prefix V2 so a sealed frame
+        // cannot be replayed as a clear header under the same message key.
+        v.extend_from_slice(&header.sealed);
+        v
+    }
+
     fn decrypt_advancing(
         &mut self,
         header: &MessageHeader,
         ciphertext: &[u8],
+        opened_with_next: bool,
     ) -> Result<(Vec<u8>, bool)> {
         if header.dh_pub != self.dhr.to_bytes() {
             self.skip_message_keys(header.pn)?;
-            self.dh_ratchet(header)?;
+            self.dh_ratchet(header, opened_with_next)?;
         }
 
         self.skip_message_keys(header.n)?;
@@ -391,7 +577,7 @@ impl SecureSession {
         let cipher = ChaCha20Poly1305::new(mk.as_slice().into());
         let nonce_bytes = header_nonce(header.n);
         let nonce = Nonce::from_slice(&nonce_bytes);
-        let aad = header.aad(&self.peer_aad);
+        let aad = self.message_aad(header);
         if let Ok(pt) = cipher.decrypt(
             nonce,
             Payload {
@@ -410,24 +596,42 @@ impl SecureSession {
             .map_err(|_| anyhow!("Decryption failed"))
     }
 
-    fn dh_ratchet(&mut self, header: &MessageHeader) -> Result<()> {
+    fn header_next(rk: &[u8]) -> [u8; 32] {
+        hkdf_sha256_derive(rk, b"VOID_HDR_V1", b"next", 32)
+            .try_into()
+            .unwrap()
+    }
+
+    fn dh_ratchet(&mut self, header: &MessageHeader, opened_with_next: bool) -> Result<()> {
+        // The peer already holds `nhk_send` (installed at init, or derived
+        // from a root they have seen). The message we send next uses it.
+        // `nhk_recv` is consumed only when this header was sealed with it;
+        // otherwise the peer's first switch is still in the future.
+        if opened_with_next {
+            self.hk_recv = self.nhk_recv;
+        }
+        self.hk_send = self.nhk_send;
         self.pn = self.ns;
         self.ns = 0;
         self.nr = 0;
         self.dhr = PublicKey::from(header.dh_pub);
 
         let shared_recv = self.dhs.diffie_hellman(&self.dhr);
-        let (rk, ck_recv_key) = self.kdf_rk(&shared_recv);
+        let (rk, ck_recv_key, _) = self.kdf_rk(&shared_recv);
         self.rk = rk;
         self.ck_recv = Some(ChainKey {
             key: ck_recv_key,
             index: 0,
         });
+        if opened_with_next {
+            self.nhk_recv = Self::header_next(self.rk.as_slice());
+        }
 
         self.dhs = self.draw_ratchet_secret();
         let shared_send = self.dhs.diffie_hellman(&self.dhr);
-        let (rk, ck_send_key) = self.kdf_rk(&shared_send);
+        let (rk, ck_send_key, _) = self.kdf_rk(&shared_send);
         self.rk = rk;
+        self.nhk_send = Self::header_next(self.rk.as_slice());
         self.ck_send = Some(ChainKey {
             key: ck_send_key,
             index: 0,
@@ -457,6 +661,7 @@ impl SecureSession {
             remote_static,
             local_ephemeral,
             remote_ephemeral,
+            None,
         );
         sess.ratchet_rng = Some(StdRng::from_seed(seed));
         sess.kickoff_send();
@@ -481,11 +686,12 @@ impl SecureSession {
         sess
     }
 
-    fn kdf_rk(&self, shared: &SharedSecret) -> ([u8; 32], [u8; 32]) {
-        let out = hkdf_sha256_derive(self.rk.as_slice(), shared.as_bytes(), b"dr_ratchet", 64);
+    fn kdf_rk(&self, shared: &SharedSecret) -> ([u8; 32], [u8; 32], [u8; 32]) {
+        let out = hkdf_sha256_derive(self.rk.as_slice(), shared.as_bytes(), b"dr_ratchet", 96);
         (
             out[0..32].try_into().unwrap(),
             out[32..64].try_into().unwrap(),
+            out[64..96].try_into().unwrap(),
         )
     }
 
@@ -582,11 +788,13 @@ mod tests {
                 dh_pub: PublicKey::from(&StaticSecret::random_from_rng(OsRng)).to_bytes(),
                 pn: 10,
                 n: 0,
+                sealed: Vec::new(),
             },
             MessageHeader {
                 dh_pub: PublicKey::from(&alice.dhs).to_bytes(),
                 pn: 0,
                 n: 4095,
+                sealed: Vec::new(),
             },
         ];
         for h in &forged {
@@ -631,6 +839,84 @@ mod tests {
             assert!(seen.insert(hb.dh_pub), "Bob reused a ratchet key");
         }
         assert_ne!(PublicKey::from(&alice.dhs).to_bytes(), initial_alice);
+    }
+
+    #[test]
+    fn header_encryption_round_trip_hides_dh() {
+        let (mut alice, mut bob) = pair();
+        alice.enable_header_aad();
+        bob.enable_header_aad();
+        alice.bind_peers(b"alice-peer", b"bob-peer");
+        bob.bind_peers(b"bob-peer", b"alice-peer");
+        alice.enable_header_enc();
+        bob.enable_header_enc();
+        for round in 0..4u8 {
+            let (ha, ca) = alice.encrypt_payload(&[round]).unwrap();
+            assert_eq!(ha.dh_pub, [0u8; 32]);
+            assert_eq!(ha.pn, 0);
+            assert_eq!(ha.n, 0);
+            assert!(!ha.sealed.is_empty());
+            assert_eq!(bob.decrypt_payload(&ha, &ca).unwrap(), [round]);
+            let (hb, cb) = bob.encrypt_payload(&[round, 1]).unwrap();
+            assert_eq!(hb.dh_pub, [0u8; 32]);
+            assert_eq!(alice.decrypt_payload(&hb, &cb).unwrap(), [round, 1]);
+        }
+    }
+
+    #[test]
+    fn header_encryption_bob_speaks_first_and_rejects_tamper() {
+        let (mut alice, mut bob) = pair();
+        alice.enable_header_enc();
+        bob.enable_header_enc();
+        let (hb, cb) = bob.encrypt_payload(b"first").unwrap();
+        assert_eq!(hb.dh_pub, [0u8; 32]);
+        assert_eq!(alice.decrypt_payload(&hb, &cb).unwrap(), b"first");
+        for round in 0..3u8 {
+            let (ha, ca) = alice.encrypt_payload(&[round]).unwrap();
+            assert_eq!(bob.decrypt_payload(&ha, &ca).unwrap(), [round]);
+            let (hb, cb) = bob.encrypt_payload(&[round]).unwrap();
+            assert_eq!(alice.decrypt_payload(&hb, &cb).unwrap(), [round]);
+        }
+        let (ha, ca) = alice.encrypt_payload(b"ok").unwrap();
+        let mut bad = ha.clone();
+        bad.sealed[20] ^= 0x5a;
+        assert!(bob.decrypt_payload(&bad, &ca).is_err());
+        assert_eq!(bob.decrypt_payload(&ha, &ca).unwrap(), b"ok");
+    }
+
+    #[test]
+    fn hybrid_root_is_not_the_x25519_root() {
+        let mut rng = OsRng;
+        let alice_static = StaticSecret::random_from_rng(&mut rng);
+        let bob_static = StaticSecret::random_from_rng(&mut rng);
+        let alice_ephem = StaticSecret::random_from_rng(&mut rng);
+        let bob_ephem = StaticSecret::random_from_rng(&mut rng);
+        let bob_eph_pub = PublicKey::from(&bob_ephem);
+        let alice_eph_pub = PublicKey::from(&alice_ephem);
+        let kem = [7u8; 32];
+        let mut plain_a = SecureSession::new_initiator(
+            &alice_static,
+            &PublicKey::from(&bob_static),
+            alice_ephem.clone(),
+            &bob_eph_pub,
+        );
+        let mut hybrid_a = SecureSession::new_initiator_kem(
+            &alice_static,
+            &PublicKey::from(&bob_static),
+            alice_ephem,
+            &bob_eph_pub,
+            &kem,
+        );
+        let mut hybrid_b = SecureSession::new_responder_kem(
+            &bob_static,
+            &PublicKey::from(&alice_static),
+            &alice_eph_pub,
+            bob_ephem,
+            Some(&kem),
+        );
+        let (h, ct) = hybrid_a.encrypt_payload(b"pq").unwrap();
+        assert_eq!(hybrid_b.decrypt_payload(&h, &ct).unwrap(), b"pq");
+        assert!(plain_a.decrypt_payload(&h, &ct).is_err());
     }
 
     #[test]

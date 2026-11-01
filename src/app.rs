@@ -176,6 +176,7 @@ pub(crate) struct App {
     /// Текущий и предыдущий prekey, пока не истёк `not_after`.
     offline_prekey_secrets: Vec<crypto::StaticSecret>,
     offline_opks: Vec<crate::offline_mail::OpkSecret>,
+    offline_kem_dks: Vec<Vec<u8>>,
     spent_opk: Vec<[u8; 16]>,
     pub(crate) pending_sends: Vec<PendingSend>,
     pub(crate) pending_file_sends: Vec<PendingFileSend>,
@@ -226,6 +227,7 @@ pub(crate) struct App {
     pub(crate) peer_prekeys: HashMap<PeerId, [u8; 32]>,
     /// Очередь контакта: owner-секрет и write-грант собеседника.
     pub(crate) contact_queues: HashMap<PeerId, crate::queue_mail::ContactQueueRecord>,
+    pub(crate) group_mls: crate::group_mls::GroupMls,
     offline_dht_publish_after: Option<Instant>,
     offline_mail_processed: HashSet<String>,
     /// Пиры, которым уже отправили group_sync в этой сессии (до disconnect).
@@ -269,6 +271,7 @@ fn resolve_vault_bootstraps(
                 None,
                 None,
                 Some(&bootstraps),
+                None,
                 None,
                 None,
             ) {
@@ -333,6 +336,7 @@ impl App {
             identity_key: None,
             offline_prekey_secrets: Vec::new(),
             offline_opks: Vec::new(),
+            offline_kem_dks: Vec::new(),
             spent_opk: Vec::new(),
             pending_sends: Vec::new(),
             pending_file_sends: Vec::new(),
@@ -364,6 +368,7 @@ impl App {
             outbox_entries: Vec::new(),
             peer_prekeys: HashMap::new(),
             contact_queues: HashMap::new(),
+            group_mls: crate::group_mls::GroupMls::empty(),
             offline_dht_publish_after: None,
             offline_mail_processed: HashSet::new(),
             group_synced_peers: HashSet::new(),
@@ -716,6 +721,10 @@ impl App {
                     left_groups,
                     master_arr,
                 );
+                self.group_mls = crate::group_mls::GroupMls::open(
+                    &self.local_peer_id.to_string(),
+                    storage.mls_snapshot.as_ref(),
+                );
             }
             VaultUnlockKind::CreateProfile => {
                 let local_key = libp2p::identity::Keypair::generate_ed25519();
@@ -730,6 +739,7 @@ impl App {
                     &nickname,
                     Some(&local_key),
                     Some(&static_secret),
+                    None,
                     None,
                     None,
                     None,
@@ -776,6 +786,8 @@ impl App {
                     HashSet::new(),
                     master_arr,
                 );
+                self.group_mls =
+                    crate::group_mls::GroupMls::open(&self.local_peer_id.to_string(), None);
             }
         }
     }
@@ -800,6 +812,7 @@ impl App {
             &crate::paths::data_file(crate::offline_mail::PREKEY_FILE),
         ) {
             self.offline_prekey_secrets = pre.secrets;
+            self.offline_kem_dks = pre.kem_dks;
             self.offline_opks = pre.opk_secrets;
             self.spent_opk = pre.spent_opk;
         }
@@ -1217,6 +1230,7 @@ impl App {
                         creator_id,
                         *version,
                         members,
+                        self.groups.get(group_id).is_some_and(|g| g.mls),
                     ) {
                         items.push(OfflineOutboxItem {
                             recipient: pid,
@@ -1298,6 +1312,11 @@ impl App {
                 &self.spent_opk,
                 &self.local_peer_id,
                 &env,
+                &self
+                    .offline_kem_dks
+                    .iter()
+                    .map(|d| d.as_slice())
+                    .collect::<Vec<_>>(),
             ) {
                 Ok(out) => {
                     if let Some(id) = out.spent_opk {
@@ -1347,6 +1366,7 @@ impl App {
                         version,
                         sig,
                         creator_pubkey_pb,
+                        mls,
                     }) = parse_decrypted_chat_frame(&plaintext)
                     {
                         self.merge_incoming_group_sync(
@@ -1358,6 +1378,7 @@ impl App {
                             version,
                             sig,
                             creator_pubkey_pb,
+                            mls,
                         );
                         self.offline_mail_processed.insert(env.message_id.clone());
                         any = true;
@@ -1739,6 +1760,10 @@ impl App {
                             voice_shown: false,
                         });
                     }
+                    match self.try_send_mls_group_text(&group_id, &message_id, &text, targets.clone()) {
+                        Ok(false) => {}
+                        _ => continue,
+                    }
                     let _ = self.command_tx.try_send(UICommand::SendGroupMessage {
                         sender_name: self.local_nickname.clone(),
                         text,
@@ -1864,6 +1889,7 @@ impl App {
                         members,
                         recipients: vec![pid],
                         version: group.version,
+                        mls: group.mls,
                     });
                 }
             }
@@ -2219,6 +2245,12 @@ impl App {
                 voice_shown: chat_message_for_pending.is_some(),
                 chat_message: chat_message_for_pending,
             });
+            if voice_path.is_none() && voice_transfer_id.is_none() {
+                match self.try_send_mls_group_text(&gid, &msg.id, &msg.text, targets.clone()) {
+                    Ok(false) => {}
+                    _ => continue,
+                }
+            }
             let _ = self.command_tx.try_send(UICommand::SendGroupMessage {
                 sender_name: self.local_nickname.clone(),
                 text: msg.text,
@@ -2267,6 +2299,17 @@ impl App {
                         && !item.voice_delivered_to.contains(p)
                 })
                 .collect();
+            if item.voice_path.is_none() && item.voice_transfer_id.is_none() {
+                match self.try_send_mls_group_text(
+                    &item.group_id,
+                    &item.message_id,
+                    &item.text,
+                    targets.clone(),
+                ) {
+                    Ok(false) => {}
+                    _ => continue,
+                }
+            }
             let _ = self.command_tx.try_send(UICommand::SendGroupMessage {
                 sender_name: self.local_nickname.clone(),
                 text: item.text.clone(),
@@ -2983,9 +3026,127 @@ impl App {
             Some(&self.void_bootstrap_strings),
             Some(&self.groups_vec()),
             Some(&self.left_groups_vec()),
+            self.group_mls.snapshot().as_ref(),
         ) {
             warn!("VOID: не удалось сохранить vault (записная книга): {}", e);
         }
+    }
+
+    pub(crate) fn ingest_group_mls(&mut self, group_id: String, body: Vec<u8>) {
+        match self.group_mls.take(&group_id, &body) {
+            Ok(crate::group_mls::MlsIn::Application { plaintext }) => {
+                if let Ok(msg) = serde_json::from_slice::<ChatMessage>(&plaintext) {
+                    self.ingest_chat_message(msg);
+                }
+            }
+            Ok(_) => self.persist_vault(),
+            Err(_) => {}
+        }
+    }
+
+    pub(crate) fn ingest_mls_key_package(
+        &mut self,
+        from: PeerId,
+        group_id: String,
+        body: Vec<u8>,
+    ) {
+        let me = self.local_peer_id.to_string();
+        let admit = self.groups.get(&group_id).is_some_and(|gr| {
+            gr.mls
+                && gr.creator_id == me
+                && gr.members.iter().any(|m| m.peer_id == from.to_string())
+        });
+        if !admit {
+            return;
+        }
+        let Ok(added) = self.group_mls.admit(&group_id, &body) else {
+            return;
+        };
+        let _ = self.command_tx.try_send(UICommand::SendGroupMls {
+            group_id: group_id.clone(),
+            epoch: added.epoch,
+            body: added.welcome,
+            recipients: vec![from],
+            message_id: String::new(),
+        });
+        let others = self
+            .groups
+            .get(&group_id)
+            .map(|gr| gr.member_peer_ids())
+            .unwrap_or_default()
+            .into_iter()
+            .filter(|p| *p != from && *p != self.local_peer_id)
+            .collect();
+        let _ = self.command_tx.try_send(UICommand::SendGroupMls {
+            group_id,
+            epoch: added.epoch,
+            body: added.commit,
+            recipients: others,
+            message_id: String::new(),
+        });
+        self.persist_vault();
+    }
+
+    pub(crate) fn group_uses_mls(&self, group_id: &str) -> bool {
+        self.groups.get(group_id).is_some_and(|g| g.mls)
+    }
+
+    /// `Ok(true)` — ciphertext ушёл в эпоху группы. `Ok(false)` — группа попарная.
+    pub(crate) fn try_send_mls_group_text(
+        &mut self,
+        group_id: &str,
+        message_id: &str,
+        text: &str,
+        recipients: Vec<PeerId>,
+    ) -> Result<bool, ()> {
+        if !self.group_uses_mls(group_id) {
+            return Ok(false);
+        }
+        let msg = ChatMessage {
+            id: message_id.to_string(),
+            sender_id: self.local_peer_id.to_string(),
+            sender_name: self.local_nickname.clone(),
+            recipient_id: None,
+            text: text.to_string(),
+            timestamp: chrono::Local::now().format("%H:%M:%S").to_string(),
+            delivery: OutgoingDeliveryStatus::Pending,
+            voice: None,
+            file: None,
+            group_id: Some(group_id.to_string()),
+        };
+        let json = serde_json::to_vec(&msg).map_err(|_| ())?;
+        let sealed = self.group_mls.seal(group_id, &json).map_err(|_| ())?;
+        self.persist_vault();
+        self.command_tx
+            .try_send(UICommand::SendGroupMls {
+                group_id: group_id.to_string(),
+                epoch: sealed.epoch,
+                body: sealed.body,
+                recipients,
+                message_id: message_id.to_string(),
+            })
+            .map_err(|_| ())?;
+        Ok(true)
+    }
+
+    fn offer_mls_key_package(&mut self, group: &GroupChat) {
+        if !group.mls || group.creator_id == self.local_peer_id.to_string() {
+            return;
+        }
+        if self.group_mls.has(&group.id) {
+            return;
+        }
+        let Ok(creator) = group.creator_id.parse::<PeerId>() else {
+            return;
+        };
+        let Ok(body) = self.group_mls.key_package() else {
+            return;
+        };
+        let _ = self.command_tx.try_send(UICommand::SendMlsKeyPackage {
+            recipient: creator,
+            group_id: group.id.clone(),
+            body,
+        });
     }
 
     fn groups_vec(&self) -> Vec<GroupChat> {
@@ -3034,21 +3195,43 @@ impl App {
         let id = group::new_group_id();
         let me = self.local_peer_id.to_string();
         let invitee_ids: Vec<String> = selected.iter().map(|p| p.to_string()).collect();
-        // В составе только создатель. Выбранные получают invite-ссылку и
-        // попадают в группу ТОЛЬКО после явного перехода/клика по ссылке.
+        let mls = selected.iter().all(|pid| crate::network::peer_has_mls(*pid));
+        // Попарная группа: в составе только создатель, пока человек не откроет ссылку.
+        // MLS-группа: выбранные уже в составе, иначе создатель не примет их KeyPackage.
+        let members = if mls {
+            let mut members = vec![GroupMember {
+                peer_id: me.clone(),
+                display_name: self.local_nickname.clone(),
+            }];
+            for pid in &selected {
+                let display = self
+                    .known_peers
+                    .get(pid)
+                    .cloned()
+                    .unwrap_or_else(|| pid.to_string().chars().take(12).collect());
+                members.push(GroupMember {
+                    peer_id: pid.to_string(),
+                    display_name: display,
+                });
+            }
+            dedupe_members(members)
+        } else {
+            group::members_on_group_create(&me, &self.local_nickname, &invitee_ids)
+        };
         let group = GroupChat {
             id: id.clone(),
             name,
             creator_id: me,
-            members: group::members_on_group_create(
-                &self.local_peer_id.to_string(),
-                &self.local_nickname,
-                &invitee_ids,
-            ),
+            members,
             created_at: chrono::Local::now().format("%Y-%m-%d %H:%M").to_string(),
             version: 1,
+            mls,
         };
         if !group::validate_group_chat(&group) {
+            return None;
+        }
+        if mls && self.group_mls.ensure_group(&id).is_err() {
+            self.add_status("⚠ Не удалось открыть MLS-группу".into());
             return None;
         }
         info!(
@@ -3154,6 +3337,7 @@ impl App {
             self.selected_chat = thread.clone();
         }
         self.messages.lock().entry(thread).or_default();
+        self.offer_mls_key_package(&group);
         if !was_active {
             self.dial_group_members(&group);
             self.broadcast_group_sync(&group);
@@ -3310,7 +3494,37 @@ impl App {
         if group.members.iter().any(|m| m.peer_id == peer.to_string()) {
             return Err("Участник уже в группе");
         }
-        // Не добавляем в members и не шлём group_sync — иначе пир
+        if group.mls {
+            if !crate::network::peer_has_mls(peer) {
+                return Err("Этот контакт не объявил MLS. В такую группу его не добавить.");
+            }
+            let mut group = group;
+            let display = self
+                .known_peers
+                .get(&peer)
+                .cloned()
+                .unwrap_or_else(|| peer.to_string().chars().take(12).collect());
+            group.members.push(GroupMember {
+                peer_id: peer.to_string(),
+                display_name: display,
+            });
+            group.members = dedupe_members(group.members);
+            if group.creator_id == self.local_peer_id.to_string() {
+                group.version = group::next_group_version(group.version);
+                self.sign_legacy_creator_version(&mut group);
+            }
+            self.groups.insert(group_id.clone(), group.clone());
+            self.broadcast_group_sync(&group);
+            self.group_departed_peers
+                .entry(group_id)
+                .or_default()
+                .remove(&peer.to_string());
+            self.send_group_invite_dm(peer, &group);
+            let _ = self.command_tx.try_send(UICommand::SearchPeer(peer));
+            self.persist_vault();
+            return Ok(());
+        }
+        // Попарная группа: не добавляем в members и не шлём group_sync — иначе пир
         // окажется в группе без перехода по ссылке. Только invite-DM.
         self.group_departed_peers
             .entry(group_id)
@@ -3369,6 +3583,7 @@ impl App {
         }
 
         self.left_groups.insert(gid.to_string());
+        self.group_mls.forget(gid);
         self.groups.remove(gid);
         self.group_synced_peers.clear();
         self.purge_group_outbox(gid);
@@ -3400,6 +3615,7 @@ impl App {
         });
 
         self.left_groups.insert(gid.to_string());
+        self.group_mls.forget(gid);
         self.groups.remove(gid);
         self.group_synced_peers.clear();
         self.purge_group_outbox(gid);
@@ -3447,6 +3663,7 @@ impl App {
         let me = self.local_peer_id.to_string();
         if peer_id == me {
             self.left_groups.insert(group_id.clone());
+            self.group_mls.forget(&group_id);
             self.groups.remove(&group_id);
             self.purge_group_outbox(&group_id);
             self.pending_group_sends
@@ -3465,6 +3682,18 @@ impl App {
             }
             let g = group.clone();
             let empty = g.members.is_empty();
+            if g.mls && g.creator_id == me {
+                if let Ok(commit) = self.group_mls.evict(&g.id, &peer_id) {
+                    let recipients = g.member_peer_ids();
+                    let _ = self.command_tx.try_send(UICommand::SendGroupMls {
+                        group_id: g.id.clone(),
+                        epoch: commit.epoch,
+                        body: commit.commit,
+                        recipients,
+                        message_id: String::new(),
+                    });
+                }
+            }
             if empty {
                 self.groups.remove(&group_id);
             }
@@ -3485,6 +3714,7 @@ impl App {
             return false;
         }
         self.left_groups.insert(group_id.clone());
+        self.group_mls.forget(&group_id);
         self.groups.remove(&group_id);
         self.purge_group_outbox(&group_id);
         self.pending_group_sends
@@ -3507,6 +3737,7 @@ impl App {
         version: u64,
         sig: Vec<u8>,
         creator_pubkey_pb: Vec<u8>,
+        mls: bool,
     ) {
         if self.left_groups.contains(&group_id) || !group::validate_group_id(&group_id) {
             return;
@@ -3520,6 +3751,7 @@ impl App {
             &members,
             &sig,
             &creator_pubkey_pb,
+            mls,
         );
         let Some(group::AuthorizedGroupSync {
             name,
@@ -3545,6 +3777,30 @@ impl App {
         if !members.iter().any(|m| m.peer_id == me) {
             return;
         }
+        let existing_mls = self.groups.get(&group_id).is_some_and(|g| g.mls);
+        let mls = existing_mls || mls;
+        if self.groups.get(&group_id).is_some_and(|g| !g.mls) {
+        } else if mls {
+            for m in &members {
+                if m.peer_id == me {
+                    continue;
+                }
+                let Ok(pid) = m.peer_id.parse::<PeerId>() else {
+                    warn!("VOID: MLS-группа отвергла участника без PeerId");
+                    return;
+                };
+                if crate::network::peer_has_mls(pid) {
+                    continue;
+                }
+                warn!("VOID: MLS-группа отвергла {} без HELLO_CAP_MLS", m.peer_id);
+                return;
+            }
+        }
+        let mls = if self.groups.get(&group_id).is_some_and(|g| !g.mls) {
+            false
+        } else {
+            mls
+        };
 
         for m in &mut members {
             if m.display_name.is_empty() {
@@ -3571,9 +3827,20 @@ impl App {
             members,
             created_at,
             version,
+            mls,
         };
         if group::validate_group_chat(&group) {
-            self.groups.insert(group_id, group);
+            let creator_for_mls = group.creator_id.clone();
+            let mls_group = group.mls;
+            self.groups.insert(group_id.clone(), group);
+            if mls_group {
+                if creator_for_mls == me && !self.group_mls.has(&group_id) {
+                    let _ = self.group_mls.ensure_group(&group_id);
+                }
+                if let Some(stored) = self.groups.get(&group_id).cloned() {
+                    self.offer_mls_key_package(&stored);
+                }
+            }
             self.persist_vault();
         } else {
             warn!("VOID: group_sync отклонён (некорректные данные)");
@@ -3634,6 +3901,7 @@ impl App {
             members,
             recipients,
             version: sync_group.version,
+            mls: sync_group.mls,
         });
     }
 
@@ -3690,6 +3958,7 @@ impl App {
                 members,
                 recipients: vec![peer],
                 version: sync_group.version,
+                mls: sync_group.mls,
             });
         }
     }
@@ -3804,6 +4073,7 @@ impl App {
                         members,
                         recipients: vec![peer],
                         version: group.version,
+                        mls: group.mls,
                     });
                 }
                 OutboxEntry::GroupMessage {
@@ -3849,6 +4119,10 @@ impl App {
                             chat_message: None,
                             voice_shown: false,
                         });
+                    }
+                    match self.try_send_mls_group_text(&group_id, &message_id, &text, targets.clone()) {
+                        Ok(false) => {}
+                        _ => continue,
                     }
                     let _ = self.command_tx.try_send(UICommand::SendGroupMessage {
                         sender_name: self.local_nickname.clone(),
@@ -4206,6 +4480,18 @@ impl App {
                 slot.attempts = slot.attempts.saturating_add(1);
                 if slot.voice_path.is_none() {
                     slot.voice_path = voice_path.clone();
+                }
+            }
+            if item.voice_path.is_none() && item.voice_transfer_id.is_none() && voice_path.is_none()
+            {
+                match self.try_send_mls_group_text(
+                    &item.group_id,
+                    &item.message_id,
+                    &item.text,
+                    targets.clone(),
+                ) {
+                    Ok(false) => {}
+                    _ => continue,
                 }
             }
             let _ = self.command_tx.try_send(UICommand::SendGroupMessage {

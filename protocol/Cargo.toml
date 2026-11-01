@@ -11,6 +11,7 @@ void-session = { path = "void-session" }
 void-envelope = { path = "void-envelope" }
 void-onion = { path = "void-onion" }
 void-kad-rules = { path = "void-kad-rules" }
+void-mls = { path = "void-mls" }
 libp2p = { version = "0.56", features = ["kad", "ed25519"] }
 anyhow = "1.0"
 serde_json = "1.0"

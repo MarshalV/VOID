@@ -8,6 +8,7 @@ pub(crate) use void_protocol::{crypto, group, kad_store, offline_mail, onion, pr
 pub(crate) mod bootstrap;
 pub(crate) mod chat_store;
 pub(crate) mod file_transfer;
+pub(crate) mod group_mls;
 pub(crate) mod hello_replay;
 pub(crate) mod metadata_strip;
 pub(crate) mod network;

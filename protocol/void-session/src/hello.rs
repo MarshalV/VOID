@@ -8,6 +8,7 @@ use libp2p_identity::PeerId;
 const VOID_HELLO_BIND_PREFIX: &[u8] = b"VOID_E2EE_HELLO_BIND_V1\0";
 const VOID_HELLO_BIND_PREFIX_V2: &[u8] = b"VOID_E2EE_HELLO_BIND_V2\0";
 const VOID_HELLO_BIND_PREFIX_V3: &[u8] = b"VOID_E2EE_HELLO_BIND_V3\0";
+const VOID_HELLO_BIND_PREFIX_V4: &[u8] = b"VOID_E2EE_HELLO_BIND_V4\0";
 pub const HELLO_FRESHNESS_SECS: u64 = 10 * 60;
 
 /// Какая подпись Hello сошлась. `V3` вяжет `caps` — hop не может вырезать флаг.
@@ -222,13 +223,122 @@ pub fn sign_hello_transport_binding(
     transport.sign(&msg).ok()
 }
 
+fn hello_bind_message_v4(
+    signer_peer: PeerId,
+    recipient_peer: PeerId,
+    x25519_static: &[u8; 32],
+    x25519_ephemeral: &[u8; 32],
+    ts: u64,
+    nonce: &[u8; 16],
+    caps: u32,
+    kem_ek: &[u8],
+    kem_ct: &[u8],
+) -> Vec<u8> {
+    let mut v = Vec::with_capacity(160 + kem_ek.len() + kem_ct.len());
+    v.extend_from_slice(VOID_HELLO_BIND_PREFIX_V4);
+    v.extend_from_slice(&signer_peer.to_bytes());
+    v.extend_from_slice(&recipient_peer.to_bytes());
+    v.extend_from_slice(x25519_static.as_slice());
+    v.extend_from_slice(x25519_ephemeral.as_slice());
+    v.extend_from_slice(&ts.to_le_bytes());
+    v.extend_from_slice(nonce);
+    v.extend_from_slice(&caps.to_le_bytes());
+    v.extend_from_slice(kem_ek);
+    v.extend_from_slice(kem_ct);
+    v
+}
+
+pub fn sign_hello_pq(
+    transport: &libp2p_identity::Keypair,
+    signer_peer: PeerId,
+    recipient_peer: PeerId,
+    x25519_static: &[u8; 32],
+    x25519_ephemeral: &[u8; 32],
+    ts: u64,
+    nonce: &[u8; 16],
+    caps: u32,
+    kem_ek: &[u8],
+    kem_ct: &[u8],
+) -> Option<Vec<u8>> {
+    let msg = hello_bind_message_v4(
+        signer_peer,
+        recipient_peer,
+        x25519_static,
+        x25519_ephemeral,
+        ts,
+        nonce,
+        caps,
+        kem_ek,
+        kem_ct,
+    );
+    transport.sign(&msg).ok()
+}
+
+/// Бит PQ требует отдельную подпись v4 над `kem_ek` и `kem_ct`.
+/// Без бита классический X25519, лишние байты на сессию не влияют.
+pub fn hello_pq_ok(
+    signer_peer_id: PeerId,
+    recipient_peer_id: PeerId,
+    x25519_static: &[u8; 32],
+    x25519_ephemeral: &[u8; 32],
+    ts: u64,
+    nonce: &[u8; 16],
+    caps: u32,
+    kem_ek: &[u8],
+    kem_ct: &[u8],
+    pq_sig: &[u8],
+    transport_pubkey_pb: &[u8],
+) -> bool {
+    if caps & HELLO_CAP_PQ == 0 {
+        return true;
+    }
+    if !(kem_ek.is_empty() || kem_ek.len() == crate::kem::EK_LEN) {
+        return false;
+    }
+    if !(kem_ct.is_empty() || kem_ct.len() == crate::kem::CT_LEN) {
+        return false;
+    }
+    if kem_ek.is_empty() && kem_ct.is_empty() {
+        return false;
+    }
+    if pq_sig.is_empty() || pq_sig.len() > 256 {
+        return false;
+    }
+    let Some(pubkey) = void_hello_signing_public_key(signer_peer_id, transport_pubkey_pb) else {
+        return false;
+    };
+    let msg = hello_bind_message_v4(
+        signer_peer_id,
+        recipient_peer_id,
+        x25519_static,
+        x25519_ephemeral,
+        ts,
+        nonce,
+        caps,
+        kem_ek,
+        kem_ct,
+    );
+    pubkey.verify(&msg, pq_sig)
+}
+
 /// Заголовок Double Ratchet (`dh_pub`, `pn`, `n`) входит в AAD.
 pub const HELLO_CAP_HEADER_AAD: u32 = 1;
 /// Кадр `/void/chat/1.0.0` можно писать CBOR. Пока бит не стоит у обеих сторон — JSON.
 pub const HELLO_CAP_CBOR: u32 = 2;
 /// Офлайн-почта идёт в очередь `queue_id`, не в слот PeerId. Нет бита — старый ящик.
 pub const HELLO_CAP_QUEUES: u32 = 4;
-pub const HELLO_CAPS: u32 = HELLO_CAP_HEADER_AAD | HELLO_CAP_CBOR | HELLO_CAP_QUEUES;
+/// Группа с этим битом говорит MLS. Нет бита — группа остаётся попарной.
+pub const HELLO_CAP_MLS: u32 = 8;
+/// Заголовок Double Ratchet шифруется отдельным ключом. Нет бита — `dh_pub` открыт.
+pub const HELLO_CAP_HEADER_ENC: u32 = 16;
+/// Hello и prekey несут ML-KEM-768 рядом с X25519. Нет бита — только X25519.
+pub const HELLO_CAP_PQ: u32 = 32;
+pub const HELLO_CAPS: u32 = HELLO_CAP_HEADER_AAD
+    | HELLO_CAP_CBOR
+    | HELLO_CAP_QUEUES
+    | HELLO_CAP_MLS
+    | HELLO_CAP_HEADER_ENC
+    | HELLO_CAP_PQ;
 
 #[cfg(test)]
 mod tests {
@@ -315,5 +425,75 @@ mod tests {
         assert!(hello_bind_ok(HelloBind::V3, HELLO_CAP_HEADER_AAD, false));
         assert!(!hello_bind_ok(HelloBind::V3, HELLO_CAP_CBOR, false));
         assert!(!hello_bind_ok(HelloBind::V3, 0, false));
+    }
+
+    #[test]
+    fn pq_signature_binds_kem_bytes() {
+        let kp = Keypair::generate_ed25519();
+        let signer = kp.public().to_peer_id();
+        let recipient = Keypair::generate_ed25519().public().to_peer_id();
+        let static_b =
+            PublicKey::from(&StaticSecret::random_from_rng(rand::rngs::OsRng)).to_bytes();
+        let ephem_b = PublicKey::from(&StaticSecret::random_from_rng(rand::rngs::OsRng)).to_bytes();
+        let ts = super::hello_now_secs();
+        let nonce = [9u8; 16];
+        let (dk, ek) = crate::kem::generate();
+        let (ct, ss) = crate::kem::encapsulate(&ek).unwrap();
+        let opened = crate::kem::decapsulate(&dk, &ct).unwrap();
+        assert_eq!(ss, opened);
+        let sig = sign_hello_pq(
+            &kp,
+            signer,
+            recipient,
+            &static_b,
+            &ephem_b,
+            ts,
+            &nonce,
+            HELLO_CAPS,
+            &ek,
+            &ct,
+        )
+        .unwrap();
+        assert!(hello_pq_ok(
+            signer,
+            recipient,
+            &static_b,
+            &ephem_b,
+            ts,
+            &nonce,
+            HELLO_CAPS,
+            &ek,
+            &ct,
+            &sig,
+            &[],
+        ));
+        let mut flipped = ct.clone();
+        flipped[0] ^= 1;
+        assert!(!hello_pq_ok(
+            signer,
+            recipient,
+            &static_b,
+            &ephem_b,
+            ts,
+            &nonce,
+            HELLO_CAPS,
+            &ek,
+            &flipped,
+            &sig,
+            &[],
+        ));
+        assert!(hello_pq_ok(
+            signer,
+            recipient,
+            &static_b,
+            &ephem_b,
+            ts,
+            &nonce,
+            HELLO_CAP_HEADER_AAD,
+            &[],
+            &[],
+            &[],
+            &[],
+        ));
     }
 }
