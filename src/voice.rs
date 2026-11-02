@@ -14,7 +14,7 @@ use cpal::traits::{DeviceTrait, HostTrait};
 use cpal::SampleFormat;
 
 pub(crate) const VOICE_SAMPLE_RATE: u32 = 48_000;
-pub(crate) const MAX_VOICE_DURATION_SECS: f32 = 300.0;
+pub(crate) const MAX_VOICE_DURATION_SECS: f32 = 60.0;
 
 const CAPTURE_DRAIN_MS: u64 = 300;
 const MIN_RECORD_SECS: f32 = 0.25;
@@ -114,7 +114,7 @@ impl VoiceRecorder {
     }
 
     fn finish_recording_wav(&mut self) -> bool {
-        match wav_duration(&self.wav_path) {
+        match clamp_voice_file(&self.wav_path) {
             Ok(duration_secs) => {
                 self.last_status =
                     format!("Голосовое {} готово", fmt_duration(duration_secs));
@@ -138,6 +138,13 @@ impl VoiceRecorder {
     fn finish_recording_result(&mut self, result: Result<f32, String>) -> bool {
         match result {
             Ok(duration_secs) if self.wav_path.is_file() && duration_secs >= MIN_RECORD_SECS => {
+                let duration_secs = match clamp_voice_file(&self.wav_path) {
+                    Ok(d) => d,
+                    Err(e) => {
+                        self.state = self.set_error(e);
+                        return false;
+                    }
+                };
                 self.last_status =
                     format!("Голосовое {} готово", fmt_duration(duration_secs));
                 self.state = VoiceRecorderState::Ready {
@@ -899,16 +906,52 @@ fn record_to_wav(
         return Err("Слишком короткая запись — говорите дольше".into());
     }
 
-    let mono = if sample_rate == VOICE_SAMPLE_RATE {
+    let mut mono = if sample_rate == VOICE_SAMPLE_RATE {
         mono
     } else {
         resample_linear(&mono, sample_rate, VOICE_SAMPLE_RATE)
     };
+    let max_samples = (VOICE_SAMPLE_RATE as f32 * MAX_VOICE_DURATION_SECS) as usize;
+    if mono.len() > max_samples {
+        mono.truncate(max_samples);
+    }
     let duration_secs = mono.len() as f32 / VOICE_SAMPLE_RATE as f32;
 
     write_wav_mono(out, &mono, VOICE_SAMPLE_RATE)?;
     voice_log(&format!("saved {} ({duration_secs:.2}s)", out.display()));
     Ok(duration_secs)
+}
+
+/// Обрезает уже записанный WAV до [`MAX_VOICE_DURATION_SECS`].
+fn clamp_voice_file(path: &Path) -> Result<f32, String> {
+    let reader = hound::WavReader::open(path).map_err(|e| format!("WAV: {e}"))?;
+    let spec = reader.spec();
+    if spec.sample_rate == 0 {
+        return Err("WAV: нулевая частота".into());
+    }
+    let max = (spec.sample_rate as f32 * MAX_VOICE_DURATION_SECS) as u32;
+    if reader.len() <= max {
+        return Ok(reader.len() as f32 / spec.sample_rate as f32);
+    }
+    if spec.bits_per_sample != 16 || spec.sample_format != hound::SampleFormat::Int {
+        return Err("Голосовое длиннее 60 секунд".into());
+    }
+    let samples: Vec<i16> = reader
+        .into_samples::<i16>()
+        .take(max as usize)
+        .map(|s| s.unwrap_or(0))
+        .collect();
+    let mut writer = hound::WavWriter::create(path, spec)
+        .map_err(|e| format!("Не удалось обрезать WAV: {e}"))?;
+    for sample in samples {
+        writer
+            .write_sample(sample)
+            .map_err(|e| format!("Ошибка записи WAV: {e}"))?;
+    }
+    writer
+        .finalize()
+        .map_err(|e| format!("Ошибка финализации WAV: {e}"))?;
+    Ok(MAX_VOICE_DURATION_SECS)
 }
 
 fn wav_duration(path: &Path) -> Result<f32, String> {

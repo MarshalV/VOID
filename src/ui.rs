@@ -1831,21 +1831,25 @@ impl eframe::App for App {
                         });
                     }
                     // Файлы из очереди — повторяем отправку при появлении пира.
-                    let files: Vec<(String, file_transfer::FileKind)> = self
+                    let files: Vec<crate::app::PendingFileSend> = self
                         .pending_file_sends
                         .iter()
                         .filter(|p| p.peer == peer)
-                        .map(|p| (p.path.clone(), p.kind))
+                        .cloned()
                         .collect();
-                    for (path, kind) in files {
+                    for item in files {
                         let _ = self.command_tx.try_send(UICommand::SendFile {
                             recipient: peer,
-                            path: path.clone(),
-                            kind,
-                            message_id: None,
-                            transfer_id: None,
-                            sender_name: String::new(),
-                            filename: file_transfer::safe_filename(&path),
+                            path: item.path.clone(),
+                            kind: item.kind,
+                            message_id: item.message_id,
+                            transfer_id: item.transfer_id,
+                            sender_name: self.local_nickname.clone(),
+                            filename: if item.filename.is_empty() {
+                                file_transfer::safe_filename(&item.path)
+                            } else {
+                                item.filename
+                            },
                         });
                     }
                     let voices = self
@@ -2047,6 +2051,9 @@ impl eframe::App for App {
                             path: path.clone(),
                             kind,
                             last_attempt: Instant::now(),
+                            message_id: None,
+                            transfer_id: None,
+                            filename: file_transfer::safe_filename(&path),
                         });
                         self.add_status(format!(
                             "⏳ Файл «{}» в очереди — ждём сеть или контакт {}",
@@ -2334,6 +2341,9 @@ impl eframe::App for App {
                         p.saved_to = saved_to.clone();
                         p.sent_chunks = p.total_chunks;
                     }
+                    if is_outgoing && !file_transfer::is_voice_filename(&filename) {
+                        self.note_offline_file_delivered(_peer, &transfer_id);
+                    }
                     if file_transfer::is_voice_filename(&filename) {
                         // Голосовые не показываем как обычные файлы.
                     } else if is_outgoing {
@@ -2450,6 +2460,7 @@ impl eframe::App for App {
         self.tick_pending_group_sends();
         self.tick_journal_persist();
         self.tick_offline_dht_publish();
+        self.drain_picked_files();
         self.tick_pending_file_sends();
         self.tick_pending_voice_sends();
         self.voice_poll_tick();
@@ -3368,7 +3379,7 @@ impl eframe::App for App {
 
                                                     if let Some(kind) = picked {
                                                         self.show_attach_menu = false;
-                                                        let cmd_tx = self.command_tx.clone();
+                                                        let picks = self.picked_files.clone();
                                                         let peer_for_file = peer_id;
                                                         std::thread::spawn(move || {
                                                             let mut dialog =
@@ -3383,21 +3394,18 @@ impl eframe::App for App {
                                                             if let Some(path) =
                                                                 dialog.pick_file()
                                                             {
-                                                                let _ = cmd_tx.try_send(
-                                                                    UICommand::SendFile {
-                                                                        recipient: peer_for_file,
-                                                                        path: path
-                                                                            .display()
-                                                                            .to_string(),
-                                                                        kind,
-                                                                        message_id: None,
-                                                                        transfer_id: None,
-                                                                        sender_name: String::new(),
-                                                                        filename: file_transfer::safe_filename(
-                                                                            &path.display().to_string(),
-                                                                        ),
-                                                                    },
-                                                                );
+                                                                if let Ok(mut queue) = picks.lock()
+                                                                {
+                                                                    queue.push(
+                                                                        crate::app::PickedAttach {
+                                                                            peer: peer_for_file,
+                                                                            path: path
+                                                                                .display()
+                                                                                .to_string(),
+                                                                            kind,
+                                                                        },
+                                                                    );
+                                                                }
                                                             }
                                                         });
                                                     }
@@ -3861,14 +3869,22 @@ impl eframe::App for App {
                                                         is_playing,
                                                     ));
                                                 } else if let Some(ref file) = msg.file {
-                                                    ui.label(
-                                                        egui::RichText::new(format!(
-                                                            "📄 {}",
-                                                            file.filename
-                                                        ))
-                                                        .size(14.5)
-                                                        .color(palette::TEXT),
+                                                    let name = egui::RichText::new(format!(
+                                                        "📄 {}",
+                                                        file.filename
+                                                    ))
+                                                    .size(14.5)
+                                                    .color(palette::TEXT);
+                                                    let resp = ui.add(
+                                                        egui::Label::new(name)
+                                                            .sense(egui::Sense::click()),
                                                     );
+                                                    if resp.clicked() {
+                                                        if let Some(path) = file.local_path.clone()
+                                                        {
+                                                            open_local_file(&path);
+                                                        }
+                                                    }
                                                 } else if !msg.text.is_empty() {
                                                     if invite_links.is_empty() {
                                                         ui.label(
@@ -4177,4 +4193,13 @@ impl eframe::App for App {
         // Реальный выход (пункт «Выйти» в трее / нет трея).
         self.persist_all_before_exit();
     }
+}
+
+fn open_local_file(path: &str) {
+    #[cfg(windows)]
+    let _ = std::process::Command::new("explorer").arg(path).spawn();
+    #[cfg(target_os = "macos")]
+    let _ = std::process::Command::new("open").arg(path).spawn();
+    #[cfg(all(unix, not(target_os = "macos")))]
+    let _ = std::process::Command::new("xdg-open").arg(path).spawn();
 }

@@ -146,7 +146,7 @@ JSON сообщения чата, поля:
 | `timestamp` | ≤ 64 |
 | `recipient_id` | ≤ 512, необязательно |
 | `group_id` | 32 hex, необязательно |
-| `voice` | `{transfer_id: 32 hex, duration_secs}` — 0 < длительность ≤ 3600 |
+| `voice` | `{transfer_id: 32 hex, duration_secs}` — 0 < длительность ≤ 60 |
 | `file` | `{transfer_id: 32 hex, filename, size}` — имя 1..256, без `/` и `\`, `size` ≤ 512 МиБ |
 | `delivery` | `pending` / `delivered` / `read` — подсказка, не доказательство |
 

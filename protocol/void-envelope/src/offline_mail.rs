@@ -32,6 +32,10 @@ pub const OFFLINE_VOICE_CHUNK_SIZE: usize = 24 * 1024;
 /// целиком (иначе — только метаданные, аудио дождётся живой передачи).
 pub const OFFLINE_VOICE_MAX_BYTES: u64 = 3 * 1024 * 1024;
 pub const OFFLINE_VOICE_CHUNK_KIND: &str = "voice_chunk";
+/// Тот же рез, что у голоса: один кусок после печати v3 (и с ML-KEM) помещается
+/// в бакет очереди 64 КиБ. Файл крупнее этого потолка остаётся на живом `VfC1`.
+pub const OFFLINE_FILE_MAX_BYTES: u64 = 8 * 1024 * 1024;
+pub const OFFLINE_FILE_CHUNK_KIND: &str = "file_chunk";
 
 /// Плейнтекст одного чанка (до шифрования в `seal_for_recipient`):
 /// `[transfer_id:16][index:u32 LE][total:u32 LE][total_size:u32 LE][bytes...]`.
@@ -80,10 +84,14 @@ pub fn decode_voice_chunk_payload(bytes: &[u8]) -> Option<VoiceChunk> {
     })
 }
 
-/// Режет байты WAV на чанки для offline-доставки. Возвращает `None`, если файл
-/// больше `OFFLINE_VOICE_MAX_BYTES` — в этом случае аудио дождётся живой передачи.
-pub fn split_voice_for_offline(transfer_id: &[u8; 16], bytes: &[u8]) -> Option<Vec<Vec<u8>>> {
-    if bytes.is_empty() || bytes.len() as u64 > OFFLINE_VOICE_MAX_BYTES {
+/// Режет байты на куски того же формата, что `voice_chunk`. `None`, если пусто
+/// или длиннее `max_bytes`.
+pub fn split_capped_for_offline(
+    transfer_id: &[u8; 16],
+    bytes: &[u8],
+    max_bytes: u64,
+) -> Option<Vec<Vec<u8>>> {
+    if bytes.is_empty() || bytes.len() as u64 > max_bytes {
         return None;
     }
     let total_size = bytes.len() as u32;
@@ -99,6 +107,18 @@ pub fn split_voice_for_offline(transfer_id: &[u8; 16], bytes: &[u8]) -> Option<V
         ));
     }
     Some(out)
+}
+
+/// Режет байты WAV на чанки для offline-доставки. Возвращает `None`, если файл
+/// больше `OFFLINE_VOICE_MAX_BYTES` — в этом случае аудио дождётся живой передачи.
+pub fn split_voice_for_offline(transfer_id: &[u8; 16], bytes: &[u8]) -> Option<Vec<Vec<u8>>> {
+    split_capped_for_offline(transfer_id, bytes, OFFLINE_VOICE_MAX_BYTES)
+}
+
+/// Режет файл для offline-доставки. Крупнее `OFFLINE_FILE_MAX_BYTES` не режется:
+/// такой файл ждёт живой `VfC1`, чтобы одна передача не забила очередь.
+pub fn split_file_for_offline(transfer_id: &[u8; 16], bytes: &[u8]) -> Option<Vec<Vec<u8>>> {
+    split_capped_for_offline(transfer_id, bytes, OFFLINE_FILE_MAX_BYTES)
 }
 
 /// Собирает WAV из набора чанков (индекс → данные). `None`, если набор неполный
@@ -141,6 +161,15 @@ pub struct OfflineEnvelope {
 impl OfflineEnvelope {
     pub fn is_voice_chunk(&self) -> bool {
         self.local_kind == OFFLINE_VOICE_CHUNK_KIND || self.kind == OFFLINE_VOICE_CHUNK_KIND
+    }
+
+    pub fn is_file_chunk(&self) -> bool {
+        self.local_kind == OFFLINE_FILE_CHUNK_KIND || self.kind == OFFLINE_FILE_CHUNK_KIND
+    }
+
+    /// Кусок файла или голоса: в DHT-запись ящика его не кладут.
+    pub fn is_offline_blob(&self) -> bool {
+        self.is_voice_chunk() || self.is_file_chunk()
     }
 }
 
@@ -2068,6 +2097,73 @@ mod tests {
         let tid = [1u8; 16];
         let big = vec![0u8; (OFFLINE_VOICE_MAX_BYTES as usize) + 1];
         assert!(split_voice_for_offline(&tid, &big).is_none());
+    }
+
+    #[test]
+    fn file_chunk_rejects_oversized_and_roundtrips() {
+        let tid = [2u8; 16];
+        let big = vec![0u8; (OFFLINE_FILE_MAX_BYTES as usize) + 1];
+        assert!(split_file_for_offline(&tid, &big).is_none());
+        let bytes = vec![9u8; OFFLINE_VOICE_CHUNK_SIZE + 10];
+        let parts = split_file_for_offline(&tid, &bytes).expect("split");
+        assert_eq!(parts.len(), 2);
+        let mut map = std::collections::HashMap::new();
+        let mut total = 0u32;
+        let mut total_size = 0u32;
+        for part in &parts {
+            let chunk = decode_voice_chunk_payload(part).expect("decode");
+            total = chunk.total;
+            total_size = chunk.total_size;
+            map.insert(chunk.index, chunk.data);
+        }
+        assert_eq!(
+            assemble_voice_chunks(total, total_size, &map).expect("assemble"),
+            bytes
+        );
+    }
+
+    #[test]
+    fn sealed_chunk_fits_queue_bucket_with_and_without_kem() {
+        let (alice, bob) = (party(), party());
+        let tid = [3u8; 16];
+        let payload = encode_voice_chunk_payload(
+            &tid,
+            0,
+            1,
+            OFFLINE_VOICE_CHUNK_SIZE as u32,
+            &[7u8; OFFLINE_VOICE_CHUNK_SIZE],
+        );
+        let sender_pk = PublicKey::from(&alice.static_sk).to_bytes();
+        let env = seal_for_recipient(
+            &alice.key,
+            &bob.pid,
+            &identity_offline_public(&bob.pid).expect("ed25519 pid"),
+            &alice.pid,
+            &sender_pk,
+            "vchunk:test:0",
+            OFFLINE_VOICE_CHUNK_KIND,
+            &payload,
+        )
+        .expect("seal");
+        assert!(crate::queue_mail::pad_queue_blob(&env).is_ok(), "identity");
+        let (_, ek) = void_session::kem::generate();
+        let hybrid = seal_for_recipient_kem(
+            &alice.key,
+            &bob.pid,
+            &identity_offline_public(&bob.pid).expect("ed25519 pid"),
+            &alice.pid,
+            &sender_pk,
+            "fchunk:test:0",
+            OFFLINE_FILE_CHUNK_KIND,
+            &payload,
+            &ek,
+        )
+        .expect("seal kem");
+        assert!(
+            crate::queue_mail::pad_queue_blob(&hybrid).is_ok(),
+            "kem ct {}",
+            hybrid.ct.len()
+        );
     }
 
     #[test]

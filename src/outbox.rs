@@ -40,6 +40,22 @@ pub(crate) enum OutboxEntry {
         voice_path: String,
         members: Vec<String>,
     },
+    /// Файл или прикреплённое аудио. В outbox только путь: байты режутся при сдаче в ящик.
+    DirectFile {
+        peer: String,
+        message_id: String,
+        transfer_id: String,
+        filename: String,
+        path: String,
+    },
+    GroupFile {
+        group_id: String,
+        message_id: String,
+        transfer_id: String,
+        filename: String,
+        path: String,
+        members: Vec<String>,
+    },
     GroupSync {
         group_id: String,
         group_name: String,

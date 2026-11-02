@@ -51,6 +51,10 @@ pub struct FileMeta {
     /// Локальный путь после приёма/отправки. На провод не уходит (очищается при разборе).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub local_path: Option<String>,
+    /// 64 hex BLAKE2b-512 (первые 32 байта). Пусто у живой передачи: там хэш в Offer.
+    /// Офлайн-файл обязан нести его, получатель сверяет до записи на диск.
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub sha256: String,
 }
 
 pub fn transfer_id_to_hex(tid: &[u8; 16]) -> String {
@@ -90,6 +94,8 @@ fn validate_file_meta(f: &FileMeta) -> bool {
         && !f.filename.contains('/')
         && !f.filename.contains('\\')
         && f.size <= MAX_CHAT_FILE_BYTES
+        && (f.sha256.is_empty()
+            || (f.sha256.len() == 64 && f.sha256.chars().all(|c| c.is_ascii_hexdigit())))
 }
 
 fn validate_voice_meta(v: &VoiceMeta) -> bool {
@@ -97,7 +103,7 @@ fn validate_voice_meta(v: &VoiceMeta) -> bool {
         && v.transfer_id.chars().all(|c| c.is_ascii_hexdigit())
         && v.duration_secs > 0.0
         && v.duration_secs.is_finite()
-        && v.duration_secs <= 3600.0
+        && v.duration_secs <= 60.0
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

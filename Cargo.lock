@@ -5637,6 +5637,7 @@ dependencies = [
  "curve25519-dalek 4.1.3",
  "dirs",
  "eframe",
+ "flate2",
  "futures",
  "hkdf 0.12.4",
  "hound",

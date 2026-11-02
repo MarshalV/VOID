@@ -371,6 +371,12 @@ struct Inner {
     offline_dht_publish_after: Option<Instant>,
     last_group_sync_retry: Option<Instant>,
     offline_mail_processed: HashSet<String>,
+    pending_offline_voice: HashMap<String, crate::offline_attach::ChunkBin>,
+    pending_offline_files: HashMap<String, crate::offline_attach::ChunkBin>,
+    pending_incoming_voice: Vec<ChatMessage>,
+    pending_incoming_files: Vec<ChatMessage>,
+    held_offline_voice: HashMap<String, Vec<u8>>,
+    held_offline_files: HashMap<String, Vec<u8>>,
     snapshot_dirty: bool,
     snapshot_rev: u64,
     /// Confirmed Circuit Relay Hop (ReservationReqAccepted).
@@ -434,6 +440,12 @@ impl Inner {
             offline_dht_publish_after: None,
             last_group_sync_retry: None,
             offline_mail_processed: HashSet::new(),
+            pending_offline_voice: HashMap::new(),
+            pending_offline_files: HashMap::new(),
+            pending_incoming_voice: Vec::new(),
+            pending_incoming_files: Vec::new(),
+            held_offline_voice: HashMap::new(),
+            held_offline_files: HashMap::new(),
             snapshot_dirty: false,
             snapshot_rev: 0,
             relay_hop_ready: false,
@@ -476,6 +488,52 @@ impl Inner {
     fn accelerate_offline_publish(&mut self) {
         if !self.outbox_entries.is_empty() {
             self.offline_dht_publish_after = Some(Instant::now());
+        }
+    }
+
+    fn drop_mailed_attach(&mut self, peer: PeerId, transfer_id: &[u8; 16]) {
+        let hex = transfer_id_to_hex(transfer_id);
+        let peer_str = peer.to_string();
+        let before = self.outbox_entries.len();
+        self.outbox_entries.retain(|e| match e {
+            OutboxEntry::DirectFile { transfer_id: t, .. }
+            | OutboxEntry::DirectVoice { transfer_id: t, .. } => !t.eq_ignore_ascii_case(&hex),
+            _ => true,
+        });
+        let mut changed = self.outbox_entries.len() != before;
+        for entry in &mut self.outbox_entries {
+            match entry {
+                OutboxEntry::GroupFile {
+                    transfer_id: t,
+                    members,
+                    ..
+                }
+                | OutboxEntry::GroupVoice {
+                    transfer_id: t,
+                    members,
+                    ..
+                } => {
+                    let matches = t.eq_ignore_ascii_case(&hex)
+                        || transfer_id_from_hex(t).is_some_and(|base| {
+                            per_peer_voice_transfer_id(&base, peer) == *transfer_id
+                        });
+                    if matches {
+                        let n = members.len();
+                        members.retain(|m| m != &peer_str);
+                        changed |= members.len() != n;
+                    }
+                }
+                _ => {}
+            }
+        }
+        self.outbox_entries.retain(|e| match e {
+            OutboxEntry::GroupFile { members, .. } | OutboxEntry::GroupVoice { members, .. } => {
+                !members.is_empty()
+            }
+            _ => true,
+        });
+        if changed || self.outbox_entries.len() != before {
+            self.persist_outbox();
         }
     }
 
@@ -648,10 +706,420 @@ impl Inner {
                         });
                     }
                 }
-                _ => {}
+                other => self.append_offline_attach(&mut items, me, other),
             }
         }
         items
+    }
+
+    fn append_offline_attach(
+        &self,
+        items: &mut Vec<OfflineOutboxItem>,
+        me: PeerId,
+        entry: &OutboxEntry,
+    ) {
+        match entry {
+            OutboxEntry::DirectVoice {
+                peer,
+                message_id,
+                transfer_id,
+                duration_secs,
+                voice_path,
+            } => {
+                let Ok(recipient) = peer.parse::<PeerId>() else {
+                    return;
+                };
+                let Some(tid) = transfer_id_from_hex(transfer_id) else {
+                    return;
+                };
+                let Ok(bytes) = std::fs::read(voice_path) else {
+                    return;
+                };
+                let bytes = crate::wire_compress::pack_voice(&bytes);
+                if !crate::offline_attach::push_offline_chunks(items, recipient, &tid, &bytes, true)
+                {
+                    return;
+                }
+                let msg = ChatMessage {
+                    id: message_id.clone(),
+                    sender_id: me.to_string(),
+                    sender_name: self.local_nickname.clone(),
+                    recipient_id: Some(peer.clone()),
+                    text: String::new(),
+                    timestamp: chrono::Local::now().format("%H:%M").to_string(),
+                    delivery: OutgoingDeliveryStatus::Pending,
+                    voice: Some(crate::protocol::VoiceMeta {
+                        transfer_id: transfer_id.clone(),
+                        duration_secs: *duration_secs,
+                    }),
+                    file: None,
+                    group_id: None,
+                };
+                if let Ok(payload) = serde_json::to_vec(&msg) {
+                    items.push(OfflineOutboxItem {
+                        recipient,
+                        message_id: message_id.clone(),
+                        kind: "dm".into(),
+                        payload,
+                    });
+                }
+            }
+            OutboxEntry::GroupVoice {
+                group_id,
+                message_id,
+                transfer_id,
+                duration_secs,
+                voice_path,
+                members,
+            } => {
+                let Ok(bytes) = std::fs::read(voice_path) else {
+                    return;
+                };
+                let bytes = crate::wire_compress::pack_voice(&bytes);
+                let Some(base) = transfer_id_from_hex(transfer_id) else {
+                    return;
+                };
+                for peer_str in members {
+                    let Ok(recipient) = peer_str.parse::<PeerId>() else {
+                        continue;
+                    };
+                    if recipient == me {
+                        continue;
+                    }
+                    let peer_tid = per_peer_voice_transfer_id(&base, recipient);
+                    if !crate::offline_attach::push_offline_chunks(
+                        items, recipient, &peer_tid, &bytes, true,
+                    ) {
+                        continue;
+                    }
+                    let msg = ChatMessage {
+                        id: message_id.clone(),
+                        sender_id: me.to_string(),
+                        sender_name: self.local_nickname.clone(),
+                        recipient_id: None,
+                        text: String::new(),
+                        timestamp: chrono::Local::now().format("%H:%M").to_string(),
+                        delivery: OutgoingDeliveryStatus::Pending,
+                        voice: Some(crate::protocol::VoiceMeta {
+                            transfer_id: transfer_id_to_hex(&peer_tid),
+                            duration_secs: *duration_secs,
+                        }),
+                        file: None,
+                        group_id: Some(group_id.clone()),
+                    };
+                    if let Ok(payload) = serde_json::to_vec(&msg) {
+                        items.push(OfflineOutboxItem {
+                            recipient,
+                            message_id: format!("{message_id}:{peer_str}"),
+                            kind: "group".into(),
+                            payload,
+                        });
+                    }
+                }
+            }
+            OutboxEntry::DirectFile {
+                peer,
+                message_id,
+                transfer_id,
+                filename,
+                path,
+            } => {
+                let Ok(recipient) = peer.parse::<PeerId>() else {
+                    return;
+                };
+                let Some(tid) = transfer_id_from_hex(transfer_id) else {
+                    return;
+                };
+                let key = self.file_cache_key().ok();
+                let Some(plain) =
+                    crate::offline_attach::load_offline_file(path, filename, key.as_ref())
+                else {
+                    return;
+                };
+                if !crate::offline_attach::push_offline_chunks(
+                    items, recipient, &tid, &plain, false,
+                ) {
+                    return;
+                }
+                if let Ok(payload) = serde_json::to_vec(&self.file_mail(
+                    message_id,
+                    Some(peer.clone()),
+                    None,
+                    transfer_id,
+                    filename,
+                    &plain,
+                )) {
+                    items.push(OfflineOutboxItem {
+                        recipient,
+                        message_id: message_id.clone(),
+                        kind: "dm".into(),
+                        payload,
+                    });
+                }
+            }
+            OutboxEntry::GroupFile {
+                group_id,
+                message_id,
+                transfer_id,
+                filename,
+                path,
+                members,
+            } => {
+                let Some(base) = transfer_id_from_hex(transfer_id) else {
+                    return;
+                };
+                let key = self.file_cache_key().ok();
+                let Some(plain) =
+                    crate::offline_attach::load_offline_file(path, filename, key.as_ref())
+                else {
+                    return;
+                };
+                for peer_str in members {
+                    let Ok(recipient) = peer_str.parse::<PeerId>() else {
+                        continue;
+                    };
+                    if recipient == me {
+                        continue;
+                    }
+                    let peer_tid = per_peer_voice_transfer_id(&base, recipient);
+                    if !crate::offline_attach::push_offline_chunks(
+                        items, recipient, &peer_tid, &plain, false,
+                    ) {
+                        continue;
+                    }
+                    let peer_hex = transfer_id_to_hex(&peer_tid);
+                    if let Ok(payload) = serde_json::to_vec(&self.file_mail(
+                        message_id,
+                        None,
+                        Some(group_id.clone()),
+                        &peer_hex,
+                        filename,
+                        &plain,
+                    )) {
+                        items.push(OfflineOutboxItem {
+                            recipient,
+                            message_id: format!("{message_id}:{peer_str}"),
+                            kind: "group".into(),
+                            payload,
+                        });
+                    }
+                }
+            }
+            _ => {}
+        }
+    }
+
+    fn file_mail(
+        &self,
+        message_id: &str,
+        recipient_id: Option<String>,
+        group_id: Option<String>,
+        transfer_id: &str,
+        filename: &str,
+        plain: &[u8],
+    ) -> ChatMessage {
+        ChatMessage {
+            id: message_id.to_string(),
+            sender_id: self
+                .local_peer_id
+                .map(|p| p.to_string())
+                .unwrap_or_default(),
+            sender_name: self.local_nickname.clone(),
+            recipient_id,
+            text: String::new(),
+            timestamp: chrono::Local::now().format("%H:%M").to_string(),
+            delivery: OutgoingDeliveryStatus::Pending,
+            voice: None,
+            file: Some(FileMeta {
+                transfer_id: transfer_id.to_string(),
+                filename: filename.to_string(),
+                size: plain.len() as u64,
+                local_path: None,
+                sha256: crate::offline_attach::blake_hex(plain),
+            }),
+            group_id,
+        }
+    }
+
+    fn note_offline_chunk(&mut self, voice: bool, plaintext: &[u8]) -> bool {
+        let step = if voice {
+            crate::offline_attach::absorb_chunk(&mut self.pending_offline_voice, plaintext)
+        } else {
+            crate::offline_attach::absorb_chunk(&mut self.pending_offline_files, plaintext)
+        };
+        match step {
+            Some(Some((tid, bytes))) => {
+                if voice {
+                    self.held_offline_voice.insert(tid.clone(), bytes);
+                } else {
+                    self.held_offline_files.insert(tid.clone(), bytes);
+                }
+                self.release_offline_meta(&tid, voice);
+                true
+            }
+            Some(None) => true,
+            None => false,
+        }
+    }
+
+    fn note_offline_meta(&mut self, msg: ChatMessage) {
+        if msg
+            .voice
+            .as_ref()
+            .is_some_and(|v| v.duration_secs > crate::voice::MAX_VOICE_DURATION_SECS)
+        {
+            return;
+        }
+        let voice = msg.voice.is_some();
+        let Some(tid) = msg
+            .voice
+            .as_ref()
+            .map(|v| v.transfer_id.to_ascii_lowercase())
+            .or_else(|| {
+                msg.file
+                    .as_ref()
+                    .map(|f| f.transfer_id.to_ascii_lowercase())
+            })
+        else {
+            return;
+        };
+        let held = if voice {
+            self.held_offline_voice.contains_key(&tid)
+        } else {
+            self.held_offline_files.contains_key(&tid)
+        };
+        if held && self.finish_offline_meta(msg.clone()) {
+            return;
+        }
+        if voice {
+            if !self.pending_incoming_voice.iter().any(|m| m.id == msg.id) {
+                self.pending_incoming_voice.push(msg);
+            }
+        } else if !self.pending_incoming_files.iter().any(|m| m.id == msg.id) {
+            self.pending_incoming_files.push(msg);
+        }
+    }
+
+    fn release_offline_meta(&mut self, tid: &str, voice: bool) {
+        let ready: Vec<ChatMessage> = if voice {
+            self.pending_incoming_voice
+                .iter()
+                .filter(|m| {
+                    m.voice
+                        .as_ref()
+                        .is_some_and(|v| v.transfer_id.eq_ignore_ascii_case(tid))
+                })
+                .cloned()
+                .collect()
+        } else {
+            self.pending_incoming_files
+                .iter()
+                .filter(|m| {
+                    m.file
+                        .as_ref()
+                        .is_some_and(|f| f.transfer_id.eq_ignore_ascii_case(tid))
+                })
+                .cloned()
+                .collect()
+        };
+        let mut done = Vec::new();
+        for msg in ready {
+            if self.finish_offline_meta(msg.clone()) {
+                done.push(msg.id);
+            }
+        }
+        if voice {
+            self.pending_incoming_voice
+                .retain(|m| !done.iter().any(|id| id == &m.id));
+        } else {
+            self.pending_incoming_files
+                .retain(|m| !done.iter().any(|id| id == &m.id));
+        }
+    }
+
+    fn finish_offline_meta(&mut self, mut msg: ChatMessage) -> bool {
+        if let Some(voice) = msg.voice.clone() {
+            let tid = voice.transfer_id.to_ascii_lowercase();
+            let Some(bytes) = self.held_offline_voice.get(&tid).cloned() else {
+                return false;
+            };
+            let Ok(bytes) = crate::wire_compress::unpack(&bytes) else {
+                self.held_offline_voice.remove(&tid);
+                return true;
+            };
+            let Some(raw) = transfer_id_from_hex(&tid) else {
+                return true;
+            };
+            let dest = file_transfer::voice_dir_absolute().join(file_transfer::voice_filename(&raw));
+            if std::fs::write(&dest, &bytes).is_err() {
+                return false;
+            }
+            self.held_offline_voice.remove(&tid);
+            self.register_voice_path(&tid, dest.display().to_string());
+            self.insert_offline_chat(msg);
+            return true;
+        }
+        let Some(file) = msg.file.clone() else {
+            return true;
+        };
+        let tid = file.transfer_id.to_ascii_lowercase();
+        let Some(packed) = self.held_offline_files.get(&tid).cloned() else {
+            return false;
+        };
+        let got = crate::offline_attach::blake_hex(&packed);
+        if file.sha256.is_empty()
+            || !file.sha256.eq_ignore_ascii_case(&got)
+            || file.size != packed.len() as u64
+        {
+            self.held_offline_files.remove(&tid);
+            return true;
+        }
+        let Ok(bytes) = crate::wire_compress::unpack(&packed) else {
+            self.held_offline_files.remove(&tid);
+            return true;
+        };
+        let dest =
+            file_transfer::unique_download_path(&file_transfer::safe_filename(&file.filename));
+        if std::fs::write(&dest, &bytes).is_err() {
+            return false;
+        }
+        self.held_offline_files.remove(&tid);
+        let path = dest.display().to_string();
+        if let Some(ref mut f) = msg.file {
+            f.local_path = Some(path.clone());
+        }
+        self.register_file_path(&tid, path.clone());
+        self.insert_offline_chat(msg);
+        self.bind_file_local_path(&tid, &path);
+        true
+    }
+
+    fn insert_offline_chat(&mut self, msg: ChatMessage) {
+        if self.messages.is_deleted(&msg.id) {
+            return;
+        }
+        let chat_id = msg
+            .group_id
+            .as_ref()
+            .map(|id| group_thread_key(id))
+            .or_else(|| {
+                let local = self.local_peer_id.map(|p| p.to_string())?;
+                if msg.sender_id == local {
+                    msg.recipient_id.clone()
+                } else {
+                    Some(msg.sender_id.clone())
+                }
+            })
+            .unwrap_or_else(|| msg.sender_id.clone());
+        let mut map = self.messages.lock();
+        let list = map.entry(chat_id).or_default();
+        if list.iter().any(|m| m.id == msg.id) {
+            return;
+        }
+        list.push(msg);
+        drop(map);
+        self.messages.mark_dirty();
+        self.persist_journal();
     }
 
     fn publish_outbox_to_dht(&self) {
@@ -986,6 +1454,7 @@ impl Inner {
                 filename: filename.to_string(),
                 size: size.max(1),
                 local_path: None,
+                sha256: String::new(),
             }),
             group_id: None,
         };
@@ -1323,6 +1792,12 @@ impl Inner {
                                 continue;
                             }
                         }
+                        if msg.voice.is_some() || msg.file.is_some() {
+                            self.note_offline_meta(msg);
+                            self.offline_mail_processed.insert(env.message_id);
+                            any = true;
+                            continue;
+                        }
                         let chat_id = msg
                             .group_id
                             .as_ref()
@@ -1355,6 +1830,18 @@ impl Inner {
                             }
                         }
                         self.offline_mail_processed.insert(env.message_id);
+                    }
+                    k if k == crate::offline_mail::OFFLINE_VOICE_CHUNK_KIND => {
+                        if self.note_offline_chunk(true, &plaintext) {
+                            self.offline_mail_processed.insert(env.message_id);
+                            any = true;
+                        }
+                    }
+                    k if k == crate::offline_mail::OFFLINE_FILE_CHUNK_KIND => {
+                        if self.note_offline_chunk(false, &plaintext) {
+                            self.offline_mail_processed.insert(env.message_id);
+                            any = true;
+                        }
                     }
                     "group_sync" => {
                         if let Some(DecryptedChatFrame::GroupSync {
@@ -2848,6 +3335,7 @@ impl VoidRuntime {
                                 }
                                 g.pending_file_sends.retain(|p| p.peer != peer);
                                 if is_outgoing {
+                                    g.drop_mailed_attach(peer, &transfer_id);
                                     g.note_group_file_delivered(peer, &transfer_id);
                                     g.add_status(format!("✅ Файл «{filename}» доставлен"));
                                 }
@@ -2898,6 +3386,9 @@ impl VoidRuntime {
                             transfer_id,
                             ok,
                         } => {
+                            if ok {
+                                g.drop_mailed_attach(peer, &transfer_id);
+                            }
                             g.pending_voice_sends
                                 .retain(|p| p.transfer_id != transfer_id);
                             if ok {
@@ -3921,7 +4412,8 @@ impl VoidRuntime {
         g.pending_voice_sends.retain(|p| p.peer != pid);
         g.outbox_entries.retain(|e| match e {
             OutboxEntry::DirectMessage { peer, .. }
-            | OutboxEntry::DirectVoice { peer, .. } => peer != &peer_id,
+            | OutboxEntry::DirectVoice { peer, .. }
+            | OutboxEntry::DirectFile { peer, .. } => peer != &peer_id,
             _ => true,
         });
         g.persist_outbox();
@@ -4091,6 +4583,7 @@ impl VoidRuntime {
             filename: filename.clone(),
             size,
             local_path: Some(path.clone()),
+            sha256: String::new(),
         };
         if let Some(gid) = group::parse_group_thread_key(&chat) {
             let gid = gid.to_string();
@@ -4123,6 +4616,18 @@ impl VoidRuntime {
             g.persist_journal();
             for pid in &targets {
                 g.ensure_peer_routed(*pid);
+            }
+            if crate::offline_attach::load_offline_file(&path, &filename, Some(&key)).is_some() {
+                g.outbox_entries.push(OutboxEntry::GroupFile {
+                    group_id: gid.clone(),
+                    message_id: mid.clone(),
+                    transfer_id: tid_hex.clone(),
+                    filename: filename.clone(),
+                    path: path.clone(),
+                    members: targets.iter().map(|p| p.to_string()).collect(),
+                });
+                g.persist_outbox();
+                g.publish_outbox_to_dht();
             }
             if let Some(tx) = &g.command_tx {
                 let _ = tx.try_send(UICommand::SendGroupFile {
@@ -4170,6 +4675,17 @@ impl VoidRuntime {
             g.messages.mark_dirty();
             g.persist_journal();
             g.ensure_peer_routed(peer);
+            if crate::offline_attach::load_offline_file(&path, &filename, Some(&key)).is_some() {
+                g.outbox_entries.push(OutboxEntry::DirectFile {
+                    peer: peer.to_string(),
+                    message_id: mid.clone(),
+                    transfer_id: tid_hex.clone(),
+                    filename: filename.clone(),
+                    path: path.clone(),
+                });
+                g.persist_outbox();
+                g.publish_outbox_to_dht();
+            }
             if let Some(tx) = &g.command_tx {
                 let _ = tx.try_send(UICommand::EnsureChatSession(peer));
                 let _ = tx.try_send(UICommand::SendFile {
@@ -4449,7 +4965,7 @@ impl VoidRuntime {
         let tid_hex = transfer_id_to_hex(&tid);
         let staged = g.stage_outgoing_voice_wav(&tid, std::path::Path::new(&path));
         let msg_voice = crate::protocol::VoiceMeta {
-            transfer_id: tid_hex,
+            transfer_id: tid_hex.clone(),
             duration_secs: duration,
         };
         if let Some(gid) = group::parse_group_thread_key(&chat) {
@@ -4473,6 +4989,21 @@ impl VoidRuntime {
             g.messages.lock().entry(chat).or_default().push(msg);
             g.messages.mark_dirty();
             g.persist_journal();
+            if std::fs::read(&staged).ok().is_some_and(|bytes| {
+                let packed = crate::wire_compress::pack_voice(&bytes);
+                crate::offline_mail::split_voice_for_offline(&tid, &packed).is_some()
+            }) {
+                g.outbox_entries.push(OutboxEntry::GroupVoice {
+                    group_id: gid.clone(),
+                    message_id: mid.clone(),
+                    transfer_id: tid_hex.clone(),
+                    duration_secs: duration,
+                    voice_path: staged.clone(),
+                    members: members.iter().map(|p| p.to_string()).collect(),
+                });
+                g.persist_outbox();
+                g.publish_outbox_to_dht();
+            }
             for pid in &members {
                 if *pid != local {
                     g.ensure_peer_routed(*pid);
@@ -4532,6 +5063,20 @@ impl VoidRuntime {
             g.messages.mark_dirty();
             g.persist_journal();
             g.ensure_peer_routed(peer);
+            if std::fs::read(&staged).ok().is_some_and(|bytes| {
+                let packed = crate::wire_compress::pack_voice(&bytes);
+                crate::offline_mail::split_voice_for_offline(&tid, &packed).is_some()
+            }) {
+                g.outbox_entries.push(OutboxEntry::DirectVoice {
+                    peer: peer.to_string(),
+                    message_id: mid.clone(),
+                    transfer_id: tid_hex.clone(),
+                    duration_secs: duration,
+                    voice_path: staged.clone(),
+                });
+                g.persist_outbox();
+                g.publish_outbox_to_dht();
+            }
             if let Some(tx) = &g.command_tx {
                 let _ = tx.try_send(UICommand::EnsureChatSession(peer));
                 let _ = tx.try_send(UICommand::SendVoiceMessage {
@@ -4785,6 +5330,7 @@ impl VoidRuntime {
         g.outbox_entries.retain(|e| match e {
             OutboxEntry::GroupMessage { group_id, .. }
             | OutboxEntry::GroupVoice { group_id, .. }
+            | OutboxEntry::GroupFile { group_id, .. }
             | OutboxEntry::GroupSync { group_id, .. } => group_id != &gid,
             _ => true,
         });

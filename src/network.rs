@@ -1861,6 +1861,23 @@ async fn apply_incoming_file_chunk(
                         })
                         .await;
                 } else {
+                    let data = match crate::wire_compress::unpack(&data) {
+                        Ok(plain) => plain,
+                        Err(e) => {
+                            debug!("[{}] ❌ FILE: распаковка «{}»: {e}", now, fname);
+                            if file_transfer::is_voice_filename(&fname) {
+                                voice_outcome = Some((transfer_id, false));
+                            }
+                            let _ = event_tx
+                                .send(NetworkEvent::FileError {
+                                    transfer_id,
+                                    reason: format!("Не удалось распаковать «{}»", fname),
+                                })
+                                .await;
+                            incoming_transfers.remove(&transfer_id);
+                            return voice_outcome;
+                        }
+                    };
                     let save_path = if file_transfer::is_voice_filename(&fname) {
                         if let Some(ref dir) = incoming_transfers
                             .get(&transfer_id)
@@ -2237,13 +2254,12 @@ fn once_publish_gate(inner: PublishDone) -> PublishDone {
     })
 }
 
-/// Голосовые чанки (аудио офлайн-доставки) не годятся для DHT-записи почтового
-/// ящика — та ограничена ~64 КБ на весь ящик получателя (см. mailbox_record_key).
-/// Они всё равно доходят через relay/bootstrap store-and-forward (`publish_relay_mail`).
+/// Голос и файлы не годятся для DHT-записи почтового ящика: та ограничена
+/// ~64 КБ на весь ящик. Куски идут через relay/bootstrap (`publish_relay_mail`).
 fn dht_eligible_envelopes(envelopes: &[OfflineEnvelope]) -> Vec<OfflineEnvelope> {
     envelopes
         .iter()
-        .filter(|e| !e.is_voice_chunk())
+        .filter(|e| !e.is_offline_blob())
         .cloned()
         .collect()
 }
@@ -4067,6 +4083,7 @@ async fn start_voice_file_transfer(
                 file_transfer::FileKind::Audio,
                 data,
             );
+            let data = crate::wire_compress::pack_voice(&data);
             if data.len() as u64 > file_transfer::MAX_FILE_SIZE {
                 let _ = event_tx
                     .send(NetworkEvent::Status(
@@ -4164,6 +4181,7 @@ async fn start_named_file_transfer(
         }
         Ok(data) => {
             let data = crate::metadata_strip::strip_metadata_for_send(&filename, file_kind, data);
+            let data = crate::wire_compress::pack_file(&data, &filename);
             if data.len() as u64 > file_transfer::MAX_FILE_SIZE {
                 let _ = event_tx
                     .send(NetworkEvent::Status(format!(
@@ -6120,6 +6138,7 @@ pub async fn run_chat_network(
                                                 filename: filename.clone(),
                                                 size,
                                                 local_path: None,
+                                                sha256: String::new(),
                                             }),
                                             group_id: None,
                                         };
@@ -6210,6 +6229,7 @@ pub async fn run_chat_network(
                                         filename: filename.clone(),
                                         size,
                                         local_path: None,
+                                        sha256: String::new(),
                                     }),
                                     group_id: Some(group_id.clone()),
                                 };

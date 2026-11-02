@@ -43,8 +43,8 @@ The main desktop is **Tauri 2** (`frontend/` + `src-tauri/`). Optionally a nativ
 - **P2P chat** — `/void/chat/1.0.0` (request-response). Payload is E2EE (`V1Packet::Encrypted`), optionally wrapped in onion (`VOID_ONION_v2`, or v1 if a hop has no descriptor).
 - **E2EE** — **Noise** on the transport, then `Hello` (X25519 + Ed25519 signature bound to `PeerId`, freshness `ts`/`nonce`), then **Double Ratchet** with a DH step on every speaker change; the header and both PeerIds go into AAD.
 - **1-to-1 and groups** — invite `void://group/…`. Group text is OpenMLS when every member has announced Hello bit `8`; otherwise the same pairwise fan-out as before. Voice and files stay per member.
-- **Voice** — record, preview, WAV over E2EE; in-chat player. Auto-accept, no “accept file” banner.
-- **Files** — up to 512 MB, including empty (0-byte) files. Chunks (`VfC1`) and offer/accept (`VfP1`) go in E2EE `/void/chat`. `/void/file/1.0.0` is a fallback channel when the peer already has a live TCP connection.
+- **Voice** — record, preview, in-chat player. A message stops at 60 seconds. On the wire it is IMA ADPCM (`VVAD`); the recipient stores a normal WAV. Auto-accept, no “accept file” banner.
+- **Files** — up to 512 MB, including empty (0-byte) files. A file is deflate (`VZDF`) on the wire when that copy is shorter; pictures, video, and archives stay as they are. The recipient writes the original bytes. Chunks (`VfC1`) and offer/accept (`VfP1`) go in E2EE `/void/chat`. `/void/file/1.0.0` is a fallback channel when the peer already has a live TCP connection.
 - **Offline mail** — store-and-forward on bootstrap (`OfflineMailboxStore` / `Query` / `Deliver`). Envelope v3 is signed with the sender’s libp2p key; sender and type sit inside `ct`; unsigned envelopes are rejected. On the node only the recipient is visible. The node in [`VOID_node`](https://github.com/MarshalV/bootstrap_node) hands the box only to the TCP peer whose PeerId is that recipient. TTL 7 days, per-uploader quotas and a store rate limit on the node.
 - **Own DHT** — Kademlia `/void/kad/1.0.0`, not IPFS. Chat text is not written to the DHT.
 - **NAT** — working path: **Relay v2 Hop** (`listen_on(…/p2p-circuit)` → `ReservationReqAccepted`). DCUtR / AutoNAT / UPnP are **off** (enable with `VOID_ENABLE_NAT=1`: a second dial to the node tears down TCP).
@@ -333,9 +333,11 @@ The live route (hop PeerIds) is shown in settings. Old nodes without `;onion=` a
 
 The filename in the offer is seen by whoever terminates the connection (the peer; with `/void/file` — also whoever sees that substream). Over relay without an E2EE offer, metadata should not leak to the node.
 
+On the wire a file is `VZDF` (deflate) when the wrapped bytes are shorter than the original. JPEG, PNG, GIF, WebP, MP3, M4A, AAC, Ogg, Opus, MP4, WebM, MOV, ZIP, gz, xz, 7z, RAR, and FLAC are left unchanged. The offer hash is BLAKE2b-512 of the bytes that are chunked, truncated to 32 bytes (the field is still named `sha256`). After that check the recipient inflates `VZDF` and writes the original file. Offline, a file whose wire form is at most 8 MiB goes as `file_chunk` through the mailbox; anything larger waits for a live `VfC1`.
+
 ### Voice (`src/voice.rs`)
 
-WAV mono 48 kHz 16-bit PCM, up to 5 min. Recording is a child process `--voice-record` (`cpal`). Into chat — `VoiceMeta`; WAV as a file with auto-accept. Offline: `voice_chunk` pieces through the same mailbox. Metadata is stripped when possible (`metadata_strip`).
+Recording is mono 48 kHz 16-bit PCM and stops at 60 seconds (`--voice-record`, `cpal`). A longer WAV already on disk is cut to 60 seconds before send. Into chat — `VoiceMeta` (`duration_secs` ≤ 60); the WAV is sent as a file with auto-accept. On the wire the PCM is IMA ADPCM (`VVAD`, about 1.4 MiB for a full minute). The recipient checks the hash, then writes a normal WAV. Offline pieces are `voice_chunk`, at most 3 MiB assembled. Metadata is stripped when possible (`metadata_strip`).
 
 ### Groups (`protocol/void-session`)
 

@@ -12,6 +12,7 @@ pub(crate) mod group_mls;
 pub(crate) mod hello_replay;
 pub(crate) mod metadata_strip;
 pub(crate) mod network;
+pub(crate) mod offline_attach;
 pub(crate) mod offline_publish;
 pub(crate) mod outbox;
 pub(crate) mod paths;
@@ -20,6 +21,7 @@ pub(crate) mod rr_codec;
 pub(crate) mod shared_chat;
 pub(crate) mod vault;
 pub(crate) mod voice;
+pub(crate) mod wire_compress;
 
 #[cfg(feature = "egui-ui")]
 pub(crate) mod app;
