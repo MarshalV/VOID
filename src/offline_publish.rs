@@ -7,8 +7,8 @@ use std::collections::{HashMap, HashSet};
 use libp2p::PeerId;
 use crate::offline_mail::OfflineEnvelope;
 
-/// DHT Put Ok как full handoff — только LAN без bootstrap (аварийный режим).
-/// С bootstrap-нодами всегда `false`: почта только через ноды.
+/// DHT Put Ok не сдаёт письмо. Очередь включена, и `/void/mailbox/` больше
+/// не пишется. Вызывающий передаёт `allow_dht_fallback = false`.
 pub(crate) fn accept_dht_as_full_handoff(
     envelopes: &[OfflineEnvelope],
     allow_dht_fallback: bool,

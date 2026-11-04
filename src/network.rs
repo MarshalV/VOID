@@ -29,7 +29,7 @@ use crate::shared_chat::SharedChatMessages;
 use crate::crypto;
 use crate::file_transfer;
 use crate::offline_mail::{
-    decode_mailbox, decode_opk_bundle, encode_mailbox, encode_opk_bundle, mailbox_record_key,
+    decode_mailbox, decode_opk_bundle, encode_mailbox, mailbox_record_key,
     opk_record_key, prekey_record_key, seal_for_recipient, seal_material, seal_with_opk, verify_opk,
     verify_prekey_offer, verify_signed_prekey, OfflineEnvelope, OneTimePrekey, SignedPrekey,
     MAILBOX_TTL_SECS,
@@ -2268,7 +2268,6 @@ fn publish_self_prekey(
     swarm: &mut libp2p::Swarm<ChatBehaviour>,
     local_peer_id: PeerId,
     published: &crate::offline_mail::PublishedPrekey,
-    opks: &[OneTimePrekey],
 ) {
     let ttl = published
         .not_after
@@ -2284,19 +2283,6 @@ fn publish_self_prekey(
         .behaviour_mut()
         .kad
         .put_record(record, kad::Quorum::One);
-    if !opks.is_empty() {
-        let opk_ttl = ttl;
-        let opk_record = kad::Record {
-            key: opk_record_key(local_peer_id),
-            value: encode_opk_bundle(opks),
-            publisher: Some(local_peer_id),
-            expires: Some(Instant::now() + Duration::from_secs(opk_ttl)),
-        };
-        let _ = swarm
-            .behaviour_mut()
-            .kad
-            .put_record(opk_record, kad::Quorum::One);
-    }
 }
 
 /// Put X25519 prekey on connected bootstrap nodes (offline seal without DHT/Hello).
@@ -2374,7 +2360,7 @@ fn republish_local_prekeys(
     ) else {
         return;
     };
-    publish_self_prekey(swarm, local_peer_id, &bundle.published, &bundle.opks);
+    publish_self_prekey(swarm, local_peer_id, &bundle.published);
     publish_self_prekey_to_bootstraps(
         swarm,
         local_peer_id,
@@ -2603,7 +2589,8 @@ fn seal_and_publish_offline_batch(
     ) {
         let _ = RelayMailbox::save(relay_mail_store);
     }
-    let allow_dht = bootstrap_peer_ids.is_empty();
+    // Очередь включена: DHT не второй ящик по PeerId.
+    let allow_dht = false;
     let done_cb: PublishDone = done.unwrap_or_else(|| Arc::new(|_| {}) as PublishDone);
     let handoff = Some(ActiveHandoff::new(&sealed, done_cb, allow_dht));
     publish_relay_mail(
@@ -3106,8 +3093,9 @@ fn query_relay_mailbox(
         return false;
     }
     *last_query_at = Some(Instant::now());
-    // VOID_node отдаёт ящик только на OfflineMailboxQuery { recipient },
-    // и только если TCP-пир — сам получатель. Challenge она не разбирает.
+    // Слот PeerId: VOID_node отдаёт его на OfflineMailboxQuery { recipient },
+    // и только если TCP-пир — сам получатель. Очередь забирается отдельно,
+    // через QueueChallenge. MailboxChallenge этот диспетчер не разбирает.
     let packet = V1Packet::OfflineMailboxQuery {
         recipient: local_peer_id.to_string(),
         ts: 0,
@@ -6564,118 +6552,9 @@ pub async fn run_chat_network(
                                         .as_ref()
                                         .map(|g| once_publish_gate(g.clone()))
                                         .unwrap_or_else(|| Arc::new(|_| {}) as PublishDone);
-                                    // PeerId уже содержит X25519. Ждать PrekeyOffer нельзя:
-                                    // нет записи на ноде — письмо так и сидит в outbox, пока
-                                    // отправитель снова не откроет клиент и не отдаст его вживую.
-                                    let mut sealed = Vec::new();
-                                    let mut need_prekey = Vec::new();
-                                    if let Some(pk) =
-                                        crate::offline_mail::identity_offline_public(&recipient)
-                                    {
-                                        for item in batch {
-                                            match seal_for_recipient(
-                                                &local_key,
-                                                &recipient,
-                                                &pk,
-                                                &local_peer_id,
-                                                &my_public_key_bytes,
-                                                &item.message_id,
-                                                &item.kind,
-                                                &item.payload,
-                                            ) {
-                                                Ok(env) => sealed.push(env),
-                                                Err(_) => need_prekey.push(item),
-                                            }
-                                        }
-                                    } else {
-                                        need_prekey = batch;
-                                    }
-                                    if sealed.is_empty() && need_prekey.is_empty() {
-                                        recip_done(false);
-                                        continue;
-                                    }
-                                    if !sealed.is_empty() {
-                                        if RelayMailbox::merge(
-                                            &mut relay_mail_store,
-                                            &recipient.to_string(),
-                                            sealed.clone(),
-                                        ) {
-                                            let _ = RelayMailbox::save(&relay_mail_store);
-                                        }
-                                        // Почта только через bootstrap-ноды (Store Ack).
-                                        // DHT-ящик отключён — нода = единственный store-and-forward.
-                                        let allow_dht = bootstrap_peer_ids.is_empty();
-                                        let handoff = Some(ActiveHandoff::new(
-                                            &sealed,
-                                            recip_done.clone(),
-                                            allow_dht,
-                                        ));
-                                        publish_relay_mail(
-                                            &mut swarm,
-                                            &bootstrap_peer_ids,
-                                            &void_bootstraps,
-                                            local_peer_id,
-                                            recipient,
-                                            &sealed,
-                                            &mut pending_relay,
-                                            &mut pending_relay_gates,
-                                            &mut outbound_mailbox_stores,
-                                            &handoff,
-                                            write_grants.get(&recipient),
-                                        );
-                                        if let Some(h) = &handoff {
-                                            let tracked = outbound_mailbox_stores
-                                                .values()
-                                                .any(|(g, _, _)| Arc::ptr_eq(g, h));
-                                            let queued = pending_relay_gates
-                                                .values()
-                                                .any(|g| Arc::ptr_eq(g, h));
-                                            if !tracked
-                                                && !queued
-                                                && !accept_dht_as_full_handoff(
-                                                    &sealed,
-                                                    allow_dht,
-                                                )
-                                            {
-                                                warn!(
-                                                    "VOID: нет подключенной bootstrap-ноды для offline-почты"
-                                                );
-                                                let _ = event_tx
-                                                    .send(NetworkEvent::Status(
-                                                        "❌ Нет связи с bootstrap — офлайн-почта не сдана".into(),
-                                                    ))
-                                                    .await;
-                                                h.note_fail();
-                                            }
-                                        }
-                                        // DHT mailbox put — только LAN без нод.
-                                        if allow_dht {
-                                            let for_dht = dht_eligible_envelopes(&sealed);
-                                            let dht_done: Option<PublishDone> =
-                                                handoff.as_ref().map(|h| {
-                                                    let h = h.clone();
-                                                    Arc::new(move |ok: bool| {
-                                                        if ok {
-                                                            h.note_dht_ok();
-                                                        }
-                                                    })
-                                                        as PublishDone
-                                                });
-                                            start_mailbox_merge_put(
-                                                &mut swarm,
-                                                &mut pending_kad_mail,
-                                                recipient,
-                                                for_dht,
-                                                dht_done,
-                                            );
-                                        } else {
-                                            let _ = event_tx
-                                                .send(NetworkEvent::Status(
-                                                    "📤 Офлайн → bootstrap-нода (без DHT)".into(),
-                                                ))
-                                                .await;
-                                        }
-                                    }
+                                    // Новое письмо не запечатывается на X25519 из PeerId.
+                                    // Нет sealable prekey — пачка остаётся в outbox.bin.
+                                    let need_prekey = batch;
                                     if !need_prekey.is_empty() {
                                         let got_bs = request_prekey_from_bootstraps(
                                             &mut swarm,
@@ -8567,12 +8446,28 @@ pub async fn run_chat_network(
                                                     now,
                                                     &peer.to_string()[..8]
                                                 );
-                                            } else if let Some((recipient, _items, _done)) =
+                                            } else if let Some((recipient, _items, done)) =
                                                 outbound_prekey_gets.remove(&request_id)
                                             {
-                                                // PrekeyGet → Ack = miss on this bootstrap.
-                                                // Не закрываем gate: DHT PrekeyForPublish /
-                                                // другой bootstrap ещё могут ответить Offer.
+                                                // PrekeyGet → Ack: на этой ноде нет sealable prekey.
+                                                // Другой Get или ещё не закрытая DHT-половина могут ответить.
+                                                let still_get = outbound_prekey_gets
+                                                    .values()
+                                                    .any(|(r, _, _)| *r == recipient);
+                                                let still_kad = pending_kad_mail.values().any(|op| {
+                                                    matches!(
+                                                        op,
+                                                        MailboxKadOp::BundleHalf { shared, .. }
+                                                            if shared
+                                                                .lock()
+                                                                .unwrap_or_else(|e| e.into_inner())
+                                                                .recipient
+                                                                == recipient
+                                                    )
+                                                });
+                                                if !still_get && !still_kad {
+                                                    signal_publish_done(&done, false);
+                                                }
                                                 debug!(
                                                     "[{}] prekey miss on bootstrap for {}",
                                                     now,

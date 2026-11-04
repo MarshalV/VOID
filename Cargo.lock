@@ -7948,6 +7948,7 @@ dependencies = [
 name = "void-kad-rules"
 version = "0.1.0"
 dependencies = [
+ "libp2p-identity",
  "void-envelope",
 ]
 

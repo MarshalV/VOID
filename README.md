@@ -45,7 +45,7 @@ The main desktop is **Tauri 2** (`frontend/` + `src-tauri/`). Optionally a nativ
 - **1-to-1 and groups** — invite `void://group/…`. Group text is OpenMLS when every member has announced Hello bit `8`; otherwise the same pairwise fan-out as before. Voice and files stay per member.
 - **Voice** — record, preview, in-chat player. A message stops at 60 seconds. On the wire it is IMA ADPCM (`VVAD`); the recipient stores a normal WAV. Auto-accept, no “accept file” banner.
 - **Files** — up to 512 MB, including empty (0-byte) files. A file is deflate (`VZDF`) on the wire when that copy is shorter; pictures, video, and archives stay as they are. The recipient writes the original bytes. Chunks (`VfC1`) and offer/accept (`VfP1`) go in E2EE `/void/chat`. `/void/file/1.0.0` is a fallback channel when the peer already has a live TCP connection.
-- **Offline mail** — store-and-forward on bootstrap (`OfflineMailboxStore` / `Query` / `Deliver`). Envelope v3 is signed with the sender’s libp2p key; sender and type sit inside `ct`; unsigned envelopes are rejected. On the node only the recipient is visible. The node in [`VOID_node`](https://github.com/MarshalV/bootstrap_node) hands the box only to the TCP peer whose PeerId is that recipient. TTL 7 days, per-uploader quotas and a store rate limit on the node.
+- **Offline mail** — store-and-forward on bootstrap. A live queue grant goes out as `QueueStore` (14 days, 64 KiB bucket). A letter without that grant still uses `OfflineMailboxStore` on the recipient PeerId (7 days). Envelope v3 is signed with the sender’s libp2p key; sender and type sit inside `ct`. The queue log is a short id and the bucket, not the recipient.
 - **Own DHT** — Kademlia `/void/kad/1.0.0`, not IPFS. Chat text is not written to the DHT.
 - **NAT** — working path: **Relay v2 Hop** (`listen_on(…/p2p-circuit)` → `ReservationReqAccepted`). DCUtR / AutoNAT / UPnP are **off** (enable with `VOID_ENABLE_NAT=1`: a second dial to the node tears down TCP).
 - **Client transport** — listen on **TCP :50001** only. One TCP to bootstrap; `/p2p/` is stripped on dial; the real PeerId is written to the vault after Identify. The client does not open QUIC to the node.
@@ -96,7 +96,7 @@ The main desktop is **Tauri 2** (`frontend/` + `src-tauri/`). Optionally a nativ
 | `protocol/void-frames` | `V1Packet` (`Hello`, `Encrypted`, mailbox, onion, …), field limits, JSON and CBOR encode/decode |
 | `protocol/void-session` | Hello bind, `SecureSession` (DH step, header and PeerId in AAD), group roster |
 | `protocol/void-onion` | Onion v2 when every hop has a descriptor, otherwise v1. Builds without `kad` |
-| `protocol/void-envelope` | New envelopes prefer the rotating prekey plus one one-time key. If the node has neither, the client seals to the X25519 key derived from the recipient PeerId. That same key still opens old letters |
+| `protocol/void-envelope` | A new envelope is sealed to a sealable prekey. Without one it is not created, and the letter stays in `outbox.bin`. The X25519 key derived from the recipient PeerId still opens old letters |
 | `protocol/void-kad-rules` | `dht_record_allowed`: signed unexpired prekey, or a v3 mailbox. Other values are refused |
 | `protocol/` (`void-protocol`) | Thin re-export of the crates above for this release, plus `VoidKadStore` (`protocol/src/kad_store.rs`) |
 | `src/relay_mailbox.rs` | Local mailbox for LAN without bootstrap: the client stores neighbours’ mail and serves it to the owner on Query. This copy keeps 256 mailboxes; the node and the harness keep 4096 |
@@ -218,14 +218,14 @@ In the connect field: `multiaddr`, `IP`, or `IP:PORT`. A bootstrap in the seed l
 | `Hello` | X25519 + identity signature, and ML-KEM-768 when bit `32` is set. Current clients sign bind v3: `ts`, `nonce`, and `caps` (±10 min). A session opens only when that signature is v3 and `caps` bit `1` (`HELLO_CAP_HEADER_AAD`) is set, on a direct path and over onion. Bit `2` is CBOR, bit `4` is the contact queue, bit `8` is MLS, bit `16` seals the ratchet header, bit `32` is the hybrid Hello. Those bits do not open a session by themselves. With bit `32` the first Hello carries `kem_ek` and an empty `kem_ct`; the reply carries `kem_ct`. `pq_sig` covers the v3 fields plus those bytes. A set bit with a bad signature or a missing ciphertext does not open a session. v1 and v2 may verify and do not create a session. A repeated ephemeral is rejected (last 256 per PeerId) and does not reset a live session. A Hello with `ts == 0` does not replace one either |
 | `Encrypted` | Double Ratchet. With Hello bit `16` on both sides, `dh_pub`, `pn`, and `n` are zeros and the real header is in `sealed` |
 | `Ack` | RR reply / empty mailbox / node accepted the letter |
-| `MailboxChallengeRequest` / `MailboxChallenge` | nonce and `ts` for a signed fetch. The desktop does not send these to the current node: that node has no such frames |
-| `OfflineMailboxStore` / `Query` / `Deliver` | offline mail on bootstrap. While TCP to the node is up, Store and Query go on that connection, one envelope per Store. `Query` is `{ recipient }` only (`ts`, `nonce`, and `sig` are omitted when they are zero). The node returns the box when the Noise peer is that recipient, then deletes the batch. Empty `Deliver` in reply to `Store` is a refusal. A v2 cell is used only when that TCP is not up and another live hop can be the entry |
-| `PrekeyPut` / `Get` / `Offer` | Signed prekey plus a batch of one-time keys. `Offer` returns the signed prekey and one one-time key, then deletes that key. If the offer has no one-time key, the letter is sealed to the signed prekey alone. If nothing sealable comes back, it is sealed to the PeerId key. An unsolicited `Offer` is ignored |
-| `CreateQueue` / `QueueStore` / `QueueQuery` / `QueueDeliver` | Contact queue (`HELLO_CAP_QUEUES`). The owner registers `queue_id`, a write token, and a signature; the grant goes inside E2EE. `QueueStore` is the envelope padded to 64 KiB. The running node still files mail by recipient PeerId; the client always stores that copy too |
-| `BootstrapGossip` | seed exchange |
+| `MailboxChallengeRequest` / `MailboxChallenge` | nonce and `ts` for a signed fetch. The bootstrap node does not implement these frames: the request is closed and there is no `Ack`. A desktop with no bootstrap does implement them, and serves a LAN box only after `VOID_MAILBOX_QUERY_v1` |
+| `OfflineMailboxStore` / `Query` / `Deliver` | PeerId slot, used when there is no live queue grant. While TCP to the node is up, Store and Query go on that connection, one envelope per Store. `Query` is `{ recipient }` (`ts`, `nonce`, and `sig` are omitted when they are zero). The node returns that slot when the Noise peer is that recipient, then deletes the batch. An onion exit does not drain it. Empty `Deliver` in reply to `Store` is a refusal |
+| `PrekeyPut` / `Get` / `Offer` | Signed prekey plus a batch of one-time keys. The node stores that batch in `node_prekeys.bin`. `Offer` returns the signed prekey and one one-time key, then deletes that key. The next `Get` does not return it. If the offer has no one-time key, the letter is sealed to the signed prekey alone. If nothing sealable comes back, no envelope is created and the letter stays in `outbox.bin`. An unsolicited `Offer` is ignored |
+| `CreateQueue` / `QueueStore` / `QueueQuery` / `QueueDeliver` | Contact queue (`HELLO_CAP_QUEUES`). The owner registers `queue_id`, a write token, and a signature; the grant goes inside E2EE. `QueueStore` is the envelope padded to 64 KiB. With a live grant and TCP to the node, this is the only copy the client sends |
+| `BootstrapGossip` | seed and hop directory, not the mailbox. The node stores a neighbor address when the v1 hop-key signature checks out. An empty `sig2` leaves `learned_epoch` at 0 and the addresses are still written |
 | `DialBack` | “dial me over circuit” |
 | `Onion` / `OnionDrop` | `VOID_ONION_v1`. `OnionDrop` is accepted only from a bootstrap that advertised `;onion=` in its own Identify; inside — only `Hello` / `Encrypted` / `Ack`. The last layer still carries `src` |
-| `Onion2` / `OnionDeliver` | `VOID_ONION_v2`. Fixed-size cell. The exit forwards an opaque body sealed to the recipient’s identity key. No `src`. Used only when every hop on the path has a fresh descriptor |
+| `Onion2` / `OnionDeliver` | `VOID_ONION_v2`. Fixed-size cell. If the peeled `next` is another peer, that hop forwards `OnionDeliver`. If `next` is the node itself, it opens the seal, runs the mailbox, and returns a new cell. No `src`. Used only when every hop on the path has a fresh descriptor |
 
 Chat RR: request up to 4 MiB, response up to 16 MiB. One serde schema for `V1Packet`. The body stays JSON until both sides have announced CBOR: bit `2` in Hello between clients, or `;cbor=1` in the node’s Identify agent (the dispatcher does not send Hello). After that, requests are CBOR. The first Hello, sent before the peer’s announcement, stays JSON. A reply uses the same encoding as the request. Receivers always accept both: content-type `VC\x01\x01` (JSON) or `VC\x01\x02` (CBOR), else CBOR magic `d9 d9 f7`, else the first byte (`{`, `[`, `"`, or whitespace is JSON). In CBOR, `Vec<u8>` is a byte string; `[u8; N]` stays an array of numbers, so JSON and the mailbox bincode layout are unchanged. Field caps, independent of JSON expansion: `ct` 256 KiB, `ciphertext` 1 MiB, at most 64 envelopes in one `Store`, at most 1024 in one `Deliver`. `/void/file/1.0.0` stays JSON.
 
@@ -254,13 +254,13 @@ Offline envelope v3 (`protocol/void-envelope`):
 - the recipient accepts `dm` / `group` only if inner `sender_id` matches the signature; `group_sync` is from the signer;
 - v3 and v2 (signed, fields in the clear) are accepted; v1 (unsigned) is dropped. **Incompatible with old clients** — update every participant.
 
-The node sees the recipient (mailbox slot), time, and size to bucket accuracy.
+On a PeerId slot the node sees the recipient, the time, and the size. On a queue it sees a short id and the 64 KiB bucket, not the recipient.
 
 ### Prekey
 
-A new offline letter is sealed to the recipient’s **rotating X25519 prekey** and one **one-time prekey** when the node returns both: DH(ephemeral, signed prekey) and DH(ephemeral, one-time key). The one-time id sits inside the ciphertext. After open the recipient deletes that key; a second letter with the same id does not open. A signed prekey with an empty one-time batch still seals (single DH). If the node has no sealable prekey at all, the letter is sealed at once to the X25519 key derived from the recipient PeerId, and still uploaded. The signed prekey lives 7 days and is rotated when less than 24 hours remain. The previous secret is kept until its own `not_after`, then dropped. The client publishes both on the bootstrap (`PrekeyPut`) and in DHT `/void/prekey/<peer>` and `/void/opk/<peer>`.
+A new offline letter is sealed to the recipient’s **rotating X25519 prekey** and one **one-time prekey** when the node returns both: DH(ephemeral, signed prekey) and DH(ephemeral, one-time key). The one-time id sits inside the ciphertext. After open the recipient deletes that key; a second letter with the same id does not open. A signed prekey with an empty one-time batch still seals (single DH). If the node has no sealable prekey at all, no envelope is created and the letter stays in `outbox.bin`. The signed prekey lives 7 days and is rotated when less than 24 hours remain. The previous secret is kept until its own `not_after`, then dropped. The client publishes the signed prekey on the bootstrap (`PrekeyPut`, with the one-time pool) and in DHT `/void/prekey/<peer>`. The pool is not part of that DHT value, and `/void/opk/<peer>` is not written.
 
-DHT value v2: `pk[32] || 0x02 || not_after[8] ||` owner signature. v3 appends the ML-KEM-768 encapsulation key after the expiry and uses mark `0x03`; the signature is `VOID_PREKEY_SIG_V3` over the X25519 key and that encapsulation key. v1 (no expiry) still verifies and is not used for seal. A letter sealed only to the signed prekey, when that prekey carries the encapsulation key, prefixes `ct` with `VQK1` and the KEM ciphertext. The envelope fields stay the same. A letter that also uses a one-time key stays on the two X25519 shares and does not add that prefix. The node source accepts a v3 put when the Noise peer is the claimed owner, the signature matches the identity key inside the PeerId, and `not_after` is in the future and at most 30 days out. An unsigned put is refused. `PrekeyOffer` is used only if the same signature and expiry check out, and only in answer to our own `PrekeyGet`. The running node binary serves one-time keys and `kem_ek` only after it is rebuilt from this tree.
+DHT value v2: `pk[32] || 0x02 || not_after[8] ||` owner signature. v3 appends the ML-KEM-768 encapsulation key after the expiry and uses mark `0x03`; the signature is `VOID_PREKEY_SIG_V3` over the X25519 key and that encapsulation key. v1 (no expiry) still verifies and is not used for seal. A letter sealed only to the signed prekey, when that prekey carries the encapsulation key, prefixes `ct` with `VQK1` and the KEM ciphertext. The envelope fields stay the same. A letter that also uses a one-time key stays on the two X25519 shares and does not add that prefix. The node source accepts a v3 put when the Noise peer is the claimed owner, the signature matches the identity key inside the PeerId, and `not_after` is in the future and at most 30 days out. An unsigned put is refused. `PrekeyOffer` is used only if the same signature and expiry check out, and only in answer to our own `PrekeyGet`. The current node source returns one one-time key and `kem_ek`, then forgets that key. A binary built before `node_prekeys.bin` does not.
 
 The PeerId key is Ed25519 inside the PeerId, Edwards → Montgomery, the same conversion as `crypto_sign_ed25519_pk_to_curve25519`. It is not distributed. The recipient opens a letter with the current prekey secret, the previous one, the one-time keys still on disk, and this identity secret.
 
@@ -270,15 +270,15 @@ Leaking the libp2p identity still opens letters that were sealed to it. Letters 
 
 The live path is **not DHT**. While the client has TCP to the bootstrap, Store and Query are ordinary request-response on that connection. A v2 cell is only the path when that TCP is down and another connected hop can be the entry. The entry hop Ack is not handoff; the node’s own `Ack` is.
 
-1. Recipient offline → seal (prekey and one-time key, signed prekey alone, or the PeerId key) → `OfflineMailboxStore`, one envelope per request. The node replies `Ack` if it stored. Empty `Deliver` is a quota, rate, or mailbox-ceiling refusal — the letter stays in `outbox.bin` and will retry later. `outbox.bin` is cleared on live delivery, not on this `Ack`.
+1. Recipient offline → seal to a sealable prekey (and one one-time key when the offer has one). No sealable prekey → the letter stays in `outbox.bin` and is not sealed to the PeerId key. The node replies `Ack` if it stored. Empty `Deliver` is a refusal — the letter stays in `outbox.bin` and will retry later. `outbox.bin` is cleared on live delivery, not on this `Ack`.
 2. Recipient comes online → `OfflineMailboxQuery` with `recipient` set to their own PeerId, on their own TCP to the node. The node returns a batch (`take_batch` ≤ 512 KiB plaintext) and **deletes** it from `relay_mailbox.bin`. The first query runs as soon as that TCP is up, then about once a second. The rest of a batch waits ~500 ms (an immediate re-query would spin the same batch and choke the connection).
-3. The frames crate can also carry a signed fetch (`MailboxChallenge` plus `VOID_MAILBOX_QUERY_v1`). The node this desktop uses does not implement those frames, so the client does not send them. A query whose TCP peer is someone else is refused and the mail stays.
+3. The frames crate can also carry a signed fetch (`MailboxChallenge` plus `VOID_MAILBOX_QUERY_v1`). The node this desktop uses does not implement those frames and closes the request instead of answering `Ack`, so the client does not send them. A query whose TCP peer is someone else is refused and the mail stays.
 
-If the contact’s Hello has `HELLO_CAP_QUEUES`, the sender also keeps a queue: `CreateQueue`, an E2EE grant, and a `QueueStore` blob padded to 64 KiB so text and voice are the same length on the wire. The node log for that copy is a short `queue_id` and the bucket, not the recipient PeerId. Until that node is the one in production, the PeerId `OfflineMailboxStore` above is the copy the recipient actually reads.
+If the contact’s Hello has `HELLO_CAP_QUEUES` and the grant is still live, the sender uses the queue: `CreateQueue`, an E2EE grant, and a `QueueStore` blob padded to 64 KiB so text and voice are the same length on the wire. That `Ack` is the handoff. The PeerId `OfflineMailboxStore` is not sent on that path. The node log is a short `queue_id` and the bucket, not the recipient PeerId. Without a live grant the PeerId slot is the copy the recipient reads.
 
-Node limits: at most 4096 mailboxes (a new slot past that is refused), envelope lifetime 7 days, up to 256 envelopes / 8 MiB from one sender in one mailbox, `Store` at most 600 requests, 600 envelopes, and 48 MiB per minute per peer.
+Node limits on the PeerId slot: at most 4096 slots (a new slot past that is refused), 7 days from accept, up to 1024 envelopes and 32 MiB in one slot. The uploader is not stored, and there is no per-uploader rate. A queue is at most 4096 ids, 14 days, 1024 blobs and 64 MiB. The 600-request window and the 256-envelope / 8 MiB uploader cap are what `protocol-conformance` and the LAN desktop still check. The node binary does not.
 
-With bootstraps configured, letters go only to them, and the client refuses `Store` from anyone else. Without bootstrap (LAN), connected peers get copies — then the client itself answers Query from local `relay_mailbox.bin`, also only to the mailbox owner, with the same per-uploader rate and volume as the node. Kademlia accepts a mailbox record only as a bincode list of v3 envelopes under `/void/mailbox/<PeerId>`.
+With bootstraps configured, letters go only to them, and the client refuses `Store` from anyone else. Without bootstrap (LAN), connected peers get copies. The desktop then answers Query from local `relay_mailbox.bin` only after `MailboxChallenge` and a signature, with the same per-uploader rate and volume as `protocol-conformance`. The node’s PeerId slot does not apply that rate. Kademlia on the desktop and on the node accepts a signed prekey. Neither writes `/void/mailbox/` or `/void/opk/`. A mailbox record already stored stays until its TTL. The desktop does not publish a DHT mailbox.
 
 ### Onion (`VOID_ONION_v2`)
 
@@ -333,11 +333,11 @@ The live route (hop PeerIds) is shown in settings. Old nodes without `;onion=` a
 
 The filename in the offer is seen by whoever terminates the connection (the peer; with `/void/file` — also whoever sees that substream). Over relay without an E2EE offer, metadata should not leak to the node.
 
-On the wire a file is `VZDF` (deflate) when the wrapped bytes are shorter than the original. JPEG, PNG, GIF, WebP, MP3, M4A, AAC, Ogg, Opus, MP4, WebM, MOV, ZIP, gz, xz, 7z, RAR, and FLAC are left unchanged. The offer hash is BLAKE2b-512 of the bytes that are chunked, truncated to 32 bytes (the field is still named `sha256`). After that check the recipient inflates `VZDF` and writes the original file. Offline, a file whose wire form is at most 8 MiB goes as `file_chunk` through the mailbox; anything larger waits for a live `VfC1`.
+On the wire a file is `VZDF` (deflate) when the wrapped bytes are shorter than the original. JPEG, PNG, GIF, WebP, MP3, M4A, AAC, Ogg, Opus, MP4, WebM, MOV, ZIP, gz, xz, 7z, RAR, and FLAC are left unchanged. The offer hash is BLAKE2b-512 of the bytes that are chunked, truncated to 32 bytes (the field is still named `sha256`). After that check the recipient inflates `VZDF` and writes the original file. Offline, the client reads at most 64 MiB and sends `file_chunk` when the wire form is at most 8 MiB. The hash on that path is of the packed bytes. Anything larger waits for a live `VfC1`.
 
 ### Voice (`src/voice.rs`)
 
-Recording is mono 48 kHz 16-bit PCM and stops at 60 seconds (`--voice-record`, `cpal`). A longer WAV already on disk is cut to 60 seconds before send. Into chat — `VoiceMeta` (`duration_secs` ≤ 60); the WAV is sent as a file with auto-accept. On the wire the PCM is IMA ADPCM (`VVAD`, about 1.4 MiB for a full minute). The recipient checks the hash, then writes a normal WAV. Offline pieces are `voice_chunk`, at most 3 MiB assembled. Metadata is stripped when possible (`metadata_strip`).
+Recording is mono 48 kHz 16-bit PCM and stops at 60 seconds (`--voice-record`, `cpal`). A longer WAV already on disk is cut to 60 seconds before send. Into chat — `VoiceMeta` (`duration_secs` ≤ 60); the WAV is sent as a file with auto-accept. On the wire the PCM is IMA ADPCM (`VVAD`, about 1.4 MiB for a full minute). The live offer hash is of those `VVAD` bytes; the recipient checks it, then writes a normal WAV. Offline pieces are `voice_chunk`, at most 3 MiB assembled, then unpacked to WAV with no second hash. Metadata is stripped when possible (`metadata_strip`).
 
 ### Groups (`protocol/void-session`)
 
@@ -381,17 +381,17 @@ Typical path behind NAT is one Hop (or LAN):
 Alice ──E2EE──► Relay/Bootstrap ──► Bob
 ```
 
-Relay does not see plaintext, but **can** match IP↔PeerId, the circuit pair `src→dst`, volume/time, and the offline-mail recipient.
+Relay does not see plaintext, but **can** match IP↔PeerId, the circuit pair `src→dst`, and volume/time. A PeerId mailbox slot still names the recipient. A queue does not: the operator sees a short id and a 64 KiB bucket, not the recipient and not the uploader.
 
 | Observer | Text / files / voice | Sender IP | Who you are |
 |----------|----------------------|-----------|-------------|
 | Peer | Yes | Yes if the channel is direct (LAN). Through one relay — usually not | PeerId + nickname |
-| Bootstrap operator | No | **Yes** | PeerId, circuit, mailbox metadata |
+| Bootstrap operator | No | **Yes** | PeerId, circuit `src`/`dst`. A queue shows a short id and the bucket; a PeerId slot shows the recipient, not the uploader |
 | Another DHT peer | No | No (except mDNS on LAN) | sometimes a prekey publisher |
 
 The stable identifier is **PeerId** (as long as the vault lives). This is **pseudonymous E2EE**, not Tor. Do not use VOID if the threat model is “the node must not know who wrote to whom”.
 
-One node is the normal mode for current VOID (discovery, Hop, mailbox). It does not hide who met whom — see [onion](#onion-void_onion_v2).
+One node is the normal mode for current VOID (discovery, Hop, mailbox). The Hop reservation still shows who met whom. A queue does not. Onion hides that pair from a single hop only when entry and exit are different people — see [onion](#onion-void_onion_v2).
 
 ---
 
@@ -479,9 +479,9 @@ Your own bootstrap/relay nodes speed up discovery and NAT.
 |------|----------------|
 | **Kademlia Server** | Entry into `/void/kad/1.0.0` |
 | **Circuit Relay v2** | Hop for clients behind NAT; opaque circuit bytes |
-| **Offline mail / prekey** | Store/query on `/void/chat`. `Query` is `{ recipient }`. The node returns the box only when that string is the TCP peer’s PeerId, then deletes the batch (`take_batch`). `relay_mailbox.bin` is encrypted. At most 4096 mailboxes, TTL 7 days, per-uploader quotas, refusal via empty `Deliver`. `PrekeyPut` is stored only with the owner’s signature and an expiry within 30 days. Kademlia `put` keeps a signed unexpired prekey or a v3 mailbox and drops anything else |
+| **Offline mail / prekey** | Queues and the PeerId slot on `/void/chat`. A queue is fetched after the owner’s signature, not because the TCP peer matches. The PeerId slot is returned only when `recipient` is that TCP peer. `relay_mailbox.bin` is encrypted (`VRM3`). At most 4096 queues, 14 days, 1024 blobs / 64 MiB each. The PeerId slot is 7 days and does not store the uploader. Refusal is an empty `Deliver`. `PrekeyGet` returns one one-time key and erases it before the reply. Kademlia `put` keeps a signed unexpired prekey. A new `/void/mailbox/` put is refused while queues are on; a record already stored expires with its TTL. There is no `/void/queue/` key. `/void/opk/` is refused, and a one-time key is not added to the prekey value |
 | **VOID-SEED** | `/void-seed/v1` on a separate TCP — list exchange **between nodes** |
-| **Onion hop** | Identify `void-bootstrap-node/…;onion=<pk>;osig=…;epoch=…;until=…;op=…;osig2=…;cbor=1`. Unwrap v2 (fixed cell) or v1 (JSON inside the cell) and forward. When the peeled `next` is this node and the seal is a mailbox frame, file `Store` by `recipient`. A direct `Query` is answered only if the TCP peer is that recipient. The hop Ack is not handoff; the handoff Ack is a new cell on the reply path. The outer `/void/chat` frame is CBOR only when that next hop announced it. The hop key rotates weekly; the previous secret lasts one more day. `next` is a PeerId. A v2 cell whose slot-0 key (BLAKE2b-128 of `eph` and the slot ciphertext) was peeled in the last 14 days is dropped and not forwarded. Forward is limited to 600/min per previous hop and 6000/min overall. Logs do not record `next` or `src` |
+| **Onion hop** | Identify `void-bootstrap-node/0.4;onion=<pk>;osig=…;epoch=…;until=…;op=…;osig2=…;cbor=1`. Unwrap v2 (fixed cell) or v1 (JSON inside the cell) and forward. When the peeled `next` is this node, open the seal and run the same queue and mailbox operations as a direct request. The previous hop is not the owner, so the PeerId slot is not drained from there. The inbound request stays a short `Ack`. The handoff `Ack` is a new cell on the reply path. A query batch is put back if that cell cannot be built. v1 has no return path: a store may stay, a query is not consumed. The outer `/void/chat` frame is CBOR only when that next hop announced it. The hop key rotates weekly; the previous secret lasts one more day. v2 replay is BLAKE2b-128 of `eph` and the slot ciphertext, 14 days. v1 replay is the 32-byte `eph`, one hour, at most 8192 keys. The two caches are separate and stay in memory. Forward of someone else’s cell is limited to 600/min per previous hop and 6000/min overall. A mailbox reply is not counted. Logs do not record `next` or `src` |
 
 Live `V1Packet::Encrypted` is **not** forwarded as a chat server. Circuit and mailbox are separate paths. Onion is another: the node sees the next hop, not plaintext.
 
@@ -491,9 +491,9 @@ Live `V1Packet::Encrypted` is **not** forwarded as a chat server. Circuit and ma
 |-----------|-------|
 | Transports | TCP + QUIC, `LISTEN_PORT` (4001) |
 | Identify | `/void/v1`, `void-bootstrap-node/…;onion=…;cbor=1`. `;cbor=1` is `HELLO_CAP_CBOR` for the dispatcher |
-| Kademlia | `/void/kad/1.0.0`, **Mode::Server**. `put` accepts `/void/prekey/*` (owner signature, expiry ≤ 30 days) and `/void/mailbox/*` (v3 envelopes). Any other key is refused |
+| Kademlia | `/void/kad/1.0.0`, **Mode::Server**. `put` accepts `/void/prekey/*` (owner signature, expiry ≤ 30 days). `/void/mailbox/*` and `/void/opk/*` are refused. A mailbox record already in the store is not deleted. Any other key is refused |
 | Relay | Default + NAT-oriented limits |
-| Logs | `RUST_LOG` default **info** (IP in `endpoint`) |
+| Logs | `RUST_LOG` default **info**. Connect and circuit events are `debug` and do not print the client IP or `src` / `dst` |
 
 The client vault needs the **current** `/p2p/<PeerId>` of this node (banner at process start). Stale node key + stale `/p2p/` in the client = TCP for 1 ms and silence.
 
@@ -564,18 +564,19 @@ What the JSON pins is listed in [`spec/vectors/README.md`](spec/vectors/README.m
 
 ## 31 October 2026
 
-What landed in this tree that day. Stages D and E are in the desktop and in `protocol/void-envelope`. The node this desktop talks to (`VOID_node`) still stores mail by recipient PeerId and does not serve one-time keys or contact queues. [`spec/`](spec/README.md) describes the protocol the crates implement; it is not a dump of that node’s binary.
+What landed in this tree that day. Stages D and E are in the desktop, in `protocol/void-envelope`, and in the current `void-bootstrap-node`. [`spec/`](spec/README.md) is the wire catalog. Where the in-memory harness still checks the older PeerId quotas, the spec says so.
 
 ### D. One-time prekeys
 
 A new letter seals with two Diffie–Hellman shares when both keys exist: DH(ephemeral, signed prekey) and DH(ephemeral, one one-time key). The one-time id (16 bytes) is inside the ciphertext and in the cipher AAD. It is not a field the node can read. `seal_with_opk` refuses an all-zero id.
 
-The recipient keeps a pool of 16 one-time keys (`offline_prekey.bin`) and publishes the signed prekey under `/void/prekey/<peer>` and the pool under `/void/opk/<peer>`. The same bundle goes out as `PrekeyPut`. In this crate, `PrekeyOffer` returns the signed prekey and one one-time key, then deletes that key. Opening the letter deletes the same key on the recipient; a second letter with that id does not open. The signed prekey still lives 7 days and rotates when less than 24 hours remain. The previous secret stays until its own `not_after`.
+The recipient keeps a pool of 16 one-time keys (`offline_prekey.bin`) and publishes the signed prekey under `/void/prekey/<peer>`. The pool goes out as `PrekeyPut` and is not written under `/void/opk/<peer>`. In this crate, `PrekeyOffer` returns the signed prekey and one one-time key, then deletes that key. Opening the letter deletes the same key on the recipient; a second letter with that id does not open. The signed prekey still lives 7 days and rotates when less than 24 hours remain. The previous secret stays until its own `not_after`.
 
-What actually ships against the running node:
+What the node returns:
 
-- That node’s `PrekeyOffer` has no one-time key. The letter is then sealed to the signed prekey alone (one DH) and still uploaded.
-- If the node has no sealable prekey at all, the letter is sealed at once to the X25519 key derived from the recipient PeerId (Ed25519 inside the PeerId, Edwards → Montgomery) and uploaded. The outbox does not wait for a prekey the node never returns.
+- `PrekeyGet` removes one one-time key, saves the file, then returns it with the signed prekey. An id already handed out is not returned again. An expired signed prekey drops the rest of the pool.
+- An offer with no one-time key seals to the signed prekey alone (one DH) and is still uploaded.
+- If the node has no sealable prekey, the letter stays in `outbox.bin`. It is not sealed to the X25519 key derived from the recipient PeerId.
 - Opening tries, in order, the current signed-prekey secret, the previous one, the one-time keys still on disk, and that identity secret. Old letters sealed only to the identity key still open. A letter sealed only to a prekey that has already been dropped does not.
 
 ### E. Contact queues
@@ -584,15 +585,15 @@ The recipient creates `queue_id` (32 random bytes), a `write_token`, and a fresh
 
 The grant (`queue_id`, `write_token`, expiry) goes to the sender inside E2EE, before the chat message, and only after that contact’s Hello has bit `4` (`HELLO_CAP_QUEUES`). The sender’s `QueueStore` is the sealed envelope plus a random tail, exactly 64 KiB, so text and voice are the same length. A blob that does not fit is not queued. The write proof is SHA-256 of the token, the queue id, and the blob. `QueueQuery` is signed by the same owner key (`VOID_QUEUE_QUERY_V1`).
 
-The queue lives 14 days. After 64 stores, or when less than 24 hours remain, the owner makes a new queue. The previous id is kept and still drained until its expiry. Secrets sit in the vault (`ContactQueueRecord`), not on the node. A Store log line from this crate is `queue=<8 hex> bucket=65536` and does not contain the recipient PeerId.
+The queue lives 14 days. After 64 stores, or when less than 24 hours remain, the owner makes a new queue. The previous id is kept and still drained until its expiry. Secrets sit in the vault (`ContactQueueRecord`), not on the node. A Store log line is `queue=` plus the first 8 bytes of the id in hex, then ` bucket=65536`. It does not contain the recipient PeerId.
 
-The running node does not decode `CreateQueue` or `QueueStore`. The client therefore always sends the PeerId `OfflineMailboxStore` as well. That copy is the one the recipient reads today. `QueueStore` is an extra, untracked copy, sent only when a grant for that contact is already in hand and TCP to the node is up.
+The node decodes `CreateQueue` and `QueueStore`. With a live grant and TCP to the node, the client sends only `QueueStore` and treats that `Ack` as handoff. The PeerId copy is sent when there is no live grant, when TCP is down, or when the blob does not fit the 64 KiB bucket. While TCP is down and an onion entry is up, the client still sends the PeerId copy, not the queue.
 
 ### Also that day
 
 - **Onion mailbox.** `Store` and `Query` can sit in a v2 cell with no outer sender. The hop `Ack` only means the cell was accepted. Handoff is the `Ack` that comes back on the reply path. One envelope per cell. While TCP to the node is already up, the client sends Store and Query on that connection instead.
 - **Hop replay.** A v2 cell whose slot-0 key (BLAKE2b-128 of `eph` and the slot ciphertext) was peeled in the last 14 days is dropped and not forwarded.
-- **Fetch.** The node answers `OfflineMailboxQuery { recipient }` when the TCP peer is that recipient. It does not implement `MailboxChallengeRequest`. The client asks on the open TCP, starting at connect and then about once a second. Zero `ts` / `nonce` / `sig` are left off the frame.
+- **Fetch.** The node answers a queue after `QueueChallenge` and the owner signature. It answers `OfflineMailboxQuery { recipient }` for the PeerId slot when the TCP peer is that recipient. It does not implement `MailboxChallengeRequest`. The client polls that PeerId query on the open TCP, starting at connect and then about once a second, with zero `ts` / `nonce` / `sig` left off the frame. It also challenges its own queues.
 - **Live retry.** When a contact’s TCP appears, that peer’s pending sends go out on the next tick instead of sitting on the backoff (up to 300 s).
 
 ## 1 November 2026
@@ -637,16 +638,16 @@ This is source. The installed desktop and a node process built earlier do not co
 - [x] Tray / beacon; a second launch raises the same window
 - [x] `VOID_ONION_v2` when every hop has a fresh descriptor (fixed 2/16/64 KiB cell, no sender in the last layer, weekly hop key, 14-day guard). v1 remains for a path that still has an old hop
 - [x] `OnionDrop` only from advertised onion hops, inside only `Hello` / `Encrypted` / `Ack`
-- [x] Offline envelope v3: sender signature, metadata inside ciphertext. Seal prefers a rotating prekey and one one-time key; the PeerId-derived key is used when the node has no sealable prekey, and it still opens old letters
-- [x] Offline fetch matches the deployed node: `OfflineMailboxQuery { recipient }` on the direct TCP, about once a second from the moment that TCP is up
-- [x] Contact queues (`HELLO_CAP_QUEUES`, 64 KiB `QueueStore`) in the client; the PeerId mailbox remains the copy that node serves
-- [x] Offline-mail Query only for the mailbox owner; on the node at most 4096 mailboxes, TTL 7 days, quotas and `Store` rate limit; with bootstrap, the client does not accept `Store` from ordinary peers
+- [x] Offline envelope v3: sender signature, metadata inside ciphertext. A new letter is sealed to a sealable prekey and, when the offer has one, a one-time key. Without a sealable prekey the envelope is not created. The PeerId-derived key still opens old letters
+- [x] Offline fetch: queue after `QueueChallenge` and the owner signature; PeerId slot via `OfflineMailboxQuery { recipient }` on the direct TCP, about once a second from the moment that TCP is up
+- [x] Contact queues (`HELLO_CAP_QUEUES`, 64 KiB `QueueStore`). With a live grant and TCP to the node, that is the only copy. The PeerId slot is the fallback
+- [x] Queue: at most 4096, 14 days, 1024 blobs / 64 MiB. PeerId slot: 7 days, no uploader id, no store rate limit. With bootstrap, the client does not accept `Store` from ordinary peers
 - [x] Double Ratchet with a DH step on every speaker change. A session opens only after Hello bind v3 with the AAD bit, on a direct path and over onion. Header and both PeerIds are in AAD before the first frame
 - [x] `Hello` freshness: `ts` (±10 min) and `nonce` in the signature. A `Hello` with `ts == 0` does not reset a live session
 - [x] CBOR `V1Packet` after both sides announce `HELLO_CAP_CBOR` (Hello bit `2`, or `;cbor=1` on the node). Mixed peers stay on JSON. Field caps on `ct`, `ciphertext`, and Store size
 - [x] Vault: Argon2id 64 MiB, AES-GCM with AAD (`VOIDKEY3`; old `VOIDKEY2` still opens)
 - [x] Group roster has a creator-signed `version`. A replay of an older `group_sync` does not roll membership back. A message is stored only if the sender is in the roster
-- [x] Kademlia `put` on the client and the node keeps only a signed unexpired prekey or a v3 mailbox
+- [x] Kademlia `put` keeps a signed unexpired prekey. A new `/void/mailbox/` put is refused; there is no `/void/queue/` key, and a one-time prekey is not stored in DHT
 - [x] A hop forwards an onion cell only after Identify, with a forward rate limit, and does not log `next` or `src`
 - [x] Wire catalog in [`spec/`](spec/README.md) and known-answer vectors in [`spec/vectors/`](spec/vectors/README.md) (`cargo test -p void-protocol --lib vectors`)
 - [x] Conformance harness `protocol-conformance`: two `SecureSession`s and an in-memory mailbox with the node Query / TTL / quota rules. No Tauri or egui
@@ -674,7 +675,7 @@ Out of spec, as this client’s local choices: vault layout, Tauri and egui, lis
 | Envelope v3, no stable cleartext sender | client and [`spec/05-envelope.md`](spec/05-envelope.md); vectors `envelope_v3_roundtrip`, `envelope_v2_reject` |
 | Two sessions and the dispatcher mailbox | [`protocol-conformance`](protocol-conformance) |
 
-Still ahead, in source as well as in the binaries: drop the `void-protocol` facade after this release; replace `libp2p-identity::PeerId` inside `void-session` and `void-envelope`; a two-process dump of an onion Store; the contact-queue index on the node (today the recipient reads the PeerId mailbox); one-time keys actually returned by `PrekeyOffer`; ML-KEM on the letter that already uses a one-time key; a remove Commit sent by the member who is leaving; a vector for the skipped-key cap of 4096. `fuzz/` and `spec/models/hello_query.pv` are in the tree and have not been executed here. A test that is green only against the desktop program is a specification failure.
+Still ahead, in source as well as in the binaries: drop the `void-protocol` facade after this release; replace `libp2p-identity::PeerId` inside `void-session` and `void-envelope`; a two-process dump of an onion Store; ML-KEM on the letter that already uses a one-time key; a remove Commit sent by the member who is leaving; a vector for the skipped-key cap of 4096. `fuzz/` and `spec/models/hello_query.pv` are in the tree and have not been executed here. A test that is green only against the desktop program is a specification failure.
 
 Reference dispatcher — [`MarshalV/bootstrap_node`](https://github.com/MarshalV/bootstrap_node). One dispatcher still sees the meeting. Onion does not cancel that until several independent nodes are on the path. A v2 cell has three size buckets. A path that still contains a v1 hop also shows the sender.
 

@@ -2058,6 +2058,33 @@ mod tests {
     }
 
     #[test]
+    fn first_offer_has_an_opk_and_the_second_does_not() {
+        let bob = party();
+        let spk = StaticSecret::random_from_rng(rand::rngs::OsRng);
+        let pk = PublicKey::from(&spk).to_bytes();
+        let now = prekey_now();
+        let published = encode_signed_prekey(&bob.key, &bob.pid, &pk, now + 3600).unwrap();
+        let (_secret, opk) = fresh_opk(&bob);
+        let mut dir = NodePrekeys::new();
+        assert!(dir.put(
+            &bob.pid.to_string(),
+            pk,
+            published.not_after,
+            published.sig,
+            &[],
+            vec![opk.clone()],
+            now,
+        ));
+        let first = dir.take_offer(&bob.pid.to_string()).unwrap();
+        assert_eq!(first.opk.id, opk.id);
+        assert!(dir.take_offer(&bob.pid.to_string()).is_none());
+        assert!(seal_material(None, None, now).is_none());
+        assert!(offline_seal_key(&bob.pid, None).is_none());
+        let mut again = NodePrekeys::import(&dir.export());
+        assert!(again.take_offer(&bob.pid.to_string()).is_none());
+    }
+
+    #[test]
     fn node_offer_drops_the_issued_opk() {
         let bob = party();
         let spk = StaticSecret::random_from_rng(rand::rngs::OsRng);

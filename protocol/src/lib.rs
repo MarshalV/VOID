@@ -22,7 +22,7 @@ pub mod group {
 
 pub mod offline_mail {
     pub use void_envelope::offline_mail::*;
-    pub use void_kad_rules::dht_record_allowed;
+    pub use void_kad_rules::{dht_put_allowed, dht_record_allowed};
 
     pub use crate::record_keys::{mailbox_record_key, opk_record_key, prekey_record_key};
 }

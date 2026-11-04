@@ -1,4 +1,6 @@
-//! Kademlia store that refuses unsigned prekeys and non-v3 mailboxes.
+//! Kademlia store. A new put is a signed prekey. A PeerId mailbox and a
+//! one-time prekey are not written. A mailbox record already in memory stays
+//! until its own TTL: `put` does not remove it.
 //!
 //! libp2p 0.56 has no `RecordValidator` trait. Incoming `put` goes straight
 //! into [`kad::store::RecordStore::put`], so the check lives there.
@@ -9,7 +11,7 @@ use libp2p::kad::store::{MemoryStore, RecordStore, Result};
 use libp2p::kad::{ProviderRecord, Record, RecordKey};
 use libp2p::PeerId;
 
-use void_kad_rules::dht_record_allowed;
+use void_kad_rules::dht_put_allowed;
 
 pub struct VoidKadStore {
     inner: MemoryStore,
@@ -32,7 +34,7 @@ impl RecordStore for VoidKadStore {
     }
 
     fn put(&mut self, r: Record) -> Result<()> {
-        if !dht_record_allowed(r.key.as_ref(), &r.value) {
+        if !dht_put_allowed(r.key.as_ref(), &r.value) {
             return Err(libp2p::kad::store::Error::ValueTooLarge);
         }
         self.inner.put(r)
