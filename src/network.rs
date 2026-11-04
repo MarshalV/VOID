@@ -2533,7 +2533,9 @@ fn seal_and_publish_offline_batch(
 ) -> bool {
     peer_prekeys.insert(recipient, pk_bytes);
     let mut sealed = Vec::new();
-    let spk_only = opk_id == [0u8; 16];
+    // Один одноразовый ключ открывает один конверт: получатель стирает его.
+    // Пачка кусков печатается на signed-prekey, иначе второй кусок уже не открывается.
+    let spk_only = items.len() != 1 || opk_id == [0u8; 16];
     for item in items {
         let sealed_one = if spk_only {
             if kem_ek.is_empty() {
@@ -4561,6 +4563,7 @@ pub async fn run_chat_network(
         // Проверенные ротируемые prekey контактов. Hello-static сюда не кладём.
         let mut seal_prekeys: HashMap<PeerId, [u8; 32]> = HashMap::new();
         let mut opk_sealed: HashSet<PeerId> = HashSet::new();
+        let mut stored_mail_ids: HashSet<String> = HashSet::new();
                                 let mut write_grants: HashMap<PeerId, crate::queue_mail::QueueGrant> = HashMap::new();
         let mut outbound_group_mls: HashMap<
             libp2p::request_response::OutboundRequestId,
@@ -6546,12 +6549,30 @@ pub async fn run_chat_network(
                                     signal_publish_done(&shared_gate, false);
                                 }
                                 for (recipient, batch) in by_recipient {
-                                    opk_sealed.remove(&recipient);
                                     // Track Store for exit-flush / handoff, not for UI ✓.
                                     let recip_done: PublishDone = shared_gate
                                         .as_ref()
                                         .map(|g| once_publish_gate(g.clone()))
                                         .unwrap_or_else(|| Arc::new(|_| {}) as PublishDone);
+                                    let batch: Vec<_> = batch
+                                        .into_iter()
+                                        .filter(|item| !stored_mail_ids.contains(&item.message_id))
+                                        .collect();
+                                    if batch.is_empty() {
+                                        recip_done(true);
+                                        continue;
+                                    }
+                                    let busy = outbound_prekey_gets
+                                        .values()
+                                        .any(|(r, _, _)| *r == recipient)
+                                        || outbound_mailbox_stores
+                                            .values()
+                                            .any(|(_, r, _)| *r == recipient);
+                                    if busy {
+                                        recip_done(false);
+                                        continue;
+                                    }
+                                    opk_sealed.remove(&recipient);
                                     // Новое письмо не запечатывается на X25519 из PeerId.
                                     // Нет sealable prekey — пачка остаётся в outbox.bin.
                                     let need_prekey = batch;
@@ -8374,6 +8395,7 @@ pub async fn run_chat_network(
                                                     now,
                                                     &message_id[..8.min(message_id.len())]
                                                 );
+                                                stored_mail_ids.insert(message_id.clone());
                                                 handoff.note_store_ack(&message_id);
                                                 // Ящик принял конверт — это НЕ доставка
                                                 // собеседнику. ✓ только с live Encrypted Ack,
