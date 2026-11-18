@@ -5517,6 +5517,7 @@ dependencies = [
  "void-envelope",
  "void-frames",
  "void-kad-rules",
+ "void-mls",
  "void-onion",
  "void-protocol",
  "void-session",
@@ -8588,11 +8589,13 @@ name = "void-session"
 version = "0.1.0"
 dependencies = [
  "anyhow",
+ "bs58",
  "chacha20poly1305",
  "chrono",
  "hkdf 0.12.4",
  "libp2p-identity",
  "ml-kem",
+ "multihash",
  "rand 0.8.8",
  "serde",
  "serde_bytes",
