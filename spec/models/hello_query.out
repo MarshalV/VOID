@@ -1,0 +1,187 @@
+Linear part:
+dh(x,pk(y)) = dh(y,pk(x))
+Completing equations...
+Completed equations:
+dh(x,pk(y)) = dh(y,pk(x))
+Convergent part: No equation.
+Process 0 (that is, the initial process):
+{1}new skA: skey;
+{2}new skB: skey;
+{3}new queue: bitstring;
+(
+    {4}let skA_1: skey = skA in
+    {5}let pkB: pkey = pk(skB) in
+    {6}new esk: skey;
+    {7}new ts: bitstring;
+    {8}new n: nonce;
+    {9}new caps: bitstring;
+    {10}let body: bitstring = hello(pk(skA_1),pkB,pk(esk),ts,n,caps) in
+    {11}event HelloSent(pk(skA_1),pkB,n);
+    {12}out(net, (body,sign(body,skA_1)));
+    {13}in(net, (hdr: bitstring,ct: bitstring));
+    {14}let key: bitstring = dh(esk,pkB) in
+    {15}let a: bitstring = header_aad(pk(skA_1),pkB,hdr) in
+    {16}let m: bitstring = open(ct,key,a) in
+    (
+        {17}event FrameOk(m)
+    ) | (
+        {18}new junk: bitstring;
+        {19}let bad: bitstring = open(ct,key,junk) in
+        {20}event BadAadAccepted(bad)
+    )
+) | (
+    {21}let skB_1: skey = skB in
+    {22}let pkA: pkey = pk(skA) in
+    {23}in(net, (body_1: bitstring,sig: bitstring));
+    {24}let hello(from: pkey,to: pkey,ek: pkey,ts_1: bitstring,n_1: nonce,caps_1: bitstring) = check(sig,pkA) in
+    {25}if (from = pkA) then
+    {26}if (to = pk(skB_1)) then
+    {27}if (body_1 = hello(from,to,ek,ts_1,n_1,caps_1)) then
+    {28}event HelloBound(pkA,pk(skB_1),n_1);
+    {29}let key_1: bitstring = dh(skB_1,ek) in
+    {30}new hdr_1: bitstring;
+    {31}let a_1: bitstring = header_aad(pkA,pk(skB_1),hdr_1) in
+    {32}out(net, (hdr_1,seal(payload,key_1,a_1)));
+    {33}in(net, (body2: bitstring,sig2: bitstring));
+    {34}let hello(from2: pkey,to2: pkey,ek2: pkey,ts2: bitstring,n2: nonce,caps2: bitstring) = check(sig2,pkA) in
+    {35}if (from2 = pkA) then
+    {36}if (to2 = pk(skB_1)) then
+    {37}if (body2 = hello(from2,to2,ek2,ts2,n2,caps2)) then
+    {38}if (n2 = n_1) then
+    {39}event HelloReplayRefused(pkA,n2)
+) | (
+    {40}let sk: skey = skA in
+    {41}let queue_1: bitstring = queue in
+    {42}new ts_2: bitstring;
+    {43}new n_2: nonce;
+    {44}let msg: bitstring = qbody(queue_1,ts_2,n_2) in
+    {45}event QuerySigned(pk(sk),queue_1);
+    {46}out(net, (msg,sign(msg,sk)))
+) | (
+    {47}let pkOwner: pkey = pk(skA) in
+    {48}let queue_2: bitstring = queue in
+    {49}in(net, (msg_1: bitstring,sig_1: bitstring));
+    {50}let qbody(qid: bitstring,ts_3: bitstring,n_3: nonce) = check(sig_1,pkOwner) in
+    {51}if (msg_1 = qbody(qid,ts_3,n_3)) then
+    {52}if (qid = queue_2) then
+    {53}event QueryOk(pkOwner,queue_2)
+)
+
+--  Process 1 (that is, process 0, with let moved downwards):
+{1}new skA: skey;
+{2}new skB: skey;
+{3}new queue: bitstring;
+(
+    {6}new esk: skey;
+    {7}new ts: bitstring;
+    {8}new n: nonce;
+    {9}new caps: bitstring;
+    {5}let pkB: pkey = pk(skB) in
+    {4}let skA_1: skey = skA in
+    {11}event HelloSent(pk(skA_1),pkB,n);
+    {10}let body: bitstring = hello(pk(skA_1),pkB,pk(esk),ts,n,caps) in
+    {12}out(net, (body,sign(body,skA_1)));
+    {13}in(net, (hdr: bitstring,ct: bitstring));
+    {15}let a: bitstring = header_aad(pk(skA_1),pkB,hdr) in
+    {14}let key: bitstring = dh(esk,pkB) in
+    {16}let m: bitstring = open(ct,key,a) in
+    (
+        {17}event FrameOk(m)
+    ) | (
+        {18}new junk: bitstring;
+        {19}let bad: bitstring = open(ct,key,junk) in
+        {20}event BadAadAccepted(bad)
+    )
+) | (
+    {23}in(net, (body_1: bitstring,sig: bitstring));
+    {22}let pkA: pkey = pk(skA) in
+    {24}let hello(from: pkey,to: pkey,ek: pkey,ts_1: bitstring,n_1: nonce,caps_1: bitstring) = check(sig,pkA) in
+    {25}if (from = pkA) then
+    {21}let skB_1: skey = skB in
+    {26}if (to = pk(skB_1)) then
+    {27}if (body_1 = hello(from,to,ek,ts_1,n_1,caps_1)) then
+    {28}event HelloBound(pkA,pk(skB_1),n_1);
+    {30}new hdr_1: bitstring;
+    {31}let a_1: bitstring = header_aad(pkA,pk(skB_1),hdr_1) in
+    {29}let key_1: bitstring = dh(skB_1,ek) in
+    {32}out(net, (hdr_1,seal(payload,key_1,a_1)));
+    {33}in(net, (body2: bitstring,sig2: bitstring));
+    {34}let hello(from2: pkey,to2: pkey,ek2: pkey,ts2: bitstring,n2: nonce,caps2: bitstring) = check(sig2,pkA) in
+    {35}if (from2 = pkA) then
+    {36}if (to2 = pk(skB_1)) then
+    {37}if (body2 = hello(from2,to2,ek2,ts2,n2,caps2)) then
+    {38}if (n2 = n_1) then
+    {39}event HelloReplayRefused(pkA,n2)
+) | (
+    {42}new ts_2: bitstring;
+    {43}new n_2: nonce;
+    {41}let queue_1: bitstring = queue in
+    {40}let sk: skey = skA in
+    {45}event QuerySigned(pk(sk),queue_1);
+    {44}let msg: bitstring = qbody(queue_1,ts_2,n_2) in
+    {46}out(net, (msg,sign(msg,sk)))
+) | (
+    {49}in(net, (msg_1: bitstring,sig_1: bitstring));
+    {47}let pkOwner: pkey = pk(skA) in
+    {50}let qbody(qid: bitstring,ts_3: bitstring,n_3: nonce) = check(sig_1,pkOwner) in
+    {51}if (msg_1 = qbody(qid,ts_3,n_3)) then
+    {48}let queue_2: bitstring = queue in
+    {52}if (qid = queue_2) then
+    {53}event QueryOk(pkOwner,queue_2)
+)
+
+-- Query not attacker(payload[]) in process 1.
+Translating the process into Horn clauses...
+Completing...
+Starting query not attacker(payload[])
+RESULT not attacker(payload[]) is true.
+-- Query event(FrameOk(m_1)) ==> m_1 = payload[] in process 1.
+Translating the process into Horn clauses...
+Completing...
+Starting query event(FrameOk(m_1)) ==> m_1 = payload[]
+goal reachable: event(FrameOk(payload[]))
+RESULT event(FrameOk(m_1)) ==> m_1 = payload[] is true.
+-- Query not event(BadAadAccepted(m_1)) in process 1.
+Translating the process into Horn clauses...
+Completing...
+Starting query not event(BadAadAccepted(m_1))
+RESULT not event(BadAadAccepted(m_1)) is true.
+-- Query inj-event(HelloBound(a_2,b,n_4)) ==> inj-event(HelloSent(a_2,b,n_4)) in process 1.
+Translating the process into Horn clauses...
+Completing...
+Starting query inj-event(HelloBound(a_2,b,n_4)) ==> inj-event(HelloSent(a_2,b,n_4))
+goal reachable: b-inj-event(HelloSent(pk(skA[]),pk(skB[]),n[]),@occ11[]) -> inj-event(HelloBound(pk(skA[]),pk(skB[]),n[]),@occ28_1)
+The hypothesis occurs strictly before the conclusion.
+Abbreviations:
+@occ28_1 = @occ28[sig = sign(hello(pk(skA[]),pk(skB[]),pk(esk[]),ts[],n[],caps[]),skA[]),body_1 = hello(pk(skA[]),pk(skB[]),pk(esk[]),ts[],n[],caps[])]
+RESULT inj-event(HelloBound(a_2,b,n_4)) ==> inj-event(HelloSent(a_2,b,n_4)) is true.
+-- Query event(HelloReplayRefused(a_2,n_4)) ==> event(HelloSent(a_2,b,n_4)) in process 1.
+Translating the process into Horn clauses...
+Completing...
+Starting query event(HelloReplayRefused(a_2,n_4)) ==> event(HelloSent(a_2,b,n_4))
+goal reachable: b-event(HelloSent(pk(skA[]),pk(skB[]),n[])) -> event(HelloReplayRefused(pk(skA[]),n[]))
+RESULT event(HelloReplayRefused(a_2,n_4)) ==> event(HelloSent(a_2,b,n_4)) is true.
+-- Query event(QueryOk(p,q)) ==> event(QuerySigned(p,q)) in process 1.
+Translating the process into Horn clauses...
+Completing...
+Starting query event(QueryOk(p,q)) ==> event(QuerySigned(p,q))
+goal reachable: b-event(QuerySigned(pk(skA[]),queue[])) -> event(QueryOk(pk(skA[]),queue[]))
+RESULT event(QueryOk(p,q)) ==> event(QuerySigned(p,q)) is true.
+
+--------------------------------------------------------------
+Verification summary:
+
+Query not attacker(payload[]) is true.
+
+Query event(FrameOk(m_1)) ==> m_1 = payload[] is true.
+
+Query not event(BadAadAccepted(m_1)) is true.
+
+Query inj-event(HelloBound(a_2,b,n_4)) ==> inj-event(HelloSent(a_2,b,n_4)) is true.
+
+Query event(HelloReplayRefused(a_2,n_4)) ==> event(HelloSent(a_2,b,n_4)) is true.
+
+Query event(QueryOk(p,q)) ==> event(QuerySigned(p,q)) is true.
+
+--------------------------------------------------------------
+

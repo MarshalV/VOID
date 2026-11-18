@@ -767,12 +767,12 @@ pub enum V1Packet {
         nonce: [u8; 32],
         ts: u64,
     },
-    /// Запросить офлайн-почту.
-    /// Нода `VOID_node` знает только `recipient` и сверяет его с TCP-пиром.
-    /// Нули не пишем в кадр: лишние поля та нода не разбирает.
+    /// Запросить офлайн-почту. Слот PeerId выдаётся после подписи
+    /// `VOID_MAILBOX_QUERY_v1` на nonce из `MailboxChallenge`.
+    /// Равенство `recipient` и TCP-пира не проверяется.
     OfflineMailboxQuery {
         recipient: String,
-        /// Echo `MailboxChallenge.ts`. 0 — запрос без подписи.
+        /// Echo `MailboxChallenge.ts`.
         #[serde(default, skip_serializing_if = "is_zero_u64")]
         ts: u64,
         #[serde(default, skip_serializing_if = "is_zero_32")]

@@ -1856,7 +1856,7 @@ impl Inner {
                         }) = parse_decrypted_chat_frame(&plaintext)
                         {
                             group_syncs.push((
-                                from,
+                                from.to_identity(),
                                 group_id,
                                 group_name,
                                 creator_id,
@@ -3618,6 +3618,34 @@ impl VoidRuntime {
                                 .map(|p| p.to_string())
                                 .unwrap_or_default();
                             match g.group_mls.take(&group_id, &body) {
+                                Ok(crate::group_mls::MlsIn::Commit {
+                                    relay: Some(commit),
+                                    epoch,
+                                }) => {
+                                    let recipients: Vec<PeerId> = g
+                                        .groups
+                                        .get(&group_id)
+                                        .map(|gr| {
+                                            gr.member_peer_ids()
+                                                .into_iter()
+                                                .filter(|p| Some(*p) != g.local_peer_id)
+                                                .collect()
+                                        })
+                                        .unwrap_or_default();
+                                    if !recipients.is_empty() {
+                                        if let Some(tx) = &g.command_tx {
+                                            let _ = tx.try_send(UICommand::SendGroupMls {
+                                                group_id: group_id.clone(),
+                                                epoch,
+                                                body: commit,
+                                                recipients,
+                                                message_id: String::new(),
+                                            });
+                                        }
+                                    }
+                                    g.persist_vault();
+                                    emit_snapshot = true;
+                                }
                                 Ok(crate::group_mls::MlsIn::Application { plaintext }) => {
                                     if let Ok(msg) = serde_json::from_slice::<ChatMessage>(&plaintext)
                                     {
@@ -5312,6 +5340,17 @@ impl VoidRuntime {
                     recipients: notify,
                 });
             } else {
+                if group.mls {
+                    if let Ok(commit) = g.group_mls.resign(&gid) {
+                        let _ = tx.try_send(UICommand::SendGroupMls {
+                            group_id: gid.clone(),
+                            epoch: commit.epoch,
+                            body: commit.commit,
+                            recipients: notify.clone(),
+                            message_id: String::new(),
+                        });
+                    }
+                }
                 let _ = tx.try_send(UICommand::SendGroupLeave {
                     group_id: gid.clone(),
                     peer_id: me.clone(),

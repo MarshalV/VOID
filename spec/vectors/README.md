@@ -1,14 +1,17 @@
 # Векторы
 
-JSON в этом каталоге — известные ответы провода. По ним вторая реализация сверяет Hello, ratchet, конверт, prekey и onion, не читая окно и не поднимая двух клиентов. Норматив байтов — в [`spec/`](../README.md); здесь только входы и то, что код обязан получить.
+JSON в этом каталоге — известные ответы провода: Hello, ratchet, конверт, prekey и onion. Норматив байтов — в [`spec/`](../README.md); здесь только входы и то, что код обязан получить. Окно и два клиента для сверки не нужны.
 
 Генератор — `protocol/src/vectors.rs`. Обычный прогон сравнивает разобранный JSON с файлом (порядок ключей и переносы не важны). `UPDATE_VECTORS=1` перезаписывает файлы текущим выводом. Так делают только когда байты на проводе меняют сознательно: иначе тест как раз и должен покраснеть.
 
-Сверка:
+Сверка Rust и вторая реализация (Python, каталог `second/`, без UI и без libp2p):
 
 ```text
 cargo test -p void-protocol --lib vectors
+python second/check_vectors.py
 ```
+
+Python сверяет Hello, ratchet, конверт и prekey. Ему нужен пакет `cryptography` с ML-KEM-768. Onion-файлы этот скрипт не читает. Расхождение — ошибка порта, JSON не переписывают.
 
 Перезапись, PowerShell:
 
@@ -42,6 +45,7 @@ Remove-Item Env:UPDATE_VECTORS
 | [`ratchet_dh_step.json`](ratchet_dh_step.json) | 4 обмена туда-обратно, AAD включён | каждый ход меняет `dh_pub` отправителя |
 | [`ratchet_bad_aad.json`](ratchet_bad_aad.json) | у кадра Алисы `pn` увеличен на 1 | decrypt отказ, состояние не сдвинуто |
 | [`envelope_v3_roundtrip.json`](envelope_v3_roundtrip.json) | seal фиксированными `eph` и nonce | открытый текст и проверенный отправитель |
+| [`envelope_opk_kem.json`](envelope_opk_kem.json) | два DH и KEM, и тот же путь без KEM | `VQK1` только у гибрида; без префикса открывается по-старому |
 | [`envelope_v2_reject.json`](envelope_v2_reject.json) | тот же конверт с `v = 1` и с `v`, переписанным в 2 | оба `open: false` |
 | [`prekey_expired.json`](prekey_expired.json) | `not_after = now − 1` | подпись верна, `sealable: false` |
 | [`onion_v2_1hop.json`](onion_v2_1hop.json) | wrap → peel одним hop | `deliver`, тело бакета, затем открытый текст |
@@ -53,7 +57,7 @@ Remove-Item Env:UPDATE_VECTORS
 
 Норматив — [`02-hello.md`](../02-hello.md).
 
-`hello_v3_ok`: подписавший и получатель заданы seed, статическая и эфемерная точки X25519 лежат в файле, `ts = now = 1700000000`, `nonce` — шестнадцать байт `0x11`, `caps = 1` (`HELLO_CAP_HEADER_AAD`). Подпись Ed25519 покрывает bind v3. `accepted: true` и `bind: "V3"` значат: проверка в этот `now` даёт v3, и такой Hello открывает сессию. Эти файлы закрепляют `caps = 1` и открытый заголовок ratchet. Биты `16` и `32`, prekey v3, префикс `VQK1` и кадр `GroupMls` здесь не лежат: их байты — в [02](../02-hello.md), [03](../03-session.md), [05](../05-envelope.md) и [10](../10-groups.md).
+`hello_v3_ok`: подписавший и получатель заданы seed, статическая и эфемерная точки X25519 лежат в файле, `ts = now = 1700000000`, `nonce` — шестнадцать байт `0x11`, `caps = 1` (`HELLO_CAP_HEADER_AAD`). Подпись Ed25519 покрывает bind v3. `accepted: true` и `bind: "V3"` значат: проверка в этот `now` даёт v3, и такой Hello открывает сессию. Эти файлы закрепляют `caps = 1` и открытый заголовок ratchet. Префикс `VQK1` вместе с одноразовым ключом лежит в `envelope_opk_kem.json`. Биты `16` и `32` и кадр `GroupMls` здесь не лежат: их байты — в [02](../02-hello.md), [03](../03-session.md) и [10](../10-groups.md).
 
 `hello_v3_stale_ts`: подпись честная и покрывает именно устаревший `ts` (`1699999399`). `now` тот же. `|now − ts| = 601` больше окна `freshness_window_secs = 600`, поэтому `accepted: false` ещё до того, как подпись можно было бы принять как v2. Нулевой `nonce` сюда не входит: nonce ненулевой, отказывает окно времени.
 
@@ -94,6 +98,8 @@ Remove-Item Env:UPDATE_VECTORS
 - `relabel_v3_as_v2.open: false` — байты v3 с номером версии 2 не вскрываются как v2.
 
 Честный подписанный конверт v2 (поля снаружи, своя подпись) этот файл не запрещает. Его разбор остаётся в спецификации.
+
+`envelope_opk_kem` запечатан на signed-prekey (`spk_sk`) и одноразовый (`opk_sk`, `opk_id`). `with_kem` мешает ещё секрет ML-KEM-768 (`kem_dk`, монета `kem_coins`): `ct` начинается с `VQK1`, эти байты входят в AAD, без секрета KEM конверт не открывается. `without_kem` — те же X25519 и тот же nonce, без префикса, открывается двумя DH.
 
 ## Prekey
 

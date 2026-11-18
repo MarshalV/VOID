@@ -7,7 +7,10 @@ license = "MIT"
 publish = false
 
 [dependencies]
-void-protocol = { path = "../protocol" }
+void-session = { path = "../protocol/void-session" }
+void-envelope = { path = "../protocol/void-envelope" }
+void-frames = { path = "../protocol/void-frames" }
+void-onion = { path = "../protocol/void-onion" }
 libp2p = { version = "0.56", features = ["ed25519"] }
 rand = "0.8"
 x25519-dalek = { version = "2.0", features = ["static_secrets"] }

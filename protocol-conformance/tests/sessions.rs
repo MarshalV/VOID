@@ -4,11 +4,11 @@
 use libp2p::identity::Keypair;
 use libp2p::PeerId;
 use rand::rngs::OsRng;
-use void_protocol::crypto::{PublicKey, SecureSession, StaticSecret};
-use void_protocol::protocol::{
+use void_frames::protocol::{
     build_v1_hello, hello_bind_ok, verify_hello_transport_binding, HelloBind, V1Packet,
     HELLO_CAP_CBOR, HELLO_CAP_HEADER_AAD,
 };
+use void_session::crypto::{PublicKey, SecureSession, StaticSecret};
 fn peer() -> (Keypair, PeerId) {
     let kp = Keypair::generate_ed25519();
     let id = PeerId::from_public_key(&kp.public());

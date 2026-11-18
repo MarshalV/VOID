@@ -1,7 +1,7 @@
 //! libp2p-facing onion API.
 //!
 //! `void-onion` speaks a byte [`void_onion::PeerId`] and does not link libp2p.
-//! These wrappers keep `void_protocol::onion` on `libp2p::PeerId` for this release.
+//! These wrappers keep the deprecated `void_protocol::onion` path on `libp2p::PeerId`.
 
 use std::collections::{HashMap, HashSet};
 
@@ -13,7 +13,8 @@ pub use void_onion::{
     agent_version_with_pk, b64_decode, b64_encode, deliver_bytes, hex32, hex_bytes, open,
     open_deliver, parse_epoch_from_agent, parse_hex32, parse_hex_bytes, parse_op_from_agent,
     parse_osig2_from_agent, parse_osig_from_agent, parse_pk_from_agent, parse_until_from_agent,
-    seal, target_hop_count, HopDesc, OnionPayload, MAX_CT_BYTES, MAX_HOPS, V2_BUCKETS, V2_SLOT_LEN,
+    seal, target_hop_count, HopDesc, OnionPayload, OnionReplay, MAX_CT_BYTES, MAX_HOPS,
+    ONION_REPLAY_TTL, V2_BUCKETS, V2_SLOT_LEN,
 };
 
 #[derive(Clone, Debug, Default)]

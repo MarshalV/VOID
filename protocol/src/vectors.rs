@@ -14,7 +14,8 @@ use x25519_dalek::{PublicKey, StaticSecret};
 use crate::crypto::{MessageHeader, SecureSession};
 use crate::offline_mail::{
     encode_signed_prekey, identity_offline_public, identity_offline_secret, open_envelope,
-    prekey_is_sealable, seal_for_recipient_fixed, verify_signed_prekey,
+    open_with_opks, prekey_is_sealable, seal_for_recipient_fixed, seal_with_opk_fixed,
+    verify_signed_prekey, OpkSecret,
 };
 use crate::onion::{deliver_bytes, open_deliver, peel_v2, seal_deliver_rng, wrap_v2_rng, V2Peel};
 use crate::protocol::{
@@ -38,6 +39,14 @@ fn hex(bytes: &[u8]) -> String {
 
 fn seed32(tag: u8) -> [u8; 32] {
     let mut s = [0u8; 32];
+    for (i, b) in s.iter_mut().enumerate() {
+        *b = tag.wrapping_mul(17).wrapping_add(i as u8);
+    }
+    s
+}
+
+fn seed64(tag: u8) -> [u8; 64] {
+    let mut s = [0u8; 64];
     for (i, b) in s.iter_mut().enumerate() {
         *b = tag.wrapping_mul(17).wrapping_add(i as u8);
     }
@@ -454,6 +463,135 @@ fn envelope_v2_reject() {
             "note": "Отказ для v=1 и для конверта v3, у которого поле v переписано в 2. Отдельно собранный подписанный конверт v2 этот вектор не запрещает.",
             "v1": { "envelope": envelope_json(&as_v1), "open": false },
             "relabel_v3_as_v2": { "envelope": envelope_json(&as_v2), "open": false }
+        }),
+    );
+}
+
+#[test]
+fn envelope_opk_kem() {
+    let sender_kp = keypair(40);
+    let recipient_kp = keypair(41);
+    let sender = peer_of(&sender_kp);
+    let recipient = peer_of(&recipient_kp);
+    let sender_pk = identity_offline_public(&sender)
+        .expect("identity pk")
+        .to_bytes();
+    let spk = static_secret(44);
+    let opk_sk = static_secret(45);
+    let mut opk_id = [0u8; 16];
+    opk_id.copy_from_slice(&seed32(46)[..16]);
+    let kem_seed = seed64(47);
+    let dk = crate::kem::KemDk::from_bytes(&kem_seed).expect("kem seed");
+    let ek = dk.encapsulation_key().expect("kem ek");
+    let coins = seed32(48);
+    let mut nonce = [0u8; 12];
+    nonce.copy_from_slice(&seed32(43)[..12]);
+    let hybrid = seal_with_opk_fixed(
+        &sender_kp,
+        &recipient,
+        &PublicKey::from(&spk),
+        opk_id,
+        &PublicKey::from(&opk_sk),
+        &sender,
+        &sender_pk,
+        "m-opk-kem",
+        "dm",
+        b"hybrid opk",
+        static_secret(42),
+        nonce,
+        &ek,
+        &coins,
+    )
+    .unwrap();
+    assert!(hybrid.ct.starts_with(b"VQK1"));
+    let opk = OpkSecret {
+        id: opk_id,
+        secret: opk_sk,
+    };
+    let opened = open_with_opks(
+        &[],
+        &[&spk],
+        &[opk],
+        &[],
+        &recipient,
+        &hybrid,
+        &[dk.as_bytes()],
+    )
+    .unwrap();
+    assert_eq!(opened.mail.body, b"hybrid opk");
+    assert_eq!(opened.spent_opk, Some(opk_id));
+    assert!(open_with_opks(
+        &[],
+        &[&spk],
+        &[OpkSecret {
+            id: opk_id,
+            secret: static_secret(45),
+        }],
+        &[],
+        &recipient,
+        &hybrid,
+        &[],
+    )
+    .is_err());
+    let plain = seal_with_opk_fixed(
+        &sender_kp,
+        &recipient,
+        &PublicKey::from(&spk),
+        opk_id,
+        &PublicKey::from(&static_secret(45)),
+        &sender,
+        &sender_pk,
+        "m-opk",
+        "dm",
+        b"two dh",
+        static_secret(42),
+        nonce,
+        &[],
+        &coins,
+    )
+    .unwrap();
+    assert!(!plain.ct.starts_with(b"VQK1"));
+    let opened_plain = open_with_opks(
+        &[],
+        &[&spk],
+        &[OpkSecret {
+            id: opk_id,
+            secret: static_secret(45),
+        }],
+        &[],
+        &recipient,
+        &plain,
+        &[],
+    )
+    .unwrap();
+    assert_eq!(opened_plain.mail.body, b"two dh");
+    check(
+        "envelope_opk_kem",
+        json!({
+            "sender_seed": hex(&seed32(40)),
+            "recipient_seed": hex(&seed32(41)),
+            "spk_sk": hex(&spk.to_bytes()),
+            "opk_sk": hex(&static_secret(45).to_bytes()),
+            "opk_id": hex(&opk_id),
+            "kem_dk": hex(&kem_seed),
+            "kem_coins": hex(&coins),
+            "eph_sk": hex(&static_secret(42).to_bytes()),
+            "nonce": hex(&nonce),
+            "with_kem": {
+                "plaintext": "hybrid opk",
+                "inner_message_id": "m-opk-kem",
+                "envelope": envelope_json(&hybrid),
+                "opened_body": hex(&opened.mail.body),
+                "spent_opk": hex(&opk_id),
+                "open_without_kem_dk": false
+            },
+            "without_kem": {
+                "plaintext": "two dh",
+                "inner_message_id": "m-opk",
+                "envelope": envelope_json(&plain),
+                "opened_body": hex(&opened_plain.mail.body),
+                "starts_with_vqk1": false
+            }
         }),
     );
 }

@@ -1,14 +1,21 @@
 (*
-  Model of three VOID messages. This is not a proof of the Rust.
+  Model of VOID messages. This is not a proof of the Rust.
 
   1. Hello bind: the signature covers both peer ids, the keys, ts, nonce, caps.
      A signature for one recipient is not a signature for another.
   2. The first ratchet frame is AEAD under a key derived from the signed Hello.
-  3. A queue query is accepted only with the owner's signature
+     The AAD is the header and both peer ids. Opening under another AAD fails.
+  3. A repeated Hello is refused. The responder keeps the nonce it just
+     accepted. The next copy of that nonce does not open a second session.
+  4. A queue query is accepted only with the owner's signature
      (VOID_QUEUE_QUERY_V1).
+
+  ProVerif 2.05 output for this file is hello_query.out, next to it.
 *)
 
 free net: channel.
+
+free payload: bitstring [private].
 
 type pkey.
 type skey.
@@ -16,47 +23,103 @@ type nonce.
 
 fun pk(skey): pkey.
 
+fun dh(skey, pkey): bitstring.
+equation forall x: skey, y: skey; dh(x, pk(y)) = dh(y, pk(x)).
+
 fun sign(bitstring, skey): bitstring.
-reduc forall m: bitstring, k: skey; check(sign(m, k), pk(k)) = true.
+reduc forall m: bitstring, k: skey; check(sign(m, k), pk(k)) = m.
 
-fun aead(bitstring, bitstring): bitstring.
-reduc forall m: bitstring, k: bitstring; open(aead(m, k), k) = m.
+fun hello(pkey, pkey, pkey, bitstring, nonce, bitstring): bitstring [data].
 
-fun hello(pkey, pkey, bitstring, bitstring, nonce, bitstring): bitstring.
-fun query(bitstring, bitstring, nonce): bitstring.
+fun header_aad(pkey, pkey, bitstring): bitstring.
 
-event HelloBound(pkey, pkey).
+fun seal(bitstring, bitstring, bitstring): bitstring.
+reduc forall m: bitstring, k: bitstring, a: bitstring;
+  open(seal(m, k, a), k, a) = m.
+
+fun qbody(bitstring, bitstring, nonce): bitstring [data].
+
+event HelloSent(pkey, pkey, nonce).
+event HelloBound(pkey, pkey, nonce).
+event HelloReplayRefused(pkey, nonce).
+event FrameOk(bitstring).
+event BadAadAccepted(bitstring).
+event QuerySigned(pkey, bitstring).
 event QueryOk(pkey, bitstring).
 
-free secret: bitstring [private].
+query attacker(payload).
 
-query attacker(secret).
-query a: pkey, b: pkey, c: pkey;
-  event(HelloBound(a, b)) ==> a <> c || b = c.
+query m: bitstring; event(FrameOk(m)) ==> m = payload.
+
+query m: bitstring; event(BadAadAccepted(m)).
+
+query a: pkey, b: pkey, n: nonce;
+  inj-event(HelloBound(a, b, n)) ==> inj-event(HelloSent(a, b, n)).
+
+query a: pkey, b: pkey, n: nonce;
+  event(HelloReplayRefused(a, n)) ==> event(HelloSent(a, b, n)).
+
+query p: pkey, q: bitstring;
+  event(QueryOk(p, q)) ==> event(QuerySigned(p, q)).
 
 let initiator(skA: skey, pkB: pkey) =
-  new eph: bitstring;
+  new esk: skey;
   new ts: bitstring;
   new n: nonce;
   new caps: bitstring;
-  let body = hello(pk(skA), pkB, eph, ts, n, caps) in
-  out(net, (body, sign(body, skA))).
+  let body = hello(pk(skA), pkB, pk(esk), ts, n, caps) in
+  event HelloSent(pk(skA), pkB, n);
+  out(net, (body, sign(body, skA)));
+  in(net, (hdr: bitstring, ct: bitstring));
+  let key = dh(esk, pkB) in
+  let a = header_aad(pk(skA), pkB, hdr) in
+  let m = open(ct, key, a) in
+  (
+    event FrameOk(m) |
+    (
+      new junk: bitstring;
+      let bad = open(ct, key, junk) in
+      event BadAadAccepted(bad)
+      else
+      0
+    )
+  )
+  else
+  0.
 
 let responder(skB: skey, pkA: pkey) =
   in(net, (body: bitstring, sig: bitstring));
-  if check(sig, pkA) = true then
-  event HelloBound(pkA, pk(skB));
-  out(net, aead(secret, body)).
+  let hello(from, to, ek, ts, n, caps) = check(sig, pkA) in
+  if from = pkA then
+  if to = pk(skB) then
+  if body = hello(from, to, ek, ts, n, caps) then
+  (
+    event HelloBound(pkA, pk(skB), n);
+    let key = dh(skB, ek) in
+    new hdr: bitstring;
+    let a = header_aad(pkA, pk(skB), hdr) in
+    out(net, (hdr, seal(payload, key, a)));
+    in(net, (body2: bitstring, sig2: bitstring));
+    let hello(from2, to2, ek2, ts2, n2, caps2) = check(sig2, pkA) in
+    if from2 = pkA then
+    if to2 = pk(skB) then
+    if body2 = hello(from2, to2, ek2, ts2, n2, caps2) then
+    if n2 = n then
+    event HelloReplayRefused(pkA, n2)
+  ).
 
 let owner(sk: skey, queue: bitstring) =
   new ts: bitstring;
   new n: nonce;
-  let msg = query(queue, ts, n) in
+  let msg = qbody(queue, ts, n) in
+  event QuerySigned(pk(sk), queue);
   out(net, (msg, sign(msg, sk))).
 
 let node(pkOwner: pkey, queue: bitstring) =
   in(net, (msg: bitstring, sig: bitstring));
-  if check(sig, pkOwner) = true then
+  let qbody(qid, ts, n) = check(sig, pkOwner) in
+  if msg = qbody(qid, ts, n) then
+  if qid = queue then
   event QueryOk(pkOwner, queue).
 
 process

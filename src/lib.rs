@@ -3,7 +3,14 @@
 
 pub mod bridge;
 
-pub(crate) use void_protocol::{crypto, group, kad_store, offline_mail, onion, protocol, queue_mail};
+pub(crate) use void_envelope::queue_mail;
+pub(crate) use void_protocol::kad_store;
+pub(crate) use void_session::{crypto, group};
+
+pub(crate) mod offline_mail;
+pub(crate) mod onion;
+pub(crate) mod protocol;
+pub(crate) mod record_keys;
 
 pub(crate) mod bootstrap;
 pub(crate) mod chat_store;

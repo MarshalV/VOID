@@ -58,7 +58,11 @@ pub struct Sealed {
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum Incoming {
-    Commit { epoch: u64 },
+    /// `relay` — Commit, которым этот член покрыл чужое предложение об уходе.
+    /// Его надо разослать остальным: сами они предложение в Commit не превращают.
+    Commit { epoch: u64, relay: Option<Vec<u8>> },
+    /// Предложение об уходе сохранено. Commit соберёт другой член.
+    Proposal,
     Application { epoch: u64, plaintext: Vec<u8> },
 }
 
@@ -168,6 +172,21 @@ impl Device {
         Ok(CommitOutcome { commit, epoch })
     }
 
+    /// Remove-предложение собственного листа. OpenMLS не даёт участнику
+    /// закоммитить такое удаление самому: предложение уходит остальным
+    /// `GroupMls`, Commit собирает член с наименьшим оставшимся листом.
+    /// Локальную группу после этого стирает вызывающий.
+    pub fn remove_self(&mut self, group_id_hex: &str) -> Result<CommitOutcome> {
+        let mut group = self.take_group(group_id_hex)?;
+        let proposal = group
+            .leave_group(&self.provider, &self.signer)
+            .map_err(|e| anyhow!("mls self remove: {e:?}"))?;
+        let epoch = epoch_of(&group);
+        let commit = tls_bytes(&proposal)?;
+        self.remember(group_id_hex, group);
+        Ok(CommitOutcome { commit, epoch })
+    }
+
     pub fn join(&mut self, welcome_bytes: &[u8]) -> Result<(String, u64)> {
         let msg = MlsMessageIn::tls_deserialize_exact(welcome_bytes)
             .map_err(|e| anyhow!("mls welcome frame: {e}"))?;
@@ -230,6 +249,48 @@ impl Device {
                 }
                 Incoming::Commit {
                     epoch: epoch_of(&group),
+                    relay: None,
+                }
+            }
+            ProcessedMessageContent::ProposalMessage(queued) => {
+                let Some(removed) = self_remove_leaf(&queued) else {
+                    self.remember(group_id_hex, group);
+                    return Err(anyhow!("mls: кадр не commit и не письмо"));
+                };
+                if !group.members().any(|m| m.index == removed) {
+                    self.remember(group_id_hex, group);
+                    return Ok(Incoming::Proposal);
+                }
+                if let Err(e) = group.store_pending_proposal(self.provider.storage(), *queued) {
+                    self.remember(group_id_hex, group);
+                    return Err(anyhow!("mls store proposal: {e:?}"));
+                }
+                if lowest_remaining(&group, removed) != Some(group.own_leaf_index()) {
+                    self.remember(group_id_hex, group);
+                    return Ok(Incoming::Proposal);
+                }
+                let built = group.commit_to_pending_proposals(&self.provider, &self.signer);
+                let (commit_msg, _, _) = match built {
+                    Ok(parts) => parts,
+                    Err(e) => {
+                        self.remember(group_id_hex, group);
+                        return Err(anyhow!("mls commit leave: {e:?}"));
+                    }
+                };
+                if let Err(e) = group.merge_pending_commit(&self.provider) {
+                    self.remember(group_id_hex, group);
+                    return Err(anyhow!("mls merge leave: {e:?}"));
+                }
+                let relay = match tls_bytes(&commit_msg) {
+                    Ok(bytes) => bytes,
+                    Err(e) => {
+                        self.remember(group_id_hex, group);
+                        return Err(e);
+                    }
+                };
+                Incoming::Commit {
+                    epoch: epoch_of(&group),
+                    relay: Some(relay),
                 }
             }
             _ => {
@@ -366,6 +427,24 @@ fn decode_key_package(provider: &OpenMlsRustCrypto, bytes: &[u8]) -> Result<KeyP
         .map_err(|e| anyhow!("mls key package validate: {e:?}"))
 }
 
+fn self_remove_leaf(queued: &QueuedProposal) -> Option<LeafNodeIndex> {
+    let Proposal::Remove(remove) = queued.proposal() else {
+        return None;
+    };
+    let Sender::Member(sender) = queued.sender() else {
+        return None;
+    };
+    (*sender == remove.removed()).then_some(remove.removed())
+}
+
+fn lowest_remaining(group: &MlsGroup, removed: LeafNodeIndex) -> Option<LeafNodeIndex> {
+    group
+        .members()
+        .map(|member| member.index)
+        .filter(|index| *index != removed)
+        .min()
+}
+
 fn leaf_of(group: &MlsGroup, peer_id: &str) -> Option<LeafNodeIndex> {
     group.members().find_map(|member| {
         let cred = member.credential.serialized_content();
@@ -444,6 +523,48 @@ mod tests {
             other => panic!("bob after {other:?}"),
         }
         assert!(carol.process(&gid(), &sealed.body).is_err());
+    }
+
+    #[test]
+    fn self_remove_commit_does_not_open_the_next_epoch() {
+        let mut alice = Device::create("alice").unwrap();
+        let mut bob = Device::create("bob").unwrap();
+        let mut carol = Device::create("carol").unwrap();
+        alice.create_group(&gid()).unwrap();
+        let added_b = alice.add_member(&gid(), &bob.key_package().unwrap()).unwrap();
+        bob.join(&added_b.welcome).unwrap();
+        bob.process(&gid(), &added_b.commit).unwrap_err();
+        let added_c = alice.add_member(&gid(), &carol.key_package().unwrap()).unwrap();
+        bob.process(&gid(), &added_c.commit).unwrap();
+        carol.join(&added_c.welcome).unwrap();
+
+        let leaving = carol.remove_self(&gid()).unwrap();
+        let saved = carol.snapshot().unwrap();
+        let Incoming::Commit {
+            relay: Some(commit),
+            ..
+        } = alice.process(&gid(), &leaving.commit).unwrap()
+        else {
+            panic!("alice covers carol's leave");
+        };
+        assert!(alice.process(&gid(), &leaving.commit).is_err());
+        assert!(matches!(
+            bob.process(&gid(), &leaving.commit).unwrap(),
+            Incoming::Proposal
+        ));
+        assert!(matches!(
+            bob.process(&gid(), &commit).unwrap(),
+            Incoming::Commit { .. }
+        ));
+        assert!(bob.process(&gid(), &commit).is_err());
+
+        let sealed = alice.seal(&gid(), &plain("next epoch")).unwrap();
+        match bob.process(&gid(), &sealed.body).unwrap() {
+            Incoming::Application { plaintext, .. } => assert_eq!(plaintext, plain("next epoch")),
+            other => panic!("bob {other:?}"),
+        }
+        let mut restored = Device::from_snapshot(&saved).unwrap();
+        assert!(restored.process(&gid(), &sealed.body).is_err());
     }
 
     #[test]

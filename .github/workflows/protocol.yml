@@ -10,7 +10,32 @@ jobs:
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
       - name: Protocol library and vectors
         run: cargo test -p void-protocol --lib
+      - name: Second implementation
+        run: |
+          python -m pip install cryptography
+          python second/check_vectors.py
       - name: Conformance harness
         run: cargo test -p protocol-conformance
+
+  # cargo test does not exercise these targets. libFuzzer is built on Ubuntu only.
+  fuzz:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@nightly
+      - name: clang for libFuzzer
+        run: sudo apt-get update && sudo apt-get install -y clang
+      - name: cargo-fuzz
+        run: cargo install cargo-fuzz --locked
+      - name: Build and short run
+        working-directory: fuzz
+        run: |
+          set -euo pipefail
+          for target in packet envelope onion_v2 seed_frame; do
+            cargo fuzz run "$target" -- -runs=128 -max_len=4096 -rss_limit_mb=2048
+          done

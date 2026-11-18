@@ -1498,7 +1498,7 @@ impl App {
                     }) = parse_decrypted_chat_frame(&plaintext)
                     {
                         self.merge_incoming_group_sync(
-                            from,
+                            from.to_identity(),
                             group_id,
                             group_name,
                             creator_id,
@@ -3532,6 +3532,31 @@ impl App {
                     self.ingest_chat_message(msg);
                 }
             }
+            Ok(crate::group_mls::MlsIn::Commit {
+                relay: Some(commit),
+                epoch,
+            }) => {
+                let recipients: Vec<PeerId> = self
+                    .groups
+                    .get(&group_id)
+                    .map(|gr| {
+                        gr.member_peer_ids()
+                            .into_iter()
+                            .filter(|p| *p != self.local_peer_id)
+                            .collect()
+                    })
+                    .unwrap_or_default();
+                if !recipients.is_empty() {
+                    let _ = self.command_tx.try_send(UICommand::SendGroupMls {
+                        group_id: group_id.clone(),
+                        epoch,
+                        body: commit,
+                        recipients,
+                        message_id: String::new(),
+                    });
+                }
+                self.persist_vault();
+            }
             Ok(_) => self.persist_vault(),
             Err(_) => {}
         }
@@ -4066,6 +4091,17 @@ impl App {
         let mut updated = group.clone();
         updated.members.retain(|m| m.peer_id != me);
 
+        if group.mls {
+            if let Ok(commit) = self.group_mls.resign(gid) {
+                let _ = self.command_tx.try_send(UICommand::SendGroupMls {
+                    group_id: gid.to_string(),
+                    epoch: commit.epoch,
+                    body: commit.commit,
+                    recipients: notify.clone(),
+                    message_id: String::new(),
+                });
+            }
+        }
         let _ = self.command_tx.try_send(UICommand::SendGroupLeave {
             group_id: gid.to_string(),
             peer_id: me.clone(),

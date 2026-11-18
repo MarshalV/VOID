@@ -1,9 +1,10 @@
 //! Hello bind: transport signature, freshness, caps.
 //!
-//! `PeerId` is `libp2p_identity::PeerId`, the same type as `libp2p::PeerId`.
-//! The signature is still the identity key. This crate does not enable libp2p `kad`.
+//! `PeerId` is the byte newtype. Callers may also pass `libp2p_identity::PeerId`
+//! through [`crate::AsPeerId`]. The signature is still the identity key.
+//! This crate does not enable libp2p `kad`.
 
-use libp2p_identity::PeerId;
+use crate::{AsPeerId, PeerId};
 
 const VOID_HELLO_BIND_PREFIX: &[u8] = b"VOID_E2EE_HELLO_BIND_V1\0";
 const VOID_HELLO_BIND_PREFIX_V2: &[u8] = b"VOID_E2EE_HELLO_BIND_V2\0";
@@ -22,9 +23,10 @@ pub enum HelloBind {
 const MAX_HELLO_TRANSPORT_PUBKEY_PB: usize = 4096;
 
 /// Inline multihash PeerId (Ed25519): извлечь транспортный `PublicKey` для проверки подписи Hello.
-pub fn void_peer_transport_public_key(peer: PeerId) -> Option<libp2p_identity::PublicKey> {
+pub fn void_peer_transport_public_key(peer: impl AsPeerId) -> Option<libp2p_identity::PublicKey> {
     const CODE_IDENTITY: u64 = 0;
-    let mh = peer.as_ref();
+    let peer = peer.to_peer_id();
+    let mh = peer.multihash();
     if mh.code() != CODE_IDENTITY {
         return None;
     }
@@ -33,9 +35,10 @@ pub fn void_peer_transport_public_key(peer: PeerId) -> Option<libp2p_identity::P
 
 /// Ключ для проверки `transport_sig`: из identity-multihash или из protobuf в Hello (hashed PeerId).
 pub fn void_hello_signing_public_key(
-    signer_peer_id: PeerId,
+    signer_peer_id: impl AsPeerId,
     transport_pubkey_pb: &[u8],
 ) -> Option<libp2p_identity::PublicKey> {
+    let signer_peer_id = signer_peer_id.to_peer_id();
     if !transport_pubkey_pb.is_empty() {
         if transport_pubkey_pb.len() > MAX_HELLO_TRANSPORT_PUBKEY_PB {
             return None;
@@ -50,11 +53,13 @@ pub fn void_hello_signing_public_key(
 }
 
 fn hello_bind_message_v1(
-    signer_peer: PeerId,
-    recipient_peer: PeerId,
+    signer_peer: impl AsPeerId,
+    recipient_peer: impl AsPeerId,
     x25519_static: &[u8; 32],
     x25519_ephemeral: &[u8; 32],
 ) -> Vec<u8> {
+    let signer_peer = signer_peer.to_peer_id();
+    let recipient_peer = recipient_peer.to_peer_id();
     let mut v = Vec::with_capacity(96 + VOID_HELLO_BIND_PREFIX.len());
     v.extend_from_slice(VOID_HELLO_BIND_PREFIX);
     v.extend_from_slice(&signer_peer.to_bytes());
@@ -65,13 +70,15 @@ fn hello_bind_message_v1(
 }
 
 fn hello_bind_message_v2(
-    signer_peer: PeerId,
-    recipient_peer: PeerId,
+    signer_peer: impl AsPeerId,
+    recipient_peer: impl AsPeerId,
     x25519_static: &[u8; 32],
     x25519_ephemeral: &[u8; 32],
     ts: u64,
     nonce: &[u8; 16],
 ) -> Vec<u8> {
+    let signer_peer = signer_peer.to_peer_id();
+    let recipient_peer = recipient_peer.to_peer_id();
     let mut v = Vec::with_capacity(96 + VOID_HELLO_BIND_PREFIX_V2.len() + 24);
     v.extend_from_slice(VOID_HELLO_BIND_PREFIX_V2);
     v.extend_from_slice(&signer_peer.to_bytes());
@@ -84,14 +91,16 @@ fn hello_bind_message_v2(
 }
 
 fn hello_bind_message_v3(
-    signer_peer: PeerId,
-    recipient_peer: PeerId,
+    signer_peer: impl AsPeerId,
+    recipient_peer: impl AsPeerId,
     x25519_static: &[u8; 32],
     x25519_ephemeral: &[u8; 32],
     ts: u64,
     nonce: &[u8; 16],
     caps: u32,
 ) -> Vec<u8> {
+    let signer_peer = signer_peer.to_peer_id();
+    let recipient_peer = recipient_peer.to_peer_id();
     let mut v = Vec::with_capacity(96 + VOID_HELLO_BIND_PREFIX_V3.len() + 28);
     v.extend_from_slice(VOID_HELLO_BIND_PREFIX_V3);
     v.extend_from_slice(&signer_peer.to_bytes());
@@ -112,8 +121,8 @@ pub fn hello_now_secs() -> u64 {
 }
 
 pub fn verify_hello_transport_binding(
-    signer_peer_id: PeerId,
-    recipient_peer_id: PeerId,
+    signer_peer_id: impl AsPeerId,
+    recipient_peer_id: impl AsPeerId,
     x25519_static: &[u8; 32],
     x25519_ephemeral: &[u8; 32],
     transport_sig: &[u8],
@@ -139,8 +148,8 @@ pub fn verify_hello_transport_binding(
 /// То же, что [`verify_hello_transport_binding`], но `now` задан снаружи.
 /// Векторы фиксируют окно свежести, не зависят от часов машины.
 pub fn verify_hello_transport_binding_at(
-    signer_peer_id: PeerId,
-    recipient_peer_id: PeerId,
+    signer_peer_id: impl AsPeerId,
+    recipient_peer_id: impl AsPeerId,
     x25519_static: &[u8; 32],
     x25519_ephemeral: &[u8; 32],
     transport_sig: &[u8],
@@ -150,6 +159,8 @@ pub fn verify_hello_transport_binding_at(
     caps: u32,
     now: u64,
 ) -> Option<HelloBind> {
+    let signer_peer_id = signer_peer_id.to_peer_id();
+    let recipient_peer_id = recipient_peer_id.to_peer_id();
     const MAX_SIG: usize = 256;
     if transport_sig.is_empty() || transport_sig.len() > MAX_SIG {
         return None;
@@ -203,14 +214,16 @@ pub fn hello_bind_ok(bind: HelloBind, caps: u32, _via_onion: bool) -> bool {
 
 pub fn sign_hello_transport_binding(
     transport: &libp2p_identity::Keypair,
-    signer_peer: PeerId,
-    recipient_peer: PeerId,
+    signer_peer: impl AsPeerId,
+    recipient_peer: impl AsPeerId,
     x25519_static: &[u8; 32],
     x25519_ephemeral: &[u8; 32],
     ts: u64,
     nonce: &[u8; 16],
     caps: u32,
 ) -> Option<Vec<u8>> {
+    let signer_peer = signer_peer.to_peer_id();
+    let recipient_peer = recipient_peer.to_peer_id();
     let msg = hello_bind_message_v3(
         signer_peer,
         recipient_peer,
@@ -224,8 +237,8 @@ pub fn sign_hello_transport_binding(
 }
 
 fn hello_bind_message_v4(
-    signer_peer: PeerId,
-    recipient_peer: PeerId,
+    signer_peer: impl AsPeerId,
+    recipient_peer: impl AsPeerId,
     x25519_static: &[u8; 32],
     x25519_ephemeral: &[u8; 32],
     ts: u64,
@@ -234,6 +247,8 @@ fn hello_bind_message_v4(
     kem_ek: &[u8],
     kem_ct: &[u8],
 ) -> Vec<u8> {
+    let signer_peer = signer_peer.to_peer_id();
+    let recipient_peer = recipient_peer.to_peer_id();
     let mut v = Vec::with_capacity(160 + kem_ek.len() + kem_ct.len());
     v.extend_from_slice(VOID_HELLO_BIND_PREFIX_V4);
     v.extend_from_slice(&signer_peer.to_bytes());
@@ -250,8 +265,8 @@ fn hello_bind_message_v4(
 
 pub fn sign_hello_pq(
     transport: &libp2p_identity::Keypair,
-    signer_peer: PeerId,
-    recipient_peer: PeerId,
+    signer_peer: impl AsPeerId,
+    recipient_peer: impl AsPeerId,
     x25519_static: &[u8; 32],
     x25519_ephemeral: &[u8; 32],
     ts: u64,
@@ -260,6 +275,8 @@ pub fn sign_hello_pq(
     kem_ek: &[u8],
     kem_ct: &[u8],
 ) -> Option<Vec<u8>> {
+    let signer_peer = signer_peer.to_peer_id();
+    let recipient_peer = recipient_peer.to_peer_id();
     let msg = hello_bind_message_v4(
         signer_peer,
         recipient_peer,
@@ -277,8 +294,8 @@ pub fn sign_hello_pq(
 /// Бит PQ требует отдельную подпись v4 над `kem_ek` и `kem_ct`.
 /// Без бита классический X25519, лишние байты на сессию не влияют.
 pub fn hello_pq_ok(
-    signer_peer_id: PeerId,
-    recipient_peer_id: PeerId,
+    signer_peer_id: impl AsPeerId,
+    recipient_peer_id: impl AsPeerId,
     x25519_static: &[u8; 32],
     x25519_ephemeral: &[u8; 32],
     ts: u64,
@@ -289,6 +306,8 @@ pub fn hello_pq_ok(
     pq_sig: &[u8],
     transport_pubkey_pb: &[u8],
 ) -> bool {
+    let signer_peer_id = signer_peer_id.to_peer_id();
+    let recipient_peer_id = recipient_peer_id.to_peer_id();
     if caps & HELLO_CAP_PQ == 0 {
         return true;
     }

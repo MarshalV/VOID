@@ -3,8 +3,8 @@
 use libp2p::identity::Keypair;
 use libp2p::PeerId;
 use protocol_conformance::mailbox::{MailboxNode, QueryOutcome, SignedMailboxQuery, StoreOutcome};
-use void_protocol::offline_mail::{OfflineEnvelope, MAILBOX_TTL_SECS};
-use void_protocol::protocol::{mailbox_query_message, sign_mailbox_query};
+use void_envelope::offline_mail::{OfflineEnvelope, MAILBOX_TTL_SECS};
+use void_session::mailbox_query::{mailbox_query_message, sign_mailbox_query};
 
 struct Who {
     kp: Keypair,

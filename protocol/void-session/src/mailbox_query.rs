@@ -4,10 +4,11 @@
 
 use std::collections::HashMap;
 
-use libp2p_identity::{Keypair, PeerId};
+use libp2p_identity::Keypair;
 use rand::RngCore;
 
 use crate::hello::void_peer_transport_public_key;
+use crate::{AsPeerId, PeerId};
 
 /// Domain separator. Bytes after it: recipient multihash, `ts` le, nonce.
 pub const MAILBOX_QUERY_PREFIX: &[u8] = b"VOID_MAILBOX_QUERY_v1";
@@ -22,7 +23,8 @@ pub fn mailbox_query_now() -> u64 {
         .unwrap_or(0)
 }
 
-pub fn mailbox_query_message(recipient: &PeerId, ts: u64, nonce: &[u8; 32]) -> Vec<u8> {
+pub fn mailbox_query_message(recipient: &impl AsPeerId, ts: u64, nonce: &[u8; 32]) -> Vec<u8> {
+    let recipient = recipient.to_peer_id();
     let id = recipient.to_bytes();
     let mut v = Vec::with_capacity(MAILBOX_QUERY_PREFIX.len() + id.len() + 8 + 32);
     v.extend_from_slice(MAILBOX_QUERY_PREFIX);
@@ -35,25 +37,32 @@ pub fn mailbox_query_message(recipient: &PeerId, ts: u64, nonce: &[u8; 32]) -> V
 /// Signature of the local identity. `None` when `key` is not `recipient`.
 pub fn sign_mailbox_query(
     key: &Keypair,
-    recipient: &PeerId,
+    recipient: &impl AsPeerId,
     ts: u64,
     nonce: &[u8; 32],
 ) -> Option<Vec<u8>> {
-    if PeerId::from_public_key(&key.public()) != *recipient {
+    let recipient = recipient.to_peer_id();
+    if PeerId::from_public_key(&key.public()) != recipient {
         return None;
     }
-    key.sign(&mailbox_query_message(recipient, ts, nonce))
+    key.sign(&mailbox_query_message(&recipient, ts, nonce))
         .ok()
 }
 
-pub fn verify_mailbox_query(recipient: &PeerId, ts: u64, nonce: &[u8; 32], sig: &[u8]) -> bool {
+pub fn verify_mailbox_query(
+    recipient: &impl AsPeerId,
+    ts: u64,
+    nonce: &[u8; 32],
+    sig: &[u8],
+) -> bool {
+    let recipient = recipient.to_peer_id();
     if sig.is_empty() {
         return false;
     }
-    let Some(pk) = void_peer_transport_public_key(*recipient) else {
+    let Some(pk) = void_peer_transport_public_key(recipient) else {
         return false;
     };
-    pk.verify(&mailbox_query_message(recipient, ts, nonce), sig)
+    pk.verify(&mailbox_query_message(&recipient, ts, nonce), sig)
 }
 
 struct Issued {
@@ -75,7 +84,8 @@ impl ChallengeBook {
     }
 
     /// Mint a nonce bound to `recipient` and `now`. The client must echo both.
-    pub fn issue(&mut self, recipient: PeerId, now: u64) -> ([u8; 32], u64) {
+    pub fn issue(&mut self, recipient: impl AsPeerId, now: u64) -> ([u8; 32], u64) {
+        let recipient = recipient.to_peer_id();
         self.sweep(now);
         if self.by_nonce.len() >= MAX_CHALLENGES {
             if let Some(old) = self.by_nonce.keys().next().copied() {
@@ -100,12 +110,13 @@ impl ChallengeBook {
     /// `ts` outside ±2 minutes does not spend a nonce and does not open the box.
     pub fn authorize(
         &mut self,
-        recipient: &PeerId,
+        recipient: &impl AsPeerId,
         ts: u64,
         nonce: &[u8; 32],
         sig: &[u8],
         now: u64,
     ) -> bool {
+        let recipient = recipient.to_peer_id();
         self.sweep(now);
         if ts.abs_diff(now) > MAILBOX_QUERY_FRESHNESS_SECS {
             return false;
@@ -113,11 +124,11 @@ impl ChallengeBook {
         let Some(issued) = self.by_nonce.get(nonce) else {
             return false;
         };
-        if issued.recipient != *recipient || issued.ts != ts {
+        if issued.recipient != recipient || issued.ts != ts {
             return false;
         }
         self.by_nonce.remove(nonce);
-        verify_mailbox_query(recipient, ts, nonce, sig)
+        verify_mailbox_query(&recipient, ts, nonce, sig)
     }
 
     fn sweep(&mut self, now: u64) {
@@ -130,7 +141,7 @@ impl ChallengeBook {
 pub fn take_if_authorized<T>(
     book: &mut ChallengeBook,
     mail: &mut Vec<T>,
-    recipient: &PeerId,
+    recipient: &impl AsPeerId,
     ts: u64,
     nonce: &[u8; 32],
     sig: &[u8],
@@ -150,8 +161,8 @@ mod tests {
     fn alice_bob() -> (Keypair, PeerId, Keypair, PeerId) {
         let alice = Keypair::generate_ed25519();
         let bob = Keypair::generate_ed25519();
-        let alice_id = alice.public().to_peer_id();
-        let bob_id = bob.public().to_peer_id();
+        let alice_id = PeerId::from_public_key(&alice.public());
+        let bob_id = PeerId::from_public_key(&bob.public());
         (alice, alice_id, bob, bob_id)
     }
 

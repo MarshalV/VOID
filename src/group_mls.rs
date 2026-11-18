@@ -1,9 +1,9 @@
 //! Локальное состояние MLS-групп. Снимок уходит в `vault.bin` и шифруется мастер-ключом.
 
 use anyhow::{anyhow, Result};
-use void_protocol::mls::{AddOutcome, CommitOutcome, Device, Incoming, Sealed};
+use void_mls::{AddOutcome, CommitOutcome, Device, Incoming, Sealed};
 
-pub use void_protocol::mls::MlsSnapshot;
+pub use void_mls::MlsSnapshot;
 
 pub struct GroupMls {
     device: Option<Device>,
@@ -17,7 +17,9 @@ pub enum MlsIn {
     Commit {
         #[allow(dead_code)]
         epoch: u64,
+        relay: Option<Vec<u8>>,
     },
+    Proposal,
     Application { plaintext: Vec<u8> },
 }
 
@@ -69,6 +71,12 @@ impl GroupMls {
         device.remove_member(group_id, peer_id)
     }
 
+    /// Remove-предложение собственного ухода. Вызывающий шлёт его `GroupMls` и только потом стирает группу.
+    pub fn resign(&mut self, group_id: &str) -> Result<CommitOutcome> {
+        let device = self.device.as_mut().ok_or_else(|| anyhow!("mls: устройство не открыто"))?;
+        device.remove_self(group_id)
+    }
+
     pub fn seal(&mut self, group_id: &str, plaintext: &[u8]) -> Result<Sealed> {
         let device = self.device.as_mut().ok_or_else(|| anyhow!("mls: устройство не открыто"))?;
         device.seal(group_id, plaintext)
@@ -84,7 +92,8 @@ impl GroupMls {
             return Ok(MlsIn::Joined { epoch });
         }
         match device.process(group_id, body)? {
-            Incoming::Commit { epoch } => Ok(MlsIn::Commit { epoch }),
+            Incoming::Commit { epoch, relay } => Ok(MlsIn::Commit { epoch, relay }),
+            Incoming::Proposal => Ok(MlsIn::Proposal),
             Incoming::Application { plaintext, .. } => Ok(MlsIn::Application { plaintext }),
         }
     }

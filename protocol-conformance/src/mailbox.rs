@@ -7,8 +7,8 @@
 use std::collections::HashMap;
 
 use libp2p::PeerId;
-use void_protocol::offline_mail::{OfflineEnvelope, ENVELOPE_VERSION, MAILBOX_TTL_SECS};
-use void_protocol::protocol::ChallengeBook;
+use void_envelope::offline_mail::{OfflineEnvelope, ENVELOPE_VERSION, MAILBOX_TTL_SECS};
+use void_session::mailbox_query::ChallengeBook;
 
 const MAX_MAILBOXES: usize = 4096;
 const MAX_PER_MAILBOX: usize = 1024;
@@ -87,7 +87,7 @@ impl MailboxNode {
 
     /// Nonce for `recipient`. Anyone may ask. The signature still has to be theirs.
     pub fn challenge(&mut self, recipient: &str) -> Option<([u8; 32], u64)> {
-        let id = recipient.parse().ok()?;
+        let id: PeerId = recipient.parse().ok()?;
         Some(self.challenges.issue(id, self.now))
     }
 

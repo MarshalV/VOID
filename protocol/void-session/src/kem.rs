@@ -71,6 +71,16 @@ pub fn encapsulate(ek: &[u8]) -> Option<(Vec<u8>, [u8; 32])> {
     Some((ct.as_slice().to_vec(), shared))
 }
 
+/// Те же байты, что [`encapsulate`], но монета задана. Для вектора, не для письма.
+pub fn encapsulate_deterministic(ek: &[u8], coins: &[u8; 32]) -> Option<(Vec<u8>, [u8; 32])> {
+    let ek = load_ek(ek)?;
+    let m = ml_kem::B32::try_from(coins.as_slice()).ok()?;
+    let (ct, ss) = ek.encapsulate_deterministic(&m);
+    let mut shared = [0u8; 32];
+    shared.copy_from_slice(ss.as_slice());
+    Some((ct.as_slice().to_vec(), shared))
+}
+
 pub fn decapsulate(dk: &KemDk, ct: &[u8]) -> Option<[u8; 32]> {
     let dk = load_dk(dk.as_bytes())?;
     let ct = Ciphertext::try_from(ct).ok()?;

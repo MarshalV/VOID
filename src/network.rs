@@ -108,11 +108,8 @@ enum MailboxOnionWait {
         handoff: Arc<ActiveHandoff>,
         message_id: String,
     },
-    // Прямой TCP до ноды. Вариант остаётся для ответа, пришедшего onion-ом.
-    #[allow(dead_code)]
-    Challenge {
-        dest: PeerId,
-    },
+    /// Ждём `MailboxChallenge`, чтобы подписать Query и вернуть его на `dest`.
+    Challenge { dest: PeerId },
     Query,
 }
 
@@ -846,9 +843,19 @@ fn ingest_onion_hints(
                 onion_rt_put_desc(pid, desc);
             }
         }
-        bootstrap_peer_ids.insert(pid);
-        for s in &hint.addrs {
-            if let Ok(ma) = s.parse::<Multiaddr>() {
+        if desc_ok {
+            bootstrap_peer_ids.insert(pid);
+            let Some(valid) = validate_bootstrap_gossip_addrs(&hint.addrs) else {
+                continue;
+            };
+            for s in valid {
+                let Ok(ma) = s.parse::<Multiaddr>() else {
+                    continue;
+                };
+                if peer_id_from_multiaddr(&ma) != Some(pid) || crate::bootstrap::addr_is_quic_v1(&ma)
+                {
+                    continue;
+                }
                 extra_addrs.push(ma);
             }
         }
@@ -2574,6 +2581,7 @@ fn seal_and_publish_offline_batch(
                 &item.message_id,
                 &item.kind,
                 &item.payload,
+                kem_ek,
             )
         };
         if let Ok(env) = sealed_one {
@@ -2584,11 +2592,29 @@ fn seal_and_publish_offline_batch(
         signal_publish_done(&done, false);
         return false;
     }
-    if RelayMailbox::merge(
-        relay_mail_store,
-        &recipient.to_string(),
-        sealed.clone(),
-    ) {
+    let now_mail = crate::offline_mail::prekey_unix_now();
+    let grant = write_grants.get(&recipient);
+    let has_queues = peer_has_queues(recipient);
+    let peer_copies: Vec<OfflineEnvelope> = if bootstrap_peer_ids.is_empty() {
+        sealed.clone()
+    } else {
+        sealed
+            .iter()
+            .filter(|env| {
+                let ready = grant.is_some()
+                    && crate::queue_mail::pad_queue_blob(env).is_ok();
+                !peer_slot_suppressed(has_queues, grant, now_mail, ready)
+            })
+            .cloned()
+            .collect()
+    };
+    if !peer_copies.is_empty()
+        && RelayMailbox::merge(
+            relay_mail_store,
+            &recipient.to_string(),
+            peer_copies,
+        )
+    {
         let _ = RelayMailbox::save(relay_mail_store);
     }
     // Очередь включена: DHT не второй ящик по PeerId.
@@ -2723,6 +2749,18 @@ fn queue_grant_live(grant: Option<&crate::queue_mail::QueueGrant>, now: u64) -> 
     grant.is_some_and(|g| g.expiry > now)
 }
 
+/// Hello bit 4 and a live grant: the TCP path sends only `QueueStore`.
+/// A peer without the bit, a dead grant, or a blob that does not fit still
+/// gets the PeerId slot.
+fn peer_slot_suppressed(
+    has_queue_cap: bool,
+    grant: Option<&crate::queue_mail::QueueGrant>,
+    now: u64,
+    queue_blob_ready: bool,
+) -> bool {
+    has_queue_cap && queue_grant_live(grant, now) && queue_blob_ready
+}
+
 fn queue_store_packet(
     env: &OfflineEnvelope,
     grant: Option<&crate::queue_mail::QueueGrant>,
@@ -2770,6 +2808,7 @@ fn fanout_relay_mail(
                 let _ = rr_send(swarm, peer, extra.clone());
             }
         }
+        // Здесь нет диспетчера: соседи держат слот PeerId. Очередь им некуда положить.
         let packet = peer_mailbox_packet(&recip, env);
         for peer in &peers {
             let rid = swarm
@@ -2811,7 +2850,34 @@ fn track_mailbox_rr(
     }
 }
 
-/// Один конверт — один RR. Если до ящика есть onion entry, кадр уходит туда, не на сам ящик.
+enum MailboxSend {
+    Onion(libp2p::request_response::OutboundRequestId),
+    Direct(libp2p::request_response::OutboundRequestId),
+    /// Нет живого TCP, и ячейка не собралась.
+    Held,
+}
+
+/// Ячейка v2, если есть hop с живым дескриптором и кадр влезает в бакет 64 КиБ.
+/// Прямой TCP: bootstrap один (пути нет) или кадр в бакет не влез.
+fn send_mailbox_frame(
+    swarm: &mut libp2p::Swarm<ChatBehaviour>,
+    dest: PeerId,
+    packet: V1Packet,
+) -> MailboxSend {
+    if onion_rt_mailbox_hops(dest, swarm.connected_peers().copied()).is_some() {
+        if let Some(rid) = send_v1_to_peer(swarm, dest, packet.clone()) {
+            return MailboxSend::Onion(rid);
+        }
+    }
+    if swarm.is_connected(&dest) {
+        return MailboxSend::Direct(rr_send(swarm, &dest, packet));
+    }
+    MailboxSend::Held
+}
+
+/// Слот PeerId — ячейкой v2, когда есть hop с живым дескриптором и конверт
+/// влезает в бакет 64 КиБ. Прямой TCP: bootstrap один или ячейка не влезла.
+/// `QueueStore` остаётся прямым: блоб 64 КиБ в ячейку не кладётся.
 fn dispatch_mailbox_stores(
     swarm: &mut libp2p::Swarm<ChatBehaviour>,
     dest: PeerId,
@@ -2821,25 +2887,32 @@ fn dispatch_mailbox_stores(
     pending_relay_gates: &mut HashMap<(PeerId, PeerId), Arc<ActiveHandoff>>,
     store_track: &mut MailboxStoreTrack,
     handoff: &Option<Arc<ActiveHandoff>>,
+    bootstrap_peer_ids: &HashSet<PeerId>,
     grant: Option<&crate::queue_mail::QueueGrant>,
 ) -> bool {
     if envelopes.is_empty() {
         return false;
     }
     let recip = recipient.to_string();
-    let ready = onion_rt_mailbox_hops(dest, swarm.connected_peers().copied()).is_some();
     let connected = swarm.is_connected(&dest);
     let now = crate::offline_mail::prekey_unix_now();
-    // Бит очереди уже обменян грантом. Копия в слот PeerId даёт пустой Deliver,
-    // и клиент считает сдачу проваленной, хотя очередь письмо приняла.
-    let queue_only = queue_grant_live(grant, now);
+    let has_queues = peer_has_queues(recipient);
+    let replicas = grant
+        .map(|g| {
+            crate::queue_mail::closest_queue_peers(
+                &g.queue_id,
+                bootstrap_peer_ids.iter().copied(),
+            )
+        })
+        .unwrap_or_default();
+    let send_queue = replicas.is_empty() || replicas.iter().any(|peer| *peer == dest);
     let mut queued = Vec::new();
     for env in envelopes {
-        let packet = peer_mailbox_packet(&recip, env);
-        if connected {
+        let queue_ready = queue_store_packet(env, grant).is_some();
+        if connected && send_queue {
             if let Some(extra) = queue_store_packet(env, grant) {
                 let rid = rr_send(swarm, &dest, extra);
-                if queue_only {
+                if peer_slot_suppressed(has_queues, grant, now, true) {
                     track_mailbox_rr(
                         rid,
                         store_track,
@@ -2850,18 +2923,15 @@ fn dispatch_mailbox_stores(
                     continue;
                 }
             }
-            let rid = rr_send(swarm, &dest, packet);
-            track_mailbox_rr(
-                rid,
-                store_track,
-                handoff,
-                recipient,
-                env.message_id.clone(),
-            );
+        } else if send_queue && queue_ready && peer_slot_suppressed(has_queues, grant, now, true) {
+            queued.push(env.clone());
+            continue;
+        } else if peer_slot_suppressed(has_queues, grant, now, queue_ready) {
             continue;
         }
-        if ready {
-            if let Some(rid) = send_v1_to_peer(swarm, dest, packet.clone()) {
+        let packet = peer_mailbox_packet(&recip, env);
+        match send_mailbox_frame(swarm, dest, packet) {
+            MailboxSend::Onion(rid) | MailboxSend::Direct(rid) => {
                 track_mailbox_rr(
                     rid,
                     store_track,
@@ -2869,10 +2939,9 @@ fn dispatch_mailbox_stores(
                     recipient,
                     env.message_id.clone(),
                 );
-                continue;
             }
+            MailboxSend::Held => queued.push(env.clone()),
         }
-        queued.push(env.clone());
     }
     if queued.is_empty() {
         return false;
@@ -2913,6 +2982,7 @@ fn fanout_relay_to_bootstraps(
             pending_relay_gates,
             store_track,
             handoff,
+            bootstrap_peer_ids,
             grant,
         );
         if !queued {
@@ -3047,6 +3117,7 @@ fn flush_pending_relay_for_peer(
     pending_relay_gates: &mut HashMap<(PeerId, PeerId), Arc<ActiveHandoff>>,
     store_track: &mut MailboxStoreTrack,
     peer: PeerId,
+    bootstrap_peer_ids: &HashSet<PeerId>,
     write_grants: &HashMap<PeerId, crate::queue_mail::QueueGrant>,
 ) {
     for (recipient, envelopes) in pending_relay.take_for(&peer) {
@@ -3060,6 +3131,7 @@ fn flush_pending_relay_for_peer(
             pending_relay_gates,
             store_track,
             &handoff,
+            bootstrap_peer_ids,
             write_grants.get(&recipient),
         );
     }
@@ -3071,7 +3143,7 @@ fn query_relay_mailbox(
     local_peer_id: PeerId,
     bootstrap_peer_ids: &HashSet<PeerId>,
     last_query_at: &mut Option<Instant>,
-    _pending_challenges: &mut HashSet<libp2p::request_response::OutboundRequestId>,
+    pending_challenges: &mut HashSet<libp2p::request_response::OutboundRequestId>,
 ) -> bool {
     const MIN_GAP: Duration = Duration::from_millis(750);
     if last_query_at.is_some_and(|t| t.elapsed() < MIN_GAP) {
@@ -3095,19 +3167,28 @@ fn query_relay_mailbox(
         return false;
     }
     *last_query_at = Some(Instant::now());
-    // Слот PeerId: VOID_node отдаёт его на OfflineMailboxQuery { recipient },
-    // и только если TCP-пир — сам получатель. Очередь забирается отдельно,
-    // через QueueChallenge. MailboxChallenge этот диспетчер не разбирает.
-    let packet = V1Packet::OfflineMailboxQuery {
+    // Сначала nonce. Подписанный Query уходит ответом на MailboxChallenge,
+    // ячейкой v2, если до ящика есть hop с живым дескриптором.
+    let packet = V1Packet::MailboxChallengeRequest {
         recipient: local_peer_id.to_string(),
-        ts: 0,
-        nonce: [0u8; 32],
-        sig: Vec::new(),
     };
+    let mut sent = false;
     for peer in peers {
-        rr_send(swarm, &peer, packet.clone());
+        match send_mailbox_frame(swarm, peer, packet.clone()) {
+            MailboxSend::Onion(rid) => {
+                if let Some(token) = mailbox_onion_rr_token(&rid) {
+                    mailbox_onion_insert(token, MailboxOnionWait::Challenge { dest: peer });
+                }
+                sent = true;
+            }
+            MailboxSend::Direct(rid) => {
+                pending_challenges.insert(rid);
+                sent = true;
+            }
+            MailboxSend::Held => {}
+        }
     }
-    true
+    sent
 }
 
 fn query_relay_mailbox_with_bootstraps(
@@ -3754,6 +3835,7 @@ fn send_create_queue(
     queue: &crate::queue_mail::OwnedQueue,
     pending: &mut HashMap<libp2p::request_response::OutboundRequestId, PeerId>,
     for_peer: PeerId,
+    already: &HashSet<PeerId>,
 ) -> bool {
     let Some(sig) = crate::queue_mail::sign_create(queue) else {
         return false;
@@ -3765,16 +3847,28 @@ fn send_create_queue(
         expiry: queue.expiry,
         sig,
     };
-    let Some(dest) = swarm.connected_peers().copied().find(|p| {
-        bootstrap_peer_ids.contains(p) && *p != local_peer_id
-    }) else {
+    let replicas = crate::queue_mail::closest_queue_peers(
+        &queue.queue_id,
+        bootstrap_peer_ids.iter().copied(),
+    );
+    let mut sent = false;
+    for dest in replicas {
+        if dest == local_peer_id || already.contains(&dest) || !swarm.is_connected(&dest) {
+            continue;
+        }
+        let rid = rr_send(swarm, &dest, packet.clone());
+        pending.insert(rid, for_peer);
+        sent = true;
+    }
+    if !sent && already.is_empty() {
         queue_offer_due().lock().expect("queue due").insert(for_peer);
-        return false;
-    };
-    let rid = rr_send(swarm, &dest, packet);
-    pending.insert(rid, for_peer);
-    true
+    }
+    sent
 }
+
+/// Пустой подписанный опрос своей очереди, когда письма не ждали.
+/// Не сдвигается от `Deliver`: время опроса не равно приходу письма.
+const QUEUE_NOISE_QUERY_EVERY: Duration = Duration::from_secs(17);
 
 fn query_contact_queues(
     swarm: &mut libp2p::Swarm<ChatBehaviour>,
@@ -3794,18 +3888,22 @@ fn query_contact_queues(
     if ids.is_empty() {
         return;
     }
-    let Some(dest) = swarm.connected_peers().copied().find(|p| {
-        bootstrap_peer_ids.contains(p) && *p != local_peer_id
-    }) else {
-        return;
-    };
     for queue_id in ids {
-        let rid = rr_send(
-            swarm,
-            &dest,
-            V1Packet::QueueChallengeRequest { queue_id },
+        let replicas = crate::queue_mail::closest_queue_peers(
+            &queue_id,
+            bootstrap_peer_ids.iter().copied(),
         );
-        pending.insert(rid, queue_id);
+        for dest in replicas {
+            if dest == local_peer_id || !swarm.is_connected(&dest) {
+                continue;
+            }
+            let rid = rr_send(
+                swarm,
+                &dest,
+                V1Packet::QueueChallengeRequest { queue_id },
+            );
+            pending.insert(rid, queue_id);
+        }
     }
 }
 
@@ -3855,6 +3953,7 @@ async fn maintain_contact_queues(
     prev_queues: &mut HashMap<PeerId, crate::queue_mail::OwnedQueue>,
     write_grants: &HashMap<PeerId, crate::queue_mail::QueueGrant>,
     queue_ready: &mut HashSet<PeerId>,
+    queue_replica_acks: &mut HashMap<PeerId, HashSet<PeerId>>,
     queue_grant_sent: &mut HashSet<PeerId>,
     pending_queue_creates: &mut HashMap<libp2p::request_response::OutboundRequestId, PeerId>,
     outbound_msg_requests: &mut HashMap<
@@ -3884,6 +3983,15 @@ async fn maintain_contact_queues(
         if q.should_rotate(now_unix) || !queue_ready.contains(peer) {
             peers.insert(*peer);
         }
+        let have = queue_replica_acks.get(peer).map(|set| set.len()).unwrap_or(0);
+        let need = crate::queue_mail::closest_queue_peers(
+            &q.queue_id,
+            bootstrap_peer_ids.iter().copied(),
+        )
+        .len();
+        if have < need {
+            peers.insert(*peer);
+        }
     }
     let now = chrono::Local::now().format("%H:%M:%S").to_string();
     for peer in peers {
@@ -3900,6 +4008,7 @@ async fn maintain_contact_queues(
         let missing = !owned_queues.contains_key(&peer);
         let stuck = owned_queues.contains_key(&peer) && !queue_ready.contains(&peer);
         if missing || rotate || stuck {
+            queue_replica_acks.remove(&peer);
             if !missing {
                 if queue_ready.contains(&peer) {
                     if let Some(old) = owned_queues.remove(&peer) {
@@ -3919,10 +4028,30 @@ async fn maintain_contact_queues(
                 &queue,
                 pending_queue_creates,
                 peer,
+                &HashSet::new(),
             ) {
                 owned_queues.insert(peer, queue);
             }
             continue;
+        }
+        if let Some(queue) = owned_queues.get(&peer) {
+            let already = queue_replica_acks.get(&peer).cloned().unwrap_or_default();
+            let need = crate::queue_mail::closest_queue_peers(
+                &queue.queue_id,
+                bootstrap_peer_ids.iter().copied(),
+            )
+            .len();
+            if already.len() < need {
+                send_create_queue(
+                    swarm,
+                    bootstrap_peer_ids,
+                    local_peer_id,
+                    queue,
+                    pending_queue_creates,
+                    peer,
+                    &already,
+                );
+            }
         }
         if queue_ready.contains(&peer) && !queue_grant_sent.contains(&peer) {
             let Some(queue) = owned_queues.get(&peer) else {
@@ -4573,6 +4702,7 @@ pub async fn run_chat_network(
         let mut prev_queues: HashMap<PeerId, crate::queue_mail::OwnedQueue> = HashMap::new();
         let mut queue_grant_sent: HashSet<PeerId> = HashSet::new();
         let mut queue_ready: HashSet<PeerId> = HashSet::new();
+        let mut queue_replica_acks: HashMap<PeerId, HashSet<PeerId>> = HashMap::new();
         let mut pending_queue_creates: HashMap<
             libp2p::request_response::OutboundRequestId,
             PeerId,
@@ -4591,6 +4721,7 @@ pub async fn run_chat_network(
         let mut relay_mail_store = RelayMailbox::load();
         let mut fetch_mailbox_after = Some(Instant::now());
         let mut last_mailbox_query_at: Option<Instant> = None;
+        let mut last_queue_noise = Instant::now();
 
         let _instance_lock = match crate::paths::acquire_instance_lock() {
             Ok(f) => f,
@@ -4815,8 +4946,9 @@ pub async fn run_chat_network(
                         &mut owned_queues,
                         &mut prev_queues,
                         &write_grants,
-                        &mut queue_ready,
-                        &mut queue_grant_sent,
+        &mut queue_ready,
+        &mut queue_replica_acks,
+        &mut queue_grant_sent,
                         &mut pending_queue_creates,
                         &mut outbound_msg_requests,
                         &mut outbound_delete_requests,
@@ -4851,6 +4983,17 @@ pub async fn run_chat_network(
                                 fetch_mailbox_after = Some(Instant::now() + gap);
                             }
                         }
+                    }
+                    if last_queue_noise.elapsed() >= QUEUE_NOISE_QUERY_EVERY {
+                        query_contact_queues(
+                            &mut swarm,
+                            local_peer_id,
+                            &bootstrap_peer_ids,
+                            &owned_queues,
+                            &prev_queues,
+                            &mut pending_queue_challenges,
+                        );
+                        last_queue_noise = Instant::now();
                     }
                 }
                 // ─── Tick: эпидемический обмен bootstrap-нодами (2 мин) ─────
@@ -7060,43 +7203,6 @@ pub async fn run_chat_network(
                                                     &void_bootstraps,
                                                 );
                                             }
-                                            if gossip_trusted {
-                                            if let Some(valid) =
-                                                validate_bootstrap_gossip_addrs(&addrs)
-                                            {
-                                                let parsed: Vec<Multiaddr> = valid
-                                                    .iter()
-                                                    .filter_map(|s| s.parse().ok())
-                                                    .collect();
-                                                let added = merge_bootstraps_into_swarm(
-                                                    &mut swarm,
-                                                    &mut void_bootstraps,
-                                                    &mut bootstrap_peer_ids,
-                                                    &parsed,
-                                                    false,
-                                                );
-                                                if added > 0 {
-                                                    fanout_bootstrap_gossip(
-                                                        &mut swarm,
-                                                        local_peer_id,
-                                                        &bootstrap_peer_ids,
-                                                        valid.clone(),
-                                                        collect_onion_hints(
-                                                            &onion_keys,
-                                                            &onion_key_sigs,
-                                                            &void_bootstraps,
-                                                            &onion_descs,
-                                                        ),
-                                                        Some(peer),
-                                                    );
-                                                    let _ = event_tx
-                                                        .send(NetworkEvent::BootstrapsLearned(
-                                                            valid,
-                                                        ))
-                                                        .await;
-                                                }
-                                            }
-                                            }
                                             let our_extra: Vec<String> = void_bootstraps
                                                 .iter()
                                                 .map(|a| a.to_string())
@@ -8240,7 +8346,9 @@ pub async fn run_chat_network(
                                         if let Some(for_peer) =
                                             pending_queue_creates.remove(&request_id)
                                         {
-                                            if !queue_ready.contains(&for_peer) {
+                                            if !queue_ready.contains(&for_peer)
+                                                && !pending_queue_creates.values().any(|p| *p == for_peer)
+                                            {
                                                 owned_queues.remove(&for_peer);
                                             }
                                             queue_offer_due()
@@ -8331,6 +8439,10 @@ pub async fn run_chat_network(
                                             if let Some(for_peer) =
                                                 pending_queue_creates.remove(&request_id)
                                             {
+                                                queue_replica_acks
+                                                    .entry(for_peer)
+                                                    .or_default()
+                                                    .insert(peer);
                                                 queue_ready.insert(for_peer);
                                                 let record =
                                                     crate::queue_mail::ContactQueueRecord::assemble(
@@ -8387,13 +8499,14 @@ pub async fn run_chat_network(
                                                         now
                                                     );
                                                 }
-                                            } else if let Some((handoff, _recip, message_id)) =
+                                            } else if let Some((handoff, recip, message_id)) =
                                                 outbound_mailbox_stores.remove(&request_id)
                                             {
                                                 debug!(
-                                                    "[{}] ✅ RR: OfflineMailboxStore Ack {}",
+                                                    "[{}] ✅ RR: OfflineMailboxStore Ack {} peer={}",
                                                     now,
-                                                    &message_id[..8.min(message_id.len())]
+                                                    &message_id[..8.min(message_id.len())],
+                                                    recip
                                                 );
                                                 stored_mail_ids.insert(message_id.clone());
                                                 handoff.note_store_ack(&message_id);
@@ -9174,7 +9287,20 @@ pub async fn run_chat_network(
                                                         nonce,
                                                         sig,
                                                     };
-                                                    rr_send(&mut swarm, &peer, packet);
+                                                    match send_mailbox_frame(&mut swarm, peer, packet) {
+                                                        MailboxSend::Onion(rid) => {
+                                                            if let Some(token) =
+                                                                mailbox_onion_rr_token(&rid)
+                                                            {
+                                                                mailbox_onion_insert(
+                                                                    token,
+                                                                    MailboxOnionWait::Query,
+                                                                );
+                                                            }
+                                                        }
+                                                        MailboxSend::Direct(_)
+                                                        | MailboxSend::Held => {}
+                                                    }
                                                 }
                                             }
                                         }
@@ -9596,6 +9722,7 @@ pub async fn run_chat_network(
                                 &mut pending_relay_gates,
                                 &mut outbound_mailbox_stores,
                                 peer_id,
+                                &bootstrap_peer_ids,
                                 &write_grants,
                             );
 
@@ -11260,5 +11387,30 @@ mod mailbox_onion_path_tests {
         assert_ne!(hops[0].0, mailbox);
         assert_eq!(hops.last().map(|(peer, _)| *peer), Some(mailbox));
         assert!(onion_rt_mailbox_hops(mailbox, std::iter::once(mailbox)).is_none());
+    }
+}
+
+#[cfg(test)]
+mod queue_copy_tests {
+    use super::peer_slot_suppressed;
+
+    fn grant(expiry: u64) -> crate::queue_mail::QueueGrant {
+        crate::queue_mail::QueueGrant {
+            queue_id: [1u8; 32],
+            write_token: [2u8; 32],
+            expiry,
+        }
+    }
+
+    #[test]
+    fn bit4_and_live_grant_drops_the_peer_slot() {
+        let now = 1_700_000_000u64;
+        let live = grant(now + 10);
+        assert!(peer_slot_suppressed(true, Some(&live), now, true));
+        assert!(!peer_slot_suppressed(false, Some(&live), now, true));
+        assert!(!peer_slot_suppressed(true, Some(&live), now, false));
+        assert!(!peer_slot_suppressed(true, None, now, true));
+        let dead = grant(now);
+        assert!(!peer_slot_suppressed(true, Some(&dead), now, true));
     }
 }

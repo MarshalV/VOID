@@ -5,7 +5,7 @@ use chacha20poly1305::{
     aead::{Aead, KeyInit, Payload},
     ChaCha20Poly1305, Nonce,
 };
-use libp2p_identity::PeerId;
+use void_session::{AsPeerId, PeerId};
 use rand::RngCore;
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
@@ -399,10 +399,12 @@ pub struct PublishedPrekey {
 /// v1 (без срока) ещё проверяется, но [`prekey_is_sealable`] его отвергает.
 pub fn encode_signed_prekey(
     transport: &libp2p_identity::Keypair,
-    owner: &PeerId,
+    owner: &impl AsPeerId,
     pk: &[u8; 32],
     not_after: u64,
 ) -> Option<PublishedPrekey> {
+    let owner = owner.to_peer_id();
+    let owner = &owner;
     if PeerId::from_public_key(&transport.public()) != *owner || not_after == 0 {
         return None;
     }
@@ -431,11 +433,13 @@ pub fn encode_signed_prekey(
 /// Подпись покрывает оба ключа. v2 остаётся для старых записей.
 pub fn encode_signed_prekey_v3(
     transport: &libp2p_identity::Keypair,
-    owner: &PeerId,
+    owner: &impl AsPeerId,
     pk: &[u8; 32],
     not_after: u64,
     kem_ek: &[u8],
 ) -> Option<PublishedPrekey> {
+    let owner = owner.to_peer_id();
+    let owner = &owner;
     if PeerId::from_public_key(&transport.public()) != *owner
         || not_after == 0
         || kem_ek.len() != void_session::kem::EK_LEN
@@ -465,7 +469,9 @@ pub fn encode_signed_prekey_v3(
 }
 
 /// Prekey из DHT-записи, только если её подписал владелец `owner`.
-pub fn verify_signed_prekey(owner: &PeerId, value: &[u8]) -> Option<SignedPrekey> {
+pub fn verify_signed_prekey(owner: &impl AsPeerId, value: &[u8]) -> Option<SignedPrekey> {
+    let owner = owner.to_peer_id();
+    let owner = &owner;
     let pk: [u8; 32] = value.get(..32)?.try_into().ok()?;
     if pk == [0u8; 32] {
         return None;
@@ -519,12 +525,14 @@ pub fn verify_signed_prekey(owner: &PeerId, value: &[u8]) -> Option<SignedPrekey
 
 /// Подпись `PrekeyPut` / `PrekeyOffer` (сырой sig, не DHT-блоб).
 pub fn verify_prekey_offer(
-    owner: &PeerId,
+    owner: &impl AsPeerId,
     pk: &[u8; 32],
     not_after: u64,
     sig: &[u8],
     kem_ek: &[u8],
 ) -> bool {
+    let owner = owner.to_peer_id();
+    let owner = &owner;
     if *pk == [0u8; 32] || sig.is_empty() || not_after == 0 {
         return false;
     }
@@ -555,7 +563,9 @@ fn prekey_now() -> u64 {
 /// X25519-ключ офлайн-почты, выведенный из Ed25519-ключа внутри PeerId
 /// (как `crypto_sign_ed25519_pk_to_curve25519`). Его не раздаёт ни нода, ни DHT —
 /// подменить нечего.
-pub fn identity_offline_public(peer: &PeerId) -> Option<PublicKey> {
+pub fn identity_offline_public(peer: &impl AsPeerId) -> Option<PublicKey> {
+    let peer = peer.to_peer_id();
+    let peer = &peer;
     let ed = void_session::hello::void_peer_transport_public_key(*peer)?
         .try_into_ed25519()
         .ok()?;
@@ -581,7 +591,7 @@ pub fn identity_offline_secret(key: &libp2p_identity::Keypair) -> Option<StaticS
 /// Ключ запечатывания нового письма: только проверенный prekey.
 /// X25519 из PeerId сюда не подставляется. Им открывают старые конверты.
 pub fn offline_seal_key(
-    _recipient: &PeerId,
+    _recipient: &impl AsPeerId,
     verified_prekey: Option<[u8; 32]>,
 ) -> Option<PublicKey> {
     let pk = verified_prekey?;
@@ -647,10 +657,12 @@ fn opk_signed_message(owner: &PeerId, id: &[u8; 16], pk: &[u8; 32]) -> Vec<u8> {
 
 pub fn encode_one_time_prekey(
     transport: &libp2p_identity::Keypair,
-    owner: &PeerId,
+    owner: &impl AsPeerId,
     id: &[u8; 16],
     pk: &[u8; 32],
 ) -> Option<OneTimePrekey> {
+    let owner = owner.to_peer_id();
+    let owner = &owner;
     if PeerId::from_public_key(&transport.public()) != *owner
         || *id == [0u8; 16]
         || *pk == [0u8; 32]
@@ -661,7 +673,9 @@ pub fn encode_one_time_prekey(
     Some(OneTimePrekey { id: *id, pk: *pk, sig })
 }
 
-pub fn verify_opk(owner: &PeerId, id: &[u8; 16], pk: &[u8; 32], sig: &[u8]) -> bool {
+pub fn verify_opk(owner: &impl AsPeerId, id: &[u8; 16], pk: &[u8; 32], sig: &[u8]) -> bool {
+    let owner = owner.to_peer_id();
+    let owner = &owner;
     if *id == [0u8; 16] || *pk == [0u8; 32] || sig.is_empty() {
         return false;
     }
@@ -685,7 +699,9 @@ pub fn encode_opk_bundle(opks: &[OneTimePrekey]) -> Vec<u8> {
     v
 }
 
-pub fn decode_opk_bundle(owner: &PeerId, bytes: &[u8]) -> Option<Vec<OneTimePrekey>> {
+pub fn decode_opk_bundle(owner: &impl AsPeerId, bytes: &[u8]) -> Option<Vec<OneTimePrekey>> {
+    let owner = owner.to_peer_id();
+    let owner = &owner;
     if bytes.first() != Some(&1) {
         return None;
     }
@@ -1136,14 +1152,18 @@ fn verify_sender(
 #[allow(clippy::too_many_arguments)]
 pub fn seal_for_recipient(
     transport: &libp2p_identity::Keypair,
-    recipient: &PeerId,
+    recipient: &impl AsPeerId,
     recipient_pk: &PublicKey,
-    sender: &PeerId,
+    sender: &impl AsPeerId,
     sender_pk: &[u8; 32],
     message_id: &str,
     kind: &str,
     plaintext: &[u8],
 ) -> Result<OfflineEnvelope> {
+    let recipient = recipient.to_peer_id();
+    let sender = sender.to_peer_id();
+    let recipient = &recipient;
+    let sender = &sender;
     if PeerId::from_public_key(&transport.public()) != *sender {
         return Err(anyhow!("offline seal: transport key ≠ sender"));
     }
@@ -1169,15 +1189,19 @@ pub fn seal_for_recipient(
 #[allow(clippy::too_many_arguments)]
 pub fn seal_for_recipient_kem(
     transport: &libp2p_identity::Keypair,
-    recipient: &PeerId,
+    recipient: &impl AsPeerId,
     recipient_pk: &PublicKey,
-    sender: &PeerId,
+    sender: &impl AsPeerId,
     sender_pk: &[u8; 32],
     message_id: &str,
     kind: &str,
     plaintext: &[u8],
     kem_ek: &[u8],
 ) -> Result<OfflineEnvelope> {
+    let recipient = recipient.to_peer_id();
+    let sender = sender.to_peer_id();
+    let recipient = &recipient;
+    let sender = &sender;
     if PeerId::from_public_key(&transport.public()) != *sender {
         return Err(anyhow!("offline seal: transport key ≠ sender"));
     }
@@ -1202,9 +1226,9 @@ pub fn seal_for_recipient_kem(
 #[doc(hidden)]
 pub fn seal_for_recipient_fixed(
     transport: &libp2p_identity::Keypair,
-    recipient: &PeerId,
+    recipient: &impl AsPeerId,
     recipient_pk: &PublicKey,
-    sender: &PeerId,
+    sender: &impl AsPeerId,
     sender_pk: &[u8; 32],
     message_id: &str,
     kind: &str,
@@ -1212,6 +1236,10 @@ pub fn seal_for_recipient_fixed(
     eph_secret: StaticSecret,
     nonce: [u8; 12],
 ) -> Result<OfflineEnvelope> {
+    let recipient = recipient.to_peer_id();
+    let sender = sender.to_peer_id();
+    let recipient = &recipient;
+    let sender = &sender;
     seal_for_recipient_parts(
         transport,
         recipient,
@@ -1311,9 +1339,11 @@ fn seal_for_recipient_parts(
 /// `recipient_secrets`: identity-секрет ([`identity_offline_secret`]) и static prekey.
 pub fn open_envelope(
     recipient_secrets: &[&StaticSecret],
-    recipient: &PeerId,
+    recipient: &impl AsPeerId,
     env: &OfflineEnvelope,
 ) -> Result<OpenedEnvelope> {
+    let recipient = recipient.to_peer_id();
+    let recipient = &recipient;
     match env.v {
         ENVELOPE_VERSION => open_v3(recipient_secrets, recipient, env, &[]),
         ENVELOPE_V2 => open_v2(recipient_secrets, recipient, env),
@@ -1461,12 +1491,16 @@ fn hkdf_x3dh(
     spk: &[u8; 32],
     opk_id: &[u8; 16],
     opk_pk: &[u8; 32],
+    kem_ss: Option<&[u8]>,
 ) -> [u8; 32] {
     use hkdf::Hkdf;
     use sha2::Sha256;
-    let mut ikm = Vec::with_capacity(dh_spk.len() + dh_opk.len());
+    let mut ikm = Vec::with_capacity(dh_spk.len() + dh_opk.len() + kem_ss.map(|s| s.len()).unwrap_or(0));
     ikm.extend_from_slice(dh_spk);
     ikm.extend_from_slice(dh_opk);
+    if let Some(ss) = kem_ss {
+        ikm.extend_from_slice(ss);
+    }
     let hk = Hkdf::<Sha256>::new(Some(b"VOID_OFFLINE_X3DH"), &ikm);
     let mut info = Vec::with_capacity(4 + 32 + 32 + 16 + 32);
     info.extend_from_slice(b"mail");
@@ -1485,9 +1519,98 @@ fn x3dh_aad(recipient: &PeerId, outer_id: &str, eph: &[u8; 32], opk_id: &[u8; 16
     v
 }
 
-/// Новое письмо: DH(eph, signed-prekey) и DH(eph, одноразовый). `opk_id` внутри AAD и `ct`.
+/// `VQK1 || kem_ct`. Те же байты стоят в начале `ct` и в конце AAD.
+fn kem_wire(kem_ct: &[u8]) -> Vec<u8> {
+    let mut wire = b"VQK1".to_vec();
+    wire.extend_from_slice(kem_ct);
+    wire
+}
+
+/// Новое письмо: DH(eph, signed-prekey) и DH(eph, одноразовый).
+/// Пустой `kem_ek` оставляет прежнюю печать. Непустой дописывает секрет KEM
+/// и ставит в начало `ct` те же `VQK1` и ciphertext, что печать на один signed-prekey.
+/// Эти байты входят в AAD.
 #[allow(clippy::too_many_arguments)]
 pub fn seal_with_opk(
+    transport: &libp2p_identity::Keypair,
+    recipient: &impl AsPeerId,
+    spk: &PublicKey,
+    opk_id: [u8; 16],
+    opk_pk: &PublicKey,
+    sender: &impl AsPeerId,
+    sender_pk: &[u8; 32],
+    message_id: &str,
+    kind: &str,
+    plaintext: &[u8],
+    kem_ek: &[u8],
+) -> Result<OfflineEnvelope> {
+    let recipient = recipient.to_peer_id();
+    let sender = sender.to_peer_id();
+    let recipient = &recipient;
+    let sender = &sender;
+    let eph_secret = StaticSecret::random_from_rng(&mut rand::rngs::OsRng);
+    let mut nonce = [0u8; 12];
+    rand::thread_rng().fill_bytes(&mut nonce);
+    seal_with_opk_parts(
+        transport,
+        recipient,
+        spk,
+        opk_id,
+        opk_pk,
+        sender,
+        sender_pk,
+        message_id,
+        kind,
+        plaintext,
+        eph_secret,
+        nonce,
+        kem_ek,
+        None,
+    )
+}
+
+#[doc(hidden)]
+#[allow(clippy::too_many_arguments)]
+pub fn seal_with_opk_fixed(
+    transport: &libp2p_identity::Keypair,
+    recipient: &impl AsPeerId,
+    spk: &PublicKey,
+    opk_id: [u8; 16],
+    opk_pk: &PublicKey,
+    sender: &impl AsPeerId,
+    sender_pk: &[u8; 32],
+    message_id: &str,
+    kind: &str,
+    plaintext: &[u8],
+    eph_secret: StaticSecret,
+    nonce: [u8; 12],
+    kem_ek: &[u8],
+    kem_coins: &[u8; 32],
+) -> Result<OfflineEnvelope> {
+    let recipient = recipient.to_peer_id();
+    let sender = sender.to_peer_id();
+    let recipient = &recipient;
+    let sender = &sender;
+    seal_with_opk_parts(
+        transport,
+        recipient,
+        spk,
+        opk_id,
+        opk_pk,
+        sender,
+        sender_pk,
+        message_id,
+        kind,
+        plaintext,
+        eph_secret,
+        nonce,
+        kem_ek,
+        Some(kem_coins),
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+fn seal_with_opk_parts(
     transport: &libp2p_identity::Keypair,
     recipient: &PeerId,
     spk: &PublicKey,
@@ -1498,6 +1621,10 @@ pub fn seal_with_opk(
     message_id: &str,
     kind: &str,
     plaintext: &[u8],
+    eph_secret: StaticSecret,
+    nonce: [u8; 12],
+    kem_ek: &[u8],
+    kem_coins: Option<&[u8; 32]>,
 ) -> Result<OfflineEnvelope> {
     if PeerId::from_public_key(&transport.public()) != *sender {
         return Err(anyhow!("offline seal: transport key ≠ sender"));
@@ -1505,12 +1632,19 @@ pub fn seal_with_opk(
     if opk_id == [0u8; 16] {
         return Err(anyhow!("offline seal: empty one-time prekey"));
     }
-    let eph_secret = StaticSecret::random_from_rng(&mut rand::rngs::OsRng);
-    let mut nonce = [0u8; 12];
-    rand::thread_rng().fill_bytes(&mut nonce);
     let eph = PublicKey::from(&eph_secret).to_bytes();
     let dh_spk = eph_secret.diffie_hellman(spk);
     let dh_opk = eph_secret.diffie_hellman(opk_pk);
+    let (kem_ct, kem_ss) = if kem_ek.is_empty() {
+        (Vec::new(), None)
+    } else {
+        let (ct, ss) = match kem_coins {
+            Some(coins) => void_session::kem::encapsulate_deterministic(kem_ek, coins),
+            None => void_session::kem::encapsulate(kem_ek),
+        }
+        .ok_or_else(|| anyhow!("offline seal: kem"))?;
+        (ct, Some(ss))
+    };
     let key = hkdf_x3dh(
         dh_spk.as_bytes(),
         dh_opk.as_bytes(),
@@ -1518,6 +1652,7 @@ pub fn seal_with_opk(
         spk.as_bytes(),
         &opk_id,
         opk_pk.as_bytes(),
+        kem_ss.as_ref().map(|s| s.as_slice()),
     );
     let mut header = envelope_header_bytes(
         OFFLINE_SIG_PREFIX_V3,
@@ -1543,8 +1678,14 @@ pub fn seal_with_opk(
     fields.resize(padded_len(fields.len()), 0);
     let inner = encode_signed_inner(&sig, &transport_pubkey_pb(transport, sender), &fields);
     let outer_id = outer_message_id(recipient, message_id);
-    let aad = x3dh_aad(recipient, &outer_id, &eph, &opk_id);
-    let ct = ChaCha20Poly1305::new(key.as_slice().into())
+    let mut aad = x3dh_aad(recipient, &outer_id, &eph, &opk_id);
+    let wire = if kem_ct.is_empty() {
+        Vec::new()
+    } else {
+        kem_wire(&kem_ct)
+    };
+    aad.extend_from_slice(&wire);
+    let aead = ChaCha20Poly1305::new(key.as_slice().into())
         .encrypt(
             Nonce::from_slice(&nonce),
             Payload {
@@ -1553,6 +1694,8 @@ pub fn seal_with_opk(
             },
         )
         .map_err(|_| anyhow!("offline seal failed"))?;
+    let mut ct = wire;
+    ct.extend_from_slice(&aead);
     Ok(OfflineEnvelope {
         v: ENVELOPE_VERSION,
         sender: String::new(),
@@ -1578,12 +1721,14 @@ pub fn open_with_opks(
     spk_secrets: &[&StaticSecret],
     opks: &[OpkSecret],
     spent: &[[u8; 16]],
-    recipient: &PeerId,
+    recipient: &impl AsPeerId,
     env: &OfflineEnvelope,
     kem_dks: &[&[u8]],
 ) -> Result<OpenOutcome> {
+    let recipient = recipient.to_peer_id();
+    let recipient = &recipient;
     if env.v == ENVELOPE_VERSION {
-        if let Some(mail) = open_x3dh(spk_secrets, opks, spent, recipient, env)? {
+        if let Some(mail) = open_x3dh(spk_secrets, opks, spent, recipient, env, kem_dks)? {
             return Ok(mail);
         }
         if !kem_dks.is_empty() {
@@ -1608,7 +1753,9 @@ fn open_x3dh(
     spent: &[[u8; 16]],
     recipient: &PeerId,
     env: &OfflineEnvelope,
+    kem_dks: &[&[u8]],
 ) -> Result<Option<OpenOutcome>> {
+    let kem = split_kem_ct(&env.ct);
     let eph_pk = PublicKey::from(env.eph);
     for spk_sk in spk_secrets {
         let spk_pk = PublicKey::from(*spk_sk);
@@ -1619,22 +1766,37 @@ fn open_x3dh(
             }
             let opk_pk = PublicKey::from(&opk.secret);
             let dh_opk = opk.secret.diffie_hellman(&eph_pk);
-            let key = hkdf_x3dh(
-                dh_spk.as_bytes(),
-                dh_opk.as_bytes(),
-                &env.eph,
-                spk_pk.as_bytes(),
-                &opk.id,
-                opk_pk.as_bytes(),
-            );
-            let aad = x3dh_aad(recipient, &env.message_id, &env.eph, &opk.id);
-            let Ok(inner) = ChaCha20Poly1305::new(key.as_slice().into()).decrypt(
-                Nonce::from_slice(&env.nonce),
-                Payload {
-                    msg: env.ct.as_ref(),
-                    aad: &aad,
-                },
-            ) else {
+            let base = x3dh_aad(recipient, &env.message_id, &env.eph, &opk.id);
+            let opened = if let Some((kct, aead_ct)) = kem {
+                let mut aad = base;
+                aad.extend_from_slice(&env.ct[..4 + kct.len()]);
+                kem_dks.iter().find_map(|dk| {
+                    let dk = void_session::kem::KemDk::from_bytes(dk)?;
+                    let ss = void_session::kem::decapsulate(&dk, kct)?;
+                    let key = hkdf_x3dh(
+                        dh_spk.as_bytes(),
+                        dh_opk.as_bytes(),
+                        &env.eph,
+                        spk_pk.as_bytes(),
+                        &opk.id,
+                        opk_pk.as_bytes(),
+                        Some(&ss),
+                    );
+                    aead_open(&key, &env.nonce, &aad, aead_ct)
+                })
+            } else {
+                let key = hkdf_x3dh(
+                    dh_spk.as_bytes(),
+                    dh_opk.as_bytes(),
+                    &env.eph,
+                    spk_pk.as_bytes(),
+                    &opk.id,
+                    opk_pk.as_bytes(),
+                    None,
+                );
+                aead_open(&key, &env.nonce, &base, &env.ct)
+            };
+            let Some(inner) = opened else {
                 continue;
             };
             let Some(mail) = parse_x3dh_inner(recipient, env, &inner, &opk.id)? else {
@@ -2012,6 +2174,7 @@ mod tests {
             mid,
             "dm",
             body,
+            &[],
         )
         .unwrap()
     }
@@ -2225,5 +2388,80 @@ mod tests {
         )
         .unwrap();
         assert_eq!(opened.mail.body, b"hybrid");
+    }
+
+    #[test]
+    fn opk_with_kem_uses_vqk1_and_plain_opk_still_opens() {
+        let alice = party();
+        let bob = party();
+        let spk = StaticSecret::random_from_rng(rand::rngs::OsRng);
+        let (opk_secret, opk) = fresh_opk(&bob);
+        let (dk, ek) = void_session::kem::generate();
+        let sender_pk = PublicKey::from(&alice.static_sk).to_bytes();
+        let hybrid = seal_with_opk(
+            &alice.key,
+            &bob.pid,
+            &PublicKey::from(&spk),
+            opk.id,
+            &PublicKey::from(opk.pk),
+            &alice.pid,
+            &sender_pk,
+            "m-both",
+            "dm",
+            b"both",
+            &ek,
+        )
+        .unwrap();
+        assert!(hybrid.ct.starts_with(b"VQK1"));
+        assert!(hybrid.ct.len() > 4 + void_session::kem::CT_LEN);
+        assert!(open_with_opks(
+            &[],
+            &[&spk],
+            &[opk_secret.clone()],
+            &[],
+            &bob.pid,
+            &hybrid,
+            &[],
+        )
+        .is_err());
+        let seed = dk.as_bytes();
+        let opened = open_with_opks(
+            &[],
+            &[&spk],
+            &[opk_secret.clone()],
+            &[],
+            &bob.pid,
+            &hybrid,
+            &[seed],
+        )
+        .unwrap();
+        assert_eq!(opened.mail.body, b"both");
+        assert_eq!(opened.spent_opk, Some(opk.id));
+        let mut tampered = hybrid.clone();
+        let flip = 4 + void_session::kem::CT_LEN / 2;
+        tampered.ct[flip] ^= 0x01;
+        assert!(open_with_opks(
+            &[],
+            &[&spk],
+            &[opk_secret.clone()],
+            &[],
+            &bob.pid,
+            &tampered,
+            &[seed],
+        )
+        .is_err());
+        let plain = seal_x3dh(&alice, &bob, &spk, &opk, b"plain", "m-plain");
+        assert!(!plain.ct.starts_with(b"VQK1"));
+        let opened = open_with_opks(
+            &[],
+            &[&spk],
+            &[opk_secret],
+            &[],
+            &bob.pid,
+            &plain,
+            &[],
+        )
+        .unwrap();
+        assert_eq!(opened.mail.body, b"plain");
     }
 }
