@@ -107,17 +107,37 @@ mod desktop {
     };
     use crate::voice;
 
+    use tracing_subscriber::{layer::SubscriberExt, util::SubscriberInitExt, fmt, EnvFilter};
+
     #[tokio::main]
     pub async fn run() -> Result<(), Box<dyn Error>> {
         if let Some(code) = voice::run_cli_mode() {
             std::process::exit(code);
         }
 
-        let _ = tracing_subscriber::fmt()
-            .with_env_filter(
-                tracing_subscriber::EnvFilter::try_from_default_env().unwrap_or_else(|_| {
-                    tracing_subscriber::EnvFilter::new("warn")
-                }),
+        let log_file = std::fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open("client.log")
+            .expect("open client.log");
+        let file_layer = fmt::layer()
+            .with_writer(move || log_file.try_clone().expect("clone client log"))
+            .with_ansi(false)
+            .with_target(true)
+            .with_level(true)
+            .with_thread_ids(true)
+            .with_file(true)
+            .with_line_number(true);
+        let console_layer = fmt::layer()
+            .with_writer(std::io::stdout)
+            .with_ansi(true)
+            .with_target(true)
+            .with_level(true);
+        let _ = tracing_subscriber::registry()
+            .with(file_layer)
+            .with(console_layer)
+            .with(
+                EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("warn")),
             )
             .try_init();
 
