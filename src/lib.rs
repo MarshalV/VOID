@@ -115,6 +115,11 @@ mod desktop {
             std::process::exit(code);
         }
 
+        let _ = std::fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open("client.log")
+            .expect("open client.log");
         let log_file = std::fs::OpenOptions::new()
             .create(true)
             .append(true)
