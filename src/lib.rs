@@ -115,15 +115,20 @@ mod desktop {
             std::process::exit(code);
         }
 
+        let exe_dir = std::env::current_exe()
+            .ok()
+            .and_then(|p| p.parent().map(|p| p.to_path_buf()))
+            .unwrap_or_else(|| std::env::current_dir().unwrap_or_default());
+        let log_path = exe_dir.join("client.log");
         let _ = std::fs::OpenOptions::new()
             .create(true)
             .append(true)
-            .open("client.log")
+            .open(&log_path)
             .expect("open client.log");
         let log_file = std::fs::OpenOptions::new()
             .create(true)
             .append(true)
-            .open("client.log")
+            .open(&log_path)
             .expect("open client.log");
         let file_layer = fmt::layer()
             .with_writer(move || log_file.try_clone().expect("clone client log"))
