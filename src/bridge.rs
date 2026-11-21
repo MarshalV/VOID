@@ -94,10 +94,10 @@ fn multiaddr_lan_or_circuit(a: &Multiaddr) -> bool {
         None => false,
     }
 }
-const RESEND_DELAY_BASE: Duration = Duration::from_secs(2);
-const RESEND_DELAY_MAX: Duration = Duration::from_secs(300);
+const RESEND_DELAY_BASE: Duration = Duration::from_millis(500);
+const RESEND_DELAY_MAX: Duration = Duration::from_secs(60);
 const SESSION_WAIT_TIMEOUT: Duration = Duration::from_secs(20);
-const OFFLINE_DHT_PUBLISH_DEBOUNCE: Duration = Duration::from_millis(200);
+const OFFLINE_DHT_PUBLISH_DEBOUNCE: Duration = Duration::from_millis(50);
 
 fn resend_delay_for_attempt(attempts: u32) -> Duration {
     let exp = attempts.min(6);

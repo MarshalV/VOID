@@ -3145,7 +3145,7 @@ fn query_relay_mailbox(
     last_query_at: &mut Option<Instant>,
     pending_challenges: &mut HashSet<libp2p::request_response::OutboundRequestId>,
 ) -> bool {
-    const MIN_GAP: Duration = Duration::from_millis(750);
+    const MIN_GAP: Duration = Duration::from_millis(100);
     if last_query_at.is_some_and(|t| t.elapsed() < MIN_GAP) {
         return false;
     }
@@ -3868,7 +3868,7 @@ fn send_create_queue(
 
 /// Пустой подписанный опрос своей очереди, когда письма не ждали.
 /// Не сдвигается от `Deliver`: время опроса не равно приходу письма.
-const QUEUE_NOISE_QUERY_EVERY: Duration = Duration::from_secs(17);
+const QUEUE_NOISE_QUERY_EVERY: Duration = Duration::from_secs(5);
 
 fn query_contact_queues(
     swarm: &mut libp2p::Swarm<ChatBehaviour>,
@@ -4979,7 +4979,7 @@ pub async fn run_chat_network(
                                     &prev_queues,
                                     &mut pending_queue_challenges,
                                 );
-                                let gap = Duration::from_secs(1);
+                                let gap = Duration::from_millis(300);
                                 fetch_mailbox_after = Some(Instant::now() + gap);
                             }
                         }
